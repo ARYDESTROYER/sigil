@@ -182,3 +182,46 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
   unique + 16-hex. Live check: `X-Request-Id` emitted (`55ee765f…`) and an
   inbound `my-trace-123` propagated.
 - Verified: gofmt ✓ · vet ✓ · test ✓ · build ✓.
+- Committed `0a9a13c`; pushed `main` → `origin/main` (user authorized push;
+  domain purchase still in progress on their side).
+
+## 2026-06-02 — Phase 2 (3 parallel agents via workflow `wu9u3qp47`)
+
+Ran a workflow with 3 agents over disjoint subtrees (libsigil / sigild / web).
+Each was constrained to its directory, forbidden from touching shared files or
+committing. **I re-verified everything myself** (did not trust agent self-reports)
+before committing.
+
+### libsigil — real (unaudited) AEAD layer ✅
+- New `core/src/aead.rs`: `seal()`/`open()` over the Envelope using
+  XChaCha20-Poly1305 (chacha20poly1305 0.10) keyed by HKDF-SHA256 (hkdf 0.12 +
+  sha2 0.10). Per-record key = HKDF(info = `sigil-record-v1` || suite_byte), so
+  keys are bound to the suite. Nonces passed in (no RNG in core). Fail-closed:
+  tamper/wrong-key/wrong-suite → `AeadError::Authentication`, no plaintext leak.
+- wasm SAFETY: all three crates added with `default-features = false` to keep
+  `getrandom` out of the tree — I confirmed **0 getrandom entries in Cargo.lock**
+  and the wasm32 build stays green.
+- Honest pre-audit caveats in the module docs (suite bound via key not AAD; no
+  zeroization; no KEM/rotation yet). 14 new tests.
+
+### sigild — hardening ✅
+- Typed JSON error envelope (`internal/api/errors.go`, `writeError`); refactored
+  the 501 ops + 500 recoverer to use it.
+- 64 KiB per-op body limit (`limitBody` middleware + MaxBytesReader): oversized →
+  413 `payload_too_large`; small body still → 501. (Brief §14: 64 KiB cap.)
+- New `internal/store`: `KV` interface + concurrency-safe in-memory `MemKV`
+  (RWMutex, defensive copies, sorted List). No crypto/DB. Tests incl. concurrency.
+
+### web — `/security` page ✅
+- `app/security/page.tsx`: no-index "Cryptographic posture" PQC table; every row
+  qualified (designed/in-development/planned/pre-audit/unaudited); intro is an
+  explicit negation; status-vocabulary key; clarifies FIPS names ≠ certification.
+  Footer link added. No forbidden claims (claims-grep clean).
+
+### My independent verification (the real gate) ✅
+- Rust: fmt --check ✓ · clippy -D warnings ✓ · **27 tests** ✓ · wasm32 ✓ ·
+  getrandom absent ✓.
+- Go: gofmt ✓ · vet ✓ · test (api + store) ✓ · build ✓.
+- Web: typecheck ✓ · lint ✓ · build ✓ (`/security` route present).
+- Updated README.md + CLAUDE.md crypto-status lines (the "no real crypto" line
+  was now stale).

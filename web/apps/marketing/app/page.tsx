@@ -43,6 +43,10 @@ export default function Home() {
           ·{" "}
           <Link href="/imprint" className="underline">
             Imprint
+          </Link>{" "}
+          ·{" "}
+          <Link href="/security" className="underline">
+            Security
           </Link>
         </p>
       </footer>

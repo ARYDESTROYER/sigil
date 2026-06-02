@@ -72,6 +72,28 @@ func accessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
+// maxOpsBodyBytes caps a single vault operation request body at 64 KiB. The op
+// log carries small CRDT deltas / signed envelopes, not bulk blobs (encrypted
+// blobs go to object storage), so a tight cap bounds memory and rejects abuse
+// early.
+const maxOpsBodyBytes = 64 << 10 // 64 KiB
+
+// limitBody wraps a handler with http.MaxBytesReader so reads past `max` bytes
+// fail. A short-circuit Content-Length check rejects an obviously oversized
+// request before any body is read. The downstream handler is responsible for
+// translating the MaxBytesReader error into a 413 (see opsNotImplemented).
+func limitBody(max int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > max {
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+				"request body exceeds the per-operation size limit")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, max)
+		next.ServeHTTP(w, r)
+	})
+}
+
 // recoverer turns a panic into a 500 instead of dropping the connection.
 func recoverer(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -83,9 +105,7 @@ func recoverer(logger *slog.Logger) func(http.Handler) http.Handler {
 						"panic", rec,
 						"path", r.URL.Path,
 					)
-					writeJSON(w, http.StatusInternalServerError, map[string]string{
-						"error": "internal",
-					})
+					writeError(w, http.StatusInternalServerError, "internal", "")
 				}
 			}()
 			next.ServeHTTP(w, r)

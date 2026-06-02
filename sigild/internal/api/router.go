@@ -34,8 +34,11 @@ func NewRouter(cfg Config) http.Handler {
 	mux.HandleFunc("GET /readyz", h.readyz)
 	// Vault operation log — intentionally unimplemented in the skeleton.
 	// We return 501 rather than fake any crypto/vault/CRDT/auth behaviour.
-	mux.HandleFunc("GET /v1/vaults/{vaultID}/ops", h.opsNotImplemented)
-	mux.HandleFunc("POST /v1/vaults/{vaultID}/ops", h.opsNotImplemented)
+	// The body is capped at 64 KiB per operation: oversized requests get 413,
+	// well-formed small requests still fall through to the 501 stub.
+	ops := limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsNotImplemented))
+	mux.Handle("GET /v1/vaults/{vaultID}/ops", ops)
+	mux.Handle("POST /v1/vaults/{vaultID}/ops", ops)
 
 	// Outermost first: recover panics, assign a request ID, then access-log.
 	return chain(mux,

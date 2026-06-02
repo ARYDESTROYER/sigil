@@ -1,10 +1,11 @@
 //! `sigil-core` — the pure, dependency-free heart of libsigil.
 //!
-//! STATUS: pre-audit skeleton. This crate currently defines only the
-//! crypto-agility envelope metadata (the algorithm-suite registry and the
-//! envelope header layout). **No real cryptography is implemented yet** — do
-//! not use any of this for anything security-sensitive. See
-//! `docs/crypto-spec.md` for the intended design.
+//! STATUS: pre-audit. This crate defines the crypto-agility envelope metadata
+//! (the algorithm-suite registry and the envelope header layout) and a real
+//! symmetric AEAD layer ([`mod@aead`]) that wraps that envelope with
+//! XChaCha20-Poly1305 + HKDF-SHA256 via the vetted RustCrypto crates. The code
+//! has **not** been audited — do not rely on it for anything
+//! security-sensitive yet. See `docs/crypto-spec.md` for the intended design.
 //!
 //! The crate is `no_std` (it pulls in only `core`) so it can be compiled to
 //! `wasm32-unknown-unknown` for the web app and browser extension, and linked
@@ -14,7 +15,9 @@
 
 extern crate alloc;
 
+mod aead;
 mod envelope;
+pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
 
 /// Envelope format version. Every encrypted record begins with this byte.

@@ -9,3 +9,13 @@ description = "Pure, dependency-free heart of libsigil: crypto-agility envelope 
 
 [lib]
 # Pure logic, no_std-compatible (see lib.rs). Builds for wasm32-unknown-unknown.
+
+[dependencies]
+# Real AEAD layer (pre-audit). Default features are disabled on every crate so
+# that NOTHING pulls in `getrandom` — `getrandom`'s default backend has no
+# implementation for `wasm32-unknown-unknown`, which would break the web/extension
+# build. We pass nonces in from the caller, so the AEAD never needs an RNG. The
+# `alloc` feature gives us `Vec`-based encrypt/decrypt on this no_std crate.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }

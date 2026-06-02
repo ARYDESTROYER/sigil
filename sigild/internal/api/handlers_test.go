@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -67,4 +69,72 @@ func TestVaultOpsReturns501(t *testing.T) {
 			t.Fatalf("ops vaultID = %q, want abc123", body["vaultID"])
 		}
 	}
+}
+
+func TestVaultOpsSmallBodyStill501(t *testing.T) {
+	// A well-formed small POST body (under the 64 KiB cap) must fall through to
+	// the 501 stub, not the size limiter.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/abc123/ops",
+		strings.NewReader(`{"op":"noop"}`))
+	testRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("small POST status = %d, want 501", rec.Code)
+	}
+	var body apiError
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("ops body not JSON: %v", err)
+	}
+	if body.Error != "not_implemented" {
+		t.Fatalf("ops error = %q, want not_implemented", body.Error)
+	}
+	if body.VaultID != "abc123" {
+		t.Fatalf("ops vaultID = %q, want abc123", body.VaultID)
+	}
+}
+
+func TestVaultOpsOversizedBodyReturns413(t *testing.T) {
+	// 64 KiB + 1 byte exceeds the per-operation cap.
+	oversized := bytes.Repeat([]byte("a"), maxOpsBodyBytes+1)
+
+	t.Run("with content-length", func(t *testing.T) {
+		// httptest.NewRequest sets ContentLength from the reader's length, so
+		// this exercises the short-circuit Content-Length check.
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/abc123/ops",
+			bytes.NewReader(oversized))
+		testRouter().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("oversized POST status = %d, want 413", rec.Code)
+		}
+		var body apiError
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("413 body not JSON: %v", err)
+		}
+		if body.Error != "payload_too_large" {
+			t.Fatalf("413 error = %q, want payload_too_large", body.Error)
+		}
+	})
+
+	t.Run("unknown content-length", func(t *testing.T) {
+		// ContentLength = -1 forces the MaxBytesReader path inside the handler.
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/abc123/ops",
+			bytes.NewReader(oversized))
+		req.ContentLength = -1
+		testRouter().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("oversized streamed POST status = %d, want 413", rec.Code)
+		}
+		var body apiError
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("413 body not JSON: %v", err)
+		}
+		if body.Error != "payload_too_large" {
+			t.Fatalf("413 error = %q, want payload_too_large", body.Error)
+		}
+	})
 }

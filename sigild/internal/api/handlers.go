@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -58,11 +60,25 @@ func dialState(addr string) string {
 	return "ok"
 }
 
-// opsNotImplemented is the deliberate 501 for the vault operation log.
+// opsNotImplemented is the deliberate 501 for the vault operation log. On POST
+// it first drains the (size-capped) request body so an oversized payload is
+// rejected with 413 before we reach the not-implemented response.
 func (h *handlers) opsNotImplemented(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusNotImplemented, map[string]string{
-		"error":   "not_implemented",
-		"detail":  "vault operation log is not implemented in the pre-audit skeleton",
-		"vaultID": r.PathValue("vaultID"),
+	if r.Method == http.MethodPost {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			if maxErr := (*http.MaxBytesError)(nil); errors.As(err, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+					"request body exceeds the per-operation size limit")
+				return
+			}
+			writeError(w, http.StatusBadRequest, "invalid_request",
+				"could not read request body")
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotImplemented, apiError{
+		Error:   "not_implemented",
+		Detail:  "vault operation log is not implemented in the pre-audit skeleton",
+		VaultID: r.PathValue("vaultID"),
 	})
 }

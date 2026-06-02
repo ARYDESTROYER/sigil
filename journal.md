@@ -225,3 +225,66 @@ before committing.
 - Web: typecheck ✓ · lint ✓ · build ✓ (`/security` route present).
 - Updated README.md + CLAUDE.md crypto-status lines (the "no real crypto" line
   was now stale).
+
+## 2026-06-02 — Phase 3 (workflow `w00itf376`, all opus 4.8 agents)
+
+Goal: finish the symmetric key chain (add the Argon2id front end), expose the
+AEAD across the FFI boundary, and harden CI. Per the user's standing directive
+("use sub agents for everything, always opus 4.8"), all build work ran through
+opus workflow agents; **I re-ran the full gate myself before committing.**
+
+Recovery note: an earlier Phase-3 run (`wkpeg2g7k`) was interrupted by a
+`/compact` and left a **half-applied** tree — `kdf.rs` existed but `lib.rs` had
+no `mod kdf;`, and `Cargo.lock` listed `argon2` while `Cargo.toml` did not
+declare it. This run rebuilt to a consistent state from that partial work.
+
+### libsigil/core — Argon2id KDF, wired in ✅
+- `core/src/kdf.rs`: `derive_master_key(password, salt, Argon2Params)` →
+  `[u8; 32]`, real Argon2id (argon2 0.5.3, `Version::V0x13`) via
+  `hash_password_into`. `Argon2Params::RECOMMENDED` = brief's m=65536 KiB
+  (64 MiB) / t=4 / p=2. **No RNG**: the salt is the caller's responsibility
+  (keeps the crate wasm-clean). `KdfError` maps Argon2 errors to
+  Invalid{Params,Salt}/Hash. 7 tests (determinism, salt/password sensitivity,
+  short-salt + bad-params rejection) use tiny FAST params so they're instant.
+- Wired into `lib.rs` (`mod kdf;` + re-exports `derive_master_key`,
+  `Argon2Params`, `KdfError`, `MASTER_KEY_LEN`); crate doc now shows the full
+  key chain (password → Argon2id → master key → HKDF → per-record key →
+  XChaCha20-Poly1305), all labelled pre-audit / building-block.
+- **wasm guardrail held:** `argon2` added with `default-features = false,
+  features = ["alloc"]` so the `rand`/`password-hash`→`rand_core`→`getrandom`
+  edge stays inactive. Confirmed **0 getrandom in Cargo.lock** and wasm32 green.
+  (argon2 pulls base64ct/blake2/cpufeatures/password-hash/rand_core into the
+  lockfile, but none activate getrandom.)
+
+### libsigil/ffi — real (unaudited) C-ABI seal/open ✅
+- `ffi/src/lib.rs`: `sigil_seal` / `sigil_open` / `sigil_buffer_free` over an
+  `#[repr(C)] SigilBuffer { *mut u8, usize }`, plus the existing
+  `sigil_current_suite`. Status codes: `SIGIL_OK`=0, `_ERR_NULL_ARG`=-1,
+  `_ERR_OPEN`=-2 (decode + auth failures collapse to one code → no structure
+  leak, never writes `*out`), `_ERR_BAD_INPUT`=-3.
+- Memory contract: library owns the heap slice until `sigil_buffer_free`; empty
+  outputs normalise to `{null,0}` to dodge the dangling-empty-Vec free trap.
+- `#![deny(unsafe_op_in_unsafe_fn)]` kept; every `unsafe` block has a `// SAFETY:`
+  note; `# Safety` doc sections on all exports. Hand-written `ffi/include/sigil.h`
+  (no cbindgen dependency — offline) mirrors the structs/codes/prototypes.
+- 7 ffi tests: round-trip, tamper→`_ERR_OPEN`, garbage/truncated→error-not-crash,
+  null-arg, empty-plaintext round-trip, free-empty no-op.
+- core's `#![forbid(unsafe_code)]` is untouched; all the unsafe lives in ffi.
+
+### CI — security scanning ✅
+- `.github/workflows/security.yml`: gitleaks (full history) + govulncheck
+  (sigild, Go 1.24.x) + cargo-audit (libsigil), on push/PR + weekly Monday cron.
+
+### My independent verification (the real gate) ✅
+- Rust: fmt --check ✓ · clippy -D warnings ✓ · **34 core + 7 ffi tests** ✓ ·
+  wasm32 ✓ · `grep -c getrandom Cargo.lock` = **0** ✓.
+- Go: gofmt ✓ · vet ✓ · test (api + store) ✓ · build ✓.
+- Web: typecheck ✓ · lint ✓ · build ✓ (10 routes).
+- YAML: all 5 workflow files parse (ruby `YAML.load_file`).
+- Over-claim scan: every "audited"/"secure" hit is a negation/caveat; no
+  "SOC 2" / "post-quantum secure" / unqualified "end-to-end encrypted".
+- Reviewed the ffi `unsafe` line-by-line (null checks, slice bounds, Box
+  reconstruction) myself before committing.
+- Tightened now-stale core crate-doc wording ("pure, dependency-free" →
+  "cryptographic"; "pulls in only core" → "core + alloc, not std") and refreshed
+  README/CLAUDE crypto-status + repo-map lines to name the KDF and the FFI API.

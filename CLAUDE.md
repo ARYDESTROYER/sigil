@@ -12,8 +12,9 @@
 post-quantum-*ready* authenticator. This repo is the **pre-launch / pre-audit
 foundation scaffold** from the 72-hour deployment sprint. It is **not** a
 shipping product: the sync server and clients are stubbed, and `libsigil` has
-only a **real but UNAUDITED** AEAD building block (XChaCha20-Poly1305 + HKDF)
-that is **not wired into any product flow**. Pre-audit — **do not store real
+**real but UNAUDITED** crypto building blocks — an Argon2id KDF, an
+XChaCha20-Poly1305 + HKDF AEAD, and a C-ABI `seal`/`open` over them — that are
+**not wired into any product flow**. Pre-audit — **do not store real
 secrets.** See [`docs/sprint-72h.md`](docs/sprint-72h.md).
 
 Posture is **stealth**: defensive, no-index, request-beta-access. Ship nothing
@@ -22,7 +23,8 @@ public, make no security claims, until the audit completes and trademark clears.
 ## Repository map
 
 - `libsigil/` — Rust crypto core (`core` = suite registry + envelope codec +
-  real-but-unaudited AEAD; `ffi` = C-ABI smoke export).
+  real-but-unaudited Argon2id KDF & XChaCha20-Poly1305+HKDF AEAD; `ffi` = C-ABI
+  `seal`/`open`/`buffer_free` + suite smoke export, hand-written `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, ops→501/413,
   request-ID/access-log/recover middleware, in-memory `store`). No crypto.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.

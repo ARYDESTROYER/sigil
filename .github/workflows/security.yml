@@ -1,0 +1,55 @@
+name: security
+
+# Pre-audit security scanning: secret detection, Go vuln scanning, and Rust
+# advisory auditing. Runs on every push/PR plus a weekly scheduled sweep so
+# advisories that land between commits still get surfaced.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly, Monday 07:00 UTC.
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    name: gitleaks secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so gitleaks can scan all commits, not just the tip.
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  govulncheck:
+    name: govulncheck (sigild)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          # Stdlib-only module, no go.sum to cache against.
+          cache: false
+      - name: govulncheck
+        working-directory: sigild
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  cargo-audit:
+    name: cargo-audit (libsigil)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: libsigil

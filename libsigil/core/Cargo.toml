@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.74"
 publish = false
 license = "Apache-2.0 OR MIT"
-description = "Pure, dependency-free heart of libsigil: crypto-agility envelope + algorithm-suite registry. Pre-audit skeleton."
+description = "Pure heart of libsigil: crypto-agility envelope + algorithm-suite registry, with a real-but-unaudited XChaCha20-Poly1305 AEAD layer and an Argon2id password-stretching KDF building block. Pre-audit skeleton."
 
 [lib]
 # Pure logic, no_std-compatible (see lib.rs). Builds for wasm32-unknown-unknown.
@@ -19,3 +19,10 @@ description = "Pure, dependency-free heart of libsigil: crypto-agility envelope 
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+# Argon2id password-stretching KDF (pre-audit). `default-features = false` keeps
+# `getrandom` out: argon2's default `rand`/`password-hash` features pull in
+# `rand_core` (and thus `getrandom`), which has no `wasm32-unknown-unknown`
+# backend and would break the web/extension build. We never generate a salt here
+# — the caller supplies it — so no RNG is needed. The `alloc` feature provides
+# the scratch memory block that `Argon2::hash_password_into` allocates.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }

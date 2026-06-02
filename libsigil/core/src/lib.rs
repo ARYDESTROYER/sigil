@@ -1,13 +1,23 @@
-//! `sigil-core` — the pure, dependency-free heart of libsigil.
+//! `sigil-core` — the cryptographic heart of libsigil.
 //!
 //! STATUS: pre-audit. This crate defines the crypto-agility envelope metadata
-//! (the algorithm-suite registry and the envelope header layout) and a real
+//! (the algorithm-suite registry and the envelope header layout), a real
 //! symmetric AEAD layer ([`mod@aead`]) that wraps that envelope with
-//! XChaCha20-Poly1305 + HKDF-SHA256 via the vetted RustCrypto crates. The code
-//! has **not** been audited — do not rely on it for anything
-//! security-sensitive yet. See `docs/crypto-spec.md` for the intended design.
+//! XChaCha20-Poly1305 + HKDF-SHA256, and an Argon2id password-stretching KDF
+//! ([`derive_master_key`]) — all via the vetted RustCrypto crates. The code
+//! has **not** been audited and the pieces are not yet wired into a complete
+//! account/key-management flow — treat them as building blocks, not a finished
+//! secure system. See `docs/crypto-spec.md` for the intended design.
 //!
-//! The crate is `no_std` (it pulls in only `core`) so it can be compiled to
+//! Argon2id is the **first hop** in the key chain: a low-entropy human password
+//! is stretched into a 32-byte master key, which is then expanded per record and
+//! used for authenticated encryption:
+//!
+//! ```text
+//!   password ─▶ Argon2id ─▶ master key ─▶ HKDF-SHA256 ─▶ per-record key ─▶ XChaCha20-Poly1305
+//! ```
+//!
+//! The crate is `no_std` (it relies on `core` + `alloc`, not `std`) so it can be compiled to
 //! `wasm32-unknown-unknown` for the web app and browser extension, and linked
 //! into the native clients via the `sigil-ffi` C-ABI layer.
 #![forbid(unsafe_code)]
@@ -17,8 +27,10 @@ extern crate alloc;
 
 mod aead;
 mod envelope;
+mod kdf;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
+pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 
 /// Envelope format version. Every encrypted record begins with this byte.
 /// See `docs/crypto-spec.md` for the full layout.

@@ -5,8 +5,9 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 > **STATUS: pre-launch / pre-audit skeleton.** This repository is the
 > foundation scaffold from the 72-hour deployment sprint — _not_ a shipping
 > product. The sync server and every client are intentionally stubbed.
-> `libsigil` now has a **real but UNAUDITED** AEAD building block
-> (XChaCha20-Poly1305 + HKDF) — it is **not wired into any product flow**.
+> `libsigil` now has **real but UNAUDITED** crypto building blocks — an
+> Argon2id KDF, an XChaCha20-Poly1305 + HKDF AEAD, and a C-ABI `seal`/`open`
+> over them — that are **not wired into any product flow**.
 > Everything is pre-audit; **do not store real secrets.** See
 > [`docs/sprint-72h.md`](docs/sprint-72h.md) for the
 > exact definition of done and the defer ledger.
@@ -17,8 +18,9 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 ## What this repo is (today)
 
 - `libsigil/` — Rust crypto core. **Builds, lints, tests, and compiles to
-  `wasm32`** — algorithm-suite registry, the crypto-agility envelope codec, and
-  a real (unaudited) XChaCha20-Poly1305 + HKDF AEAD seal/open layer.
+  `wasm32`** — algorithm-suite registry, the crypto-agility envelope codec, a
+  real (unaudited) Argon2id KDF and XChaCha20-Poly1305 + HKDF AEAD seal/open
+  layer, plus a `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
 - `sigild/` — Go sync server. **Builds, vets, tests.** Serves `/healthz`,
   `/readyz`, and a deliberate `501` on `/v1/vaults/{id}/ops`. Performs no crypto.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +

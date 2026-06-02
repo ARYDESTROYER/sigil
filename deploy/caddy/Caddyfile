@@ -1,0 +1,26 @@
+# Caddy reverse proxy for sigild. SKELETON — not applied.
+# Replace api.example.com with the real api.<host> once the domain resolves.
+#
+# WALL-CLOCK GATE: the DNS A record must resolve before Caddy can obtain a
+# Let's Encrypt cert (ACME validation). Budget retry/backoff on first boot.
+#
+# ⚠️ PQ-TLS NOTE: this edge terminates TLS with Caddy's classical groups. The
+# X25519MLKEM768 hybrid proof in the sprint must be run against the GO-NATIVE
+# sigild listener (Go 1.24.x, CurvePreferences=nil), NOT this Caddy edge. Do not
+# mislabel a Caddy classical handshake as the PQ proof.
+
+api.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

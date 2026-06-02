@@ -1,0 +1,8 @@
+# Sigil (working name) — security contact. PRE-LAUNCH / pre-audit.
+# RFC 9116. Domain is provisional (working anchor: sigilapp.io), pending
+# trademark clearance; update Contact/Canonical once the domain is registered.
+
+Contact: mailto:security@sigilapp.io
+Preferred-Languages: en
+Expires: 2026-12-31T23:59:59.000Z
+# Canonical: https://sigilapp.io/.well-known/security.txt

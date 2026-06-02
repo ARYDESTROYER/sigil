@@ -1,0 +1,18 @@
+# Code ownership. Replace @ARYDESTROYER with org teams once the GitHub org is
+# created and Cofounder B's handle is known (see docs/sprint-72h.md, Day 0).
+
+*                 @ARYDESTROYER
+
+# Crypto core + server lean to Cofounder A (crypto/backend)
+/libsigil/        @ARYDESTROYER
+/sigild/          @ARYDESTROYER
+/deploy/          @ARYDESTROYER
+
+# Web/product lean to Cofounder B
+/web/             @ARYDESTROYER
+/extension/       @ARYDESTROYER
+
+# Security-sensitive: require review regardless of who touches it
+/docs/threat-model.md   @ARYDESTROYER
+/docs/crypto-spec.md     @ARYDESTROYER
+/.github/                @ARYDESTROYER

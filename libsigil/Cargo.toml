@@ -1,0 +1,5 @@
+# libsigil — Sigil's cryptographic core (Rust workspace).
+# STATUS: pre-audit skeleton. No real cryptography is implemented yet.
+[workspace]
+resolver = "2"
+members = ["core", "ffi"]

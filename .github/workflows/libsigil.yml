@@ -1,0 +1,41 @@
+name: libsigil
+
+on:
+  push:
+    paths:
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/libsigil.yml"
+  pull_request:
+    paths:
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/libsigil.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: libsigil
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: libsigil
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test --all
+      - name: wasm build (sigil-core)
+        run: cargo build -p sigil-core --target wasm32-unknown-unknown

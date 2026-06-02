@@ -1,0 +1,22 @@
+name: release
+
+# INERT PLACEHOLDER. Signed, reproducible releases (cosign signing + SLSA
+# provenance + artifact upload) are deferred until libsigil and sigild are real
+# (see docs/sprint-72h.md, defer ledger). This workflow is intentionally
+# disabled so it is wired but never runs.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # not yet enabled — do not remove without wiring real signing
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: placeholder
+        run: echo "TODO reproducible build then cosign sign then SLSA provenance then upload"

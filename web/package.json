@@ -1,0 +1,10 @@
+{
+  "name": "sigil-web",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "build": "pnpm --filter marketing build",
+    "lint": "pnpm --filter marketing lint",
+    "typecheck": "pnpm --filter marketing typecheck"
+  }
+}

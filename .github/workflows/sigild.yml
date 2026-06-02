@@ -1,0 +1,36 @@
+name: sigild
+
+on:
+  push:
+    paths:
+      - "sigild/**"
+      - ".github/workflows/sigild.yml"
+  pull_request:
+    paths:
+      - "sigild/**"
+      - ".github/workflows/sigild.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sigild
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          # No external modules yet, so there is no go.sum to cache against.
+          cache: false
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
+      - name: build
+        run: go build ./...

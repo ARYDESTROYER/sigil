@@ -1,0 +1,15 @@
+[package]
+name = "sigil-ffi"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.74"
+publish = false
+license = "Apache-2.0 OR MIT"
+description = "C-ABI surface for libsigil, consumed by the native clients via FFI. Pre-audit skeleton."
+
+[lib]
+# rlib so we can unit-test; cdylib/staticlib for the native clients to link.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+sigil-core = { path = "../core" }

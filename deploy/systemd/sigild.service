@@ -1,0 +1,36 @@
+# Hardened systemd unit for sigild on a single VM. SKELETON — not applied.
+# Install to /etc/systemd/system/sigild.service. Secrets come from an
+# EnvironmentFile sourced from the team password manager, NEVER the repo.
+[Unit]
+Description=Sigil sync server (sigild)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sigild
+Group=sigild
+# SIGILD_ADDR, SIGILD_POSTGRES_ADDR, SIGILD_REDIS_ADDR, etc.
+EnvironmentFile=/etc/sigild/sigild.env
+ExecStart=/usr/local/bin/sigild
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

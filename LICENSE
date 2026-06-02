@@ -1,0 +1,20 @@
+Sigil — licensing overview
+===========================
+
+This project uses a dual-licensing model that mirrors its "open-source clients,
+source-available server" posture.
+
+1. The cryptographic core (`libsigil/`), the client applications, the CLI, and
+   the web front-end are licensed under the Apache License, Version 2.0.
+   See `LICENSE-APACHE` for the full text. SPDX-License-Identifier: Apache-2.0
+
+2. The sync server (`sigild/`) is intended to be source-available under the
+   Business Source License 1.1 (BSL-1.1) with an Apache-2.0 change license. The
+   full server license text is **not finalized yet (deferred)** — do not treat
+   `sigild/` as licensed until it lands.
+
+If a subdirectory contains its own LICENSE file, that file governs the contents
+of that subdirectory.
+
+This is a pre-launch repository; license choices are final but the entity that
+holds the copyright is still being formed and will be named here on incorporation.

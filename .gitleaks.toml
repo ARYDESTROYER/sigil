@@ -1,0 +1,22 @@
+# gitleaks config — secret scanning in pre-commit and CI.
+# See docs/sprint-72h.md for the "gitleaks fired" rotation runbook.
+title = "sigil-gitleaks"
+
+[extend]
+# Start from gitleaks' maintained default rule set.
+useDefault = true
+
+[allowlist]
+description = "Known-safe non-secrets"
+paths = [
+  '''(.*?)(jpg|gif|png|svg|ico)$''',
+  '''pnpm-lock\.yaml$''',
+  '''Cargo\.lock$''',
+  '''go\.sum$''',
+]
+regexes = [
+  # Placeholder/example values intentionally committed.
+  '''you@example\.com''',
+  '''example\.invalid''',
+  '''SIGILD_(POSTGRES|REDIS)_ADDR''',
+]

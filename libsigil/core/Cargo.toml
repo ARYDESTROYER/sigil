@@ -1,0 +1,11 @@
+[package]
+name = "sigil-core"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.74"
+publish = false
+license = "Apache-2.0 OR MIT"
+description = "Pure, dependency-free heart of libsigil: crypto-agility envelope + algorithm-suite registry. Pre-audit skeleton."
+
+[lib]
+# Pure logic, no_std-compatible (see lib.rs). Builds for wasm32-unknown-unknown.

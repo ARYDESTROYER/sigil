@@ -12,6 +12,11 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
+mod envelope;
+pub use envelope::{Envelope, EnvelopeError};
+
 /// Envelope format version. Every encrypted record begins with this byte.
 /// See `docs/crypto-spec.md` for the full layout.
 pub const ENVELOPE_VERSION: u8 = 0x01;

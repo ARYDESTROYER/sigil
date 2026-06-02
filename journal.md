@@ -148,3 +148,24 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 1. Approve the first signed commit + push, OR keep iterating locally.
 2. Buy `sigilapp.io` (or chosen name) → Cloudflare zone → Postmark DKIM/SPF/DMARC.
 3. Provision PQ-TLS client (OpenSSL 3.5+) before attempting the stretch sigild VM.
+
+### Commit `0edd579` — genesis scaffold ✅
+- 83 files, working tree clean. Local commit on `main`, unsigned (no signing key
+  configured), **not pushed** (user buying the domain; push not requested).
+
+### Dev increment #1 — libsigil crypto-agility envelope codec ✅
+- Added `libsigil/core/src/envelope.rs`: `Envelope { suite, aad, nonce,
+  ciphertext, tag, kem_ct }` with `encode()`/`decode()`. Concrete self-describing
+  format `0x01` — per-field unsigned-LEB128 varint length prefixes + a `flags`
+  byte for the optional `kem_ct`. **Serialization only; no encryption** (does not
+  fake crypto). `core` now `extern crate alloc`.
+- Rationale: lands the crypto-AGILITY property (suite byte travels inside the
+  frame → migrate suites without flag-day re-encryption) without touching real
+  crypto, which stays weeks out per the brief.
+- Design note: the brief's prose layout left nonce/ct/tag boundaries
+  implicit-by-suite; chose explicit length prefixes so the frame parses
+  unambiguously and is testable. Documented in `docs/crypto-spec.md`.
+- Tests (8 new): round-trip with/without kem_ct, header bytes, empty fields,
+  multibyte varint length (5000-byte field), reject bad version / unknown suite /
+  truncated / trailing bytes. Verified: fmt --check ✓ · clippy -D warnings ✓ ·
+  `cargo test` 14 core + 1 ffi ✓ · wasm32 build ✓.

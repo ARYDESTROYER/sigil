@@ -56,6 +56,13 @@ in [`libsigil/core/src/lib.rs`](../libsigil/core/src/lib.rs).
 [..]  kem_ct     (bytes)  KEM ciphertext — present only on key-rotation records
 ```
 
+**Implemented (format `0x01`):** [`libsigil/core/src/envelope.rs`](../libsigil/core/src/envelope.rs)
+is a concrete, self-describing codec — each variable field carries an unsigned
+LEB128 varint length prefix and a `flags` byte marks the optional `kem_ct`, so
+the frame parses unambiguously (the brief's prose left nonce/ciphertext/tag
+boundaries implicit-by-suite). It is **serialization only — no encryption** — and
+is covered by round-trip + negative-case tests.
+
 ## Hybrid construction (intended)
 
 **Key encapsulation** (per RFC 9794 / NIST SP 800-56C Rev. 2):

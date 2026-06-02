@@ -8,7 +8,7 @@ import (
 )
 
 func testRouter() http.Handler {
-	return NewRouter(Config{Version: "test"})
+	return NewRouter(Config{Version: "test", Logger: discardLogger()})
 }
 
 func TestHealthz(t *testing.T) {

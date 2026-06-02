@@ -36,5 +36,11 @@ func NewRouter(cfg Config) http.Handler {
 	// We return 501 rather than fake any crypto/vault/CRDT/auth behaviour.
 	mux.HandleFunc("GET /v1/vaults/{vaultID}/ops", h.opsNotImplemented)
 	mux.HandleFunc("POST /v1/vaults/{vaultID}/ops", h.opsNotImplemented)
-	return mux
+
+	// Outermost first: recover panics, assign a request ID, then access-log.
+	return chain(mux,
+		recoverer(cfg.Logger),
+		requestID,
+		accessLog(cfg.Logger),
+	)
 }

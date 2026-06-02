@@ -169,3 +169,16 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
   multibyte varint length (5000-byte field), reject bad version / unknown suite /
   truncated / trailing bytes. Verified: fmt --check ✓ · clippy -D warnings ✓ ·
   `cargo test` 14 core + 1 ffi ✓ · wasm32 build ✓.
+- Committed `bbf496f`.
+
+### Dev increment #2 — sigild HTTP middleware ✅
+- Added `sigild/internal/api/middleware.go`: `requestID` (assign/propagate
+  `X-Request-ID`, stash in ctx), `accessLog` (one structured slog line per
+  request — method/path/status/bytes/dur; **never logs bodies**, so no vault
+  material reaches logs), `recoverer` (panic → 500), `statusRecorder`, and a
+  `chain()` helper. Wired into `NewRouter` (recoverer → requestID → accessLog →
+  mux).
+- Tests (4): ID generated, inbound ID propagated, recoverer → 500, `newRequestID`
+  unique + 16-hex. Live check: `X-Request-Id` emitted (`55ee765f…`) and an
+  inbound `my-trace-123` propagated.
+- Verified: gofmt ✓ · vet ✓ · test ✓ · build ✓.

@@ -29,6 +29,25 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestVersion(t *testing.T) {
+	rec := httptest.NewRecorder()
+	testRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/version", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("version status = %d, want 200", rec.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("version body not JSON: %v", err)
+	}
+	if body["name"] != "sigild" {
+		t.Fatalf("version name = %q, want sigild", body["name"])
+	}
+	if body["version"] != "test" {
+		t.Fatalf("version version = %q, want test (the configured version)", body["version"])
+	}
+}
+
 func TestReadyzUnconfiguredIsOK(t *testing.T) {
 	rec := httptest.NewRecorder()
 	testRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))

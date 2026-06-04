@@ -19,7 +19,9 @@ job "sigild" {
       driver = "docker"
 
       config {
-        image = "ghcr.io/PLACEHOLDER/sigild:latest" # set once an image is published
+        # Placeholder — repoint at the image built from ../../sigild/Dockerfile
+        # and published to the registry (tag = git short SHA). Not yet published.
+        image = "ghcr.io/PLACEHOLDER/sigild:latest"
         ports = ["http"]
       }
 

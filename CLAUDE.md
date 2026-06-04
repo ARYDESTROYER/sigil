@@ -23,12 +23,14 @@ public, make no security claims, until the audit completes and trademark clears.
 ## Repository map
 
 - `libsigil/` — Rust crypto core (`core` = suite registry + envelope codec +
-  real-but-unaudited Argon2id KDF & XChaCha20-Poly1305+HKDF AEAD; `ffi` = C-ABI
-  `seal`/`open`/`buffer_free` + suite smoke export, hand-written `sigil.h`).
-- `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, ops→501/413,
-  request-ID/access-log/recover middleware, in-memory `store`). No crypto.
+  real-but-unaudited Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, and composed
+  `seal_record`/`open_record`; `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite
+  smoke export, hand-written `sigil.h`).
+- `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
+  ops→501/413, request-ID/access-log/recover middleware, in-memory `store`;
+  distroless `Dockerfile`). No crypto.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
-- `docs/` — threat model, crypto spec, sprint plan (internal/pre-audit).
+- `docs/` — threat model, crypto spec, sprint plan, deployment runbook (internal/pre-audit).
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not applied).
 - `extension/`, `cli/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
@@ -61,6 +63,9 @@ $go -C sigild vet ./...
 $go -C sigild test ./...
 $go -C sigild build ./...
 
+# sigild container (multi-stage → distroless, ~14 MB) — needs the Docker daemon
+docker build --build-arg VERSION=$(git rev-parse --short HEAD) -t sigild:dev sigild
+
 # Web — typecheck / lint / build (NEXT_TELEMETRY_DISABLED=1)
 corepack pnpm -C web typecheck
 corepack pnpm -C web lint
@@ -86,5 +91,7 @@ corepack pnpm -C web build
 
 ## Git / deploy
 
-The repo has no commits yet. **Do not commit, push, register domains, or deploy
-publicly without explicit human approval** — these are outward-facing/irreversible.
+`main` is committed and pushed to `origin` (genesis → Phase 4); the human has
+authorized commits + pushes to `main`. **Still do not register domains or deploy
+publicly without explicit human approval** — those are outward-facing/irreversible.
+See [`docs/deployment.md`](docs/deployment.md) for the (not-yet-applied) deploy story.

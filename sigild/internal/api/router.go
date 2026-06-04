@@ -32,6 +32,7 @@ func NewRouter(cfg Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
+	mux.HandleFunc("GET /version", h.version)
 	// Vault operation log — intentionally unimplemented in the skeleton.
 	// We return 501 rather than fake any crypto/vault/CRDT/auth behaviour.
 	// The body is capped at 64 KiB per operation: oversized requests get 413,

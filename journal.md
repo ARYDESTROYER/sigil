@@ -288,3 +288,54 @@ declare it. This run rebuilt to a consistent state from that partial work.
 - Tightened now-stale core crate-doc wording ("pure, dependency-free" →
   "cryptographic"; "pulls in only core" → "core + alloc, not std") and refreshed
   README/CLAUDE crypto-status + repo-map lines to name the KDF and the FFI API.
+
+## 2026-06-04 — Phase 4 (workflow `wnwct8sms`, 3 parallel opus tracks + verify)
+
+Theme: deployment readiness + the composed encryption API. Three disjoint
+subtrees ran in parallel (libsigil/core · sigild · deploy+docs), then one
+independent verifier; **I re-ran the gate and the container smoke myself.**
+
+### libsigil/core — composed record API ✅
+- New `core/src/record.rs`: `seal_record(password, salt, params, nonce, aad,
+  plaintext) -> Vec<u8>` and `open_record(password, salt, params, bytes)`,
+  composing Argon2id → AEAD → envelope codec into the single call a client makes.
+  `RecordError { Kdf, Aead, Envelope }` with `From` impls (`?`). **No new
+  crypto** — it only wires existing blocks. `open_record` decodes *before*
+  deriving the key so garbage is rejected without paying the Argon2id cost.
+- Wired into `lib.rs` (`mod record;` + re-exports); crate doc names it the
+  end-to-end entry point. 8 tests (round-trip, wrong-password→Aead-auth-fail,
+  tamper, key-path determinism, empty, garbage/truncated/empty→Envelope).
+- Honest caveats: `(salt, params)` are NOT in the envelope — caller must persist
+  them; nonce-reuse is the caller's job; no zeroization; not an account/rotation
+  system.
+
+### sigild — container + `/version` ✅
+- `GET /version` → `{"name":"sigild","version":<buildinfo>}` (no secrets, no
+  crypto) + `TestVersion`. Multi-stage `Dockerfile` (golang:1.24-alpine builder,
+  `CGO_ENABLED=0 -trimpath -ldflags …Version=$VERSION` → `gcr.io/distroless/
+  static-debian12:nonroot`, USER nonroot, EXPOSE 8080) + `.dockerignore`. No
+  Docker HEALTHCHECK by design (distroless has no shell; orchestrator probes
+  `/healthz`). sigild still does NO crypto / NO storage; ops still `501`.
+
+### deploy + docs — runbook ✅
+- New `docs/deployment.md`: topology (systemd VM → Nomad+image → k8s), artifact
+  flow, the PQ-TLS-must-be-proven-on-the-Go-listener caveat, DNS/ACME wall-clock
+  gate, secrets posture, a "what is NOT yet deployable" section, and a validation
+  status table. `deploy/README.md` + nomad image comment point at `sigild/
+  Dockerfile`.
+
+### My independent gate (the real commit gate) ✅
+- Rust: fmt ✓ · clippy -D warnings ✓ · **42 core + 7 ffi tests** ✓ · wasm32 ✓ ·
+  getrandom **0** ✓ · `#![forbid(unsafe_code)]` intact.
+- Go: gofmt ✓ · vet ✓ · test (api + store, incl. `/version`) ✓ · build ✓.
+- Web: unchanged this phase (no `web/` edits) — prior green build still holds.
+- **Docker smoke (first-hand):** built the image (**13.9 MB** distroless), ran
+  it, and probed the live container — `/healthz` + `/version` carried the stamped
+  `VERSION` build-arg, `/readyz` → deps `unconfigured`, ops → `501`. Cleaned up.
+- **Caught a cross-track inaccuracy:** Track C wrote deployment.md §8 saying the
+  Docker daemon was stopped and the image was "NOT built", but Track B had
+  brought the daemon up and built+probed it. Corrected §8 (and the intro) to the
+  truth — image built/validated locally; only terraform/caddy/nomad/systemd
+  validators remain uninstalled. (Accuracy is the whole point here.)
+- Refreshed CLAUDE repo-map/build-commands (added the docker build) and the
+  Git/deploy note (no longer "no commits yet").

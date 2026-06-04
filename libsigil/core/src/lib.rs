@@ -9,6 +9,11 @@
 //! account/key-management flow — treat them as building blocks, not a finished
 //! secure system. See `docs/crypto-spec.md` for the intended design.
 //!
+//! [`seal_record`] / [`open_record`] ([`mod@record`]) compose those building
+//! blocks into the single end-to-end call a client makes for one record
+//! (Argon2id → AEAD → envelope codec); they add no new cryptography and are not
+//! a complete account/key-management system.
+//!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
 //! used for authenticated encryption:
@@ -28,9 +33,11 @@ extern crate alloc;
 mod aead;
 mod envelope;
 mod kdf;
+mod record;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
+pub use record::{open_record, seal_record, RecordError};
 
 /// Envelope format version. Every encrypted record begins with this byte.
 /// See `docs/crypto-spec.md` for the full layout.

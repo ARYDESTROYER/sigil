@@ -1,0 +1,25 @@
+# Build context is sigild/. Keep it minimal and hermetic.
+
+# Version control metadata.
+.git
+.gitignore
+
+# Docs and markdown — not needed in the build.
+*.md
+README.md
+
+# Local build artifacts / compiled binaries.
+/out
+sigild
+*.exe
+*.test
+*.out
+
+# Editor / OS cruft.
+.DS_Store
+.idea
+.vscode
+
+# The Dockerfile and .dockerignore themselves don't belong in the image layers.
+Dockerfile
+.dockerignore

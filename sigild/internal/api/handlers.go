@@ -27,6 +27,17 @@ func (h *handlers) healthz(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// version reports the build's name and injected version string. It exposes no
+// secrets and performs no cryptography — it simply echoes the value threaded in
+// from buildinfo at build time (via api.Config.Version). Useful for confirming
+// which build is deployed without parsing the liveness probe.
+func (h *handlers) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"name":    "sigild",
+		"version": h.cfg.Version,
+	})
+}
+
 // readyz reports whether sigild's dependencies are reachable. The skeleton does
 // a plain TCP dial (no auth handshake); the production build replaces this with
 // real pgx/redis pings. If a *configured* dependency is unreachable we return

@@ -32,7 +32,10 @@ public, make no security claims, until the audit completes and trademark clears.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — threat model, crypto spec, sprint plan, deployment runbook (internal/pre-audit).
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not applied).
-- `extension/`, `cli/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
+- `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
+  core. **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace
+  member) so it can use `getrandom` without polluting the wasm-pure core.
+- `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)
 
@@ -55,6 +58,13 @@ cargo fmt --manifest-path $M --all -- --check
 cargo clippy --manifest-path $M --all-targets -- -D warnings
 cargo test --manifest-path $M
 cargo build --manifest-path $M -p sigil-core --target wasm32-unknown-unknown
+
+# Rust demo CLI — separate crate; native-only, so getrandom is fine here. After
+# building it, confirm it did NOT leak into the wasm-pure core:
+cargo fmt   --manifest-path cli/Cargo.toml --all -- --check
+cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
+cargo test  --manifest-path cli/Cargo.toml
+grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # Go server — fmt / vet / test / build
 go=/opt/homebrew/bin/go

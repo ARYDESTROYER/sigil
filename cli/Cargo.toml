@@ -1,0 +1,39 @@
+# sigil-cli — a tiny, standalone demonstration binary over the libsigil core.
+#
+# STATUS: pre-audit. This crate seals/opens a single file with the REAL but
+# UNAUDITED `sigil-core` record API (Argon2id -> XChaCha20-Poly1305 envelope).
+# It is a demonstration of the libsigil building block only and MUST NOT be used
+# to protect real secrets. See README.md for the loud warning and the on-disk
+# container format.
+#
+# IMPORTANT: this crate is INTENTIONALLY OUTSIDE the `libsigil/` cargo workspace.
+# It has its own `cli/Cargo.lock`. Keeping it separate is what lets it depend on
+# `getrandom` for native randomness without ever touching `libsigil/Cargo.lock`
+# — `sigil-core` compiles to `wasm32-unknown-unknown`, where `getrandom` has no
+# backend, so the libsigil workspace lockfile MUST stay getrandom-free. This
+# binary is native-only (never wasm), so `getrandom` is fine HERE.
+[package]
+name = "sigil-cli"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.74"
+publish = false
+license = "Apache-2.0 OR MIT"
+description = "Pre-audit demonstration CLI that seals/opens a file with the real-but-unaudited libsigil sigil-core record API. Not for real secrets."
+
+[[bin]]
+name = "sigil"
+path = "src/main.rs"
+
+[lib]
+name = "sigil_cli"
+path = "src/lib.rs"
+
+[dependencies]
+# The real (UNAUDITED) crypto building block. Path dependency only; this does NOT
+# add `cli` to the libsigil workspace.
+sigil-core = { path = "../libsigil/core" }
+# Native CSPRNG for the salt and nonce. Safe to use here because this crate is a
+# native binary and is NEVER compiled to wasm32 (where getrandom has no backend).
+# It lives in `cli/Cargo.lock`, never in `libsigil/Cargo.lock`.
+getrandom = "0.2"

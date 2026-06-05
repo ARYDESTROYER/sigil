@@ -1,0 +1,40 @@
+name: cli
+
+on:
+  push:
+    paths:
+      - "cli/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/cli.yml"
+  pull_request:
+    paths:
+      - "cli/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/cli.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+      - name: build
+        run: cargo build

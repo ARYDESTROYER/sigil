@@ -22,7 +22,11 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   real (unaudited) Argon2id KDF and XChaCha20-Poly1305 + HKDF AEAD seal/open
   layer, plus a `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
 - `sigild/` — Go sync server. **Builds, vets, tests.** Serves `/healthz`,
-  `/readyz`, and a deliberate `501` on `/v1/vaults/{id}/ops`. Performs no crypto.
+  `/readyz`, `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops`.
+  Performs no crypto. Ships a distroless `Dockerfile`.
+- `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
+  libsigil core (`sigil seal`/`sigil open`). Standalone crate; unaudited; not for
+  real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — threat model, crypto spec, and the sprint plan (kept internal/pre-audit).
@@ -35,7 +39,7 @@ libsigil/        Rust crypto core (workspace: core + ffi)
 sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
 web/             Next.js marketing (+ webapp/admin reserved), pnpm workspace
 extension/       Browser extension (reserved)
-cli/             Rust CLI (reserved)
+cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 deploy/          terraform / nomad / helm / caddy / systemd
 docs/            threat model, crypto spec, sprint plan
 ```
@@ -58,6 +62,9 @@ cargo fmt   --manifest-path libsigil/Cargo.toml --all -- --check
 cargo clippy --manifest-path libsigil/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path libsigil/Cargo.toml
 cargo build --manifest-path libsigil/Cargo.toml -p sigil-core --target wasm32-unknown-unknown
+
+# Rust demo CLI (separate crate; native-only)
+cargo test  --manifest-path cli/Cargo.toml
 
 # Go sync server
 ( cd sigild && gofmt -l . && go vet ./... && go test ./... && go build ./... )

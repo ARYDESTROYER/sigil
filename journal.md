@@ -339,3 +339,52 @@ independent verifier; **I re-ran the gate and the container smoke myself.**
   validators remain uninstalled. (Accuracy is the whole point here.)
 - Refreshed CLAUDE repo-map/build-commands (added the docker build) and the
   Git/deploy note (no longer "no commits yet").
+
+## 2026-06-05 — Phase 5 (workflow `w8y9u2ofg`, 2 parallel opus tracks + verify)
+
+Theme: the first **runnable** end-to-end demonstration of the crypto core — a
+small CLI that seals/opens a file with a password. Two disjoint tracks (the
+`cli/` crate · its CI workflow), then an independent verifier; **I re-ran the
+gate and a real binary round-trip myself.**
+
+### cli/ — the `sigil` demo CLI ✅
+- New **standalone** crate `sigil-cli` (binary `sigil`), path-depending on
+  `../libsigil/core`. Composes `seal_record`/`open_record` into a self-describing
+  on-disk **container**: `magic "SIGILcli" | version u8 | m_cost/t_cost/p_cost
+  u32 LE | salt_len u8 | salt | envelope`. The salt+params live in the header
+  because they are NOT in the envelope (the nonce is); the AEAD nonce stays
+  inside the envelope. Fixed `aad = b"sigil-cli/1"`.
+- `cli/src/lib.rs` (testable, `#![forbid(unsafe_code)]`): `seal_to_container` /
+  `open_container` + `CliError`. The container **parser is bounds-checked** — a
+  `len < FIXED_HEADER_LEN(22)` gate makes every later index provably in-range,
+  and the declared `salt_len` is checked before `split_at`, so untrusted bytes
+  never panic. Errors surface `RecordError` via Debug — **never** plaintext.
+- `cli/src/main.rs`: hand-rolled `std::env` arg parser (no clap), password from
+  `SIGIL_PASSWORD` (unset/empty → hard error, never hangs), loud
+  **PRE-AUDIT / UNAUDITED / not-for-real-secrets** banner in `--help`.
+- 13 tests (11 lib unit incl. tamper/bad-magic/version/salt-overrun/truncation;
+  2 integration that drive the real binary via `CARGO_BIN_EXE_sigil`).
+
+### getrandom isolation (the key guardrail) ✅
+- The CLI uses `getrandom` for salt+nonce — **fine**, it is native-only and never
+  compiled to wasm. It is a **standalone crate with its own `cli/Cargo.lock`**,
+  NOT a libsigil workspace member (`libsigil/Cargo.toml` members stay
+  `["core","ffi"]`). Verified `libsigil/Cargo.lock` getrandom count = **0** and
+  its **mtime was byte-identical before/after** the CLI build (`1780397378`);
+  `cli/Cargo.lock` getrandom = 1 (expected).
+
+### CI ✅
+- `.github/workflows/cli.yml` mirrors `libsigil.yml` (paths `cli/**`, fmt/clippy/
+  test/build, `workspaces: cli`, no wasm job — native-only).
+
+### My independent gate (the real commit gate) ✅
+- CLI: fmt ✓ · clippy -D warnings ✓ · **11 unit + 2 integration tests** ✓ ·
+  build ✓.
+- **First-hand binary round-trip:** sealed a file → opaque 131-byte container
+  (plaintext absent) → opened with the right password → **byte-identical**;
+  wrong password → exit 1, `Aead(Authentication)`, **no output written**; unset
+  `SIGIL_PASSWORD` → fail-fast exit 1.
+- Regression: libsigil fmt/clippy/**42+7** tests/wasm/getrandom 0 ✓; Go
+  fmt/vet/test/build ✓; all 6 workflow YAMLs parse ✓. Web untouched.
+- Refreshed README + CLAUDE (repo map: `cli/` no longer "reserved"; known-green
+  CLI commands + the getrandom-stays-0 check).

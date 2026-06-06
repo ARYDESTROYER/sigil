@@ -4,8 +4,10 @@
 > for `sigild`, the Sigil sync server. Nothing here has been provisioned,
 > applied, or exposed to the public internet. The artifacts under
 > [`../deploy/`](../deploy/) are reference shapes, and `sigild` itself is a
-> skeleton that performs **no cryptography, stores no vault data, and runs no
-> auth** (vault ops return `501`). Treat every "production" word below as
+> skeleton that performs **no cryptography and runs no auth** (vault ops default
+> to `501`; an opt-in `SIGILD_ENABLE_DEV_OPS` dev-only, in-memory, unauthenticated
+> store of opaque client-encrypted blobs exists for local wiring only — never
+> expose it). Treat every "production" word below as
 > *future, unbuilt, unaudited*. See [`sprint-72h.md`](sprint-72h.md) for the
 > wall-clock gates and the defer ledger this descends from.
 
@@ -34,8 +36,8 @@ not skip ahead. The driver is operational burden, not feature need.
                ▼
         ┌──────────────┐
         │   sigild     │   Go-native HTTP listener (:8080)
-        │  (skeleton)  │   /healthz, /readyz  +  /v1/.../ops → 501
-        └──────────────┘
+        │  (skeleton)  │   /healthz, /readyz, /version
+        └──────────────┘   /v1/.../ops → 501 (dev-only opt-in via SIGILD_ENABLE_DEV_OPS)
           (future: Postgres + Redis — NOT wired yet)
 ```
 
@@ -211,11 +213,20 @@ returns `503` when a configured dependency is down.
 
 To avoid any over-claim, the honest gaps:
 
-- **`sigild` does no cryptography, stores no vault data, runs no auth.** The
-  vault operation log (`/v1/vaults/{id}/ops`) deliberately returns **`501`**
-  (oversized bodies are capped at 64 KiB and rejected with **`413`** first). It
-  understands no vault format. This is by design (brief §14) and must stay this
-  way pre-audit — do not "deploy a backend" and imply it stores secrets.
+- **`sigild` does no cryptography and runs no auth.** The vault operation log
+  (`/v1/vaults/{id}/ops`) **defaults to `501`** and stays that way in any
+  production configuration. It can be turned on **only as a dev scaffold** by
+  setting the environment variable **`SIGILD_ENABLE_DEV_OPS`**; when enabled it
+  is an **in-memory, non-durable, UNAUTHENTICATED** store of **opaque
+  client-encrypted blobs** — the server does no crypto and never sees plaintext
+  or keys (POST → `201 {vaultID, seq}`; GET → the stored blobs base64-encoded).
+  Oversized bodies are capped at 64 KiB and rejected with **`413`**. There is
+  still **no auth, no durability, no Postgres**, and no real op/CRDT semantics.
+  **Do NOT set `SIGILD_ENABLE_DEV_OPS` on any exposed instance** — the dev
+  op-log must never be reachable from the public internet, and no real secrets
+  may be stored in it. This honours the "stub with `501` rather than poison the
+  audit" guardrail (brief §14): the production default stays `501`. See
+  [`api.md`](api.md) for the full contract.
 - **No data stores are wired.** Postgres / Redis / S3(R2) are referenced by env
   var names and by the readiness probe only; there is no schema, no migration, no
   client, no backup/restore. The first Postgres migration (with RLS as
@@ -248,7 +259,7 @@ implied.
 
 | Artifact | How checked | Result / notes |
 |----------|-------------|----------------|
-| `sigild/Dockerfile` | **Built, run, and probed** — `docker build` (multi-stage → distroless, ~14 MB), `docker run`, then `curl` against the live container. | **Validated locally.** `/healthz` and `/version` returned the stamped `VERSION` build-arg, `/readyz` reported deps `unconfigured`, and vault ops still `501`. Push to a registry is the future step. |
+| `sigild/Dockerfile` | **Built, run, and probed** — `docker build` (multi-stage → distroless, ~14 MB), `docker run`, then `curl` against the live container. | **Validated locally.** `/healthz` and `/version` returned the stamped `VERSION` build-arg, `/readyz` reported deps `unconfigured`, and vault ops still `501` (the dev op-log is gated behind `SIGILD_ENABLE_DEV_OPS`, unset in the image — production default). Push to a registry is the future step. |
 | `deploy/caddy/Caddyfile` | Syntactic review by eye only — **`caddy validate` NOT installed**. | Reverse-proxy target `127.0.0.1:8080` matches `sigild`'s default `:8080`. `api.example.com` is a deliberate placeholder. PQ-TLS caveat present inline. No errors spotted; **not tool-validated**. |
 | `deploy/nomad/sigild.nomad.hcl` | Syntactic review by eye only — **`nomad job validate` NOT installed**. | Port `to = 8080` and `/healthz` check match `sigild`. Image is the placeholder `ghcr.io/PLACEHOLDER/sigild:latest` — must be repointed at the image built from `sigild/Dockerfile` once published (comment added). No errors spotted; **not tool-validated**. |
 | `deploy/systemd/sigild.service` | Syntactic review by eye only — **`systemd-analyze verify` NOT installed**. | `ExecStart=/usr/local/bin/sigild`, `EnvironmentFile` for secrets, hardening directives present. Consistent with Shape 1. No errors spotted; **not tool-validated**. |

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,13 +25,18 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	addr := getenv("SIGILD_ADDR", ":8080")
+	devOps := truthy(os.Getenv("SIGILD_ENABLE_DEV_OPS"))
 	cfg := api.Config{
 		Version: buildinfo.Version,
 		// host:port reachability targets; empty => reported "unconfigured".
 		// The production build will replace plain dials with real pgx/redis pings.
-		PostgresAddr: os.Getenv("SIGILD_POSTGRES_ADDR"),
-		RedisAddr:    os.Getenv("SIGILD_REDIS_ADDR"),
-		Logger:       logger,
+		PostgresAddr:  os.Getenv("SIGILD_POSTGRES_ADDR"),
+		RedisAddr:     os.Getenv("SIGILD_REDIS_ADDR"),
+		Logger:        logger,
+		DevOpsEnabled: devOps,
+	}
+	if devOps {
+		logger.Warn("DEV op-log enabled: UNAUTHENTICATED, in-memory, non-durable — do NOT expose publicly")
 	}
 
 	srv := &http.Server{
@@ -65,4 +71,15 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// truthy reports whether an env value enables a flag: "1", "true", or "TRUE"
+// (case-insensitive). Anything else (including empty) is false.
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true":
+		return true
+	default:
+		return false
+	}
 }

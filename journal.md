@@ -388,3 +388,73 @@ gate and a real binary round-trip myself.**
   fmt/vet/test/build ✓; all 6 workflow YAMLs parse ✓. Web untouched.
 - Refreshed README + CLAUDE (repo map: `cli/` no longer "reserved"; known-green
   CLI commands + the getrandom-stays-0 check).
+
+## 2026-06-06 — Phase 6 (dev-gated opaque vault op-log in sigild + verify)
+
+Theme: the first **client→server→client** path — give `sigild` a place to put
+the CLI's sealed container and hand it back unchanged, **without the server ever
+touching crypto or plaintext**. Built behind a dev flag, then independently
+verified incl. a live round-trip; **I re-ran the gate and the demo myself.**
+
+### sigild — opaque, dev-gated, in-memory op-log ✅
+- New `internal/store/vaultlog.go`: `MemVaultLog` with `Append(vaultID, blob)
+  -> seq` and `Since(vaultID, sinceSeq) -> []Op`. **1-based, per-vault**
+  monotonic sequence; **defensive copies** of the blob on the way in AND on the
+  way out (server never aliases caller memory). Stdlib-only (`sync` mutex). The
+  blob is an **opaque `[]byte`** — the server does **no crypto**, never decodes,
+  never interprets it; it is exactly the bytes the client sent.
+- New handlers (`internal/api/handlers.go` + wiring in `router.go`):
+  `POST /v1/vaults/{vaultID}/ops` (read body → `Append` → `201 {"vaultID","seq"}`)
+  and `GET …/ops?since=N` (→ `200 {"ops":[{seq,blob}],"next"}`, `blob`
+  base64). Empty POST body → `400`; bad `since` → `400`; the **64 KiB
+  `limitBody` cap still wraps POST**, so oversized → `413` even when enabled.
+- **DEV-GATED, default OFF.** `cfg.DevOpsEnabled` defaults `false` in `Config`;
+  `main.go` only flips it from a truthy `SIGILD_ENABLE_DEV_OPS`. When the flag is
+  **unset, `NewRouter`'s else-branch routes BOTH verbs to `opsNotImplemented` →
+  `501 not_implemented`** — production default is unchanged, honoring the
+  "stub with 501 rather than poison the audit" guardrail.
+- ⚠️ Loudly labeled, in code + `docs/api.md`: this op-log is **UNAUTHENTICATED,
+  IN-MEMORY, NON-DURABLE, DEV-ONLY**, stores **opaque blobs only**, and is **not**
+  a real op-log. `api.md` leads with a bold "READ THIS FIRST. This endpoint is a
+  development scaffold, not a product." block. No fake auth was added.
+
+### docs — `docs/api.md` ✅
+- New endpoint reference for the dev op-log: the `SIGILD_ENABLE_DEV_OPS` gate
+  (default → `501`), request/response shapes, the `400`/`413` cases, and the
+  honest caveats (opaque/unauthenticated/in-memory/non-durable, server never
+  decrypts). No over-claims (the only "audited" hit is the negation "Nothing here
+  is audited or production-ready").
+
+### My independent gate (the real commit gate) ✅
+- Go: gofmt ✓ · vet ✓ · build ✓ · test ✓ — **7 new store tests** (SeqIncrements,
+  SeqIsPerVault, SinceZeroReturnsAll, SinceFilters, SinceUnknownVault,
+  DefensiveCopy, ConcurrentAppends) + **5 new api tests** (AppendAndList,
+  EmptyBodyIs400, BadSinceIs400, OversizedStill413WhenEnabled, **and
+  DefaultStill501**), plus the pre-existing 501/413 tests still pass.
+- **stdlib-only held:** `vaultlog.go` imports only `sync`; handlers use
+  `encoding/json`/`io`/`strconv` etc. `go.mod` unchanged (no `require` block).
+- **Live round-trip (real binaries, real localhost sockets):** sealed a known
+  plaintext (sha256 `92bbc8a6…`) with the CLI → 165-byte `secret.sigil`
+  (sha256 `05780ac6…`); started `sigild` with `SIGILD_ENABLE_DEV_OPS=1`;
+  `POST --data-binary @container` → **`201 {"vaultID":"demo","seq":1}`**;
+  `GET ?since=0` → **`200`**, `ops[0].seq=1`, `next=1`; base64-decoded
+  `ops[0].blob` = 165 bytes, sha256 `05780ac6…` — **byte-identical** to the
+  container (server stored the ciphertext opaquely, unchanged); ran `sigil open`
+  on the decoded bytes with the same password → recovered plaintext sha256
+  `92bbc8a6…` = original. **Full client→server→client round-trip: YES.**
+- **Default-501 confirmed three ways:** code (else-branch), httptest
+  (`TestVaultOpsDefaultStill501`), and **live** — a second server started
+  WITHOUT the flag (`:18091`) returned `501 not_implemented` on BOTH POST and
+  GET. Both background servers were killed; no leftover procs/listeners.
+- Regression: libsigil fmt/clippy/**7** tests/wasm/**getrandom 0** ✓; cli
+  fmt/clippy/**2** tests ✓; all 6 workflow YAMLs parse ✓. Web untouched.
+- Over-claim scan CLEAN — every "audited"/"unaudited" hit across the changed
+  `sigild/*.go` + `docs/*` is a negation/caveat or the guardrail line itself; no
+  unqualified "secure"/"post-quantum secure"/"SOC 2"/"E2E".
+
+### ⛔ Still NOT production (honest)
+- The op-log is a **dev scaffold**. Production needs: real **auth** (this is
+  explicitly unauthenticated), a **durable** store (this is in-memory and lost on
+  restart), and **CRDT / conflict-resolution semantics** (this is a naive
+  append-only log with a per-vault counter, not a real sync protocol). The prod
+  default stays `501` until those land.

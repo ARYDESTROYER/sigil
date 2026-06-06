@@ -27,8 +27,13 @@ public, make no security claims, until the audit completes and trademark clears.
   `seal_record`/`open_record`; `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite
   smoke export, hand-written `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
-  ops→501/413, request-ID/access-log/recover middleware, in-memory `store`;
-  distroless `Dockerfile`). No crypto.
+  request-ID/access-log/recover middleware, in-memory `store`; distroless
+  `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an
+  opaque, **dev-gated** op-log (`MemVaultLog`) is wired in only when
+  `SIGILD_ENABLE_DEV_OPS` is truthy (**dev only, unauthenticated, in-memory,
+  non-durable**; default OFF → ops stay `501`). **No crypto**: the server never
+  decodes the blob; it stores/returns the exact client bytes. Endpoint reference
+  in [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — threat model, crypto spec, sprint plan, deployment runbook (internal/pre-audit).
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not applied).

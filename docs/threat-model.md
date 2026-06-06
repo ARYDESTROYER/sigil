@@ -23,6 +23,20 @@ defense, and the layer the defense lives at.
 | 11 | Push-notification operator | Reads push payloads | Payloads carry only opaque vault ID + wake hint; approval blobs decryptable only by the user's other devices | Architecture |
 | 12 | Lost master password | User locked out | Recovery kit (12-word seed), recovery delegates (delay, default 7d), platform-passkey-bound recovery — none let Sigil decrypt unilaterally | Workflow |
 
-**Status note for this repo:** none of the above is implemented yet. The current
-`sigild` skeleton stores no vault data and performs no crypto; `libsigil` has no
-crypto. Do not represent these defenses as live.
+**Server-stores-opaque-blobs property.** Even where `sigild` does hold data, it
+holds **only opaque client-encrypted blobs** — never plaintext and never keys.
+The server does no cryptography and never decrypts or interprets what it stores,
+so vault confidentiality does **not** depend on the server (adversary classes 4
+and 5 above). The only stateful surface today is the **dev-only vault op-log**
+(see [`api.md`](api.md)): it is **gated off by default** (opt-in via
+`SIGILD_ENABLE_DEV_OPS`, otherwise `501`), **in-memory / non-durable**, and
+**UNAUTHENTICATED** — it has no access control whatsoever. It is a local-wiring
+scaffold only and **must never be exposed publicly or hold real secrets**; a
+production op-log will add device-key auth, per-vault authorization, and durable
+storage, while still storing only opaque ciphertext.
+
+**Status note for this repo:** none of the defenses in the table above is
+implemented yet. The current `sigild` skeleton performs no crypto, runs no auth,
+and stores only the opaque blobs described above; `libsigil` has real-but-
+**unaudited** crypto building blocks not wired into any product flow. Do not
+represent these defenses as live.

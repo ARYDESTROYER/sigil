@@ -22,8 +22,11 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   real (unaudited) Argon2id KDF and XChaCha20-Poly1305 + HKDF AEAD seal/open
   layer, plus a `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
 - `sigild/` — Go sync server. **Builds, vets, tests.** Serves `/healthz`,
-  `/readyz`, `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops`.
-  Performs no crypto. Ships a distroless `Dockerfile`.
+  `/readyz`, `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by
+  default. Behind a dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route
+  becomes an **unauthenticated, in-memory, non-durable** op-log that stores
+  **opaque client-encrypted blobs** and hands them back unchanged. Performs no
+  crypto — never decodes the blob. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`). Standalone crate; unaudited; not for
   real secrets.

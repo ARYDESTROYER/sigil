@@ -43,6 +43,9 @@
 
 #![forbid(unsafe_code)]
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use serde::Deserialize;
 use sigil_core::{open_record, seal_record, Argon2Params, RecordError, NONCE_LEN};
 
 /// The 8-byte magic that prefixes every container.
@@ -85,6 +88,19 @@ pub enum CliError {
     /// envelope, or — most importantly — an authentication failure (wrong
     /// password or tampered data). The plaintext is never returned in this case.
     Record(RecordError),
+    /// A transport/IO error while talking to the dev sigild op-log over plain
+    /// HTTP (connection refused, broken pipe, etc.). Carries a short message.
+    Http(String),
+    /// The dev op-log returned a non-2xx HTTP status. `status` is the HTTP code
+    /// (e.g. `501` when sigild's dev op-log flag is off) and `body` is the raw
+    /// response body for context. Never contains plaintext (the op is opaque).
+    Server { status: u16, body: String },
+    /// A 2xx response that could not be parsed: bad JSON, missing field, or a
+    /// `blob` that was not valid base64.
+    BadResponse(String),
+    /// The supplied vault identifier is empty or contains a path separator or
+    /// whitespace, so it cannot be safely placed in the request URL.
+    BadVault(String),
 }
 
 impl From<RecordError> for CliError {
@@ -113,6 +129,15 @@ impl core::fmt::Display for CliError {
             // sees Kdf / Aead / Envelope without us claiming more than we know.
             // Never includes plaintext.
             CliError::Record(e) => write!(f, "could not open record: {e:?}"),
+            CliError::Http(e) => write!(f, "dev op-log transport error: {e}"),
+            CliError::Server { status, body } => {
+                write!(f, "dev op-log returned HTTP {status}: {body}")
+            }
+            CliError::BadResponse(e) => write!(f, "could not parse dev op-log response: {e}"),
+            CliError::BadVault(v) => write!(
+                f,
+                "invalid vault id {v:?}: must be non-empty with no '/' or whitespace"
+            ),
         }
     }
 }
@@ -211,6 +236,142 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
 
     let plaintext = open_record(password, salt, params, envelope)?;
     Ok(plaintext)
+}
+
+// ---------------------------------------------------------------------------
+// Sync layer: push/pull OPAQUE containers to/from sigild's DEV-ONLY op-log.
+//
+// STATUS: pre-audit, dev/localhost ONLY. These functions move already-sealed,
+// OPAQUE container bytes over PLAIN HTTP to a sigild dev op-log that is itself
+// dev-gated (SIGILD_ENABLE_DEV_OPS=1) and UNAUTHENTICATED. They perform NO
+// cryptography and never see plaintext or the password — they just shuttle the
+// envelope bytes. No TLS, no auth, no durability: not for production or real
+// secrets.
+// ---------------------------------------------------------------------------
+
+/// One operation pulled back from the dev op-log: its server sequence number
+/// and the OPAQUE container bytes (already base64-decoded from the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledOp {
+    /// The op-log sequence number assigned by sigild (monotonic per vault).
+    pub seq: u64,
+    /// The opaque container bytes (a `seal_to_container` output, decoded).
+    pub blob: Vec<u8>,
+}
+
+/// Reject vault ids that cannot be placed verbatim in a URL path segment.
+///
+/// We do not percent-encode; instead we require the id to be non-empty and free
+/// of `/` and ASCII whitespace, which keeps the request line unambiguous.
+fn check_vault(vault: &str) -> Result<(), CliError> {
+    if vault.is_empty() || vault.contains('/') || vault.chars().any(|c| c.is_whitespace()) {
+        return Err(CliError::BadVault(vault.to_string()));
+    }
+    Ok(())
+}
+
+/// Trim a single trailing `/` from the server base URL so we don't build
+/// `http://host//v1/...` when the caller passes a trailing slash.
+fn ops_url(server: &str, vault: &str) -> String {
+    let base = server.strip_suffix('/').unwrap_or(server);
+    format!("{base}/v1/vaults/{vault}/ops")
+}
+
+/// Map a `ureq` call result into a 2xx response string, or a [`CliError`].
+///
+/// `ureq` returns `Err(Status(code, resp))` for non-2xx; we fold that into
+/// [`CliError::Server`]. Transport/IO errors become [`CliError::Http`]. On 2xx
+/// we read the body to a string (a read failure is also `Http`).
+fn finish(result: Result<ureq::Response, ureq::Error>) -> Result<String, CliError> {
+    match result {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| CliError::Http(e.to_string())),
+        Err(ureq::Error::Status(status, resp)) => {
+            // Best-effort read of the error body; ignore a body-read failure.
+            let body = resp.into_string().unwrap_or_default();
+            Err(CliError::Server { status, body })
+        }
+        Err(ureq::Error::Transport(t)) => Err(CliError::Http(t.to_string())),
+    }
+}
+
+/// POST an OPAQUE `container` to the dev op-log and return its assigned `seq`.
+///
+/// Sends the raw container bytes (Content-Type `application/octet-stream`) to
+/// `{server}/v1/vaults/{vault}/ops`. On `201` it parses `{"seq": <u64>}` and
+/// returns the sequence number.
+///
+/// DEV/LOCALHOST/PLAIN-HTTP ONLY — see the module note above. This never sees
+/// plaintext; the container is opaque.
+///
+/// # Errors
+/// - [`CliError::BadVault`] if `vault` is empty or has a `/`/whitespace.
+/// - [`CliError::Server`] on any non-2xx (e.g. `501` if the dev flag is off,
+///   `400` empty op, `413` oversized).
+/// - [`CliError::Http`] on a transport/IO failure.
+/// - [`CliError::BadResponse`] if the `201` body is not the expected JSON.
+pub fn push_op(server: &str, vault: &str, container: &[u8]) -> Result<u64, CliError> {
+    check_vault(vault)?;
+    let url = ops_url(server, vault);
+
+    let result = ureq::post(&url)
+        .set("Content-Type", "application/octet-stream")
+        .send_bytes(container);
+    let body = finish(result)?;
+
+    #[derive(Deserialize)]
+    struct AppendResp {
+        seq: u64,
+    }
+    let parsed: AppendResp =
+        serde_json::from_str(&body).map_err(|e| CliError::BadResponse(e.to_string()))?;
+    Ok(parsed.seq)
+}
+
+/// GET operations with `seq > since` from the dev op-log, in ascending order.
+///
+/// Calls `{server}/v1/vaults/{vault}/ops?since={since}`, parses the JSON, and
+/// base64-decodes each `blob` (standard alphabet) into the opaque container
+/// bytes. Returns them in the order the server sent them (seq-ascending).
+///
+/// DEV/LOCALHOST/PLAIN-HTTP ONLY — see the module note above.
+///
+/// # Errors
+/// - [`CliError::BadVault`] if `vault` is empty or has a `/`/whitespace.
+/// - [`CliError::Server`] on any non-2xx (e.g. `501` if the dev flag is off).
+/// - [`CliError::Http`] on a transport/IO failure.
+/// - [`CliError::BadResponse`] if the body is not the expected JSON or a `blob`
+///   is not valid base64.
+pub fn pull_ops(server: &str, vault: &str, since: u64) -> Result<Vec<PulledOp>, CliError> {
+    check_vault(vault)?;
+    let url = ops_url(server, vault);
+
+    let result = ureq::get(&url).query("since", &since.to_string()).call();
+    let body = finish(result)?;
+
+    #[derive(Deserialize)]
+    struct WireOp {
+        seq: u64,
+        blob: String,
+    }
+    #[derive(Deserialize)]
+    struct ListResp {
+        #[serde(default)]
+        ops: Vec<WireOp>,
+    }
+
+    let parsed: ListResp =
+        serde_json::from_str(&body).map_err(|e| CliError::BadResponse(e.to_string()))?;
+
+    let mut out = Vec::with_capacity(parsed.ops.len());
+    for op in parsed.ops {
+        let blob = BASE64
+            .decode(op.blob.as_bytes())
+            .map_err(|e| CliError::BadResponse(format!("op {} blob not base64: {e}", op.seq)))?;
+        out.push(PulledOp { seq: op.seq, blob });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -338,5 +499,163 @@ mod tests {
         let result = open_container(PASSWORD, truncated);
         // Surfaces as a Record(Envelope(..)) or Record(Aead(..)) error, never a panic.
         assert!(matches!(result, Err(CliError::Record(_))));
+    }
+
+    // --- Sync-layer tests against a tiny in-process mock HTTP server ---------
+    //
+    // These do NOT need sigild. Each test spins a one-shot TCP listener on
+    // 127.0.0.1:0, hands the client the captured request and the canned
+    // response, and joins the thread to read what the client actually sent.
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// What the mock server captured from the single request it served.
+    struct CapturedRequest {
+        /// The HTTP request line, e.g. `POST /v1/vaults/v/ops HTTP/1.1`.
+        request_line: String,
+        /// The request body bytes (read via Content-Length, if any).
+        body: Vec<u8>,
+    }
+
+    /// Spawn a one-shot mock server that accepts exactly one connection, reads
+    /// the full request (request line + headers + Content-Length body), then
+    /// writes `response` verbatim. Returns the bound `http://127.0.0.1:PORT`
+    /// base URL and a join handle yielding the [`CapturedRequest`].
+    fn spawn_mock(response: &'static str) -> (String, thread::JoinHandle<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}");
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one connection");
+
+            // Read until we have the full headers (terminated by CRLFCRLF),
+            // then read exactly Content-Length more bytes for the body.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let header_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) {
+                    break pos;
+                }
+                let n = stream.read(&mut tmp).expect("read request");
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let request_line = head.lines().next().unwrap_or_default().to_string();
+
+            // Parse Content-Length (case-insensitive) to know the body size.
+            let content_len = head
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+
+            let mut body = buf[header_end..].to_vec();
+            while body.len() < content_len {
+                let n = stream.read(&mut tmp).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            body.truncate(content_len);
+
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().ok();
+
+            CapturedRequest { request_line, body }
+        });
+
+        (base, handle)
+    }
+
+    #[test]
+    fn push_op_posts_body_to_right_path_and_returns_seq() {
+        // Body `{"vaultID":"v","seq":7}` is 23 bytes; Content-Length matches.
+        let response = "HTTP/1.1 201 Created\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 23\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"seq\":7}";
+        let (base, handle) = spawn_mock(response);
+
+        let container = b"\x00\x01\x02opaque-container-bytes";
+        let seq = push_op(&base, "v", container).expect("push_op ok");
+        assert_eq!(seq, 7);
+
+        let req = handle.join().expect("server thread");
+        assert_eq!(req.request_line, "POST /v1/vaults/v/ops HTTP/1.1");
+        // The exact container bytes must have been sent as the body.
+        assert_eq!(req.body, container);
+    }
+
+    #[test]
+    fn pull_ops_sends_since_and_decodes_base64_blobs() {
+        // Body below is 56 bytes; Content-Length matches.
+        let response = "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 56\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"ops\":[{\"seq\":1,\"blob\":\"aGk=\"}],\"next\":1}";
+        let (base, handle) = spawn_mock(response);
+
+        let ops = pull_ops(&base, "v", 5).expect("pull_ops ok");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].seq, 1);
+        assert_eq!(ops[0].blob, b"hi"); // "aGk=" base64-decodes to "hi"
+
+        let req = handle.join().expect("server thread");
+        assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
+    }
+
+    #[test]
+    fn server_500_becomes_cli_error_server() {
+        let response = "HTTP/1.1 500 Internal Server Error\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 16\r\n\
+             \r\n\
+             {\"error\":\"boom\"}";
+        let (base, handle) = spawn_mock(response);
+
+        let err = push_op(&base, "v", b"x").expect_err("should be a server error");
+        match err {
+            CliError::Server { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("boom"), "body should carry server detail");
+            }
+            other => panic!("expected CliError::Server, got {other:?}"),
+        }
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn bad_vault_is_rejected_before_any_request() {
+        // No server is spawned; these must fail purely on validation.
+        assert!(matches!(
+            push_op("http://127.0.0.1:1", "", b"x"),
+            Err(CliError::BadVault(_))
+        ));
+        assert!(matches!(
+            push_op("http://127.0.0.1:1", "a/b", b"x"),
+            Err(CliError::BadVault(_))
+        ));
+        assert!(matches!(
+            pull_ops("http://127.0.0.1:1", "has space", 0),
+            Err(CliError::BadVault(_))
+        ));
     }
 }

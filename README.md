@@ -28,11 +28,14 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   **opaque client-encrypted blobs** and hands them back unchanged. Performs no
   crypto — never decodes the blob. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
-  libsigil core (`sigil seal`/`sigil open`). Standalone crate; unaudited; not for
-  real secrets.
+  libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
+  two-device **opaque sync demo** that ships the sealed container to/from
+  sigild's op-log over plain HTTP (**dev / localhost only**, unauthenticated; the
+  server never decrypts). Standalone crate; unaudited; not for real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
-- `docs/` — threat model, crypto spec, and the sprint plan (kept internal/pre-audit).
+- `docs/` — architecture map, threat model, crypto spec, op-log API reference,
+  and the sprint plan (kept internal/pre-audit).
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not yet applied).
 
 ## Repository layout
@@ -44,7 +47,7 @@ web/             Next.js marketing (+ webapp/admin reserved), pnpm workspace
 extension/       Browser extension (reserved)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 deploy/          terraform / nomad / helm / caddy / systemd
-docs/            threat model, crypto spec, sprint plan
+docs/            architecture, threat model, crypto spec, op-log API, sprint plan
 ```
 
 Native platform clients (iOS/Android/macOS/Windows/Linux/watchOS/wearOS) live in

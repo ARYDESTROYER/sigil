@@ -458,3 +458,116 @@ verified incl. a live round-trip; **I re-ran the gate and the demo myself.**
   restart), and **CRDT / conflict-resolution semantics** (this is a naive
   append-only log with a per-vault counter, not a real sync protocol). The prod
   default stays `501` until those land.
+
+## 2026-06-06 — Phase 7 (CLI push/pull two-device sync demo + architecture.md + verify)
+
+Theme: close the loop the Phase-6 server opened — teach the `sigil` CLI to
+**push** a sealed container to sigild's dev op-log and **pull** it back on a
+second device, then write the missing top-level **`docs/architecture.md`**. The
+client never decrypts on the server's behalf and the server still never touches
+crypto; the only thing that crosses the wire is the opaque container. Built,
+then independently verified incl. a **live two-device round-trip**; **I re-ran
+the gate and the demo myself.**
+
+### cli/ — `sigil push` / `sigil pull` ✅
+- Added to `cli/src/lib.rs`: `push_op(server, vault, blob) -> seq` (`POST
+  {server}/v1/vaults/{vault}/ops` with the raw container as the body, parses
+  `{"seq"}` from the `201`) and `pull_ops(server, vault, since) -> Vec<(seq,
+  blob)>` (`GET …/ops?since=N`, base64-decodes each `ops[].blob`). Wired into
+  `main.rs` as two new subcommands; vault id is validated **before any request**
+  (rejects empty / path-y ids). HTTP errors surface as `CliError` with the
+  server's status + body — e.g. a non-dev server's `501` becomes
+  `dev op-log returned HTTP 501: …` and a non-zero exit.
+- New deps (cli crate only): **`ureq`** with `default-features = false` (so it
+  speaks **plain HTTP**, no TLS stack pulled in — these talk to **localhost dev
+  sigild only**), `serde` + `serde_json` (parse the op-log JSON), `base64`
+  (decode the returned blobs). Server URL comes from `--server` or the
+  **`SIGIL_SERVER`** env var (default `http://127.0.0.1:8080`).
+- ⚠️ **Loudly labeled dev/localhost/plain-HTTP/unauthenticated/opaque** in the
+  `--help` banner, the `lib.rs` push/pull doc comments, and `cli/README.md` ("dev /
+  localhost / plain HTTP only", "no TLS and no auth"). The op-log they hit is
+  itself dev-gated + unauthenticated. The CLI keeps its loud **PRE-AUDIT /
+  UNAUDITED / not-for-real-secrets** banner. No over-claims.
+- Tests: **4 new mock-server unit tests** stand up a real `TcpListener` on a
+  loopback port and assert wire behavior without sigild —
+  `push_op_posts_body_to_right_path_and_returns_seq`,
+  `pull_ops_sends_since_and_decodes_base64_blobs`,
+  `server_500_becomes_cli_error_server`, and
+  `bad_vault_is_rejected_before_any_request` (no request is even sent).
+
+### getrandom isolation (the key guardrail) — re-proven ✅
+- The new deps land in **`cli/Cargo.lock` only**. `libsigil/Cargo.lock` is
+  **byte-for-byte unchanged** (`git diff --quiet libsigil/Cargo.lock` →
+  UNCHANGED) and its **getrandom count is still `0`** (getrandom remains present
+  only in `cli/Cargo.lock`, count `1`). `libsigil/Cargo.toml` members stay
+  `["core","ffi"]` — the CLI is still **not** a workspace member.
+
+### docs — `docs/architecture.md` ✅
+- New 269-line top-level architecture doc: §1 **Component map** with an ASCII
+  component diagram and the **trust boundary** (client-side crypto vs. the
+  zero-knowledge server); §2 **Data flow — the life of one record** with a full
+  diagram (password → Argon2id → HKDF → XChaCha20-Poly1305 AEAD → envelope →
+  CLI container → `push` → sigild op-log → `pull` → `open`). Cross-links
+  `crypto-spec.md`, `api.md`, `threat-model.md`, `deployment.md`,
+  `sprint-72h.md`, `CLAUDE.md`, and `README.md`. Honest throughout — leads with
+  the negation list (nothing here is audited / "secure" / "post-quantum secure" /
+  SOC 2 / unqualified "end-to-end encrypted"); the lone "audited core" phrase
+  names the core as the *audit target* (intent), not a claim of having been
+  audited.
+
+### My independent gate (the real commit gate) ✅
+- CLI: fmt ✓ · clippy -D warnings ✓ · **15 lib + 2 integration = 17 tests** ✓ ·
+  build ✓ (`sigil` binary).
+- **Live two-device round-trip (real binaries, real localhost sockets):** built
+  sigild fresh; ran it **with `SIGILD_ENABLE_DEV_OPS=1` on :18094** (and a second
+  instance **without** the flag on :18095 for the negative case), both green on
+  `/healthz`. **Device A:** wrote `pt.txt` (sha256 `0581f73e…`) → `sigil seal` →
+  `op.bin` (145 bytes) → `sigil push --vault demo --in op.bin --server
+  http://127.0.0.1:18094` → **"pushed vault demo seq 1"**. **Device B** (separate
+  dir): `sigil pull --vault demo --since 0 --out-dir pulled …` → wrote
+  `pulled/op-1.sigil`. **BYTE-IDENTICAL:** `op.bin` and `pulled/op-1.sigil` are
+  both sha256 `0e5ed487…` — the server stored/returned the ciphertext opaquely.
+  Device B `sigil open --in pulled/op-1.sigil --out got.txt` → `got.txt` sha256
+  `0581f73e…` == the original plaintext. **Full seal→push→pull→open across two
+  devices: YES.**
+- **Flag-off 501 confirmed live:** pushing to the non-dev server (:18095)
+  surfaced `dev op-log returned HTTP 501: {"error":"not_implemented",…,
+  "vaultID":"demo"}` and exited non-zero (`1`). Both servers killed; no lingering
+  processes.
+- Regression: libsigil fmt/clippy/**42+7** tests/wasm/**getrandom 0** ✓; Go
+  fmt/vet/test/build ✓; all 6 workflow YAMLs parse ✓. Web untouched.
+- Over-claim scan CLEAN across `cli/src/*.rs`, `cli/README.md`, `cli/Cargo.toml`,
+  `docs/architecture.md` — every "audited"/"secure"/"post-quantum"/"SOC 2"/"E2E"
+  hit is a negation, an explicit caveat, the "post-quantum-*ready*" qualified
+  form, or a legitimate technical descriptor ("cryptographically-secure random
+  bytes from the OS"). `#![forbid(unsafe_code)]` intact in both `cli/src/main.rs`
+  and `cli/src/lib.rs`.
+
+### ⛔ Still NOT production (honest)
+- push/pull is a **dev/localhost demo over plain HTTP**. Still missing, same as
+  Phase 6 plus the client side: real **auth** (both the CLI and the op-log are
+  unauthenticated), **TLS for the client** (the CLI speaks plain HTTP — it never
+  pulls in a TLS stack, intentionally, and is localhost-only), a **durable
+  store** (the op-log is in-memory, lost on restart), and **CRDT /
+  conflict-resolution** (still a naive per-vault append counter, not a sync
+  protocol). The prod ops default stays `501`.
+
+## Documentation strategy
+
+Recording the decision so the doc set stays coherent as the repo grows:
+
+- **`CLAUDE.md`** = the working guide (toolchains, known-green commands,
+  guardrails) — read first by anyone (human or agent) doing work.
+- **`journal.md`** = this chronological log (what/why/next, per session/phase) —
+  the source of truth for non-obvious context. ~510 lines now; **fine for now**.
+  ➡️ If it keeps growing we will **rotate it per-month** (e.g. `journal/2026-06.md`)
+  rather than let one file sprawl.
+- **`README.md`** = the front door (what the repo is, layout, build/test) for a
+  first-time reader.
+- **`docs/`** = topic docs: `crypto-spec.md`, `threat-model.md`, `sprint-72h.md`,
+  `deployment.md`, `api.md`, and now **`architecture.md`** (the map that ties the
+  pieces together).
+- ➡️ For **load-bearing design choices** we will consider lightweight **ADRs**
+  under `docs/decisions/` (e.g. "why the salt+params live in the CLI container
+  header, not the envelope", "why the client speaks plain HTTP only"). Not added
+  yet — noting the intent so it isn't lost.

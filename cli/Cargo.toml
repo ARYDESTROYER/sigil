@@ -37,3 +37,16 @@ sigil-core = { path = "../libsigil/core" }
 # native binary and is NEVER compiled to wasm32 (where getrandom has no backend).
 # It lives in `cli/Cargo.lock`, never in `libsigil/Cargo.lock`.
 getrandom = "0.2"
+
+# --- Sync (push/pull) deps: native-only, dev/localhost, PLAIN HTTP. ---------
+# These move OPAQUE sealed containers to/from sigild's DEV-ONLY, unauthenticated
+# op-log over plain HTTP on localhost. Like `getrandom` above, they are
+# native-only and live exclusively in `cli/Cargo.lock` — they are NEVER added to
+# `libsigil/Cargo.lock` (the wasm-pure core must not gain these).
+#
+# `default-features = false` strips ureq's TLS stack: this is intentional. The
+# CLI talks PLAIN HTTP to a localhost dev sigild only — no TLS, no real secrets.
+ureq = { version = "2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"

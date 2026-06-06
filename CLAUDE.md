@@ -35,11 +35,15 @@ public, make no security claims, until the audit completes and trademark clears.
   decodes the blob; it stores/returns the exact client bytes. Endpoint reference
   in [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
-- `docs/` — threat model, crypto spec, sprint plan, deployment runbook (internal/pre-audit).
+- `docs/` — architecture map, threat model, crypto spec, op-log API reference,
+  sprint plan, deployment runbook (internal/pre-audit).
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not applied).
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
-  core. **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace
-  member) so it can use `getrandom` without polluting the wasm-pure core.
+  core, plus `push`/`pull` that sync the opaque container to/from sigild's
+  **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
+  unauthenticated, dev-only). **Standalone crate** (own `cli/Cargo.lock`, NOT a
+  libsigil workspace member) so it can use `getrandom` (+ `ureq`/`serde`/`base64`)
+  without polluting the wasm-pure core.
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)

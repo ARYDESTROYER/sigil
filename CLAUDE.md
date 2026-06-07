@@ -11,7 +11,12 @@
 > [`threat-model.md`](docs/threat-model.md), [`deployment.md`](docs/deployment.md),
 > and [`sprint-72h.md`](docs/sprint-72h.md). **And keep `journal.md` updated** —
 > **frequently and in depth**, at the start and end of every work session and
-> after every meaningful decision, build, test, or scope change.
+> after every meaningful decision, build, test, or scope change. **And keep the
+> `docs/` files in sync with the code in the SAME change, not later**: when you
+> change the HTTP surface update [`api.md`](docs/api.md); a component or data flow,
+> [`architecture.md`](docs/architecture.md); crypto, [`crypto-spec.md`](docs/crypto-spec.md);
+> the deploy story, [`deployment.md`](docs/deployment.md); and record any
+> load-bearing decision as an ADR under [`docs/decisions/`](docs/decisions/).
 
 ## What this is
 
@@ -43,7 +48,8 @@ public, make no security claims, until the audit completes and trademark clears.
   in [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
-  sprint plan, deployment runbook (internal/pre-audit).
+  sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
+  Architecture Decision Records (Nygard-style ADRs for load-bearing choices).
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not applied).
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
@@ -116,6 +122,9 @@ corepack pnpm -C web build
 - **Don't fake crypto/auth.** Stub with `501` / clear "not implemented" rather
   than implement something that would poison the future audit.
 - Rust: `#![forbid(unsafe_code)]` in `core`; clippy `-D warnings` is the bar.
+- **Record load-bearing decisions as ADRs** under
+  [`docs/decisions/`](docs/decisions/) (Nygard-style; keep them accurate to the
+  current code — don't invent decisions that weren't made).
 - The brand name and `sigilapp.io` are **provisional** (trademark pending).
 
 ## Git / deploy

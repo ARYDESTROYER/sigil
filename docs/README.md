@@ -17,6 +17,8 @@ independent audit completes and trademark clears (brief, GTM Phase 1).
 - [`deployment.md`](deployment.md) — the (not-yet-applied) `sigild` deployment
   runbook: topology, secrets posture, PQ-TLS nuance, and an honest
   what-is-not-deployable / validation-status accounting.
+- [`decisions/`](decisions/README.md) — Architecture Decision Records (the
+  load-bearing *why*), Nygard-style and pre-audit.
 
 Every line here is **subject to change** and describes a system that is **not yet
 built or audited**.

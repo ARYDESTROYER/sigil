@@ -708,6 +708,85 @@ named `op-<seq>.sigil` flat, with no vault namespacing.
   conflict-resolution** (still a naive per-vault append counter). The prod ops
   default stays `501`.
 
+## 2026-06-08 — Phase 9 (sigild op-log integration test + ADRs)
+
+Theme: pin down the dev op-log's *wire* behavior with a real-socket Go
+integration test (the existing api tests drive an `httptest.ResponseRecorder`,
+not an actual client over TCP), and start the **`docs/decisions/`** ADR set so
+load-bearing choices are recorded once and cross-linked instead of re-derived
+from the code. Built, then **independently verified** green (race-clean, ADRs
+accurate); production behavior is **unchanged** (default ops still `501`).
+
+### sigild — real-socket op-log integration test ✅
+- New `sigild/internal/api/oplog_integration_test.go` — **TEST-ONLY** (untracked;
+  no tracked non-`_test.go` sigild file modified, so production behavior is
+  unchanged and the default ops route still returns `501`). It stands up a real
+  `httptest.NewServer` over an **actual TCP socket** and drives it with a real
+  `net/http` client (stdlib only — `httptest`/`net/http`/`encoding/json`/
+  `encoding/base64`).
+- 6 new top-level integration tests (23 top-level tests in `internal/api/` total,
+  all pass): `TestOplogIntegrationAppendListLifecycle`,
+  `TestOplogIntegrationSinceCursor` (3 subtests),
+  `TestOplogIntegrationOpaqueBinaryIntegrity`,
+  `TestOplogIntegrationMultiVaultIndependence`,
+  `TestOplogIntegrationProbes` (3 subtests),
+  `TestOplogIntegrationGatingDisabled` (3 subtests — incl. POST+GET ops `== 501`
+  when `DevOpsEnabled=false`), `TestOplogIntegrationErrorShapes` (3 subtests:
+  empty_op `400`, bad_since `400`, oversized `413`).
+- What it adds over the recorder unit tests: a **real client + real socket**
+  (not an in-process recorder), end-to-end **multi-vault independence**, round-trip
+  **opaque binary integrity** (the server hands back the exact client bytes,
+  unchanged — no decode), **since-cursor** paging behavior, and the **dev gating**
+  proven over the wire (flag off → both verbs `501`).
+
+### docs — first ADRs under `docs/decisions/` ✅
+- New `docs/decisions/` with a `README.md` index + `0001`–`0005`, all Nygard-style
+  (Status / Context / Decision / Consequences), all **Accepted — 2026-06**, framed
+  **pre-audit** in the README. Siblings are cross-linked; no invented decisions.
+  - **0001** — record architecture decisions (the ADR practice itself).
+  - **0002** — standalone CLI crate for getrandom isolation (CI-checkable invariant:
+    `getrandom` count in `libsigil/Cargo.lock` = `0`; `cli/Cargo.lock` = `1`; cli is
+    not a libsigil workspace member).
+  - **0003** — dev-gated opaque op-log (default `501`; opaque blobs only; server
+    never decodes).
+  - **0004** — crypto-agility suite registry (`#[non_exhaustive]` `AlgorithmSuite`,
+    `HybridPq = 0x12`, `CURRENT = HybridPq`, reserved `kem_ct` envelope field; the
+    KEM/signature halves honestly labeled *specified-and-reserved, not implemented,
+    unaudited*).
+  - **0005** — stdlib-only sigild (no `go.sum`, hermetic builds/tests).
+- This realizes the "lightweight ADRs under `docs/decisions/`" intent noted at the
+  end of Phase 8 — now a standing practice (see CLAUDE.md onboarding + guardrails).
+
+### Verification (independently verified — the real gate) ✅
+- Go: `gofmt -l sigild` clean · `go -C sigild vet ./...` clean · `go -C sigild
+  build ./...` clean · `go -C sigild test ./...` — **23 top-level api tests pass**
+  (incl. all 6 new oplog integration tests), `internal/store` ok, 0 failures ·
+  `go -C sigild test -race -count=1 ./internal/api/` → **ok in 1.281s,
+  fully race-clean** (no DATA RACE output).
+- **Production unchanged:** `router.go` still routes BOTH verbs to
+  `opsNotImplemented` (`501`) when `DevOpsEnabled` is false; `main.go` only flips it
+  from a truthy `SIGILD_ENABLE_DEV_OPS`; the new file is the only sigild change and
+  it is test-only.
+- ADRs accurate — spot-checked mechanically against code: `getrandom` count in
+  `libsigil/Cargo.lock` = **0** (cli = 1; cli not a member); `router.go` default
+  `501` matches 0003; `core/src/lib.rs` non_exhaustive suite enum + `HybridPq=0x12`
+  + `CURRENT` + `envelope.rs` `kem_ct` field match 0004.
+- Regression: libsigil fmt/clippy/**42+7** tests/wasm/**getrandom 0** ✓; cli
+  fmt/clippy/**22+2** tests ✓; all 6 workflow YAMLs parse ✓. Web untouched.
+- Over-claim scan CLEAN across the new test + `docs/decisions/*.md` — no
+  "audited"/"secure"/"post-quantum secure"/"SOC 2"/unqualified "end-to-end
+  encrypted"; the only "audited"/"unaudited" hits are explicit negations/caveats
+  (e.g. 0004 "This is **unaudited**", README "Nothing here is audited or
+  production-ready"). The ADRs call the core **audit-bound** / **pre-audit**
+  throughout; the lone loose "audited core" shorthand in 0002 is a guardrail
+  framing, not a product security claim.
+
+### ⛔ Held — outward-facing, awaits explicit human approval (NOT done)
+- **GHCR (container registry) publish** of the `sigild` image is outward-facing and
+  irreversible-ish, so it is **not** done — it awaits explicit human approval, same
+  posture as domain purchase / public deploy. The image still only builds + is
+  smoke-tested **locally** (Phase 4); nothing was published.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:
@@ -723,7 +802,10 @@ Recording the decision so the doc set stays coherent as the repo grows:
 - **`docs/`** = topic docs: `crypto-spec.md`, `threat-model.md`, `sprint-72h.md`,
   `deployment.md`, `api.md`, and now **`architecture.md`** (the map that ties the
   pieces together).
-- ➡️ For **load-bearing design choices** we will consider lightweight **ADRs**
-  under `docs/decisions/` (e.g. "why the salt+params live in the CLI container
-  header, not the envelope", "why the client speaks plain HTTP only"). Not added
-  yet — noting the intent so it isn't lost.
+- **`docs/decisions/`** = lightweight **ADRs** (Nygard-style) for load-bearing
+  choices — started in **Phase 9** with an index + `0001`–`0005` (ADR practice,
+  getrandom isolation, dev-gated op-log, crypto-agility suite registry, stdlib-only
+  sigild). ➡️ Add a new ADR in the **same change** as any future load-bearing
+  decision (e.g. "why the salt+params live in the CLI container header, not the
+  envelope", "why the client speaks plain HTTP only" remain good candidates to
+  capture).

@@ -21,12 +21,13 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `wasm32`** — algorithm-suite registry, the crypto-agility envelope codec, a
   real (unaudited) Argon2id KDF and XChaCha20-Poly1305 + HKDF AEAD seal/open
   layer, plus a `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
-- `sigild/` — Go sync server. **Builds, vets, tests.** Serves `/healthz`,
-  `/readyz`, `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by
-  default. Behind a dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route
-  becomes an **unauthenticated, in-memory, non-durable** op-log that stores
-  **opaque client-encrypted blobs** and hands them back unchanged. Performs no
-  crypto — never decodes the blob. Ships a distroless `Dockerfile`.
+- `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
+  `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
+  `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a
+  dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route becomes an
+  **unauthenticated, in-memory, non-durable** op-log that stores **opaque
+  client-encrypted blobs** and hands them back unchanged. Performs no crypto —
+  never decodes the blob. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from
@@ -37,7 +38,8 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
-  and the sprint plan (kept internal/pre-audit).
+  and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
+  Architecture Decision Records (ADRs) for load-bearing choices.
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not yet applied).
 
 ## Repository layout
@@ -50,6 +52,7 @@ extension/       Browser extension (reserved)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 deploy/          terraform / nomad / helm / caddy / systemd
 docs/            architecture, threat model, crypto spec, op-log API, sprint plan
+docs/decisions/  Architecture Decision Records (ADRs)
 ```
 
 Native platform clients (iOS/Android/macOS/Windows/Linux/watchOS/wearOS) live in

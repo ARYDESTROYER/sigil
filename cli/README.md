@@ -80,16 +80,53 @@ sigil push --vault demo --in secret.sigil
 # -> pushed vault demo seq 1
 
 # Device B: pull new ops into an inbox dir, then open each one locally.
-sigil pull --vault demo --since 0 --out-dir ./inbox
-# -> pulled seq 1 -> ./inbox/op-1.sigil
+sigil pull --vault demo --out-dir ./inbox
+# -> pulled seq 1 -> ./inbox/demo/op-1.sigil
+# -> cursor for demo now at 1
 SIGIL_PASSWORD='correct horse battery staple' \
-  sigil open --in ./inbox/op-1.sigil --out recovered.txt
+  sigil open --in ./inbox/demo/op-1.sigil --out recovered.txt
 ```
 
-`pull --since N` returns only ops with sequence `> N`; if there are none it
-prints `no new ops since N` and writes nothing. Each pulled op is written to
-`<out-dir>/op-<seq>.sigil`. If the dev op-log flag is off, `sigild` returns
-`501` and `sigil` surfaces that as a clear error and exits non-zero.
+Each pulled op is written to `<out-dir>/<vault>/op-<seq>.sigil` — a **per-vault
+subdir**, so multiple vaults can safely share one `--out-dir` without their
+`op-<seq>.sigil` filenames colliding on disk. If the dev op-log flag is off,
+`sigild` returns `501` and `sigil` surfaces that as a clear error and exits
+non-zero.
+
+### Incremental pull
+
+Pulled ops are written to `<out-dir>/<vault>/op-<seq>.sigil` (a per-vault subdir,
+so multiple vaults can safely share one `--out-dir` without their `op-<seq>.sigil`
+filenames colliding). The cursor state file stays at the `--out-dir` **root** —
+`<out-dir>/.sigil-pull-state.json`, **not** inside the per-vault subdir — shared
+across vaults and keyed by `(server, vault)`.
+
+`pull` is **incremental**. It remembers the last pulled op sequence for each
+`(server, vault)` pair in that small **local** state file,
+`.sigil-pull-state.json`:
+
+- The **first** pull for a `(server, vault)` gets every op.
+- **Subsequent** pulls fetch only ops newer than the saved cursor, so you never
+  re-download what you already have. When there is nothing new it prints
+  `no new ops since <start>` and writes nothing.
+- After a successful pull it prints `cursor for <vault> now at <seq>`.
+
+The cursor is **monotonic** — it only ever advances. `--since N` overrides the
+start for a **one-off** pull (returns ops with sequence `> N`; `--since 0`
+re-fetches everything), but it does **not** rewind the saved cursor: after an
+explicit `--since`, future incremental pulls still resume from the highest seq
+seen.
+
+```bash
+sigil pull --vault demo --out-dir ./inbox     # first time: gets everything
+sigil pull --vault demo --out-dir ./inbox     # later: only new ops
+sigil pull --vault demo --since 0 --out-dir ./inbox   # one-off full re-fetch
+```
+
+The state file is **local, per-device state**: it is **not secret** and is
+**not synced** (it holds only server URLs, vault ids, and integers — never any
+crypto material). Delete `<out-dir>/.sigil-pull-state.json` to reset the cursor
+and pull from scratch.
 
 To run the dev op-log locally (see `sigild/README.md` for details):
 

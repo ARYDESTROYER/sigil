@@ -31,7 +31,9 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from
   sigild's op-log over plain HTTP (**dev / localhost only**, unauthenticated; the
-  server never decrypts). Standalone crate; unaudited; not for real secrets.
+  server never decrypts). `pull` is **incremental** — a per-vault cursor is kept
+  in the out-dir, so repeat pulls fetch only new ops. Standalone crate; unaudited;
+  not for real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,

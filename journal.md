@@ -552,6 +552,162 @@ the gate and the demo myself.**
   conflict-resolution** (still a naive per-vault append counter, not a sync
   protocol). The prod ops default stays `501`.
 
+## 2026-06-07 — Phase 8 (incremental pull cursor + multi-vault)
+
+Theme: make `sigil pull` **incremental** so a second device only fetches ops it
+hasn't seen yet, instead of re-pulling the whole op-log every time. No server
+change (sigild already exposes `?since=N`); the work is entirely a thin client
+cursor layer + wiring it through `cmd_pull`. Built, then **independently
+verified** incl. a **live incremental + multi-vault demo**; **I re-ran the gate
+and the demo myself.**
+
+### cli/ — per-(server,vault) pull cursor ✅
+- New cursor layer in `cli/src/lib.rs`: `read_cursor` / `write_cursor` over a
+  JSON **state file** that lives **inside `--out-dir`** as
+  `.sigil-pull-state.json`. The map key is **`"{server}|{vault}"`**, so each
+  `(server, vault)` pair tracks its own high-water seq independently. Missing
+  file or missing key reads **0** (first pull → fetch from the beginning); a
+  malformed/unparseable state file surfaces a `CliError` (state error), it does
+  not silently reset. The stored cursor is **local, non-secret bookkeeping** — it
+  holds only seq numbers and the server/vault label, never plaintext or key
+  material.
+- `cmd_pull` now takes `since: Option<u64>`: an explicit **`--since N` overrides**
+  the cursor for a one-off pull; otherwise it reads the persisted cursor, asks
+  the op-log for everything **after** it, writes the new `op-<seq>.sigil` files,
+  and **advances + persists the cursor** to the highest seq pulled (monotonic —
+  it only ever moves forward). When there are no new ops it prints
+  `no new ops since <cursor>` and writes nothing.
+- 7 new unit tests: `cursor_write_then_read_round_trip`,
+  `cursor_missing_file_reads_zero`, `cursor_missing_key_reads_zero`,
+  `cursor_two_keys_are_independent`, `cursor_malformed_state_is_state_error`,
+  `cursor_write_overwrites_same_key`, `cursor_key_combines_server_and_vault`.
+- ⚠️ Still **loudly labeled dev/localhost/plain-HTTP/unauthenticated/opaque** in
+  the `--help` banner — a new **INCREMENTAL PULL** section documents the
+  per-(server,vault) cursor, the `.sigil-pull-state.json` location inside
+  `--out-dir`, monotonic advancement, the `--since` override, and that the state
+  is local/non-secret. The loud **PRE-AUDIT / UNAUDITED / not-for-real-secrets**
+  banner is intact. No over-claims.
+
+### getrandom isolation + no new deps (the key guardrail) — re-proven ✅
+- **No new deps this phase** — the cursor uses `serde_json` + `std::fs`, both
+  already in the cli crate. `cli/Cargo.toml` is **unchanged** (`git diff --quiet
+  cli/Cargo.toml` → unchanged), and no `Cargo.lock`/`Cargo.toml` changed anywhere
+  in the repo. `libsigil/Cargo.lock` is **byte-for-byte unchanged**
+  (`git diff --quiet` → unchanged) and its **getrandom count is still `0`**
+  (getrandom present, count `1`, only in `cli/Cargo.lock`, as expected). The CLI
+  is still **not** a libsigil workspace member.
+
+### My independent gate (the real commit gate) ✅
+- CLI: fmt ✓ · clippy -D warnings ✓ · **22 lib + 2 integration = 24 tests** ✓
+  (incl. the 7 new cursor tests) · build ✓ (`sigil` binary, 3.7 MB).
+- **Live incremental + multi-vault demo (real binaries, real localhost
+  sockets):** ran `sigild` with `SIGILD_ENABLE_DEV_OPS=1` on `:18097` (server
+  logged the loud `DEV op-log enabled: UNAUTHENTICATED, in-memory, non-durable`
+  WARN); sealed real containers with `SIGIL_PASSWORD=pw` from 3 distinct
+  plaintexts. **Vault A:** pushed op1→seq 1, op2→seq 2; first pull into out-dir D
+  wrote `op-1.sigil`+`op-2.sigil` and **`cursor for A now at 2`** (state =
+  `{"http://127.0.0.1:18097|A":2}`); a second pull with no new ops printed
+  **`no new ops since 2`** and wrote nothing (D unchanged); sealing+pushing
+  op3→seq 3 then pulling wrote **only** `op-3.sigil` (`pulled seq 3`,
+  `cursor for A now at 3`). **Multi-vault:** pushed one op to vault B→seq 1;
+  pulling `--vault B` into the **same** out-dir D used B's **independent** cursor
+  (started at 0, pulled seq 1, `cursor for B now at 1`) and **left A's cursor
+  untouched at 3** — final state `{"…|A":3,"…|B":1}`. Cursor
+  independence/monotonicity all correct. **Open:** A's `op-2.sigil` opened to
+  exactly `PLAINTEXT-TWO` and A's `op-3.sigil` to its original; wrong password
+  failed with `could not open record: Aead(Authentication)` and wrote no
+  plaintext.
+- ⚠️ **One honest behavioral note (found here, FIXED in Phase 8b below):** at the
+  time of this demo, pulled files were named `op-<seq>.sigil` with **no vault
+  namespacing**, so pulling vault B (seq 1) into the **same** out-dir as vault A
+  **overwrote A's `op-1.sigil`** on disk (a filename collision — opening
+  `op-1.sigil` after the B pull yielded B's plaintext). The per-vault **cursors**
+  stayed correct and independent; the collision was purely a filesystem naming
+  clash when two vaults shared one out-dir (the demo deliberately used one dir).
+  A's uncollided containers (op-2, op-3) round-tripped correctly. ➡️ Fixed by
+  namespacing pulled filenames per vault — see **Phase 8b** below.
+- Regression: libsigil fmt/clippy/**42+7** tests/wasm/**getrandom 0** ✓; Go
+  (sigild) fmt/vet/test/build ✓ (untouched this phase); all 6 workflow YAMLs
+  parse ✓. Web untouched.
+- Over-claim scan CLEAN across `cli/src/*.rs` + `cli/README.md` — every
+  "audited"/"unaudited" hit is a negation/disclaimer, the lone "secure" is the
+  legitimate technical descriptor (OS CSPRNG, "cryptographically-secure random
+  bytes"), and there is no "post-quantum secure" / "SOC 2" / unqualified
+  "end-to-end encrypted". `#![forbid(unsafe_code)]` intact in the cli.
+
+### docs — CLAUDE.md onboarding pointer ✅
+- Expanded the top `CLAUDE.md` blockquote into a **required onboarding path** for
+  any new (cold-start) session: read `journal.md` first, then the `docs/` folder
+  **in full** — `docs/README.md` (index) → `docs/architecture.md` (system shape /
+  data flow / trust boundary) → `api.md` / `crypto-spec.md` / `threat-model.md` /
+  `deployment.md` / `sprint-72h.md` — before making changes. Kept the
+  "keep `journal.md` updated frequently and in depth" mandate. Also refreshed the
+  `cli/` repo-map bullet (CLAUDE.md + README.md) to note incremental pull.
+
+### ⛔ Still NOT production (honest)
+- Incremental pull only changes **which ops the client re-fetches**; the
+  underlying sync is still a **dev/localhost demo over plain HTTP**. Same gaps as
+  Phase 7: real **auth** (CLI and op-log are both unauthenticated), **TLS for the
+  client** (plain HTTP, localhost-only), a **durable store** (the op-log is
+  in-memory, lost on restart), and **CRDT / conflict-resolution** (still a naive
+  per-vault append counter — the cursor is a high-water mark, not merge
+  semantics). The prod ops default stays `501`.
+
+## 2026-06-08 — Phase 8b (per-vault pulled-file namespacing — fix the collision)
+
+Theme: close the one honest behavioral note from Phase 8 — multiple vaults pulled
+into a **shared `--out-dir`** could overwrite each other because pulled ops were
+named `op-<seq>.sigil` flat, with no vault namespacing.
+
+### cli/ — pulled ops now go to `<out_dir>/<vault>/op-<seq>.sigil` ✅
+- Fixed: `cmd_pull` now writes each pulled op into a **per-vault subdir** —
+  `<out_dir>/<vault>/op-<seq>.sigil` instead of `<out_dir>/op-<seq>.sigil`. Two
+  (or more) vaults can now safely share one `--out-dir`: their files land under
+  distinct `<vault>/` subdirs and never collide. The shared cursor **state file
+  stays at the out-dir ROOT** (`<out_dir>/.sigil-pull-state.json`), unchanged — it
+  still keys on `"{server}|{vault}"`, so the per-vault high-water cursors keep
+  working exactly as before.
+- `--help` + `cli/README.md` updated to document the `<out-dir>/<vault>/op-<seq>.sigil`
+  per-vault layout and that the state file lives at the out-dir root, keeping the
+  loud **DEV / LOCALHOST / PLAIN-HTTP / UNAUTHENTICATED / PRE-AUDIT / UNAUDITED**
+  caveats. No over-claims. `#![forbid(unsafe_code)]` intact in the cli.
+
+### My independent gate (the real commit gate) ✅
+- CLI: fmt ✓ · clippy -D warnings ✓ · **22 lib + 2 integration = 24 tests** ✓ ·
+  build ✓ (`sigil` binary).
+- **Live same-out-dir multi-vault no-collision demo (real binaries, real localhost
+  sockets):** ran dev `sigild` (`SIGILD_ENABLE_DEV_OPS=1` on `:18098`), sealed 3
+  containers with distinct plaintexts under one password. Pushed 2 ops to vault A
+  (seq 1, seq 2) and 1 to vault B (seq 1) — A/op-1 and B/op-1 deliberately share
+  the `op-1.sigil` filename, exactly the Phase-8 collision. Pulled both into ONE
+  shared out-dir D (`pull --vault A --out-dir D`, then `pull --vault B --out-dir
+  D`). Result: `D/A/op-1.sigil`, `D/A/op-2.sigil`, and `D/B/op-1.sigil` all exist
+  (per-vault subdirs); the state file is at `D/.sigil-pull-state.json` (out-dir
+  root, not inside a subdir). **`D/A/op-1.sigil` was byte-identical (`cmp`) to the
+  original A container — NOT overwritten by the B pull — and opened to A's first
+  plaintext, NOT B's.** A/op-2 and B/op-1 also opened to their correct plaintexts.
+  State file held BOTH cursors:
+  `{"http://127.0.0.1:18098|A":2,"http://127.0.0.1:18098|B":1}`. Server killed and
+  confirmed down; temp dirs cleaned.
+- getrandom isolation re-proven: `libsigil/Cargo.lock` **unchanged** and its
+  **getrandom count still `0`**; `cli/Cargo.toml` **unchanged** (no new deps —
+  dependency set still `sigil-core`, `getrandom`, `ureq`, `serde`, `serde_json`,
+  `base64`). The CLI is still **not** a libsigil workspace member.
+- Regression: libsigil fmt/clippy/**42+7** tests/wasm/**getrandom 0** ✓; Go
+  (sigild) fmt/vet/test/build ✓ (untouched this phase). Web untouched.
+- Over-claim scan CLEAN across the updated `--help` + `cli/README.md` — every
+  "audited" hit is a negation (`UNAUDITED` / "has not been audited"); no "SOC 2" /
+  "post-quantum secure" / "production-ready" / unqualified "end-to-end encrypted".
+
+### ⛔ Still NOT production (honest)
+- This is a **filesystem-layout fix only** — it changes where pulled files land,
+  nothing else. The underlying sync is still the same **dev/localhost demo over
+  plain HTTP** with the same gaps as Phase 7/8: real **auth** (CLI + op-log both
+  unauthenticated), **TLS for the client** (plain HTTP, localhost-only), a
+  **durable store** (op-log in-memory, lost on restart), and **CRDT /
+  conflict-resolution** (still a naive per-vault append counter). The prod ops
+  default stays `501`.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

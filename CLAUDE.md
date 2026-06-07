@@ -1,10 +1,17 @@
 # CLAUDE.md — working guide for this repo
 
-> **Read [`journal.md`](journal.md) first, and keep it updated.** `journal.md`
-> is the running log of everything done, why, and what's next. Update it
-> **frequently and in depth** — at the start and end of every work session, and
-> after every meaningful decision, build, test, or scope change. Treat it as the
-> source of truth for context that isn't obvious from the code.
+> **Onboarding — the required first step for any new session.** Before changing
+> anything, orient by reading, in order: (i) [`journal.md`](journal.md) — the
+> running log of everything done, why, and what's next (the source of truth for
+> context that isn't obvious from the code); then (ii) the [`docs/`](docs/)
+> folder **in full** — start with [`docs/README.md`](docs/README.md) (the index),
+> then [`docs/architecture.md`](docs/architecture.md) (the system shape, data
+> flow, and trust boundary), then the rest:
+> [`api.md`](docs/api.md), [`crypto-spec.md`](docs/crypto-spec.md),
+> [`threat-model.md`](docs/threat-model.md), [`deployment.md`](docs/deployment.md),
+> and [`sprint-72h.md`](docs/sprint-72h.md). **And keep `journal.md` updated** —
+> **frequently and in depth**, at the start and end of every work session and
+> after every meaningful decision, build, test, or scope change.
 
 ## What this is
 
@@ -41,7 +48,10 @@ public, make no security claims, until the audit completes and trademark clears.
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
   **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
-  unauthenticated, dev-only). **Standalone crate** (own `cli/Cargo.lock`, NOT a
+  unauthenticated, dev-only). `pull` is **incremental**: a per-`(server,vault)`
+  monotonic cursor is persisted in `<out-dir>/.sigil-pull-state.json`, so repeat
+  pulls fetch only new ops (multi-vault independent); `--since` overrides the
+  cursor for a one-off. **Standalone crate** (own `cli/Cargo.lock`, NOT a
   libsigil workspace member) so it can use `getrandom` (+ `ureq`/`serde`/`base64`)
   without polluting the wasm-pure core.
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.

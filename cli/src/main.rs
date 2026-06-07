@@ -10,7 +10,10 @@
 
 use std::process::ExitCode;
 
-use sigil_cli::{open_container, pull_ops, push_op, seal_to_container};
+use sigil_cli::{
+    cursor_key, open_container, pull_ops, push_op, read_cursor, seal_to_container, write_cursor,
+    PULL_STATE_FILE,
+};
 use sigil_core::Argon2Params;
 
 /// Environment variable the password is read from. Empty/unset is a hard error.
@@ -38,8 +41,8 @@ USAGE:
   sigil open --in <file> --out <file>    Open an encrypted container <in> into <out>
   sigil push --vault <id> --in <file> [--server <url>]
                                          Upload an opaque container to the dev op-log
-  sigil pull --vault <id> [--since <N>] --out-dir <dir> [--server <url>]
-                                         Download new opaque containers from the dev op-log
+  sigil pull --vault <id> --out-dir <dir> [--since <N>] [--server <url>]
+                                         Download NEW opaque containers from the dev op-log
   sigil --help                           Show this help
   sigil --version                        Show the version
 
@@ -64,7 +67,26 @@ SYNC (push/pull) — !! DEV / LOCALHOST / PLAIN HTTP ONLY !!
   environment variable, else the default http://127.0.0.1:8080. Example:
 
     sigil push --vault demo --in secret.sigil
-    SIGIL_SERVER=http://127.0.0.1:8080 sigil pull --vault demo --since 0 --out-dir ./inbox
+    SIGIL_SERVER=http://127.0.0.1:8080 sigil pull --vault demo --out-dir ./inbox
+
+INCREMENTAL PULL (pull only):
+  Pulled ops are written to <out-dir>/<vault>/op-<seq>.sigil — a PER-VAULT subdir,
+  so multiple vaults can safely share one --out-dir without their op-<seq>.sigil
+  filenames colliding. The shared cursor state file is <out-dir>/.sigil-pull-state.json
+  (at the out-dir root, NOT inside the per-vault subdir).
+
+  pull is INCREMENTAL. It remembers the last pulled op sequence per (server,
+  vault) in that LOCAL state file. The first pull for a (server, vault) gets
+  every op; later pulls fetch only ops newer than the saved cursor. The cursor
+  is MONOTONIC: it only ever advances.
+
+    --since <N> overrides the start for ONE pull (fetch ops with seq > N), e.g.
+    --since 0 re-fetches everything. It does NOT rewind the saved cursor: after
+    an explicit --since, the cursor still only moves forward.
+
+  The state file is LOCAL, per-device state — it is NOT secret and is NOT synced
+  (it holds only server URLs, vault ids, and integers, never crypto material).
+  Delete it to reset the cursor and re-pull from scratch.
 
 ON-DISK CONTAINER FORMAT (all integers little-endian):
   magic[8]=\"SIGILcli\" | version:u8=1 | m_cost:u32 | t_cost:u32 | p_cost:u32 |
@@ -146,7 +168,9 @@ struct PushArgs {
 /// Parsed args for `sigil pull`.
 struct PullArgs {
     vault: String,
-    since: u64,
+    /// The start seq override. `Some(n)` means `--since n` was given explicitly
+    /// (a one-off re-fetch start); `None` means use the saved incremental cursor.
+    since: Option<u64>,
     out_dir: String,
     server: String,
 }
@@ -188,11 +212,14 @@ fn parse_pull(mut args: impl Iterator<Item = String>) -> Result<PullArgs, String
         }
     }
 
+    // Parse `--since` only when it was actually provided; `None` lets cmd_pull
+    // fall back to the saved incremental cursor instead of forcing a start.
     let since = match since_raw {
-        Some(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| format!("--since must be a non-negative integer, got {raw:?}"))?,
-        None => 0,
+        Some(raw) => Some(
+            raw.parse::<u64>()
+                .map_err(|_| format!("--since must be a non-negative integer, got {raw:?}"))?,
+        ),
+        None => None,
     };
 
     Ok(PullArgs {
@@ -302,20 +329,48 @@ fn cmd_push(p: &PushArgs) -> Result<(), String> {
 }
 
 fn cmd_pull(p: &PullArgs) -> Result<(), String> {
-    let ops = pull_ops(&p.server, &p.vault, p.since).map_err(|e| e.to_string())?;
+    // The state file lives at the out-dir ROOT (NOT inside the per-vault subdir),
+    // shared across vaults and keyed by (server, vault).
+    let state_path = std::path::Path::new(&p.out_dir).join(PULL_STATE_FILE);
+    let key = cursor_key(&p.server, &p.vault);
+
+    // Read the saved incremental cursor first; we need it both to choose the
+    // default start AND to keep the new cursor monotonic on an explicit --since.
+    let saved = read_cursor(&state_path, &key).map_err(|e| e.to_string())?;
+
+    // Explicit `--since N` overrides the start for this one-off pull; otherwise
+    // resume from the saved cursor.
+    let start = p.since.unwrap_or(saved);
+
+    let ops = pull_ops(&p.server, &p.vault, start).map_err(|e| e.to_string())?;
 
     if ops.is_empty() {
-        println!("no new ops since {}", p.since);
+        println!("no new ops since {start}");
         return Ok(());
     }
 
-    std::fs::create_dir_all(&p.out_dir)
-        .map_err(|e| format!("could not create out dir {:?}: {e}", p.out_dir))?;
+    // Write each op into a PER-VAULT subdir so multiple vaults can safely share
+    // one --out-dir without their flat `op-<seq>.sigil` filenames colliding. The
+    // vault id was validated in pull_ops (check_vault rejects empty / '/' /
+    // whitespace), so it is a safe single path segment. We create the subdir only
+    // now that pull_ops returned a non-empty result, so "no new ops" leaves no
+    // empty dirs behind.
+    let vault_dir = std::path::Path::new(&p.out_dir).join(&p.vault);
+    std::fs::create_dir_all(&vault_dir)
+        .map_err(|e| format!("could not create out dir {:?}: {e}", vault_dir))?;
 
-    for op in ops {
-        let path = std::path::Path::new(&p.out_dir).join(format!("op-{}.sigil", op.seq));
+    let mut max_seq = 0u64;
+    for op in &ops {
+        let path = vault_dir.join(format!("op-{}.sigil", op.seq));
         std::fs::write(&path, &op.blob).map_err(|e| format!("could not write {:?}: {e}", path))?;
         println!("pulled seq {} -> {}", op.seq, path.display());
+        max_seq = max_seq.max(op.seq);
     }
+
+    // Advance the cursor MONOTONICALLY: never below the saved value, even when an
+    // explicit `--since 0` re-fetched older ops.
+    let new_cursor = saved.max(max_seq);
+    write_cursor(&state_path, &key, new_cursor).map_err(|e| e.to_string())?;
+    println!("cursor for {} now at {}", p.vault, new_cursor);
     Ok(())
 }

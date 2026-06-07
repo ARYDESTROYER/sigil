@@ -101,6 +101,10 @@ pub enum CliError {
     /// The supplied vault identifier is empty or contains a path separator or
     /// whitespace, so it cannot be safely placed in the request URL.
     BadVault(String),
+    /// A failure reading, parsing, or writing the LOCAL pull cursor state file
+    /// (`.sigil-pull-state.json`). This is local, non-secret device state — an
+    /// IO error or a corrupt/unparseable state file. Carries a short message.
+    State(String),
 }
 
 impl From<RecordError> for CliError {
@@ -138,6 +142,7 @@ impl core::fmt::Display for CliError {
                 f,
                 "invalid vault id {v:?}: must be non-empty with no '/' or whitespace"
             ),
+            CliError::State(e) => write!(f, "local pull-state error: {e}"),
         }
     }
 }
@@ -372,6 +377,94 @@ pub fn pull_ops(server: &str, vault: &str, since: u64) -> Result<Vec<PulledOp>, 
         out.push(PulledOp { seq: op.seq, blob });
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Pull cursor: per-(server, vault) "last pulled seq" so repeated pulls only
+// fetch NEW ops.
+//
+// The cursor lives in a small JSON state file (`.sigil-pull-state.json`) inside
+// the pull `--out-dir`. It is a flat object mapping a cursor key (a
+// `"{server}|{vault}"` string) to the last seq that has been pulled for that
+// (server, vault) pair, e.g. `{"http://127.0.0.1:8080|demo": 7}`.
+//
+// This is LOCAL DEVICE STATE: it is NOT secret, NOT synced, and contains no
+// crypto material (only opaque server URLs, vault ids, and integers). The
+// cursor is MONOTONIC — callers advance it forward and never move it backward,
+// so a one-off `--since 0` re-fetch does not rewind future incremental pulls.
+// ---------------------------------------------------------------------------
+
+/// File name of the local pull-cursor state file, written into the pull
+/// `--out-dir`. Local, non-secret device state — see the module note above.
+pub const PULL_STATE_FILE: &str = ".sigil-pull-state.json";
+
+/// Build the cursor key for a `(server, vault)` pair: `"{server}|{vault}"`.
+///
+/// `vault` ids are validated elsewhere to be free of whitespace and `/`; the
+/// `|` separator keeps distinct pairs from colliding in the state map.
+pub fn cursor_key(server: &str, vault: &str) -> String {
+    format!("{server}|{vault}")
+}
+
+/// Read the last-pulled seq for `key` from the JSON state file at `state_path`.
+///
+/// Semantics:
+/// - the file does not exist -> `Ok(0)` (nothing pulled yet);
+/// - the file exists and parses as a `{string: u64}` object, but `key` is
+///   absent -> `Ok(0)`;
+/// - the file exists and `key` is present -> `Ok(its value)`;
+/// - the file exists but cannot be read or parsed as such an object ->
+///   `Err(CliError::State(..))`, so corruption is surfaced, not silently masked.
+///
+/// The state file is LOCAL, non-secret device state (see the module note).
+///
+/// # Errors
+/// - [`CliError::State`] on a read failure (other than not-found) or if the
+///   file is not a valid `{string: u64}` JSON object.
+pub fn read_cursor(state_path: &std::path::Path, key: &str) -> Result<u64, CliError> {
+    let text = match std::fs::read_to_string(state_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(CliError::State(format!("could not read state file: {e}"))),
+    };
+    let map = parse_state(&text)?;
+    Ok(map.get(key).copied().unwrap_or(0))
+}
+
+/// Set `key = seq` in the JSON state file at `state_path`, preserving any other
+/// entries, and write the whole map back.
+///
+/// If the file does not exist it is created with a single entry; if it exists it
+/// is read first (a corrupt file is an error, so we never clobber state we can't
+/// understand) and the one key is updated.
+///
+/// The state file is LOCAL, non-secret device state (see the module note).
+///
+/// # Errors
+/// - [`CliError::State`] on a read/parse failure of the existing file or on a
+///   write failure.
+pub fn write_cursor(state_path: &std::path::Path, key: &str, seq: u64) -> Result<(), CliError> {
+    let mut map = match std::fs::read_to_string(state_path) {
+        Ok(t) => parse_state(&t)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::BTreeMap::new(),
+        Err(e) => return Err(CliError::State(format!("could not read state file: {e}"))),
+    };
+    map.insert(key.to_string(), seq);
+
+    let serialized = serde_json::to_string(&map)
+        .map_err(|e| CliError::State(format!("could not serialize state: {e}")))?;
+    std::fs::write(state_path, serialized)
+        .map_err(|e| CliError::State(format!("could not write state file: {e}")))
+}
+
+/// Parse the state-file text into a `{string: u64}` map, mapping any JSON or
+/// shape error to [`CliError::State`].
+fn parse_state(text: &str) -> Result<std::collections::BTreeMap<String, u64>, CliError> {
+    serde_json::from_str(text).map_err(|e| {
+        CliError::State(format!(
+            "state file is not a valid {{string: u64}} map: {e}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -657,5 +750,106 @@ mod tests {
             pull_ops("http://127.0.0.1:1", "has space", 0),
             Err(CliError::BadVault(_))
         ));
+    }
+
+    // --- Pull-cursor tests ---------------------------------------------------
+    //
+    // Each test makes a unique temp dir under `std::env::temp_dir()` (no deps),
+    // operates on a state file inside it, and removes the dir on the way out.
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A self-cleaning unique temp dir under the OS temp dir (no tempfile dep).
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            // Unique-enough name: pid + a process-local monotonic counter.
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("sigil-cli-cursor-{tag}-{pid}-{n}"));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir { path }
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.path.join(PULL_STATE_FILE)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn cursor_write_then_read_round_trip() {
+        let dir = TempDir::new("round-trip");
+        let sp = dir.state_path();
+        let key = cursor_key("http://127.0.0.1:8080", "demo");
+        write_cursor(&sp, &key, 7).expect("write");
+        assert_eq!(read_cursor(&sp, &key).expect("read"), 7);
+    }
+
+    #[test]
+    fn cursor_missing_file_reads_zero() {
+        let dir = TempDir::new("missing-file");
+        let sp = dir.state_path();
+        // No file written yet.
+        assert!(!sp.exists());
+        assert_eq!(read_cursor(&sp, "any|key").expect("read"), 0);
+    }
+
+    #[test]
+    fn cursor_missing_key_reads_zero() {
+        let dir = TempDir::new("missing-key");
+        let sp = dir.state_path();
+        write_cursor(&sp, "present|key", 42).expect("write");
+        assert_eq!(read_cursor(&sp, "absent|key").expect("read"), 0);
+    }
+
+    #[test]
+    fn cursor_two_keys_are_independent() {
+        let dir = TempDir::new("two-keys");
+        let sp = dir.state_path();
+        let a = cursor_key("http://a", "v1");
+        let b = cursor_key("http://b", "v2");
+        write_cursor(&sp, &a, 3).expect("write a");
+        write_cursor(&sp, &b, 9).expect("write b");
+        assert_eq!(read_cursor(&sp, &a).expect("read a"), 3);
+        assert_eq!(read_cursor(&sp, &b).expect("read b"), 9);
+    }
+
+    #[test]
+    fn cursor_malformed_state_is_state_error() {
+        let dir = TempDir::new("malformed");
+        let sp = dir.state_path();
+        std::fs::write(&sp, b"{ this is not valid json").expect("write garbage");
+        assert!(matches!(read_cursor(&sp, "k"), Err(CliError::State(_))));
+        // write_cursor must also refuse to clobber an unparseable file.
+        assert!(matches!(write_cursor(&sp, "k", 1), Err(CliError::State(_))));
+    }
+
+    #[test]
+    fn cursor_write_overwrites_same_key() {
+        let dir = TempDir::new("overwrite");
+        let sp = dir.state_path();
+        let key = cursor_key("http://h", "v");
+        write_cursor(&sp, &key, 1).expect("write 1");
+        write_cursor(&sp, &key, 5).expect("write 5");
+        assert_eq!(read_cursor(&sp, &key).expect("read"), 5);
+        // Overwriting is idempotent for the same value.
+        write_cursor(&sp, &key, 5).expect("write 5 again");
+        assert_eq!(read_cursor(&sp, &key).expect("read"), 5);
+    }
+
+    #[test]
+    fn cursor_key_combines_server_and_vault() {
+        assert_eq!(cursor_key("http://h:8080", "demo"), "http://h:8080|demo");
     }
 }

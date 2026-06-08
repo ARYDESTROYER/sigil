@@ -57,10 +57,16 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
-  **unauthenticated**, **in-memory**, **non-durable** vault op-log that stores
-  **opaque client-encrypted blobs** and hands them back unchanged. It performs
-  **no cryptography** and never sees plaintext or keys. Full contract in
-  [`api.md`](api.md).
+  **unauthenticated** vault op-log that stores **opaque client-encrypted blobs**
+  and hands them back unchanged. The op-log sits behind a `VaultLog` seam with
+  **two dev backends**: an **in-memory, non-durable** map (the default) and an
+  optional **file-backed** one selected via `SIGILD_OPLOG_DIR` for local-dev
+  durability (the `vaultID` is base64url-encoded to a safe flat filename to
+  prevent path traversal). Both are dev-only and opaque; **production storage
+  (Postgres/S3, with auth/backups/restore) is still unbuilt** — see
+  [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md).
+  `sigild` performs **no cryptography** and never sees plaintext or keys. Full
+  contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
   Next.js 15 stealth splash + early-access waitlist. No-index, wallable, no
   product surface.

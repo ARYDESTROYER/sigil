@@ -41,11 +41,17 @@ public, make no security claims, until the audit completes and trademark clears.
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
   request-ID/access-log/recover middleware, in-memory `store`; distroless
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an
-  opaque, **dev-gated** op-log (`MemVaultLog`) is wired in only when
-  `SIGILD_ENABLE_DEV_OPS` is truthy (**dev only, unauthenticated, in-memory,
-  non-durable**; default OFF → ops stay `501`). **No crypto**: the server never
-  decodes the blob; it stores/returns the exact client bytes. Endpoint reference
-  in [`docs/api.md`](docs/api.md).
+  opaque, **dev-gated** op-log (the `VaultLog` interface) is wired in only when
+  `SIGILD_ENABLE_DEV_OPS` is truthy (**dev only, unauthenticated**; default OFF →
+  ops stay `501`). Two dev backends, same `VaultLog` interface: the default
+  **in-memory** `MemVaultLog` (non-durable, lost on restart), or — when
+  **`SIGILD_OPLOG_DIR`** is set — a **file-backed** `FileVaultLog`
+  (length-prefixed + `fsync`'d per-vault append-only files, durable across
+  restart; the untrusted `vaultID` is `base64.RawURLEncoding`-encoded to a flat,
+  path-traversal-safe filename). The file backend is a **local-dev convenience,
+  NOT the production store** (production = Postgres/S3). **No crypto**: the server
+  never decodes the blob; it stores/returns the exact client bytes. Endpoint
+  reference in [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —

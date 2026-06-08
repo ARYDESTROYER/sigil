@@ -27,6 +27,12 @@ type Config struct {
 	// an UNAUTHENTICATED, in-memory, non-durable op-log of opaque
 	// client-encrypted blobs — for local development ONLY, never production.
 	DevOpsEnabled bool
+	// VaultLog is OPTIONAL. When DevOpsEnabled is true, NewRouter uses this
+	// backend if it is non-nil; otherwise it falls back to an in-memory
+	// MemVaultLog (the default). It lets local dev select a durable
+	// FileVaultLog without changing handler behaviour. It is ignored when
+	// DevOpsEnabled is false (the routes stay at their 501 stub).
+	VaultLog store.VaultLog
 }
 
 // NewRouter returns the sigild HTTP handler.
@@ -42,10 +48,17 @@ func NewRouter(cfg Config) http.Handler {
 	mux.HandleFunc("GET /version", h.version)
 
 	if cfg.DevOpsEnabled {
-		// DEV-ONLY op-log: UNAUTHENTICATED, in-memory, non-durable. Stores
-		// opaque client-encrypted blobs; performs no crypto. Never expose
-		// publicly. POST is body-capped (oversized -> 413); GET reads only.
-		h.log = store.NewMemVaultLog()
+		// DEV-ONLY op-log: UNAUTHENTICATED. Stores opaque client-encrypted
+		// blobs; performs no crypto. Never expose publicly. POST is body-capped
+		// (oversized -> 413); GET reads only. Backend selection: use the
+		// caller-supplied cfg.VaultLog if set (e.g. a durable FileVaultLog),
+		// else default to a non-durable in-memory MemVaultLog. Handler
+		// behaviour is identical for either backend.
+		if cfg.VaultLog != nil {
+			h.log = cfg.VaultLog
+		} else {
+			h.log = store.NewMemVaultLog()
+		}
 		mux.Handle("POST /v1/vaults/{vaultID}/ops",
 			limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsAppend)))
 		mux.Handle("GET /v1/vaults/{vaultID}/ops", http.HandlerFunc(h.opsList))

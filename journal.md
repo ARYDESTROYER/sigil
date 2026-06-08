@@ -787,6 +787,122 @@ accurate); production behavior is **unchanged** (default ops still `501`).
   posture as domain purchase / public deploy. The image still only builds + is
   smoke-tested **locally** (Phase 4); nothing was published.
 
+## 2026-06-08 — Phase 10 (file-backed durable dev op-log)
+
+Theme: give the dev op-log an **optional durable backend** so a sealed container
+survives a `sigild` restart, without changing the default and without the server
+ever touching crypto or plaintext. The new backend sits behind the **same
+`VaultLog` interface** as the in-memory default and is selected purely by an env
+var. Built behind the existing dev flag, then **independently verified** incl. a
+**real over-HTTP restart-durability demo + path-safety**; production behavior is
+**unchanged** (default still in-memory; ops still default `501`).
+
+### sigild — `FileVaultLog`, a file-backed durable backend ✅
+- New `internal/store/filevaultlog.go`: a `FileVaultLog` implementing the same
+  `Append(vaultID, blob) -> seq` / `Since(vaultID, sinceSeq) -> []Op` contract as
+  `MemVaultLog`. Each vault is a **per-vault append-only file** of **4-byte
+  big-endian length-prefixed records** (`encoding/binary`); `Append` writes the
+  length prefix + the raw blob and **`fsync`s** before returning. The **1-based,
+  per-vault `seq` is re-derived from disk** by counting records in the file (no
+  separate counter file), so a fresh process over the same dir continues at the
+  right next seq. **Defensive copies** of the blob on the way out (the server
+  never aliases caller memory); a **truncated trailing record** (partial final
+  write, e.g. an `fsync` that didn't complete) is **tolerated** — the reader stops
+  at the last whole record rather than erroring. Stdlib-only (`bufio`,
+  `encoding/base64`, `encoding/binary`, `errors`, `io`, `os`, `path/filepath`,
+  `sync`). The blob stays an **opaque `[]byte`** — the server does **no crypto**,
+  never decodes/parses it; **IT IS NOT THE PRODUCTION STORE**.
+- **Path-traversal-proof filename scheme.** The `vaultID` comes from the
+  **untrusted HTTP path**, so `pathFor` does NOT use it directly: it
+  **`base64.RawURLEncoding`-encodes** the raw vaultID bytes (alphabet has no `/`,
+  `+`, or `=`), appends `.log`, then `filepath.Join`s onto the base dir. No input
+  can therefore contain a path separator or `..`, so **any** vaultID maps to **one
+  flat file inside the dir** — `"../../etc/passwd"`, `"a/b"`, `".."` all become
+  safe flat filenames and never write outside the base dir.
+- **Selected via `SIGILD_OPLOG_DIR`; default unchanged.** `main.go` wires the file
+  backend **only when `SIGILD_OPLOG_DIR` is set** (and the dev flag is on);
+  otherwise the op-log stays the in-memory `MemVaultLog`. The op-log itself is
+  **still dev-gated** (`SIGILD_ENABLE_DEV_OPS`) and **still defaults to `501`** —
+  no flag, no op-log, durable or not. On startup with the dir set, the server logs
+  a loud WARN: **"FILE-BACKED durable backend active — UNAUTHENTICATED, dev-only,
+  NOT the production store — do NOT expose publicly."** No fake auth was added.
+- ⚠️ Loudly labeled in code + ADR 0006: this durable backend is a **LOCAL-DEV
+  convenience**, **UNAUTHENTICATED / dev-only**, stores **opaque blobs only**, and
+  is **explicitly NOT the production store** (production = Postgres/S3 per the
+  brief). It is durability **only** — still **no auth, no crypto, no CRDT**.
+
+### docs — api.md / architecture.md / ADR 0006 ✅
+- `docs/api.md`, `docs/architecture.md`, and the new **ADR 0006** (file-backed
+  durable dev op-log backend) were updated by the docs track to document the
+  `SIGILD_OPLOG_DIR` selector, the durable-vs-in-memory choice, the
+  base64url-safe-filename / path-traversal property, and the "NOT the production
+  store" framing. This entry finalizes the remaining living docs (this file,
+  `CLAUDE.md`, `README.md`).
+
+### Verification (independently verified — the real gate) ✅
+- Go: `gofmt -l sigild` clean · `go vet ./...` clean · `go build ./...` clean ·
+  `go test ./...` — all packages ok, **store 25 PASS** (incl. **11 new
+  `FileVaultLog` tests**: SeqIncrements, SeqIsPerVault, SinceZeroReturnsAll,
+  SinceFilters, SinceUnknownVault, DurabilityAcrossRestart, PathTraversalSafety,
+  OpaqueBinaryIntegrity, ConcurrentAppends, DefensiveCopy,
+  TruncatedTrailingRecordIgnored), **api 23 PASS**. `go test -race -count=1
+  ./internal/store/ ./internal/api/` → both ok, **race-clean** (incl. a 16×50
+  concurrent-append test).
+- **Real over-HTTP restart durability (first-hand, byte-checked):** built
+  `/tmp/sigild_p10` from `cmd/server`; started it with
+  `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_DIR=… SIGILD_ADDR=:18100` (startup logged
+  the loud FILE-BACKED-durable WARN). POSTed a raw opaque binary blob
+  (`00 01 de ad be ef ff 10 "sigil-opaque"`, sha256 `43f60cfc…4642`) to
+  `/v1/vaults/dur/ops` → `{"vaultID":"dur","seq":1}`; `GET ?since=0` returned the
+  blob base64 `AAHerb7v/xBzaWdpbC1vcGFxdWU=` (matches). **On disk:** `ZHVy.log`
+  (`ZHVy` = base64url(`"dur"`)) contained exactly `00 00 00 14` (len=20 BE) + the
+  20 raw blob bytes. **`kill -9`** the server, **restart on the SAME port + SAME
+  OPLOG dir**: `GET ?since=0` returned seq 1 with a **byte-identical** blob (sha256
+  `43f60cfc…4642`, `cmp` byte-identical). The server stored/returned the exact
+  client bytes across a crash — **durability: YES.**
+- **Negative control A (in-memory non-durable):** dev flag set but **no
+  `SIGILD_OPLOG_DIR`** — op present before restart, **empty `ops` (`[]`)** after
+  `kill -9` + restart on the same port → non-durable confirmed (the default
+  behavior is unchanged).
+- **Negative control B (gating, no dev flag):** **no `SIGILD_ENABLE_DEV_OPS`** —
+  both GET and POST `/v1/vaults/x/ops` return **`501`** with the pre-audit-skeleton
+  body (`{"error":"not_implemented","detail":"vault operation log is not
+  implemented in the pre-audit skeleton"}`). Default stays `501`, durable or not.
+- **Path traversal SAFE, verified two ways.** UNIT: `TestFileVaultLogPathTraversalSafety`
+  appends hostile ids (`"../escape"`, `"a/b/c"`, `".."`, `"../../etc/passwd"`),
+  walks the **parent** of the oplog dir, and asserts every file is **flat and
+  directly under the dir**, then re-reads each id and gets its exact blob back.
+  REAL HTTP: POSTing to `/v1/vaults/..%2F..%2Fevil/ops`,
+  `/v1/vaults/..%2F..%2F..%2Ftmp%2Fetc%2Fpasswd/ops`, and `/v1/vaults/a%2Fb/ops`
+  produced **three flat files directly under the dir** (`Li4vLi4vZXZpbA.log` =
+  `../../evil`, `Li4vLi4vLi4vdG1wL2V0Yy9wYXNzd2Q.log` = `../../../tmp/etc/passwd`,
+  `YS9i.log` = `a/b`); `find` showed **no subdirectories** and nothing outside the
+  base dir, and sentinel checks confirmed **no `/tmp/etc`, `/tmp/evil`, or `/evil`**
+  were created. The hostile blobs were still **retrievable by id** over HTTP. The
+  untrusted vaultID cannot escape the dir.
+- **Same-dir restart at the unit level:** `TestFileVaultLogDurabilityAcrossRestart`
+  builds a new instance over the same dir, re-derives seqs, returns prior blobs,
+  and continues at the next seq (4).
+- Regression: libsigil fmt/clippy/**42+7** tests/wasm/**getrandom 0** ✓; cli
+  fmt/clippy/**22+2** tests ✓; all 6 workflow YAMLs parse ✓. Web untouched.
+- **stdlib-only held:** `filevaultlog.go` imports only `bufio`,
+  `encoding/base64`, `encoding/binary`, `errors`, `io`, `os`, `path/filepath`,
+  `sync` — no third-party deps; `go.mod` unchanged (no `go.sum`).
+- Over-claim scan CLEAN: the new Go files and ADR 0006 have **zero** hits for
+  "audited"/"secure"/"post-quantum secure"/"SOC 2"/unqualified "end-to-end
+  encrypted"; the backend is labeled "NOT the production store",
+  "UNAUTHENTICATED / dev-only", "OPAQUE … never decrypted/parsed", "performs no
+  cryptography" throughout. The only "audited"/"unaudited" hits in the edited docs
+  are pre-existing negations/caveats, not added diff lines.
+
+### ⛔ Still NOT production (honest)
+- `FileVaultLog` adds **durability only**. It is a **LOCAL-DEV** backend, **NOT**
+  the production Postgres/S3 store named in the brief. Same gaps as Phase 6/7
+  otherwise: real **auth** (the op-log is still unauthenticated), **crypto** (the
+  server still does none — opaque blobs only), and **CRDT / conflict-resolution**
+  (still a naive per-vault append counter, now persisted to a flat file, not a
+  sync protocol). The prod ops default stays `501`.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

@@ -38,3 +38,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0003](0003-dev-gated-opaque-op-log.md) | Dev-gated, opaque vault op-log in `sigild` | Accepted (2026-06) |
 | [0004](0004-crypto-agility-suite-registry.md) | Crypto-agility via an algorithm-suite registry | Accepted (2026-06) |
 | [0005](0005-stdlib-only-sigild.md) | `sigild` is Go stdlib-only | Accepted (2026-06) |
+| [0006](0006-file-backed-dev-op-log-backend.md) | File-backed dev op-log backend (`SIGILD_OPLOG_DIR`) | Accepted (2026-06) |

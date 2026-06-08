@@ -72,9 +72,15 @@ The `version` value is injected at build time from the git short SHA via
 >   would poison the future audit.
 > - **UNAUTHENTICATED.** There is no auth, no identity, no per-vault access
 >   control. Anyone who can reach the port can read and append to any vault ID.
-> - **IN-MEMORY / NON-DURABLE.** Backed by a process-memory map. It is **lost on
->   restart**, never written to disk, and not replicated. No Postgres, no S3, no
->   backups.
+> - **IN-MEMORY BY DEFAULT / OPTIONAL FILE-BACKED.** With the dev flag on, the
+>   op-log is backed by a process-memory map by default — **lost on restart**,
+>   never written to disk, not replicated. If **`SIGILD_OPLOG_DIR`** is also set,
+>   a **file-backed** backend persists each vault's journal under that directory
+>   for **local-dev durability** instead (the `vaultID` is base64url-encoded to a
+>   safe flat filename, so it cannot escape the directory). Either way it is the
+>   **same opaque, dev-only, unauthenticated `VaultLog`** — **not** the production
+>   store. Production durability is still Postgres/S3 with backups, and is
+>   unbuilt. See [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md).
 > - **OPAQUE BLOBS ONLY.** The server treats each operation body as an opaque
 >   byte string. It does **no cryptography**, never sees plaintext or keys, and
 >   does **not** parse, validate, decrypt, order, merge, or otherwise interpret

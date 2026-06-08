@@ -19,6 +19,7 @@ import (
 
 	"github.com/ARYDESTROYER/sigil/sigild/internal/api"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/buildinfo"
+	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
 )
 
 func main() {
@@ -36,7 +37,21 @@ func main() {
 		DevOpsEnabled: devOps,
 	}
 	if devOps {
-		logger.Warn("DEV op-log enabled: UNAUTHENTICATED, in-memory, non-durable — do NOT expose publicly")
+		// Optional durable LOCAL-DEV backend: if SIGILD_OPLOG_DIR is set, persist
+		// the dev op-log to per-vault append-only files there so it survives a
+		// restart. It is still UNAUTHENTICATED / dev-only and is NOT the
+		// production store (production = Postgres/S3/Redis). Unset => in-memory.
+		if dir := os.Getenv("SIGILD_OPLOG_DIR"); dir != "" {
+			fileLog, err := store.NewFileVaultLog(dir)
+			if err != nil {
+				logger.Error("failed to open file-backed dev op-log", "dir", dir, "err", err)
+				os.Exit(1)
+			}
+			cfg.VaultLog = fileLog
+			logger.Warn("DEV op-log enabled: FILE-BACKED durable backend active — UNAUTHENTICATED, dev-only, NOT the production store — do NOT expose publicly", "dir", dir)
+		} else {
+			logger.Warn("DEV op-log enabled: UNAUTHENTICATED, in-memory, non-durable — do NOT expose publicly")
+		}
 	}
 
 	srv := &http.Server{

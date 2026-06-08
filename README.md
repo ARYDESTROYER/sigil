@@ -25,9 +25,11 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a
   dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route becomes an
-  **unauthenticated, in-memory, non-durable** op-log that stores **opaque
-  client-encrypted blobs** and hands them back unchanged. Performs no crypto —
-  never decodes the blob. Ships a distroless `Dockerfile`.
+  **unauthenticated** op-log that stores **opaque client-encrypted blobs** and
+  hands them back unchanged — by default **in-memory** (non-durable), or, when
+  `SIGILD_OPLOG_DIR` is set, a **file-backed durable** backend (path-traversal-safe
+  filenames; **dev-only, NOT the production store**). Performs no crypto — never
+  decodes the blob. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

@@ -35,9 +35,13 @@ public, make no security claims, until the audit completes and trademark clears.
 ## Repository map
 
 - `libsigil/` — Rust crypto core (`core` = suite registry + envelope codec +
-  real-but-unaudited Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, and composed
-  `seal_record`/`open_record`; `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite
-  smoke export, hand-written `sigil.h`).
+  real-but-unaudited Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, composed
+  `seal_record`/`open_record`, and a classical **Ed25519** sign/verify primitive
+  (`public_key_from_seed`/`sign`/`verify`, caller-supplied 32-byte seed, no
+  in-core RNG; the signature half of the future Ed25519&ML-DSA-65 hybrid — the
+  ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth);
+  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, hand-written
+  `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
   request-ID/access-log/recover middleware, in-memory `store`; distroless
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an

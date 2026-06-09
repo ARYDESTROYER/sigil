@@ -26,3 +26,12 @@ sha2 = { version = "0.10", default-features = false }
 # — the caller supplies it — so no RNG is needed. The `alloc` feature provides
 # the scratch memory block that `Argon2::hash_password_into` allocates.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# Classical Ed25519 signatures (pre-audit) — the Ed25519 half of the hybrid
+# Ed25519&ML-DSA-65 suite (the ML-DSA-65 PQ half is future/unimplemented).
+# `default-features = false` disables the `rand_core` feature, which keeps
+# `getrandom` out and preserves the `wasm32-unknown-unknown` build; we never
+# generate keys here, so no RNG is needed — the caller supplies the 32-byte
+# secret seed and we derive/sign/verify deterministically. `from_bytes` (seed →
+# keypair), `sign`, and `verify_strict` are all RNG-free. The `alloc` feature is
+# not needed by these fixed-size raw-byte calls.
+ed25519-dalek = { version = "2", default-features = false }

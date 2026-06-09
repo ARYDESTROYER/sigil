@@ -1,11 +1,14 @@
 # Sigil cryptographic specification (condensed)
 
-> **Internal / pre-audit. NOT YET IMPLEMENTED OR AUDITED.** This describes the
-> intended design of `libsigil`. The code in this repo implements only the
-> algorithm-suite registry and envelope metadata — no real cryptography runs
-> yet. Condensed from the product brief §11/§20/§21. Subject to change. A
-> Cure53 audit of the hybrid construction is to be commissioned before public
-> beta.
+> **Internal / pre-audit. UNAUDITED.** This describes the intended design of
+> `libsigil`. The code in this repo implements **real but UNAUDITED** building
+> blocks — the algorithm-suite registry, the envelope codec, an Argon2id KDF, an
+> XChaCha20-Poly1305 + HKDF AEAD, a composed `seal_record`/`open_record`, and a
+> standalone classical **Ed25519 sign/verify** primitive — none wired into a
+> finished product. The **KEM and the ML-DSA-65 post-quantum signature halves of
+> the hybrid construction remain specified-but-not-implemented.** Condensed from
+> the product brief §11/§20/§21. Subject to change. A Cure53 audit of the hybrid
+> construction is to be commissioned before public beta.
 
 ## Design principle
 
@@ -78,6 +81,17 @@ breaking both X25519 and ML-KEM.
 
 **Signatures**: `Ed25519.Sign(m) || ML-DSA-65.Sign(m)`; verification requires
 **both** to validate.
+
+**Implementation status (pre-audit, UNAUDITED).** The **classical Ed25519 half**
+is now **implemented** in `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):
+a deterministic RFC 8032 Ed25519 `sign`/`verify` primitive over a
+**caller-supplied 32-byte secret seed** (the core generates no key material — see
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). It is **real but
+NOT YET AUDITED**, and it is **not yet wired into the hybrid signature
+construction or any product flow** — it stands as a standalone primitive. The
+**ML-DSA-65 post-quantum half remains specified-but-not-implemented**, so the
+hybrid `Ed25519 & ML-DSA-65` signature above is **not** available: there is no
+post-quantum signature in this repo yet, and no combined hybrid `Sign`/`Verify`.
 
 ## Migration plan (intended)
 

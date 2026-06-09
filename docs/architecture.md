@@ -41,7 +41,17 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   - the **XChaCha20-Poly1305 + HKDF-SHA256 AEAD** (`seal`/`open`) — per-record key
     derivation plus authenticated encryption;
   - the **composed record API** (`seal_record`/`open_record`) — the single
-    end-to-end call (Argon2id → AEAD → envelope codec) that adds no new crypto.
+    end-to-end call (Argon2id → AEAD → envelope codec) that adds no new crypto;
+  - the **classical Ed25519 signature primitive** (`sign`/`verify`) — a
+    deterministic RFC 8032 sign/verify over a **caller-supplied 32-byte secret
+    seed** (real but UNAUDITED; a standalone primitive, **not yet** wired into the
+    hybrid `Ed25519 & ML-DSA-65` signature of suite `0x12` — the ML-DSA-65
+    post-quantum half stays unimplemented).
+
+  Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
+  the AEAD nonce, and the Ed25519 signing seed are **all caller-supplied**, so the
+  core stays `wasm32-unknown-unknown`-pure and `getrandom`-free (see
+  [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
 - **`libsigil/ffi`** ([`../libsigil/ffi/`](../libsigil/ffi/)) — a thin, hand-written
   **C-ABI** over the AEAD layer: `sigil_seal` / `sigil_open` / `sigil_buffer_free`
   (plus `sigil_current_suite` as a link/smoke check), with a hand-maintained
@@ -81,6 +91,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   envelope codec (encode/decode)                                │    │
    │   │   Argon2id KDF  →  XChaCha20-Poly1305 + HKDF AEAD               │    │
    │   │   record API: seal_record / open_record                        │    │
+   │   │   Ed25519 sign / verify  (seed caller-supplied; no RNG)         │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
@@ -257,10 +268,14 @@ authoritative list, with rationale, is the **defer ledger** in
   device-key authentication and no per-vault membership check.
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **No KEM / signatures in a flow.** The hybrid X25519 & ML-KEM-768 key
-  encapsulation and Ed25519 & ML-DSA-65 signatures of suite `0x12` are *specified*
-  and *reserved* in the envelope (`kem_ct`), but **not implemented**. Only the
-  symmetric path (Argon2id → AEAD → envelope) actually runs.
+- **No KEM, and no hybrid signature, in a flow.** The hybrid X25519 & ML-KEM-768
+  key encapsulation of suite `0x12` is *specified* and *reserved* in the envelope
+  (`kem_ct`), but **not implemented**. For signatures, the **classical Ed25519
+  half is implemented** as a standalone `sign`/`verify` primitive (caller-supplied
+  seed; UNAUDITED), but the **ML-DSA-65 post-quantum half is not**, so the combined
+  hybrid signature does not yet exist — and neither the KEM nor any signature is
+  wired into a record/product flow. Only the symmetric path (Argon2id → AEAD →
+  envelope) actually runs end-to-end.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number — no signed ops, no Lamport/Merkle
   ordering, no conflict-free merge.

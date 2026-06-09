@@ -903,6 +903,77 @@ var. Built behind the existing dev flag, then **independently verified** incl. a
   (still a naive per-vault append counter, now persisted to a flat file, not a
   sync protocol). The prod ops default stays `501`.
 
+## 2026-06-09 — Phase 11 (Ed25519 signature primitive in libsigil-core)
+
+### Context & mandate
+- Goal: add the **classical Ed25519** signature half of the planned hybrid
+  signature suite (Ed25519&ML-DSA-65) to `libsigil-core` as a standalone, real
+  cryptographic primitive — sign and verify — without touching any existing
+  KDF/AEAD code and without breaking the wasm-pure / no-RNG invariants.
+- ⚠️ This is the **signature PRIMITIVE only**. It is **not** yet wired into any
+  product flow (no device-key auth). The **ML-DSA-65 post-quantum half stays
+  FUTURE/unimplemented** — there is still **no post-quantum signature** in this
+  repo. Real but **UNAUDITED**.
+
+### core — `core/src/sig.rs` ✅
+- New module exposing a **raw-bytes** Ed25519 API, re-exported from `lib.rs`:
+  `public_key_from_seed(&[u8; 32]) -> [u8; 32]`, `sign(seed, msg) -> [u8; 64]`,
+  and `verify(public_key, msg, signature) -> Result<(), SigError>`, plus the
+  length constants `SIG_SEED_LEN`/`SIG_PUBLIC_KEY_LEN` (32) and `SIGNATURE_LEN`
+  (64) and the `SigError` enum (malformed key / bad signature).
+- **Caller-supplied entropy:** the API takes a **32-byte secret SEED** from the
+  caller — exactly like the KDF takes the salt and the AEAD takes the nonce.
+  **core still generates NO randomness** (no RNG, no key-gen). The seed must come
+  from a cryptographically secure source on the caller's side.
+- **Deterministic.** Ed25519 signatures are deterministic per RFC 8032, so a
+  given (seed, message) always yields the same signature — asserted by a
+  `signing_is_deterministic` test. `verify` uses dalek `verify_strict` (rejects
+  non-canonical / small-order points).
+- ⚠️ **classical only** — this is the Ed25519 half. The PQ ML-DSA-65 half is
+  documented as future/unimplemented in the module docs, `lib.rs`, the crypto
+  spec, the architecture map, and ADR 0007. Labeled **UNAUDITED** throughout.
+
+### Dependency & the WASM/GETRANDOM gate
+- Chose **`ed25519-dalek = { version = "2", default-features = false }`** — the
+  `default-features = false` is load-bearing: it drops the `rand_core`/`getrandom`
+  path (we use only `from_bytes`/`sign`/`verify_strict`, never key-gen RNG).
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` =
+  **0** (before and after the change), and `cargo build -p sigil-core --target
+  wasm32-unknown-unknown` **succeeds** — the wasm-pure invariant is preserved.
+  `#![forbid(unsafe_code)]` and `no_std` (`core` + `alloc`) are intact.
+
+### Tests ✅
+- **RFC 8032 known-answer vector:** `sig::tests::rfc8032_test1_known_answer_vector`
+  asserts **RFC 8032 §7.1 Ed25519 "TEST 1"** (the empty-message vector): seed
+  `9d61b19deffd5a60…`, expected public key `d75a980182b10ab7…`, expected signature
+  `e5564300c360ac72…`. It checks `public_key_from_seed(seed) == expected_pk` **and**
+  `sign(seed, "") == expected_sig` **and** `verify(expected_pk, "", expected_sig) ==
+  Ok(())` — a real interop vector, not just an internal round-trip.
+- Plus the behavioural suite: `round_trip_verifies`, `wrong_message_fails`,
+  `wrong_public_key_fails`, `malformed_public_key_is_rejected`,
+  `flipped_signature_byte_fails`, `all_zero_signature_fails`,
+  `signing_is_deterministic`, `constants_have_expected_lengths`.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 51 PASS**, sigil-ffi 7 PASS · wasm build OK ·
+  getrandom count **0**. Regression: cli fmt/clippy/**22** tests ✓; sigild
+  gofmt/vet/test/build ✓; all 6 workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0007 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and the new **ADR 0007**
+  (Ed25519 signature primitive — **caller-supplied entropy / 32-byte seed**, no
+  in-core RNG, classical half only) were updated by the docs track. The spec marks
+  the Ed25519 half "real but NOT YET AUDITED" and the ML-DSA-65 half
+  "specified-but-not-implemented". This entry finalizes the remaining living docs
+  (this file, `CLAUDE.md`, `README.md`).
+
+### ➡️ Still NOT wired in — planned NEXT phase (honest)
+- This phase adds the **primitive only**. It is **not** yet connected to
+  device-key authentication. The planned next phase is to **use** it: have the CLI
+  **sign** Ed25519 op-log requests with a per-device key, and have **sigild**
+  **verify** those signatures before accepting an op-log append (replacing today's
+  unauthenticated dev op-log). The hybrid Ed25519&ML-DSA-65 signature does **not
+  yet exist** — only the classical half, and it is unaudited.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

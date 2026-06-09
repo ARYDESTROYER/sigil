@@ -20,7 +20,12 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 - `libsigil/` — Rust crypto core. **Builds, lints, tests, and compiles to
   `wasm32`** — algorithm-suite registry, the crypto-agility envelope codec, a
   real (unaudited) Argon2id KDF and XChaCha20-Poly1305 + HKDF AEAD seal/open
-  layer, plus a `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
+  layer, and a real (unaudited) **classical Ed25519** sign/verify primitive
+  (`public_key_from_seed`/`sign`/`verify` over a caller-supplied 32-byte seed —
+  the core generates no randomness; this is the signature half of the planned
+  Ed25519&ML-DSA-65 hybrid, the ML-DSA-65 post-quantum half is **not yet
+  implemented**, and the primitive is not yet wired into any auth flow), plus a
+  `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
 - `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a

@@ -11,8 +11,8 @@
 use std::process::ExitCode;
 
 use sigil_cli::{
-    cursor_key, open_container, pull_ops, push_op, read_cursor, seal_to_container, write_cursor,
-    PULL_STATE_FILE,
+    cursor_key, generate_key, load_key, open_container, pull_ops, push_op, read_cursor, save_key,
+    seal_to_container, write_cursor, PULL_STATE_FILE,
 };
 use sigil_core::Argon2Params;
 
@@ -24,6 +24,10 @@ const SERVER_ENV: &str = "SIGIL_SERVER";
 
 /// Default dev sigild base URL when neither --server nor SIGIL_SERVER is set.
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+
+/// Environment variable giving the path to the device key file used to SIGN
+/// op-log requests (overridden by `--key`).
+const DEVICE_KEY_ENV: &str = "SIGIL_DEVICE_KEY";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -39,9 +43,10 @@ sigil — pre-audit demonstration CLI over the libsigil core
 USAGE:
   sigil seal --in <file> --out <file>    Seal <in> into an encrypted container at <out>
   sigil open --in <file> --out <file>    Open an encrypted container <in> into <out>
-  sigil push --vault <id> --in <file> [--server <url>]
+  sigil keygen --out <file>              Generate a DEV device key (0600) and print its public key
+  sigil push --vault <id> --in <file> [--server <url>] [--key <file>]
                                          Upload an opaque container to the dev op-log
-  sigil pull --vault <id> --out-dir <dir> [--since <N>] [--server <url>]
+  sigil pull --vault <id> --out-dir <dir> [--since <N>] [--server <url>] [--key <file>]
                                          Download NEW opaque containers from the dev op-log
   sigil --help                           Show this help
   sigil --version                        Show the version
@@ -68,6 +73,30 @@ SYNC (push/pull) — !! DEV / LOCALHOST / PLAIN HTTP ONLY !!
 
     sigil push --vault demo --in secret.sigil
     SIGIL_SERVER=http://127.0.0.1:8080 sigil pull --vault demo --out-dir ./inbox
+
+DEVICE-KEY SIGNING (push/pull) — DEV-ONLY, single device key:
+  If the dev sigild is configured with SIGILD_OPLOG_PUBKEY (standard-base64 of a
+  32-byte Ed25519 public key), it REQUIRES every op-log request to be SIGNED by
+  the matching device key — unsigned or invalid requests get HTTP 401. Otherwise
+  signing is OFF and the op-log stays unauthenticated (unchanged).
+
+  Generate a device key once, then point sigild at its public key:
+
+    sigil keygen --out device.key       # writes device.key (mode 0600), prints the public key
+    # -> device public key (set sigild SIGILD_OPLOG_PUBKEY to this): <base64>
+
+  Then pass the key on push/pull with --key <file>, or set SIGIL_DEVICE_KEY to
+  the key-file path (--key takes precedence over SIGIL_DEVICE_KEY):
+
+    sigil push --vault demo --in secret.sigil --key device.key
+    SIGIL_DEVICE_KEY=device.key sigil pull --vault demo --out-dir ./inbox
+
+  HONEST SCOPE: this is a SINGLE device key, DEV-ONLY, over plain HTTP. The
+  signature is bound to the method, path, query, a unix-seconds timestamp, and the
+  body; sigild rejects timestamps skewed more than 300s. That window BOUNDS replay
+  but does NOT fully prevent it (no per-request nonce). Device enrollment, a
+  multi-device registry, and JWT bearer tokens are all FUTURE work. The signing
+  primitive (Ed25519) is REAL but UNAUDITED.
 
 INCREMENTAL PULL (pull only):
   Pulled ops are written to <out-dir>/<vault>/op-<seq>.sigil — a PER-VAULT subdir,
@@ -136,6 +165,10 @@ fn run() -> Result<(), String> {
             let io = parse_io(args)?;
             cmd_open(&io)
         }
+        "keygen" => {
+            let out = parse_keygen(args)?;
+            cmd_keygen(&out)
+        }
         "push" => {
             let p = parse_push(args)?;
             cmd_push(&p)
@@ -163,6 +196,9 @@ struct PushArgs {
     vault: String,
     input: String,
     server: String,
+    /// Path to the device key file to SIGN the request with: `--key`, else the
+    /// `SIGIL_DEVICE_KEY` env var, else `None` (send unsigned).
+    key: Option<String>,
 }
 
 /// Parsed args for `sigil pull`.
@@ -173,18 +209,30 @@ struct PullArgs {
     since: Option<u64>,
     out_dir: String,
     server: String,
+    /// Path to the device key file to SIGN the request with: `--key`, else the
+    /// `SIGIL_DEVICE_KEY` env var, else `None` (send unsigned).
+    key: Option<String>,
+}
+
+/// Resolve the device key-file path: explicit `--key` wins, else the
+/// `SIGIL_DEVICE_KEY` env var (empty treated as unset), else `None` (unsigned).
+fn resolve_key(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| std::env::var(DEVICE_KEY_ENV).ok())
+        .filter(|s| !s.is_empty())
 }
 
 fn parse_push(mut args: impl Iterator<Item = String>) -> Result<PushArgs, String> {
     let mut vault: Option<String> = None;
     let mut input: Option<String> = None;
     let mut server: Option<String> = None;
+    let mut key: Option<String> = None;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--vault" => set_once(&mut vault, &mut args, "--vault")?,
             "--in" => set_once(&mut input, &mut args, "--in")?,
             "--server" => set_once(&mut server, &mut args, "--server")?,
+            "--key" => set_once(&mut key, &mut args, "--key")?,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
     }
@@ -193,6 +241,7 @@ fn parse_push(mut args: impl Iterator<Item = String>) -> Result<PushArgs, String
         vault: vault.ok_or_else(|| "missing required --vault <id>".to_string())?,
         input: input.ok_or_else(|| "missing required --in <file>".to_string())?,
         server: resolve_server(server),
+        key: resolve_key(key),
     })
 }
 
@@ -201,6 +250,7 @@ fn parse_pull(mut args: impl Iterator<Item = String>) -> Result<PullArgs, String
     let mut since_raw: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut server: Option<String> = None;
+    let mut key: Option<String> = None;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -208,6 +258,7 @@ fn parse_pull(mut args: impl Iterator<Item = String>) -> Result<PullArgs, String
             "--since" => set_once(&mut since_raw, &mut args, "--since")?,
             "--out-dir" => set_once(&mut out_dir, &mut args, "--out-dir")?,
             "--server" => set_once(&mut server, &mut args, "--server")?,
+            "--key" => set_once(&mut key, &mut args, "--key")?,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
     }
@@ -227,7 +278,20 @@ fn parse_pull(mut args: impl Iterator<Item = String>) -> Result<PullArgs, String
         since,
         out_dir: out_dir.ok_or_else(|| "missing required --out-dir <dir>".to_string())?,
         server: resolve_server(server),
+        key: resolve_key(key),
     })
+}
+
+/// Parse `sigil keygen --out <file>` from the remaining args.
+fn parse_keygen(mut args: impl Iterator<Item = String>) -> Result<String, String> {
+    let mut out: Option<String> = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--out" => set_once(&mut out, &mut args, "--out")?,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    out.ok_or_else(|| "missing required --out <file>".to_string())
 }
 
 /// Store a value into `slot` exactly once, erroring on a missing value or a
@@ -318,12 +382,42 @@ fn cmd_open(io: &IoArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Generate a fresh DEV device key, write it to `out` (mode `0600`), and print
+/// its public key so the user can set `SIGILD_OPLOG_PUBKEY` to it.
+fn cmd_keygen(out: &str) -> Result<(), String> {
+    let kf = generate_key().map_err(|e| e.to_string())?;
+    let path = std::path::Path::new(out);
+    save_key(path, &kf).map_err(|e| e.to_string())?;
+    // Echo the public key (base64) for the user to paste into sigild's config.
+    println!(
+        "wrote device key to {out} (mode 0600)\n\
+         device public key (set sigild SIGILD_OPLOG_PUBKEY to this): {}",
+        kf.public_key
+    );
+    Ok(())
+}
+
+/// Load the device-key seed from an optional key-file path. `None` -> `None`
+/// (send unsigned); `Some(path)` -> decode the seed, mapping errors to a string.
+fn load_seed(key: &Option<String>) -> Result<Option<[u8; sigil_core::SIG_SEED_LEN]>, String> {
+    match key {
+        None => Ok(None),
+        Some(path) => {
+            let (seed, _public) =
+                load_key(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+            Ok(Some(seed))
+        }
+    }
+}
+
 fn cmd_push(p: &PushArgs) -> Result<(), String> {
     let container =
         std::fs::read(&p.input).map_err(|e| format!("could not read input {:?}: {e}", p.input))?;
 
-    // push_op moves OPAQUE bytes to the dev op-log; no password is involved.
-    let seq = push_op(&p.server, &p.vault, &container).map_err(|e| e.to_string())?;
+    // When a device key is configured, SIGN the request (required if sigild has
+    // SIGILD_OPLOG_PUBKEY set). push_op still moves OPAQUE bytes; no password.
+    let seed = load_seed(&p.key)?;
+    let seq = push_op(&p.server, &p.vault, &container, seed.as_ref()).map_err(|e| e.to_string())?;
     println!("pushed vault {} seq {}", p.vault, seq);
     Ok(())
 }
@@ -342,7 +436,10 @@ fn cmd_pull(p: &PullArgs) -> Result<(), String> {
     // resume from the saved cursor.
     let start = p.since.unwrap_or(saved);
 
-    let ops = pull_ops(&p.server, &p.vault, start).map_err(|e| e.to_string())?;
+    // When a device key is configured, SIGN the request (required if sigild has
+    // SIGILD_OPLOG_PUBKEY set).
+    let seed = load_seed(&p.key)?;
+    let ops = pull_ops(&p.server, &p.vault, start, seed.as_ref()).map_err(|e| e.to_string())?;
 
     if ops.is_empty() {
         println!("no new ops since {start}");

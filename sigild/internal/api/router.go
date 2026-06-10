@@ -7,6 +7,7 @@
 package api
 
 import (
+	"crypto/ed25519"
 	"log/slog"
 	"net/http"
 
@@ -33,6 +34,18 @@ type Config struct {
 	// FileVaultLog without changing handler behaviour. It is ignored when
 	// DevOpsEnabled is false (the routes stay at their 501 stub).
 	VaultLog store.VaultLog
+	// OpLogPubKey, when non-nil AND DevOpsEnabled is true, turns on Ed25519
+	// request-authentication for the dev op-log: every GET/POST
+	// /v1/vaults/{vaultID}/ops must carry a valid X-Sigil-Timestamp +
+	// X-Sigil-Signature per the op-log auth contract (see opsauth.go). nil
+	// (the default) means NO auth — unchanged, UNAUTHENTICATED behaviour.
+	//
+	// HONEST SCOPE: this is a SINGLE configured DEV device key. The timestamp
+	// window bounds replay but does NOT fully prevent it (no nonce/jti
+	// tracking). Real device enrollment, a multi-device registry, and JWT
+	// bearer tokens (see internal/auth) remain FUTURE. Dev-only; do NOT expose
+	// publicly.
+	OpLogPubKey ed25519.PublicKey
 }
 
 // NewRouter returns the sigild HTTP handler.

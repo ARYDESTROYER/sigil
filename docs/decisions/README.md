@@ -40,3 +40,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0005](0005-stdlib-only-sigild.md) | `sigild` is Go stdlib-only | Accepted (2026-06) |
 | [0006](0006-file-backed-dev-op-log-backend.md) | File-backed dev op-log backend (`SIGILD_OPLOG_DIR`) | Accepted (2026-06) |
 | [0007](0007-caller-supplied-entropy-in-core.md) | Caller-supplied entropy in `sigil-core` | Accepted (2026-06) |
+| [0008](0008-device-key-request-auth.md) | Device-key request auth for the dev op-log (`SIGILD_OPLOG_PUBKEY`) | Accepted (2026-06) |

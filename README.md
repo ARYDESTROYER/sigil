@@ -29,19 +29,27 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 - `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a
-  dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route becomes an
-  **unauthenticated** op-log that stores **opaque client-encrypted blobs** and
-  hands them back unchanged — by default **in-memory** (non-durable), or, when
-  `SIGILD_OPLOG_DIR` is set, a **file-backed durable** backend (path-traversal-safe
-  filenames; **dev-only, NOT the production store**). Performs no crypto — never
-  decodes the blob. Ships a distroless `Dockerfile`.
+  dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route becomes an op-log
+  that stores **opaque client-encrypted blobs** and hands them back unchanged — by
+  default **in-memory** (non-durable), or, when `SIGILD_OPLOG_DIR` is set, a
+  **file-backed durable** backend (path-traversal-safe filenames; **dev-only, NOT
+  the production store**). Op-log requests are **unauthenticated by default**, but
+  when `SIGILD_OPLOG_PUBKEY` (std-base64 of a 32-byte Ed25519 public key) is set
+  the server **verifies an Ed25519 signature** (Go stdlib `crypto/ed25519`) over a
+  canonical `(method,path,query,timestamp,body)` message on every op-log request
+  (else `401`) — a **single static dev key**, replay-window-bounded, **dev-only**
+  (enrollment / multi-device / JWT are future). Performs no crypto on the blob —
+  never decodes it. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from
-  sigild's op-log over plain HTTP (**dev / localhost only**, unauthenticated; the
-  server never decrypts). `pull` is **incremental** — a per-vault cursor is kept
-  in the out-dir, so repeat pulls fetch only new ops. Standalone crate; unaudited;
-  not for real secrets.
+  sigild's op-log over plain HTTP (**dev / localhost only**; the server never
+  decrypts). `sigil keygen` writes a 0600 device-key file and prints the pubkey for
+  `SIGILD_OPLOG_PUBKEY`; `push`/`pull` then **Ed25519-sign** the request with
+  `--key` (or `SIGIL_DEVICE_KEY`) so a pubkey-configured server accepts them
+  (no key → unsigned, as before) — **dev-only**. `pull` is **incremental** — a
+  per-vault cursor is kept in the out-dir, so repeat pulls fetch only new ops.
+  Standalone crate; unaudited; not for real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,

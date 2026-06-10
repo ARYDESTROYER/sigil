@@ -45,8 +45,11 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use serde::Deserialize;
-use sigil_core::{open_record, seal_record, Argon2Params, RecordError, NONCE_LEN};
+use serde::{Deserialize, Serialize};
+use sigil_core::{
+    open_record, public_key_from_seed, seal_record, sign, Argon2Params, RecordError, NONCE_LEN,
+    SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
+};
 
 /// The 8-byte magic that prefixes every container.
 pub const MAGIC: &[u8; 8] = b"SIGILcli";
@@ -105,6 +108,12 @@ pub enum CliError {
     /// (`.sigil-pull-state.json`). This is local, non-secret device state — an
     /// IO error or a corrupt/unparseable state file. Carries a short message.
     State(String),
+    /// A failure generating, reading, parsing, or writing the LOCAL device key
+    /// file: an IO error, malformed JSON, a `seed`/`public_key` that is not valid
+    /// base64, or a decoded seed/public key of the wrong length. The key file is
+    /// LOCAL device material — DEV-ONLY (see the signing module note). Carries a
+    /// short message and never the raw seed bytes.
+    Key(String),
 }
 
 impl From<RecordError> for CliError {
@@ -143,6 +152,7 @@ impl core::fmt::Display for CliError {
                 "invalid vault id {v:?}: must be non-empty with no '/' or whitespace"
             ),
             CliError::State(e) => write!(f, "local pull-state error: {e}"),
+            CliError::Key(e) => write!(f, "device key error: {e}"),
         }
     }
 }
@@ -244,6 +254,212 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
 }
 
 // ---------------------------------------------------------------------------
+// Device-key signing: sign op-log requests so a hardened sigild will accept
+// them (the op-log REQUEST-AUTH contract).
+//
+// STATUS: pre-audit, DEV-ONLY. This implements the CLIENT side of the
+// `sigil-oplog-auth-v1` request-auth contract. sigild enables it ONLY when it is
+// configured with SIGILD_OPLOG_PUBKEY = standard-base64 of this device's 32-byte
+// Ed25519 PUBLIC key. When sigild has no pubkey configured, the dev op-log is
+// UNAUTHENTICATED and these signatures are simply ignored.
+//
+// HONEST SCOPE: this is a SINGLE device key, DEV-ONLY. The contract's timestamp
+// window (sigild rejects skew/staleness beyond 300s) BOUNDS replay but does NOT
+// fully prevent it — there is no nonce/jti tracking, so a captured request can be
+// replayed within the window. Real device enrollment, a multi-device registry,
+// per-request nonces, and JWT bearer tokens all remain FUTURE work. The signing
+// uses sigil_core's REAL but UNAUDITED Ed25519 primitive.
+// ---------------------------------------------------------------------------
+
+/// The version byte written into every device key file. The only version this
+/// build writes or reads.
+pub const KEY_FILE_VERSION: u8 = 1;
+
+/// The fixed domain-separation prefix that opens the signed op-log auth message.
+/// It MUST match sigild's verifier byte-for-byte (the `sigil-oplog-auth-v1`
+/// contract).
+const OPLOG_AUTH_PREFIX: &[u8] = b"sigil-oplog-auth-v1\n";
+
+/// A LOCAL, DEV-ONLY device key file: a single Ed25519 key pair used to sign
+/// op-log requests under the `sigil-oplog-auth-v1` contract.
+///
+/// On disk this is JSON `{"version":1,"seed":"<b64>","public_key":"<b64>"}`,
+/// where `seed` is standard-base64 of the 32-byte Ed25519 secret seed and
+/// `public_key` is standard-base64 of the 32-byte Ed25519 public key. The file
+/// holds SECRET key material and is written with mode `0600`; it is per-device,
+/// DEV-ONLY, and NOT synced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyFile {
+    /// Key file format version. Always [`KEY_FILE_VERSION`].
+    pub version: u8,
+    /// Standard-base64 of the 32-byte Ed25519 secret seed. SECRET material.
+    pub seed: String,
+    /// Standard-base64 of the 32-byte Ed25519 public key. Set sigild's
+    /// `SIGILD_OPLOG_PUBKEY` to exactly this string to enable verification.
+    pub public_key: String,
+}
+
+/// Generate a fresh DEV-ONLY device key: draw a 32-byte Ed25519 seed from the OS
+/// CSPRNG, derive its public key with [`sigil_core::public_key_from_seed`], and
+/// return the [`KeyFile`] (seed + public key, both standard-base64).
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails while drawing the seed.
+pub fn generate_key() -> Result<KeyFile, CliError> {
+    let mut seed = [0u8; SIG_SEED_LEN];
+    fill_random(&mut seed)?;
+    let public = public_key_from_seed(&seed);
+    Ok(KeyFile {
+        version: KEY_FILE_VERSION,
+        seed: BASE64.encode(seed),
+        public_key: BASE64.encode(public),
+    })
+}
+
+/// Write `key` to `path` as JSON, with file mode `0600` (owner read/write only),
+/// since it contains the secret seed.
+///
+/// The file is created if absent and truncated if present; permissions are set
+/// to `0600` regardless of the prior mode (or the process umask) so the secret
+/// seed is never group/world-readable.
+///
+/// # Errors
+/// - [`CliError::Key`] on a serialize, write, or permission-set failure.
+pub fn save_key(path: &std::path::Path, key: &KeyFile) -> Result<(), CliError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let json = serde_json::to_string_pretty(key)
+        .map_err(|e| CliError::Key(format!("could not serialize key file: {e}")))?;
+    // Create with 0600 up front so the secret is never briefly world-readable,
+    // then write. `truncate` handles an existing file at the same path.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| CliError::Key(format!("could not create key file: {e}")))?;
+    use std::io::Write as _;
+    f.write_all(json.as_bytes())
+        .map_err(|e| CliError::Key(format!("could not write key file: {e}")))?;
+    // Re-assert 0600 in case the file pre-existed with looser permissions
+    // (OpenOptions::mode only applies to newly-created files).
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| CliError::Key(format!("could not set key file permissions: {e}")))
+}
+
+/// Read a device key file from `path` and return its decoded `(seed, public_key)`.
+///
+/// Validates the JSON shape, that `version == 1`, and that `seed` and
+/// `public_key` are standard-base64 decoding to exactly 32 bytes each. The public
+/// key is returned for convenience (e.g. echoing it); the seed is what callers
+/// pass to [`push_op`] / [`pull_ops`] for signing.
+///
+/// # Errors
+/// - [`CliError::Key`] on an IO error, malformed JSON, an unsupported version, a
+///   non-base64 field, or a seed/public key of the wrong length.
+pub fn load_key(
+    path: &std::path::Path,
+) -> Result<([u8; SIG_SEED_LEN], [u8; SIG_PUBLIC_KEY_LEN]), CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Key(format!("could not read key file: {e}")))?;
+    let kf: KeyFile = serde_json::from_str(&text)
+        .map_err(|e| CliError::Key(format!("key file is not valid JSON: {e}")))?;
+    if kf.version != KEY_FILE_VERSION {
+        return Err(CliError::Key(format!(
+            "unsupported key file version {}: expected {KEY_FILE_VERSION}",
+            kf.version
+        )));
+    }
+
+    let seed_vec = BASE64
+        .decode(kf.seed.as_bytes())
+        .map_err(|e| CliError::Key(format!("seed is not valid base64: {e}")))?;
+    let seed: [u8; SIG_SEED_LEN] = seed_vec.try_into().map_err(|v: Vec<u8>| {
+        CliError::Key(format!(
+            "seed must decode to {SIG_SEED_LEN} bytes, got {}",
+            v.len()
+        ))
+    })?;
+
+    let pub_vec = BASE64
+        .decode(kf.public_key.as_bytes())
+        .map_err(|e| CliError::Key(format!("public_key is not valid base64: {e}")))?;
+    let public: [u8; SIG_PUBLIC_KEY_LEN] = pub_vec.try_into().map_err(|v: Vec<u8>| {
+        CliError::Key(format!(
+            "public_key must decode to {SIG_PUBLIC_KEY_LEN} bytes, got {}",
+            v.len()
+        ))
+    })?;
+
+    Ok((seed, public))
+}
+
+/// The current wall-clock time as decimal-ASCII Unix SECONDS, e.g. `"1717900000"`.
+///
+/// Used as the `{TIMESTAMP}` line of the signed message AND sent verbatim in the
+/// `X-Sigil-Timestamp` header, so the server reconstructs the exact same bytes.
+fn unix_timestamp_secs() -> Result<String, CliError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| CliError::Key(format!("system clock is before the Unix epoch: {e}")))?;
+    Ok(now.as_secs().to_string())
+}
+
+/// Build and sign the `sigil-oplog-auth-v1` message for one request, returning the
+/// `(X-Sigil-Timestamp value, X-Sigil-Signature value)` header pair.
+///
+/// The signed MESSAGE is, byte-for-byte (lines joined by a single `\n`, with a
+/// trailing `\n` after the timestamp, then the raw body):
+///
+/// ```text
+/// sigil-oplog-auth-v1\n
+/// {METHOD}\n          (uppercase: "POST" or "GET")
+/// {PATH}\n            (URL path, no query — e.g. /v1/vaults/demo/ops)
+/// {QUERY}\n           (raw query string, or "" if none — e.g. since=0)
+/// {TIMESTAMP}\n       (unix seconds, decimal ASCII)
+/// {BODY}              (raw request body bytes; empty for GET)
+/// ```
+///
+/// i.e. `MESSAGE = b"sigil-oplog-auth-v1\n" + METHOD + b"\n" + PATH + b"\n" +
+/// QUERY + b"\n" + TIMESTAMP + b"\n" + BODY`. The `(method, path, query, body)`
+/// passed here MUST be exactly what the HTTP request will send (see [`push_op`] /
+/// [`pull_ops`]), or the server's reconstruction will not match and verification
+/// fails. The signature is standard-base64 of the 64-byte Ed25519 signature.
+fn sign_oplog_request(
+    seed: &[u8; SIG_SEED_LEN],
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> Result<(String, String), CliError> {
+    let timestamp = unix_timestamp_secs()?;
+
+    let mut message = Vec::with_capacity(
+        OPLOG_AUTH_PREFIX.len()
+            + method.len()
+            + path.len()
+            + query.len()
+            + timestamp.len()
+            + body.len()
+            + 4, // the four interior '\n' separators
+    );
+    message.extend_from_slice(OPLOG_AUTH_PREFIX);
+    message.extend_from_slice(method.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(path.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(query.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(timestamp.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(body);
+
+    let signature = sign(seed, &message);
+    Ok((timestamp, BASE64.encode(signature)))
+}
+
+// ---------------------------------------------------------------------------
 // Sync layer: push/pull OPAQUE containers to/from sigild's DEV-ONLY op-log.
 //
 // STATUS: pre-audit, dev/localhost ONLY. These functions move already-sealed,
@@ -279,7 +495,14 @@ fn check_vault(vault: &str) -> Result<(), CliError> {
 /// `http://host//v1/...` when the caller passes a trailing slash.
 fn ops_url(server: &str, vault: &str) -> String {
     let base = server.strip_suffix('/').unwrap_or(server);
-    format!("{base}/v1/vaults/{vault}/ops")
+    format!("{base}{}", ops_path(vault))
+}
+
+/// The URL PATH (no scheme/host, no query) of the op-log endpoint for `vault`,
+/// e.g. `/v1/vaults/demo/ops`. This is exactly the `{PATH}` the server parses
+/// from `r.URL.Path`, so it is also what [`sign_oplog_request`] must sign.
+fn ops_path(vault: &str) -> String {
+    format!("/v1/vaults/{vault}/ops")
 }
 
 /// Map a `ureq` call result into a 2xx response string, or a [`CliError`].
@@ -307,22 +530,43 @@ fn finish(result: Result<ureq::Response, ureq::Error>) -> Result<String, CliErro
 /// `{server}/v1/vaults/{vault}/ops`. On `201` it parses `{"seq": <u64>}` and
 /// returns the sequence number.
 ///
+/// When `key` is `Some(seed)`, signs the request under the `sigil-oplog-auth-v1`
+/// contract and attaches the `X-Sigil-Timestamp` / `X-Sigil-Signature` headers,
+/// so a sigild configured with `SIGILD_OPLOG_PUBKEY` will accept the append. The
+/// signed `(method, path, query, body)` is exactly what this request sends:
+/// `POST`, `/v1/vaults/{vault}/ops`, an EMPTY query, and `container` as the body.
+/// When `key` is `None`, no signature headers are sent (the legacy
+/// unauthenticated dev path).
+///
 /// DEV/LOCALHOST/PLAIN-HTTP ONLY — see the module note above. This never sees
 /// plaintext; the container is opaque.
 ///
 /// # Errors
 /// - [`CliError::BadVault`] if `vault` is empty or has a `/`/whitespace.
 /// - [`CliError::Server`] on any non-2xx (e.g. `501` if the dev flag is off,
+///   `401` if the request is unsigned/invalid while sigild requires a signature,
 ///   `400` empty op, `413` oversized).
 /// - [`CliError::Http`] on a transport/IO failure.
 /// - [`CliError::BadResponse`] if the `201` body is not the expected JSON.
-pub fn push_op(server: &str, vault: &str, container: &[u8]) -> Result<u64, CliError> {
+pub fn push_op(
+    server: &str,
+    vault: &str,
+    container: &[u8],
+    key: Option<&[u8; SIG_SEED_LEN]>,
+) -> Result<u64, CliError> {
     check_vault(vault)?;
     let url = ops_url(server, vault);
 
-    let result = ureq::post(&url)
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(container);
+    let mut req = ureq::post(&url).set("Content-Type", "application/octet-stream");
+    if let Some(seed) = key {
+        // Sign EXACTLY what this request sends: POST, the op path, NO query,
+        // body = container. The query is "" to match the server's r.URL.RawQuery.
+        let (ts, sig) = sign_oplog_request(seed, "POST", &ops_path(vault), "", container)?;
+        req = req
+            .set("X-Sigil-Timestamp", &ts)
+            .set("X-Sigil-Signature", &sig);
+    }
+    let result = req.send_bytes(container);
     let body = finish(result)?;
 
     #[derive(Deserialize)]
@@ -340,19 +584,47 @@ pub fn push_op(server: &str, vault: &str, container: &[u8]) -> Result<u64, CliEr
 /// base64-decodes each `blob` (standard alphabet) into the opaque container
 /// bytes. Returns them in the order the server sent them (seq-ascending).
 ///
+/// When `key` is `Some(seed)`, signs the request under the `sigil-oplog-auth-v1`
+/// contract and attaches the `X-Sigil-Timestamp` / `X-Sigil-Signature` headers,
+/// so a sigild configured with `SIGILD_OPLOG_PUBKEY` will accept the list. The
+/// signed `(method, path, query, body)` is exactly what this request sends:
+/// `GET`, `/v1/vaults/{vault}/ops`, the query `since={since}`, and an EMPTY body.
+/// The `since` value is rendered once and used both for the signed query and the
+/// `?since=` parameter so the bytes match. When `key` is `None`, no signature
+/// headers are sent (the legacy unauthenticated dev path).
+///
 /// DEV/LOCALHOST/PLAIN-HTTP ONLY — see the module note above.
 ///
 /// # Errors
 /// - [`CliError::BadVault`] if `vault` is empty or has a `/`/whitespace.
-/// - [`CliError::Server`] on any non-2xx (e.g. `501` if the dev flag is off).
+/// - [`CliError::Server`] on any non-2xx (e.g. `501` if the dev flag is off,
+///   `401` if the request is unsigned/invalid while sigild requires a signature).
 /// - [`CliError::Http`] on a transport/IO failure.
 /// - [`CliError::BadResponse`] if the body is not the expected JSON or a `blob`
 ///   is not valid base64.
-pub fn pull_ops(server: &str, vault: &str, since: u64) -> Result<Vec<PulledOp>, CliError> {
+pub fn pull_ops(
+    server: &str,
+    vault: &str,
+    since: u64,
+    key: Option<&[u8; SIG_SEED_LEN]>,
+) -> Result<Vec<PulledOp>, CliError> {
     check_vault(vault)?;
     let url = ops_url(server, vault);
 
-    let result = ureq::get(&url).query("since", &since.to_string()).call();
+    // Render `since` ONCE so the signed query and the wire query are byte-identical.
+    let since_str = since.to_string();
+    let query = format!("since={since_str}");
+
+    let mut req = ureq::get(&url).query("since", &since_str);
+    if let Some(seed) = key {
+        // Sign EXACTLY what this request sends: GET, the op path, query
+        // "since={since}", empty body — matching the server's r.URL.RawQuery.
+        let (ts, sig) = sign_oplog_request(seed, "GET", &ops_path(vault), &query, b"")?;
+        req = req
+            .set("X-Sigil-Timestamp", &ts)
+            .set("X-Sigil-Signature", &sig);
+    }
+    let result = req.call();
     let body = finish(result)?;
 
     #[derive(Deserialize)]
@@ -610,6 +882,21 @@ mod tests {
         request_line: String,
         /// The request body bytes (read via Content-Length, if any).
         body: Vec<u8>,
+        /// All request headers, captured as `(lowercased name, value)` pairs in
+        /// the order received, so tests can assert on signature headers.
+        headers: Vec<(String, String)>,
+    }
+
+    impl CapturedRequest {
+        /// Look up a header value by case-insensitive name (the stored names are
+        /// already lowercased).
+        fn header(&self, name: &str) -> Option<&str> {
+            let want = name.to_ascii_lowercase();
+            self.headers
+                .iter()
+                .find(|(k, _)| *k == want)
+                .map(|(_, v)| v.as_str())
+        }
     }
 
     /// Spawn a one-shot mock server that accepts exactly one connection, reads
@@ -642,6 +929,17 @@ mod tests {
             let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
             let request_line = head.lines().next().unwrap_or_default().to_string();
 
+            // Capture every header line (after the request line) as
+            // (lowercased name, trimmed value) for the signature-header tests.
+            let headers: Vec<(String, String)> = head
+                .lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                })
+                .collect();
+
             // Parse Content-Length (case-insensitive) to know the body size.
             let content_len = head
                 .lines()
@@ -670,7 +968,11 @@ mod tests {
                 .expect("write response");
             stream.flush().ok();
 
-            CapturedRequest { request_line, body }
+            CapturedRequest {
+                request_line,
+                body,
+                headers,
+            }
         });
 
         (base, handle)
@@ -687,13 +989,16 @@ mod tests {
         let (base, handle) = spawn_mock(response);
 
         let container = b"\x00\x01\x02opaque-container-bytes";
-        let seq = push_op(&base, "v", container).expect("push_op ok");
+        let seq = push_op(&base, "v", container, None).expect("push_op ok");
         assert_eq!(seq, 7);
 
         let req = handle.join().expect("server thread");
         assert_eq!(req.request_line, "POST /v1/vaults/v/ops HTTP/1.1");
         // The exact container bytes must have been sent as the body.
         assert_eq!(req.body, container);
+        // No key -> no signature headers.
+        assert!(req.header("x-sigil-timestamp").is_none());
+        assert!(req.header("x-sigil-signature").is_none());
     }
 
     #[test]
@@ -706,13 +1011,16 @@ mod tests {
              {\"vaultID\":\"v\",\"ops\":[{\"seq\":1,\"blob\":\"aGk=\"}],\"next\":1}";
         let (base, handle) = spawn_mock(response);
 
-        let ops = pull_ops(&base, "v", 5).expect("pull_ops ok");
+        let ops = pull_ops(&base, "v", 5, None).expect("pull_ops ok");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].seq, 1);
         assert_eq!(ops[0].blob, b"hi"); // "aGk=" base64-decodes to "hi"
 
         let req = handle.join().expect("server thread");
         assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
+        // No key -> no signature headers.
+        assert!(req.header("x-sigil-timestamp").is_none());
+        assert!(req.header("x-sigil-signature").is_none());
     }
 
     #[test]
@@ -724,7 +1032,7 @@ mod tests {
              {\"error\":\"boom\"}";
         let (base, handle) = spawn_mock(response);
 
-        let err = push_op(&base, "v", b"x").expect_err("should be a server error");
+        let err = push_op(&base, "v", b"x", None).expect_err("should be a server error");
         match err {
             CliError::Server { status, body } => {
                 assert_eq!(status, 500);
@@ -739,15 +1047,15 @@ mod tests {
     fn bad_vault_is_rejected_before_any_request() {
         // No server is spawned; these must fail purely on validation.
         assert!(matches!(
-            push_op("http://127.0.0.1:1", "", b"x"),
+            push_op("http://127.0.0.1:1", "", b"x", None),
             Err(CliError::BadVault(_))
         ));
         assert!(matches!(
-            push_op("http://127.0.0.1:1", "a/b", b"x"),
+            push_op("http://127.0.0.1:1", "a/b", b"x", None),
             Err(CliError::BadVault(_))
         ));
         assert!(matches!(
-            pull_ops("http://127.0.0.1:1", "has space", 0),
+            pull_ops("http://127.0.0.1:1", "has space", 0, None),
             Err(CliError::BadVault(_))
         ));
     }
@@ -759,6 +1067,161 @@ mod tests {
 
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // --- Device-key + op-log signing tests -----------------------------------
+    //
+    // These exercise the CLIENT side of the `sigil-oplog-auth-v1` contract and
+    // close the loop IN-PROCESS: the push/pull tests reconstruct the EXACT
+    // message bytes the server would build from the captured request, then
+    // verify the captured `X-Sigil-Signature` against the key's public key with
+    // `sigil_core::verify`. If the client signs the wrong bytes, verify fails.
+
+    use sigil_core::verify;
+
+    /// Reconstruct the contract MESSAGE the server builds, exactly as documented
+    /// in [`sign_oplog_request`], so a test can verify the captured signature.
+    fn rebuild_oplog_message(
+        method: &str,
+        path: &str,
+        query: &str,
+        timestamp: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(b"sigil-oplog-auth-v1\n");
+        m.extend_from_slice(method.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(path.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(query.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(timestamp.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(body);
+        m
+    }
+
+    #[test]
+    fn generated_key_public_matches_derivation_and_round_trips() {
+        let dir = TempDir::new("keygen");
+        let path = dir.path.join("device.key");
+
+        let kf = generate_key().expect("generate");
+        assert_eq!(kf.version, KEY_FILE_VERSION);
+
+        // The stored public_key must equal public_key_from_seed(seed).
+        let seed_bytes: [u8; SIG_SEED_LEN] = BASE64
+            .decode(kf.seed.as_bytes())
+            .expect("seed b64")
+            .try_into()
+            .expect("seed 32");
+        let derived = public_key_from_seed(&seed_bytes);
+        assert_eq!(BASE64.encode(derived), kf.public_key);
+
+        // Save with 0600, then load back; seed + public must match.
+        save_key(&path, &kf).expect("save");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
+
+        let (seed, public) = load_key(&path).expect("load");
+        assert_eq!(seed, seed_bytes);
+        assert_eq!(public, derived);
+    }
+
+    #[test]
+    fn load_key_rejects_wrong_length_seed() {
+        let dir = TempDir::new("badkey");
+        let path = dir.path.join("bad.key");
+        // 16-byte seed (not 32) — must be rejected as a Key error.
+        let bad = KeyFile {
+            version: KEY_FILE_VERSION,
+            seed: BASE64.encode([0u8; 16]),
+            public_key: BASE64.encode([0u8; SIG_PUBLIC_KEY_LEN]),
+        };
+        let json = serde_json::to_string(&bad).unwrap();
+        std::fs::write(&path, json).unwrap();
+        assert!(matches!(load_key(&path), Err(CliError::Key(_))));
+    }
+
+    #[test]
+    fn push_with_key_sets_headers_and_signature_verifies() {
+        let response = "HTTP/1.1 201 Created\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 23\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"seq\":7}";
+        let (base, handle) = spawn_mock(response);
+
+        let kf = generate_key().expect("keygen");
+        let seed: [u8; SIG_SEED_LEN] = BASE64
+            .decode(kf.seed.as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let public: [u8; SIG_PUBLIC_KEY_LEN] = BASE64
+            .decode(kf.public_key.as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let container = b"\x00\x01\x02opaque-container-bytes";
+        let seq = push_op(&base, "v", container, Some(&seed)).expect("push ok");
+        assert_eq!(seq, 7);
+
+        let req = handle.join().expect("server thread");
+        assert_eq!(req.request_line, "POST /v1/vaults/v/ops HTTP/1.1");
+        let ts = req.header("x-sigil-timestamp").expect("timestamp header");
+        let sig_b64 = req.header("x-sigil-signature").expect("signature header");
+
+        // Reconstruct the server's message: POST, path, EMPTY query, body=container.
+        let msg = rebuild_oplog_message("POST", "/v1/vaults/v/ops", "", ts, container);
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        verify(&public, &msg, &sig).expect("signature must verify over the contract message");
+    }
+
+    #[test]
+    fn pull_with_key_sets_headers_and_signature_verifies() {
+        let response = "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 56\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"ops\":[{\"seq\":1,\"blob\":\"aGk=\"}],\"next\":1}";
+        let (base, handle) = spawn_mock(response);
+
+        let kf = generate_key().expect("keygen");
+        let seed: [u8; SIG_SEED_LEN] = BASE64
+            .decode(kf.seed.as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let public: [u8; SIG_PUBLIC_KEY_LEN] = BASE64
+            .decode(kf.public_key.as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let ops = pull_ops(&base, "v", 5, Some(&seed)).expect("pull ok");
+        assert_eq!(ops.len(), 1);
+
+        let req = handle.join().expect("server thread");
+        assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
+        let ts = req.header("x-sigil-timestamp").expect("timestamp header");
+        let sig_b64 = req.header("x-sigil-signature").expect("signature header");
+
+        // Reconstruct: GET, path, query "since=5", EMPTY body.
+        let msg = rebuild_oplog_message("GET", "/v1/vaults/v/ops", "since=5", ts, b"");
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        verify(&public, &msg, &sig).expect("signature must verify over the contract message");
+    }
 
     /// A self-cleaning unique temp dir under the OS temp dir (no tempfile dep).
     struct TempDir {

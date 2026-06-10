@@ -974,6 +974,141 @@ var. Built behind the existing dev flag, then **independently verified** incl. a
   unauthenticated dev op-log). The hybrid Ed25519&ML-DSA-65 signature does **not
   yet exist** — only the classical half, and it is unaudited.
 
+## 2026-06-09 — Phase 12 (Ed25519 device-key auth for the op-log)
+
+Theme: **use** the Phase-11 Ed25519 primitive — close the "still unauthenticated"
+gap on the dev op-log by signing op-log *requests* on the CLI and verifying them
+in `sigild`, with the **exact same canonical message constructed byte-for-byte in
+both languages** (Go stdlib `crypto/ed25519` on the server, `sigil_core::sign` on
+the client). The whole point of this phase is the **cross-language contract**, so
+it was independently verified with a **LIVE Rust-signed / Go-verified round-trip**.
+Built behind a new env gate, then **I re-ran the gate and the live interop myself.**
+
+### The cross-language request-auth contract (`sigil-oplog-auth-v1`)
+- The signed **MESSAGE** (raw bytes) is a 5-line ASCII prefix immediately followed
+  by the raw request **body** bytes:
+
+      MESSAGE = b"sigil-oplog-auth-v1\n"
+              + METHOD    + b"\n"   (uppercase: "POST" or "GET")
+              + PATH      + b"\n"   (URL path, NO query — e.g. /v1/vaults/demo/ops)
+              + QUERY     + b"\n"   (raw query string, or "" if none — e.g. since=0)
+              + TIMESTAMP + b"\n"   (current unix SECONDS, decimal ASCII)
+              + BODY                (raw request body bytes; EMPTY for GET)
+
+  The client signs MESSAGE with Ed25519 (its 32-byte secret seed via
+  `sigil_core::sign`) and sends two headers: **`X-Sigil-Timestamp`** (the same
+  decimal value used in MESSAGE) and **`X-Sigil-Signature`** (standard-base64 of
+  the 64-byte signature). Go (`opsauth.go`) and Rust (`cli/src/lib.rs`) build the
+  same domain prefix + same append order, so the messages agree byte-for-byte.
+
+### sigild — `authorizeOps`, dev-gated Ed25519 verification ✅
+- New `internal/api/opsauth.go` (**stdlib-only**: `crypto/ed25519`,
+  `encoding/base64`, `errors`, `net/http`, `strconv`, `time`). Enabled **only**
+  when `sigild` is configured with **`SIGILD_OPLOG_PUBKEY`** = standard-base64 of a
+  32-byte Ed25519 **public** key (and the dev op-log flag is on). When
+  `SIGILD_OPLOG_PUBKEY` is **unset there is NO auth** — current behavior is
+  unchanged and the existing op-log tests still pass.
+- On **both GET and POST** `/v1/vaults/{vaultID}/ops`, when configured:
+  (1) read `X-Sigil-Timestamp` + `X-Sigil-Signature` — missing/blank → **401**;
+  (2) parse the timestamp as int64, reject non-int or `abs(now - ts) > 300s`
+  (stale/skew) → **401**; (3) reconstruct MESSAGE from `r.Method`, `r.URL.Path`,
+  `r.URL.RawQuery`, the timestamp header, and the (already 64-KiB-size-limited)
+  body; (4) base64-decode the signature and `ed25519.Verify(pubkey, MESSAGE, sig)`
+  — false → **401**; (5) on success, fall through to the normal append/list
+  handler. Every 401 uses the existing typed envelope
+  `{"error":"unauthorized","detail":"…"}` via the existing `writeError` path.
+- On startup with the pubkey configured, `main.go` emits a loud WARN: **"DEV op-log
+  request AUTH ENABLED: Ed25519, SINGLE configured DEV device key,
+  replay-window-bounded (not replay-proof) — dev-only, do NOT expose publicly."**
+
+### cli/ — `sigil keygen` + `--key` request signing ✅
+- New `sigil keygen --out device.key` generates a 32-byte seed (OS CSPRNG via the
+  already-present `getrandom`), derives the public key with
+  `sigil_core::public_key_from_seed`, and writes the **key file** as JSON
+  `{"version":1,"seed":"<std-b64 32B>","public_key":"<std-b64 32B>"}` with mode
+  **0600**; it prints the public key to paste into `SIGILD_OPLOG_PUBKEY`.
+- `sigil push` / `sigil pull` gained **`--key <file>`** (or the **`SIGIL_DEVICE_KEY`**
+  env var): when supplied they construct the same canonical MESSAGE and attach the
+  `X-Sigil-Timestamp` / `X-Sigil-Signature` headers (signing via `sigil_core::sign`).
+  With no key the requests are sent unsigned exactly as before — so they succeed
+  against a no-pubkey server and get a **401** against a pubkey-configured one.
+- ⚠️ Loudly labeled in `--help`, the lib doc comments, and `cli/README.md`. The
+  CLI keeps its **PRE-AUDIT / UNAUDITED / not-for-real-secrets** banner.
+
+### libsigil/core — untouched (lock unchanged) ✅
+- This phase only **uses** the existing `sigil_core::{sign, public_key_from_seed}`
+  from Phase 11. **No core change:** `git diff --quiet libsigil/Cargo.lock` →
+  unchanged, `getrandom` count still **0**, `#![forbid(unsafe_code)]` + wasm-pure
+  intact. The CLI's `getrandom` did not leak into the wasm-pure core.
+
+### Tests ✅
+- sigild: `opsauth_test.go` covers signed POST/GET accepted, missing headers → 401,
+  garbage signature → 401, stale/future skew → 401, wrong key → 401, tampered body
+  → 401, and the **disabled-unchanged regression** (no pubkey → existing behavior).
+  `go test -race ./internal/api/` race-clean.
+- cli: 26 lib + 2 integration tests, incl. `push_with_key`/`pull_with_key` asserting
+  the signature verifies over the contract message, and keygen 0600 / round-trip.
+
+### Verification — LIVE cross-language interop (the real gate) ✅
+Built `sigild` (`/tmp/sigild_p12` from `./cmd/server`) + the CLI
+(`cli/target/debug/sigil`). `sigil keygen --out device.key` → file mode 0600,
+printed pubkey `UQKTPgGDkRSyDQ57tRKH8Nj2n/6DaYOW6xUOEQexZpw=`. Started the server
+with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<that> SIGILD_ADDR=:18103` (the
+loud AUTH-ENABLED WARN fired). Sealed a real container with `SIGIL_PASSWORD=pw`
+(`op.bin`, 177 bytes). **The point — Rust-signed, Go-verified:**
+1. `sigil push --vault demo --in op.bin --key device.key --server :18103` →
+   **"pushed vault demo seq 1"**, exit 0; access log **POST … status 201**. The
+   **Rust Ed25519 signature was ACCEPTED by Go `crypto/ed25519.Verify`** — the
+   canonical messages agree byte-for-byte.
+2. Same `sigil push` **without `--key`** → **HTTP 401**
+   `{"error":"unauthorized","detail":"missing or invalid op-log request signature"}`,
+   exit 1.
+3. `sigil pull --vault demo --out-dir inbox --key device.key` →
+   **"pulled seq 1 → …/inbox/demo/op-1.sigil"**, cursor at 1, exit 0; signed
+   **GET status 200**.
+4. `sigil pull` **without `--key`** → **HTTP 401**, exit 1 (signed GET 200 vs
+   unsigned GET 401 both in the access log).
+5. Raw `curl` POST with a bogus `X-Sigil-Signature` + `X-Sigil-Timestamp` → **401**;
+   raw `curl` GET with bogus sig → **401**; a structurally-valid-but-wrong 64-byte
+   sig (base64 of 64 zero bytes) → **401**.
+6. **END-TO-END:** `sigil open` the **pulled** `op-1.sigil` with `pw` → recovered
+   plaintext **== original** (`diff` match). Encryption survives the full
+   push → auth → pull round trip.
+7. **No-pubkey server** (`SIGILD_ENABLE_DEV_OPS=1`, **no** `SIGILD_OPLOG_PUBKEY`,
+   `:18104`) → an **UNSIGNED** push succeeded ("pushed vault demo seq 1", exit 0).
+   **Auth is off by default; existing behavior is unchanged.**
+
+Server access log corroborates: signed POST 201, unsigned POST 401, signed GET 200,
+unsigned GET 401, two bogus-curl 401s, wrong-64B-sig 401 — **zero ERROR lines**.
+Servers killed cleanly; temp dir + binaries removed.
+
+- Gate: sigild `gofmt -l` clean · `go vet ./...` clean · `go test ./...` pass
+  (api + store, all `opsauth_test` cases) · `go test -race ./internal/api/`
+  race-clean · `go build ./...` OK. cli `cargo fmt --check` · `clippy -D warnings`
+  · **26 lib + 2 integration** tests · build OK. Regression: libsigil
+  fmt/clippy/**51+7** tests/wasm/**getrandom 0** ✓; `libsigil/Cargo.lock`
+  unchanged. All 6 workflow YAMLs parse ✓. Web untouched.
+- Over-claim scan CLEAN across `opsauth.go`, `opsauth_test.go`, `cli/src/{lib,main}.rs`,
+  `cli/README.md`, `main.go`, `handlers.go`, `router.go`, and the docs — every
+  "audited"/"secure" hit is a negation or a qualified/technical term (OS CSPRNG
+  "cryptographically-secure random bytes"); no "post-quantum secure" / "SOC 2" /
+  unqualified "end-to-end encrypted". The auth is explicitly labeled **SINGLE
+  configured DEV device key**, **replay-window-bounded (not replay-proof)**,
+  **dev-only**, **plain-HTTP**.
+
+### ⛔ Still NOT production (honest scope)
+- This is a **single, static, configured DEV device key** — one `SIGILD_OPLOG_PUBKEY`,
+  not a registry. The **300-second timestamp window bounds replay but does NOT
+  fully prevent it** — there is **no nonce/jti store**, so a captured signed request
+  can be replayed inside the window; production needs nonce tracking. **Full device
+  enrollment, a multi-device key registry, and JWT bearer tokens** (see
+  `sigild/internal/auth`) remain **FUTURE**. The transport is still **plain HTTP,
+  dev/localhost only**. Auth stays **off by default** (no pubkey configured → the
+  op-log is unauthenticated exactly as before), and the prod ops default is still
+  `501`. ADR 0008 + `docs/{api,architecture}.md` were updated by the docs track;
+  this entry finalizes the remaining living docs (this file, `CLAUDE.md`,
+  `README.md`).
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

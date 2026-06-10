@@ -8,6 +8,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -51,6 +53,28 @@ func main() {
 			logger.Warn("DEV op-log enabled: FILE-BACKED durable backend active — UNAUTHENTICATED, dev-only, NOT the production store — do NOT expose publicly", "dir", dir)
 		} else {
 			logger.Warn("DEV op-log enabled: UNAUTHENTICATED, in-memory, non-durable — do NOT expose publicly")
+		}
+
+		// Optional op-log request-auth: if SIGILD_OPLOG_PUBKEY is set, it MUST be
+		// the standard-base64 of a 32-byte Ed25519 public key. When set, every
+		// GET/POST vault-ops request must carry a valid X-Sigil-Timestamp +
+		// X-Sigil-Signature (see internal/api/opsauth.go). Unset => no auth
+		// (unchanged). HONEST SCOPE: a SINGLE configured DEV device key;
+		// replay-window-bounded (not replay-proof); full device enrollment is
+		// FUTURE. Only meaningful while dev-ops is on.
+		if raw := os.Getenv("SIGILD_OPLOG_PUBKEY"); raw != "" {
+			pub, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				logger.Error("SIGILD_OPLOG_PUBKEY is not valid standard base64", "err", err)
+				os.Exit(1)
+			}
+			if len(pub) != ed25519.PublicKeySize {
+				logger.Error("SIGILD_OPLOG_PUBKEY must decode to a 32-byte Ed25519 public key",
+					"got_bytes", len(pub), "want_bytes", ed25519.PublicKeySize)
+				os.Exit(1)
+			}
+			cfg.OpLogPubKey = ed25519.PublicKey(pub)
+			logger.Warn("DEV op-log request AUTH ENABLED: Ed25519, SINGLE configured DEV device key, replay-window-bounded (not replay-proof) — dev-only, do NOT expose publicly")
 		}
 	}
 

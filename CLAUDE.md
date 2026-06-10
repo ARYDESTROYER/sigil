@@ -53,9 +53,17 @@ public, make no security claims, until the audit completes and trademark clears.
   (length-prefixed + `fsync`'d per-vault append-only files, durable across
   restart; the untrusted `vaultID` is `base64.RawURLEncoding`-encoded to a flat,
   path-traversal-safe filename). The file backend is a **local-dev convenience,
-  NOT the production store** (production = Postgres/S3). **No crypto**: the server
-  never decodes the blob; it stores/returns the exact client bytes. Endpoint
-  reference in [`docs/api.md`](docs/api.md).
+  NOT the production store** (production = Postgres/S3). When
+  **`SIGILD_OPLOG_PUBKEY`** (std-base64 of a 32-byte Ed25519 public key) is set,
+  op-log requests are **Ed25519-authenticated** (`authorizeOps`, Go stdlib
+  `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` /
+  `X-Sigil-Timestamp` over a canonical `(method,path,query,timestamp,body)` message
+  (300 s window), else **401** `{"error":"unauthorized",…}`. **Default off** (no
+  pubkey → unauthenticated, behavior unchanged); a **SINGLE static dev key**,
+  replay-window-bounded (no nonce store), dev-only — enrollment / multi-device /
+  JWT remain future. **No crypto on the blob**: the server never decodes it; it
+  stores/returns the exact client bytes. Endpoint reference in
+  [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
@@ -64,12 +72,16 @@ public, make no security claims, until the audit completes and trademark clears.
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
   **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
-  unauthenticated, dev-only). `pull` is **incremental**: a per-`(server,vault)`
-  monotonic cursor is persisted in `<out-dir>/.sigil-pull-state.json`, so repeat
-  pulls fetch only new ops (multi-vault independent); `--since` overrides the
-  cursor for a one-off. **Standalone crate** (own `cli/Cargo.lock`, NOT a
-  libsigil workspace member) so it can use `getrandom` (+ `ureq`/`serde`/`base64`)
-  without polluting the wasm-pure core.
+  dev-only). `sigil keygen --out <file>` writes a 0600 device-key JSON
+  (`{version,seed,public_key}`, std-base64) and prints the pubkey for
+  `SIGILD_OPLOG_PUBKEY`; `push`/`pull` then **sign** the request with `--key
+  <file>` (or **`SIGIL_DEVICE_KEY`**) via `sigil_core::sign` (no key → unsigned,
+  as before). `pull` is **incremental**: a per-`(server,vault)` monotonic cursor is
+  persisted in `<out-dir>/.sigil-pull-state.json`, so repeat pulls fetch only new
+  ops (multi-vault independent); `--since` overrides the cursor for a one-off.
+  **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
+  it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
+  wasm-pure core.
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)

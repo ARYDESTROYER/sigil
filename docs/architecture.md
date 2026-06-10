@@ -67,8 +67,15 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
-  **unauthenticated** vault op-log that stores **opaque client-encrypted blobs**
-  and hands them back unchanged. The op-log sits behind a `VaultLog` seam with
+  vault op-log that stores **opaque client-encrypted blobs** and hands them back
+  unchanged. The op-log is **unauthenticated by default**; when started with
+  **`SIGILD_OPLOG_PUBKEY`** (std-base64 Ed25519 public key) it additionally
+  requires each request to carry an Ed25519 signature over a canonical
+  `(method, path, query, timestamp, body)` message — a **single static dev
+  device key**, replay-window-bounded (not nonce-tracked); real multi-device
+  enrollment / JWT auth remains **future** (see
+  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
+  The op-log sits behind a `VaultLog` seam with
   **two dev backends**: an **in-memory, non-durable** map (the default) and an
   optional **file-backed** one selected via `SIGILD_OPLOG_DIR` for local-dev
   durability (the `vaultID` is base64url-encoded to a safe flat filename to
@@ -109,8 +116,9 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │  SERVER SIDE — sigild (Go)        NO CRYPTO · OPAQUE BLOBS ONLY         │
    │   /healthz · /readyz · /version   (probes; no secrets)                 │
    │   /v1/vaults/{id}/ops  →  501 by default                               │
-   │     └─ SIGILD_ENABLE_DEV_OPS: in-memory, unauthenticated op-log of     │
-   │        opaque ciphertext (append seq / read since) — dev wiring only   │
+   │     └─ SIGILD_ENABLE_DEV_OPS: in-memory op-log of opaque ciphertext    │
+   │        (append seq / read since) — dev wiring only; unauthenticated    │
+   │        unless SIGILD_OPLOG_PUBKEY sets a single Ed25519 dev device key  │
    └───────────────────────────────────────────────────────────────────────┘
 
    web/apps/marketing (Next.js): stealth splash + waitlist. Separate; no product surface.
@@ -172,8 +180,10 @@ plaintext, and never holds a key. Vault confidentiality therefore does **not**
 depend on the server (this is the property the threat model leans on for the
 rogue-employee and compromised-server adversaries — see
 [`threat-model.md`](threat-model.md)). Note the current dev op-log is *also*
-unauthenticated and non-durable, which is why it is dev-gated-off and must never
-be exposed or hold real secrets.
+non-durable and unauthenticated by default — optionally guarded by a single
+static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, replay-window-bounded, not
+nonce-tracked; real multi-device auth is still future) — which is why it is
+dev-gated-off and must never be exposed or hold real secrets.
 
 ---
 
@@ -218,7 +228,7 @@ between them are load-bearing:
    there is no system entropy backend, so `core` never generates randomness — the
    caller supplies the salt and nonce. Consequently **`getrandom` must never enter
    `libsigil/Cargo.lock`** (it would break the wasm build and pull a non-pure
-   dependency into the audited core).
+   dependency into the audit-bound core).
 3. **The standalone `cli` crate** — deliberately **outside** the `libsigil`
    workspace, with its **own [`../cli/Cargo.lock`](../cli/Cargo.lock)**. Because it
    is native-only (never wasm), it *may* depend on `getrandom` (for the salt/nonce)
@@ -264,8 +274,12 @@ authoritative list, with rationale, is the **defer ledger** in
   watch) live in separate repos and consume `libsigil` as a versioned artifact;
   none exist yet. The web app, admin console, and browser extension are reserved
   directories.
-- **No real auth or authorization.** The dev op-log is wide open; there is no
-  device-key authentication and no per-vault membership check.
+- **No real auth or authorization.** The dev op-log is wide open by default; an
+  optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
+  device-key signature check (replay-window-bounded, not nonce-tracked), but
+  there is no device enrollment, no multi-device registry, no JWT auth, and no
+  per-vault membership check
+  ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
 - **No KEM, and no hybrid signature, in a flow.** The hybrid X25519 & ML-KEM-768

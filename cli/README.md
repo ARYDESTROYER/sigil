@@ -93,6 +93,62 @@ subdir**, so multiple vaults can safely share one `--out-dir` without their
 `sigild` returns `501` and `sigil` surfaces that as a clear error and exits
 non-zero.
 
+### Device-key signing (`keygen` + `--key`) — ⚠️ dev-only, single device key
+
+By default the dev op-log is **unauthenticated**. A hardened `sigild` can instead
+**require** every op-log request to be **signed** by one configured device key: set
+`sigild`'s `SIGILD_OPLOG_PUBKEY` to the standard-base64 of a 32-byte Ed25519
+**public** key, and `sigild` will reject any unsigned or invalid request with
+HTTP `401`. When `SIGILD_OPLOG_PUBKEY` is **unset**, signing is off and the op-log
+stays unauthenticated (unchanged).
+
+> **HONEST SCOPE.** This is a **single** device key, **dev-only**, still over
+> **plain HTTP**. The signature is bound to the request's method, path, query, a
+> unix-seconds timestamp, and the body; `sigild` rejects timestamps skewed more
+> than **300 s**. That window **bounds** replay but does **not** fully prevent it —
+> there is **no per-request nonce/jti tracking**, so a captured request can be
+> replayed inside the window. Real **device enrollment**, a **multi-device
+> registry**, and **JWT bearer tokens** all remain **future** work. The signing
+> primitive (Ed25519, from `sigil-core`) is **real but UNAUDITED**.
+
+Generate a device key once (written with mode `0600`; its public key is printed),
+then point `sigild` at the public key:
+
+```bash
+# 1. Generate a device key. Prints the public key to paste into sigild's config.
+sigil keygen --out device.key
+# -> wrote device key to device.key (mode 0600)
+# -> device public key (set sigild SIGILD_OPLOG_PUBKEY to this): <base64>
+
+# 2. Run the dev sigild REQUIRING that key (dev op-log + configured pubkey).
+SIGILD_ENABLE_DEV_OPS=1 \
+SIGILD_OPLOG_PUBKEY='<base64 from step 1>' \
+  go -C ../sigild run ./cmd/server
+```
+
+Then **sign** every `push`/`pull` by passing the key with `--key <file>`, or by
+setting the `SIGIL_DEVICE_KEY` environment variable to the key-file path (`--key`
+takes precedence over `SIGIL_DEVICE_KEY`):
+
+```bash
+# Sign the push with the device key.
+sigil push --vault demo --in secret.sigil --key device.key
+
+# Or point at the key via the environment.
+SIGIL_DEVICE_KEY=device.key sigil pull --vault demo --out-dir ./inbox
+```
+
+Without a key against a `sigild` that has `SIGILD_OPLOG_PUBKEY` set, `push`/`pull`
+get a `401` (surfaced as a clear error, non-zero exit). Against a `sigild` with no
+pubkey configured, the key is simply ignored and the request is accepted.
+
+**Key file format** (JSON, mode `0600`; it holds the secret seed — keep it local
+and do not commit it):
+
+```json
+{ "version": 1, "seed": "<std-base64 of 32 bytes>", "public_key": "<std-base64 of 32 bytes>" }
+```
+
 ### Incremental pull
 
 Pulled ops are written to `<out-dir>/<vault>/op-<seq>.sigil` (a per-vault subdir,

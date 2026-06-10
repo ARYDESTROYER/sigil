@@ -126,6 +126,14 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "could not read request body")
 		return
 	}
+	// Verify the op-log request signature over (method, path, query, ts, body).
+	// No-op (returns nil) unless cfg.OpLogPubKey is set. Must run AFTER the body
+	// is read (it is part of the signed message) and BEFORE we append.
+	if err := h.authorizeOps(r, blob); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized",
+			"missing or invalid op-log request signature")
+		return
+	}
 	if len(blob) == 0 {
 		writeError(w, http.StatusBadRequest, "empty_op", "operation body must not be empty")
 		return
@@ -154,6 +162,15 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 	vaultID := r.PathValue("vaultID")
 	if vaultID == "" {
 		writeError(w, http.StatusBadRequest, "missing_vault_id", "vault ID is required")
+		return
+	}
+
+	// Verify the op-log request signature over (method, path, query, ts, "").
+	// GET carries no body, so the signed body is empty. No-op (returns nil)
+	// unless cfg.OpLogPubKey is set. Must run BEFORE we list.
+	if err := h.authorizeOps(r, nil); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized",
+			"missing or invalid op-log request signature")
 		return
 	}
 

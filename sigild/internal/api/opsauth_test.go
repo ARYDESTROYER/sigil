@@ -346,6 +346,66 @@ func TestOpsAuthDistinctNoncesBothAccepted(t *testing.T) {
 	}
 }
 
+// TestOpsAuthGetReplayRejected: the read path (opsList -> authorizeOps(r, nil))
+// must also reject a replayed nonce, not just the append path.
+func TestOpsAuthGetReplayRejected(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/vaults/demo/ops?since=0", nil)
+	signOpsRequest(t, req, seed, now, "n-get-replay", nil)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first signed GET status = %d, want 200", rec.Code)
+	}
+	// Byte-identical replay (same ts, nonce, query, empty body): 401.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/vaults/demo/ops?since=0", nil)
+	signOpsRequest(t, req, seed, now, "n-get-replay", nil)
+	router.ServeHTTP(rec, req)
+	assertUnauthorized(t, rec)
+}
+
+// TestOpsAuthBase64NonceAccepted: the real CLI sends std-base64 of 16 bytes,
+// whose alphabet includes '+', '/', and '=' padding — all within validNonce's
+// 0x21..0x7E range. A regression tightening validNonce to base64url/alphanumeric
+// would break the shipped contract, so assert such a nonce is accepted.
+func TestOpsAuthBase64NonceAccepted(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	body := []byte("op")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+	signOpsRequest(t, req, seed, now, "AbC+/9de==", body)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("base64-alphabet nonce status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestOpsAuthMaxLenNonceAccepted: a nonce of exactly opsAuthNonceMaxLen bytes
+// must be ACCEPTED (only > max is rejected). Guards a '>' vs '>=' off-by-one in
+// validNonce (the reject side, max+1, is covered by TestOpsAuthMalformedNonceRejected).
+func TestOpsAuthMaxLenNonceAccepted(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	body := []byte("op")
+
+	nonce := strings.Repeat("x", opsAuthNonceMaxLen)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+	signOpsRequest(t, req, seed, now, nonce, body)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("%d-byte nonce status = %d, want 201", opsAuthNonceMaxLen, rec.Code)
+	}
+}
+
 func assertUnauthorized(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	if rec.Code != http.StatusUnauthorized {

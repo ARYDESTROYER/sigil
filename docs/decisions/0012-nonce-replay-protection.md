@@ -37,10 +37,15 @@ to **v2**) and a bounded, in-memory server-side nonce store.
   validly-signed requests consume store space, so an unauthenticated attacker
   cannot populate or flood it.
 - **Bounded, TTL-evicting in-memory store** (`nonceStore`, Go stdlib
-  `sync.Mutex` + map). **TTL = 2× the skew window (600 s), not 1×** — the skew
-  check is two-sided (a request may be signed up to `opsAuthSkew` in the future),
-  so a captured request stays replayable until wall-clock reaches
-  `ts + opsAuthSkew`, i.e. up to `2 × opsAuthSkew` after first receipt. Expiry is
+  `sync.Mutex` + map). **TTL = 2× the skew window + 1 s (601 s), not 1×** — the
+  skew check is two-sided *and inclusive* (a request may be signed up to
+  `opsAuthSkew` in the future, and `skew == +opsAuthSkew` still passes), so a
+  captured request is replayable on the **closed** interval `[ts−skew, ts+skew]`.
+  Worst case the earliest first receipt is server-time `ts−skew`, so the guard must
+  survive until `ts+skew` inclusive = `(ts−skew) + 2·skew`. Because the store's
+  replay check is strict (`exp > now`), retaining for exactly `2·skew` would expire
+  the guard one tick early at `now == ts+skew` and admit a single boundary replay;
+  the **+1** closes that so retention covers the full replayable lifetime. Expiry is
   anchored to the **server's** receipt time, never the attacker-controlled client
   timestamp. A hard cap (`nonceStoreMaxEntries`, 65536) bounds memory; at capacity
   (after sweeping expired entries) `checkAndRecord` **fails closed**.

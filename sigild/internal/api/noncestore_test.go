@@ -3,6 +3,7 @@ package api
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -80,5 +81,51 @@ func TestNonceStoreConcurrent(t *testing.T) {
 	// A replay of a known nonce is still rejected after the concurrent storm.
 	if s.checkAndRecord("g0-0", 1000) {
 		t.Fatal("replay after concurrent inserts must be rejected")
+	}
+}
+
+func TestNonceStoreConcurrentSameNonceSingleWinner(t *testing.T) {
+	// The security-load-bearing property: when many goroutines race the IDENTICAL
+	// nonce, EXACTLY ONE checkAndRecord returns true (the rest see a replay). A
+	// TOCTOU double-accept in the read-modify-write would fail this. Run under -race.
+	s := newNonceStore(600, 100)
+	const goroutines = 64
+	var wins int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release all goroutines at once to maximize contention
+			if s.checkAndRecord("contended", 1000) {
+				atomic.AddInt64(&wins, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("exactly one goroutine must win the identical nonce; got %d", wins)
+	}
+}
+
+func TestNonceStoreCoversFullSkewWindow(t *testing.T) {
+	// Regression for the 2x-skew boundary: the store's retention (nonceStoreTTL)
+	// must cover the FULL closed interval on which a byte-identical replay still
+	// passes authorizeOps' inclusive skew gate. Worst case the earliest first
+	// receipt is server-time ts-opsAuthSkew, and the latest a replay still verifies
+	// is server-time ts+opsAuthSkew (skew == +opsAuthSkew passes). A nonce first
+	// seen at ts-skew must therefore STILL be a replay at ts+skew. With
+	// nonceStoreTTL == 2*opsAuthSkew this fails by one tick; the +1 closes it.
+	s := newNonceStore(nonceStoreTTL, 100)
+	const ts = int64(1_000_000)
+	firstReceipt := ts - opsAuthSkew
+	if !s.checkAndRecord("n", firstReceipt) {
+		t.Fatal("first receipt must be accepted")
+	}
+	latestReplay := ts + opsAuthSkew
+	if s.checkAndRecord("n", latestReplay) {
+		t.Fatalf("a replay at the latest still-timestamp-valid instant (now=%d) must be rejected", latestReplay)
 	}
 }

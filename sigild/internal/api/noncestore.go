@@ -3,12 +3,17 @@ package api
 import "sync"
 
 // nonceStoreTTL is how long a seen nonce is retained, keyed on the server's
-// receipt time. It is **2× the auth skew window, not 1×**: the timestamp check in
-// authorizeOps is two-sided (a request may be signed up to opsAuthSkew in the
-// FUTURE), so a captured request stays replayable until wall-clock reaches
-// ts+opsAuthSkew — i.e. up to 2*opsAuthSkew after we first record it. A 1× TTL
-// would evict the guard a full window before the request stops being replayable.
-const nonceStoreTTL = 2 * opsAuthSkew // seconds (600)
+// receipt time. It is **just over 2× the auth skew window**. The timestamp check
+// in authorizeOps is two-sided AND inclusive (a request may be signed up to
+// opsAuthSkew in the FUTURE, and skew == +opsAuthSkew still passes), so a captured
+// request is replayable on the CLOSED interval [ts-skew, ts+skew]. Worst case the
+// earliest first receipt is server-time ts-skew, so the guard must survive until
+// ts+skew inclusive = (ts-skew) + 2*skew. Because the replay check is strict
+// (exp > now), retaining for exactly 2*skew would expire the guard one tick early
+// at now == ts+skew and admit a single boundary replay; the +1 closes that so the
+// retention covers the full replayable lifetime (see noncestore_test.go
+// TestNonceStoreCoversFullSkewWindow).
+const nonceStoreTTL = 2*opsAuthSkew + 1 // seconds (601)
 
 // nonceStoreMaxEntries is the hard cap on live nonces the in-memory replay-guard
 // retains at once. It caps memory against a flood of validly-signed unique
@@ -28,7 +33,7 @@ const nonceStoreMaxEntries = 65536
 // This closes the in-window replay gap for a single running dev process only.
 type nonceStore struct {
 	mu   sync.Mutex
-	ttl  int64            // seconds a nonce is retained (set to nonceStoreTTL = 2× the skew window)
+	ttl  int64            // seconds a nonce is retained (set to nonceStoreTTL, just over 2× the skew window)
 	max  int              // hard cap on retained nonces (flood bound)
 	seen map[string]int64 // nonce -> unix-seconds expiry
 }

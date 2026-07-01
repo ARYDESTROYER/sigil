@@ -4,6 +4,9 @@ name: release
 # provenance + artifact upload) are deferred until libsigil and sigild are real
 # (see docs/sprint-72h.md, defer ledger). This workflow is intentionally
 # disabled so it is wired but never runs.
+#
+# NOTE: this is NOT the sigild container-publish pipeline. Building/pushing the
+# sigild image to GHCR lives in publish-sigild.yml (manual workflow_dispatch).
 
 on:
   workflow_dispatch:

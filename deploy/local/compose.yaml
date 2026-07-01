@@ -1,0 +1,63 @@
+# LOCAL topology smoke for the Caddy -> sigild edge. NOT A DEPLOYMENT.
+#
+# This compose stack exists ONLY to confirm the proxy/app wiring from
+# docs/deployment.md §1 (Caddy reverse-proxying to sigild) on the local
+# machine. It is the LOCAL counterpart of the production shapes under
+# deploy/{caddy,systemd,nomad,terraform}/ and is deliberately kept separate.
+#
+# HARD GUARANTEES (see deploy/local/README.md):
+#   * LOOPBACK ONLY  — every published port binds 127.0.0.1, never 0.0.0.0,
+#     so nothing is reachable from the network/internet.
+#   * NO REAL TLS / NO ACME — the local Caddy (Caddyfile.local) runs with
+#     automatic HTTPS off; it never contacts Let's Encrypt and obtains no
+#     publicly-trusted certificate. The DNS/ACME wall-clock gate is NOT
+#     exercised here.
+#   * NO PQ PROOF — a Caddy handshake here is, at most, local classical TLS;
+#     it proves nothing about X25519MLKEM768 (that needs the Go-native
+#     sigild listener — see docs/deployment.md §3).
+#   * DISPOSABLE — bring up, probe, then `docker compose down -v`.
+#
+# Run (from the repo root):
+#   docker compose -f deploy/local/compose.yaml up -d --build
+#   curl -fsS http://127.0.0.1:8080/healthz        # through Caddy -> sigild
+#   docker compose -f deploy/local/compose.yaml down -v
+
+services:
+  # The Sigil sync server skeleton, built from the same Dockerfile the publish
+  # workflow would use. It serves plain HTTP on :8080 inside the compose
+  # network and is NOT published to the host — only Caddy can reach it.
+  sigild:
+    build:
+      context: ../../sigild
+      dockerfile: Dockerfile
+    image: sigild:local
+    environment:
+      # Plain-HTTP listener on the compose network. No dev op-log:
+      # SIGILD_ENABLE_DEV_OPS is intentionally left unset (production default
+      # — vault ops stay 501). This is a topology probe only.
+      SIGILD_ADDR: ":8080"
+    expose:
+      - "8080"
+    restart: "no"
+    networks:
+      - edge
+
+  # Local TLS-terminating edge, mirroring the production Caddy role but with
+  # automatic HTTPS DISABLED (see Caddyfile.local). Published to LOOPBACK ONLY.
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - sigild
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+    ports:
+      # 127.0.0.1 binding is load-bearing: do NOT change to 0.0.0.0 or a bare
+      # port (which would bind all interfaces). Loopback-only by design.
+      - "127.0.0.1:8080:80"
+    restart: "no"
+    networks:
+      - edge
+
+networks:
+  edge:
+    driver: bridge

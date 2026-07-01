@@ -1,0 +1,42 @@
+# LOCAL Caddy config for the loopback topology smoke. NOT FOR PRODUCTION.
+#
+# This is the LOCAL dev counterpart of deploy/caddy/Caddyfile. The production
+# Caddyfile terminates real TLS for api.<host> via Let's Encrypt/ACME; this one
+# deliberately does the opposite:
+#
+#   * `auto_https off` — automatic HTTPS is DISABLED. Caddy never contacts an
+#     ACME server, never obtains a publicly-trusted certificate, and the
+#     DNS/ACME wall-clock gate (docs/deployment.md §4) is NOT exercised.
+#   * Plain HTTP on :80 inside the compose network, published to 127.0.0.1 only
+#     by compose.yaml. Nothing is exposed off-box.
+#
+# It reverse-proxies to the `sigild` service on the compose network (Docker DNS
+# resolves the service name `sigild` to the container) on :8080, mirroring the
+# production reverse_proxy target shape (prod uses 127.0.0.1:8080 on the same VM;
+# here the hop is across the compose network instead of loopback).
+{
+	# No automatic HTTPS: never reach for an ACME cert. Loopback smoke only.
+	auto_https off
+	# Quiet, structured admin-less local run.
+	admin off
+}
+
+# Listen on plain HTTP :80 inside the container; compose maps 127.0.0.1:8080->80.
+:80 {
+	encode zstd gzip
+
+	reverse_proxy sigild:8080
+
+	header {
+		# Keep the prod hardening headers so the topology smoke exercises the
+		# same response shape. (HSTS is harmless here — no TLS — but kept for
+		# parity with deploy/caddy/Caddyfile.)
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

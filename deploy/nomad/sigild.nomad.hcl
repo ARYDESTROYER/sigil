@@ -18,6 +18,12 @@ job "sigild" {
     task "sigild" {
       driver = "docker"
 
+      # Give the service registry / health check time to deregister this
+      # allocation before the container is killed, so in-flight requests drain
+      # and Caddy/Nomad stop routing to it first (silences the validate warning
+      # "defines services, but has no shutdown_delay set").
+      shutdown_delay = "5s"
+
       config {
         # Placeholder — repoint at the image built from ../../sigild/Dockerfile
         # and published to the registry (tag = git short SHA). Not yet published.

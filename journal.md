@@ -1246,6 +1246,32 @@ Servers killed cleanly; temp dir + binaries removed.
   account/key-management flow. Optional `panic = "abort"` hardening left as a noted
   future option (the wrapped core fns are already panic-free for fixed inputs).
 
+## 2026-07-01 — Phases 13 & 14 adversarial review follow-ups
+
+Both phases went through large multi-agent adversarial review passes after commit;
+**must-fix was empty in both** (no code defects, UB, or invariant violations —
+the code was verified sound, KATs pass, constant-time check confirmed, alias-safety
+confirmed genuinely sound). The surviving items were doc-accuracy and test-coverage
+gaps, applied as follow-up commits:
+
+- **Phase 13 review** (35 reviewers) → commit `2999c76`: corrected ADR 0010's
+  `default-features` description (matches the Cargo.toml comment now); documented +
+  tested two X25519 properties — non-canonical public-key encoding (bit-255 mask /
+  mod-p) and the argument-order footgun; added `clamping_equivalence` and a
+  non-trivial order-8 low-order-point test (sigil-core → 63 tests).
+- **Phase 14 review** (22 dimensions × 3 independent voters = 66) → this commit:
+  the loudly-documented FFI alias-safety guarantee (out may overlap in) was tested
+  by zero tests; added three in-place aliasing regression tests
+  (`ed25519_public_key_in_place_alias`, `ed25519_sign_out_overlaps_seed`,
+  `x25519_shared_secret_in_place_alias`) that pin the copy-before-write ordering
+  against a known-answer vector (sigil-ffi → 25 tests). The review explicitly
+  discarded two suggested "missing" tests as non-issues (a wrong-length verify is
+  structurally impossible for fixed-size array params; is_contributory-on-real-DH is
+  already covered).
+
+Gate after both follow-ups: fmt/clippy clean; **sigil-core 63 + sigil-ffi 25** pass;
+wasm green; getrandom 0.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

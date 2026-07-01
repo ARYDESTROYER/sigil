@@ -1129,4 +1129,44 @@ mod tests {
             (0, -1, -2, -3, -4)
         );
     }
+
+    // In-place / aliasing tests: the header + docs promise the out buffer may
+    // overlap an input (because each input is copied into a local before any
+    // output is written). These pin that copy-before-write ordering so a future
+    // refactor that read a raw input pointer after writing the output would fail.
+
+    #[test]
+    fn ed25519_public_key_in_place_alias() {
+        // out_pk aliases seed (same buffer). The seed is copied out first, so the
+        // in-place call still yields the RFC 8032 public key.
+        let mut buf = RFC8032_SEED;
+        let rc = unsafe { sigil_ed25519_public_key(buf.as_ptr(), buf.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(buf, RFC8032_PK);
+    }
+
+    #[test]
+    fn ed25519_sign_out_overlaps_seed() {
+        // out_sig (64 bytes) overlaps the seed region (its first 32 bytes). The
+        // seed is copied out before out_sig is written, so the RFC 8032 signature
+        // is still correct.
+        let mut buf = [0u8; SIGNATURE_LEN];
+        buf[..SIG_SEED_LEN].copy_from_slice(&RFC8032_SEED);
+        let rc =
+            unsafe { sigil_ed25519_sign(buf.as_ptr(), core::ptr::null(), 0, buf.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(buf, RFC8032_SIG);
+    }
+
+    #[test]
+    fn x25519_shared_secret_in_place_alias() {
+        // out_ss aliases secret (same buffer). The secret is copied out before
+        // out_ss is written, so the RFC 7748 §6.1 shared secret is still correct.
+        let mut sec = X_ALICE_SECRET;
+        let rc = unsafe {
+            sigil_x25519_shared_secret(sec.as_ptr(), X_BOB_PUBLIC.as_ptr(), sec.as_mut_ptr())
+        };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(sec, X_SHARED);
+    }
 }

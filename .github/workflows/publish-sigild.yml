@@ -45,7 +45,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Short SHA is the canonical, immutable tag for every build. The optional
       # dispatch input is published alongside it (skipped when left blank).

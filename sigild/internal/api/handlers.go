@@ -18,6 +18,10 @@ type handlers struct {
 	// in which case NewRouter wires an in-memory MemVaultLog and routes
 	// opsAppend/opsList here instead of the 501 stub.
 	log store.VaultLog
+	// nonces is the in-memory replay guard for op-log request auth. It is nil
+	// unless op-log auth is enabled (cfg.DevOpsEnabled && cfg.OpLogPubKey != nil);
+	// when set, authorizeOps rejects a replayed X-Sigil-Nonce (see opsauth.go).
+	nonces *nonceStore
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

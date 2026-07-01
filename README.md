@@ -44,9 +44,11 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   the production store**). Op-log requests are **unauthenticated by default**, but
   when `SIGILD_OPLOG_PUBKEY` (std-base64 of a 32-byte Ed25519 public key) is set
   the server **verifies an Ed25519 signature** (Go stdlib `crypto/ed25519`) over a
-  canonical `(method,path,query,timestamp,body)` message on every op-log request
-  (else `401`) — a **single static dev key**, replay-window-bounded, **dev-only**
-  (enrollment / multi-device / JWT are future). Performs no crypto on the blob —
+  canonical `(method,path,query,timestamp,nonce,body)` message (contract **v2**)
+  on every op-log request (else `401`), and a bounded **in-memory nonce store**
+  rejects in-window replays — a **single static dev key**, **dev-only** (the nonce
+  store is lost on restart; enrollment / multi-device / JWT are future). Performs
+  no crypto on the blob —
   never decodes it. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a

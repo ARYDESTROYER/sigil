@@ -147,13 +147,16 @@ Return the vault's operations with sequence number **greater than `N`** (default
 ### Authentication (optional, dev) — `SIGILD_OPLOG_PUBKEY`
 
 > **DEV-ONLY, off by default, and intentionally minimal.** This is a
-> **single static device key** check, not an account/enrollment system. The
-> 300-second timestamp window **bounds** replay but does **not** prevent it —
-> there is **no nonce/jti tracking** (a replayed request inside the window still
-> verifies). Full device enrollment, a multi-device registry, and JWT bearer
-> tokens (see [`../sigild/internal/auth/`](../sigild/internal/auth/)) remain
-> **future**. Still plain-HTTP, dev-gated, and not for real secrets. See
-> [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md).
+> **single static device key** check, not an account/enrollment system. A
+> per-request **nonce** (contract **v2**) plus the 300-second timestamp window
+> now let the server **reject replays** within the window — but the nonce store
+> is **in-memory** (lost on restart, not shared across instances), so it is not a
+> production replay defense. Full device enrollment, a multi-device registry, JWT
+> bearer tokens (see [`../sigild/internal/auth/`](../sigild/internal/auth/)), and
+> a shared/persistent nonce store remain **future**. Still plain-HTTP, dev-gated,
+> and not for real secrets. See
+> [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)
+> and [`decisions/0012-nonce-replay-protection.md`](decisions/0012-nonce-replay-protection.md).
 
 By default the dev op-log is **unauthenticated** (above). When `sigild` is
 started — with dev-ops on — **and** the environment variable
@@ -163,46 +166,57 @@ signature. With `SIGILD_OPLOG_PUBKEY` **unset (the default), there is no auth**
 and behaviour is exactly as described above.
 
 When configured, **both** `POST` and `GET /v1/vaults/{vaultID}/ops` requests
-**MUST** carry two headers:
+**MUST** carry three headers:
 
 | Header | Value |
 |--------|-------|
 | `X-Sigil-Timestamp` | the signing timestamp, unix **seconds**, decimal ASCII (e.g. `1717900000`) |
+| `X-Sigil-Nonce` | a fresh per-request nonce, printable ASCII (`0x21`–`0x7E`, no space/control), **≤ 128 bytes** — the demo `cli` sends standard-base64 of 16 random bytes |
 | `X-Sigil-Signature` | standard-base64 of the 64-byte Ed25519 signature over the message below |
 
-The signed **message** (raw bytes) is a fixed 5-line ASCII prefix —
+The signed **message** (raw bytes) is a fixed 6-line ASCII prefix —
 lines joined by a single `\n` (`0x0A`), **with a trailing `\n` after the
-timestamp** — immediately followed by the raw request **body** bytes:
+nonce** — immediately followed by the raw request **body** bytes:
 
 ```
-sigil-oplog-auth-v1\n
+sigil-oplog-auth-v2\n
 {METHOD}\n          uppercase HTTP method — "POST" or "GET"
 {PATH}\n            URL path, NO query — e.g. /v1/vaults/demo/ops
 {QUERY}\n           raw query string, or "" if none — e.g. since=0
 {TIMESTAMP}\n       same decimal value sent in X-Sigil-Timestamp
+{NONCE}\n           same value sent in X-Sigil-Nonce
 {BODY}              raw request body bytes; EMPTY for GET
 ```
 
 That is, byte-for-byte:
 
 ```
-MESSAGE = "sigil-oplog-auth-v1\n" + METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TIMESTAMP + "\n" + BODY
+MESSAGE = "sigil-oplog-auth-v2\n" + METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY
 ```
 
 The client signs `MESSAGE` with its 32-byte Ed25519 secret seed (the demo `cli`
 uses `sigil_core::{sign, public_key_from_seed}`) and sends the signature in
-`X-Sigil-Signature` and the same timestamp in `X-Sigil-Timestamp`.
+`X-Sigil-Signature`, the same timestamp in `X-Sigil-Timestamp`, and the same
+nonce in `X-Sigil-Nonce`. **v2 is a hard cutover — v1 signatures no longer
+verify** (the domain string and the message framing both differ).
 
 The server, when `SIGILD_OPLOG_PUBKEY` is configured, verifies on both verbs:
 
-1. read `X-Sigil-Timestamp` and `X-Sigil-Signature`; missing or blank → `401`.
+1. read `X-Sigil-Timestamp`, `X-Sigil-Nonce`, `X-Sigil-Signature`; if a required
+   header is missing/blank **or** the nonce is malformed (empty, `> 128` bytes,
+   or contains a non-`0x21`–`0x7E` byte) → `401`. The nonce is validated **before**
+   it is folded into the message, so it cannot shift the message framing.
 2. parse the timestamp as `int64`; if it is not an integer **or** the skew
    `abs(now - ts)` exceeds **300 seconds** → `401` (stale/skew).
 3. reconstruct `MESSAGE` from the request method, path, raw query, the timestamp
-   header, and the (size-limited) body.
+   header, the nonce header, and the (size-limited) body.
 4. base64-decode the signature and `ed25519.Verify(pubkey, MESSAGE, sig)`; if it
    does not verify → `401`.
-5. on success, fall through to the normal append/read handler above.
+5. **replay guard:** check the nonce against the in-memory nonce store; a nonce
+   already seen within its retention window (2× the skew window) → `401`. Only
+   validly-signed requests reach this step, so unauthenticated traffic cannot
+   populate the store.
+6. on success, record the nonce and fall through to the normal append/read handler.
 
 All failures use the standard typed envelope with `401 Unauthorized`:
 
@@ -216,9 +230,11 @@ The matching CLI key file is JSON, written with mode `0600`:
 { "version": 1, "seed": "<std-base64 of 32 bytes>", "public_key": "<std-base64 of 32 bytes>" }
 ```
 
-**Honest scope:** a single configured DEV device key; the replay window is
-**not** nonce-tracked; multi-device enrollment / registry / JWT auth is future;
-and with `SIGILD_OPLOG_PUBKEY` unset there is no auth at all.
+**Honest scope:** a single configured DEV device key; replays are rejected only
+by an **in-memory, per-process nonce store** (lost on restart, not shared across
+instances — a captured request could still be replayed after a restart within its
+window); multi-device enrollment / registry / JWT auth is future; and with
+`SIGILD_OPLOG_PUBKEY` unset there is no auth at all.
 
 ---
 
@@ -230,8 +246,9 @@ minimum:
 - **Authentication and authorization** — full device enrollment, a multi-device
   registry, JWT bearer tokens, and per-vault membership checks. The optional
   `SIGILD_OPLOG_PUBKEY` signature check (above) is only a single static DEV
-  device key with a window-bounded (not nonce-tracked) replay guard; with it
-  unset the dev route is wide open.
+  device key; its replay guard is an **in-memory, per-process nonce store** (lost
+  on restart, not shared across instances), so production still needs a
+  shared/persistent nonce store; with the pubkey unset the dev route is wide open.
 - **Durable, replicated storage** — a real Postgres/object-store (S3/R2) backend
   with migrations, backups, and a proven restore, replacing the in-memory map.
 - **Real operation / CRDT semantics** — signed, ordered operations with

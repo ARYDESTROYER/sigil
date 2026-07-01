@@ -1272,6 +1272,92 @@ gaps, applied as follow-up commits:
 Gate after both follow-ups: fmt/clippy clean; **sigil-core 63 + sigil-ffi 25** pass;
 wasm green; getrandom 0.
 
+## 2026-07-01 — Phase 15 (op-log replay protection: per-request nonce, contract v2)
+
+### Context & mandate
+- Goal: close the replay gap the docs/code explicitly flagged on the dev op-log's
+  optional Ed25519 auth ("the 300 s window bounds replay but does NOT prevent it —
+  there is no nonce/jti store"). Add a per-request **nonce** and a bounded
+  server-side nonce store so a captured signed request cannot be replayed within
+  the window. Cross-language (sigild Go + CLI Rust), byte-exact contract.
+- Method: 34-agent research fan-out → synthesized design brief (the first
+  schema-constrained synthesis failed the retry cap; re-ran the synthesis as
+  free-text from the cached research). I implemented; **I re-ran the gate and a
+  LIVE cross-language interop + replay test myself.**
+
+### The v2 contract (`sigil-oplog-auth-v2`)
+- Bumped the domain `v1`→`v2` and inserted a `NONCE` line **between TIMESTAMP and
+  BODY**: `MESSAGE = "sigil-oplog-auth-v2\n" + METHOD + "\n" + PATH + "\n" + QUERY
+  + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY`. A **hard cutover** — v1 and v2
+  are mutually unverifiable (domain + framing both differ). New required header
+  **`X-Sigil-Nonce`**; the CLI sends standard-base64 of 16 CSPRNG bytes.
+
+### sigild — nonce store + v2 verify ✅
+- New `internal/api/noncestore.go`: a bounded, TTL-evicting, in-memory
+  `nonceStore` (Go stdlib `sync.Mutex` + map). `checkAndRecord(nonce, now)` is an
+  atomic read-modify-write. **TTL = 2× the skew window (600 s), not 1×** — the
+  skew check is two-sided (a request may be signed up to 300 s in the future), so
+  a captured request stays replayable until `ts+300` = up to `now+600`; a 1× TTL
+  would evict the guard a window too early. Expiry anchors to the **server's**
+  receipt time (never the attacker-controlled client ts). Hard cap
+  (`nonceStoreMaxEntries = 65536`); at capacity, after sweeping expired entries,
+  it **fails closed**.
+- `opsauth.go` (v2): read all three headers; **validate the nonce BEFORE folding
+  it into the message** (`validNonce`: non-empty, ≤128 bytes, printable ASCII
+  `0x21`–`0x7E` so it can't contain `\n` and shift framing); fold nonce into the
+  message; `ed25519.Verify`; then — **only after a valid signature** — consult the
+  nonce store (so unauthenticated traffic can't populate/flood it). Nonce store
+  wired onto `handlers` and created in `NewRouter` only when auth is on.
+- Unchanged when auth is off (no pubkey → no nonce required, byte-for-byte the
+  same). `main.go` WARN updated. Still Go stdlib-only (no `go.sum`).
+
+### cli/ — v2 signing ✅
+- `sign_oplog_request` now generates a `fresh_nonce()` (16 CSPRNG bytes via the
+  already-present `getrandom`, standard-base64), folds it into the v2 message, and
+  returns `(timestamp, nonce, signature)`; `push`/`pull` attach `X-Sigil-Nonce`.
+  Unsigned path (no `--key`) unchanged. `libsigil/Cargo.lock` unchanged, getrandom
+  **0**; `cli/Cargo.lock` gained `x25519-dalek`/`subtle` transitively from Phase
+  13's `sigil-core` (expected; cli getrandom stays 1, `cli/Cargo.toml` unchanged).
+
+### Tests + gate (independently re-run) ✅
+- Go: `noncestore_test.go` (fresh/replay/expiry/cap-fail-closed/cap-reclaim/
+  concurrent, `-race`) + `opsauth_test.go` extended to v2 (replay→401, missing/
+  malformed nonce→401, v1-message→401, distinct-nonces→both accepted, plus all
+  existing cases updated). `gofmt`/`vet`/`build` clean; `go test -race ./internal/
+  api/` green.
+- Rust: `fresh_nonce` distinctness/framing test; `push/pull_with_key` updated to
+  verify over the v2 message + assert the nonce header. cli fmt/clippy clean, 27
+  lib + 2 integration tests. libsigil 63+25 unaffected.
+
+### Verification — LIVE cross-language interop + replay (the real gate) ✅
+Built `sigild` + the CLI. `keygen` → device.key (0600) + pubkey. Started sigild
+with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
+1. **Rust-signed v2 push → Go verify:** `sigil push --key` → "pushed vault demo
+   seq 1" (the byte-exact cross-language contract works over a real socket).
+2. Second signed push → **seq 2** (fresh nonce accepted).
+3. Unsigned push → **HTTP 401** `{"error":"unauthorized",…}`.
+4. **Replay (the point):** captured a real CLI-signed request (via a one-shot
+   capture server), then `curl`-replayed it twice to the live sigild — **first →
+   201, identical resend (same nonce, same still-fresh timestamp) → 401.** Because
+   the *same timestamp* succeeded on the first replay, the 401 is the **nonce
+   store** catching the replay, not staleness.
+5. Tampered nonce → **401**. Server killed; no leftover processes.
+
+### docs ✅
+- New **ADR 0012** (nonce replay protection, v2); `api.md` auth section rewritten
+  to v2 (3 headers, 6-line message, replay step, honest in-memory caveat);
+  `architecture.md` §1/§2/§6, `README.md`, `CLAUDE.md`, `cli/README.md`, and the
+  decisions index updated; the stale "not nonce-tracked" phrasing replaced (ADR
+  0008 and journal history left immutable).
+
+### ⛔ Still NOT production (honest)
+- The nonce store is **in-memory / per-process**: lost on restart (a captured
+  request could be replayed after a restart within its remaining window) and not
+  shared across instances (replicas don't dedupe). Production needs a
+  shared/persistent store (e.g. Redis `SET NX EX`). Still a SINGLE static dev key,
+  plain-HTTP, dev-gated-off by default. Enrollment / multi-device / JWT remain
+  future.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

@@ -103,13 +103,15 @@ HTTP `401`. When `SIGILD_OPLOG_PUBKEY` is **unset**, signing is off and the op-l
 stays unauthenticated (unchanged).
 
 > **HONEST SCOPE.** This is a **single** device key, **dev-only**, still over
-> **plain HTTP**. The signature is bound to the request's method, path, query, a
-> unix-seconds timestamp, and the body; `sigild` rejects timestamps skewed more
-> than **300 s**. That window **bounds** replay but does **not** fully prevent it —
-> there is **no per-request nonce/jti tracking**, so a captured request can be
-> replayed inside the window. Real **device enrollment**, a **multi-device
-> registry**, and **JWT bearer tokens** all remain **future** work. The signing
-> primitive (Ed25519, from `sigil-core`) is **real but UNAUDITED**.
+> **plain HTTP**. The signature (contract **v2**) is bound to the request's method,
+> path, query, a unix-seconds timestamp, a fresh **per-request nonce**
+> (`X-Sigil-Nonce`), and the body; `sigild` rejects timestamps skewed more than
+> **300 s** and rejects a **replayed nonce** within the window via a bounded
+> in-memory nonce store. That store is **in-memory / dev-only** (lost on restart,
+> not shared across instances), so it is not a production replay defense. Real
+> **device enrollment**, a **multi-device registry**, **JWT bearer tokens**, and a
+> shared/persistent nonce store all remain **future** work. The signing primitive
+> (Ed25519, from `sigil-core`) is **real but UNAUDITED**.
 
 Generate a device key once (written with mode `0600`; its public key is printed),
 then point `sigild` at the public key:

@@ -63,11 +63,14 @@ public, make no security claims, until the audit completes and trademark clears.
   NOT the production store** (production = Postgres/S3). When
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 of a 32-byte Ed25519 public key) is set,
   op-log requests are **Ed25519-authenticated** (`authorizeOps`, Go stdlib
-  `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` /
-  `X-Sigil-Timestamp` over a canonical `(method,path,query,timestamp,body)` message
-  (300 s window), else **401** `{"error":"unauthorized",…}`. **Default off** (no
-  pubkey → unauthenticated, behavior unchanged); a **SINGLE static dev key**,
-  replay-window-bounded (no nonce store), dev-only — enrollment / multi-device /
+  `crypto/ed25519`): both GET and POST verify `X-Sigil-Signature` /
+  `X-Sigil-Timestamp` / `X-Sigil-Nonce` over a canonical
+  `(method,path,query,timestamp,nonce,body)` message (contract **v2**, 300 s
+  window), else **401** `{"error":"unauthorized",…}`. A bounded **in-memory nonce
+  store** (`noncestore.go`, TTL = 2× window, checked after signature verify)
+  rejects in-window replays — but it is dev-only (lost on restart, not shared
+  across instances). **Default off** (no pubkey → unauthenticated, behavior
+  unchanged); a **SINGLE static dev key**, dev-only — enrollment / multi-device /
   JWT remain future. **No crypto on the blob**: the server never decodes it; it
   stores/returns the exact client bytes. Endpoint reference in
   [`docs/api.md`](docs/api.md).

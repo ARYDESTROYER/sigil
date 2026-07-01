@@ -72,6 +72,11 @@ func NewRouter(cfg Config) http.Handler {
 		} else {
 			h.log = store.NewMemVaultLog()
 		}
+		// When op-log auth is enabled, wire the in-memory replay guard so a
+		// captured signed request cannot be replayed within its timestamp window.
+		if cfg.OpLogPubKey != nil {
+			h.nonces = newNonceStore(nonceStoreTTL, nonceStoreMaxEntries)
+		}
 		mux.Handle("POST /v1/vaults/{vaultID}/ops",
 			limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsAppend)))
 		mux.Handle("GET /v1/vaults/{vaultID}/ops", http.HandlerFunc(h.opsList))

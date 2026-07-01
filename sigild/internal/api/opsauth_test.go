@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,19 +26,22 @@ func authedRouter(t *testing.T, pub ed25519.PublicKey) http.Handler {
 	})
 }
 
-// signOpsRequest builds the canonical op-log MESSAGE and sets the contract
-// headers on req, signing with seed. It mirrors what the Rust CLI must produce:
+// signOpsRequest builds the canonical v2 op-log MESSAGE and sets the three
+// contract headers on req, signing with seed. It mirrors what the Rust CLI must
+// produce:
 //
-//	"sigil-oplog-auth-v1\n" + METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TS + "\n" + BODY
+//	"sigil-oplog-auth-v2\n" + METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TS + "\n" + NONCE + "\n" + BODY
 //
-// ts is the unix-seconds value used both in the message and the
-// X-Sigil-Timestamp header (they MUST match).
-func signOpsRequest(t *testing.T, req *http.Request, seed []byte, ts int64, body []byte) {
+// ts is the unix-seconds value used both in the message and the X-Sigil-Timestamp
+// header; nonce is used both in the message and the X-Sigil-Nonce header (each
+// MUST match). Reusing the same (ts, nonce, method, path, query, body) twice
+// produces a byte-identical replay that the nonce store rejects.
+func signOpsRequest(t *testing.T, req *http.Request, seed []byte, ts int64, nonce string, body []byte) {
 	t.Helper()
 	tsStr := strconv.FormatInt(ts, 10)
 
 	var msg []byte
-	msg = append(msg, "sigil-oplog-auth-v1\n"...)
+	msg = append(msg, "sigil-oplog-auth-v2\n"...)
 	msg = append(msg, req.Method...)
 	msg = append(msg, '\n')
 	msg = append(msg, req.URL.Path...)
@@ -46,12 +50,15 @@ func signOpsRequest(t *testing.T, req *http.Request, seed []byte, ts int64, body
 	msg = append(msg, '\n')
 	msg = append(msg, tsStr...)
 	msg = append(msg, '\n')
+	msg = append(msg, nonce...)
+	msg = append(msg, '\n')
 	msg = append(msg, body...)
 
 	priv := ed25519.NewKeyFromSeed(seed)
 	sig := ed25519.Sign(priv, msg)
 
 	req.Header.Set("X-Sigil-Timestamp", tsStr)
+	req.Header.Set("X-Sigil-Nonce", nonce)
 	req.Header.Set("X-Sigil-Signature", base64.StdEncoding.EncodeToString(sig))
 }
 
@@ -75,7 +82,7 @@ func TestOpsAuthSignedPostAndGet(t *testing.T) {
 	body := []byte("opaque-op-1")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
-	signOpsRequest(t, req, seed, now, body)
+	signOpsRequest(t, req, seed, now, "n-signed-post", body)
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("signed POST status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
@@ -83,7 +90,7 @@ func TestOpsAuthSignedPostAndGet(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/v1/vaults/demo/ops?since=0", nil)
-	signOpsRequest(t, req, seed, now, nil)
+	signOpsRequest(t, req, seed, now, "n-signed-get", nil)
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("signed GET status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
@@ -109,7 +116,7 @@ func TestOpsAuthGetNoQuerySigned(t *testing.T) {
 	if req.URL.RawQuery != "" {
 		t.Fatalf("expected empty RawQuery, got %q", req.URL.RawQuery)
 	}
-	signOpsRequest(t, req, seed, now, nil)
+	signOpsRequest(t, req, seed, now, "n-noquery", nil)
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("signed GET (no query) status = %d, want 200", rec.Code)
@@ -151,6 +158,7 @@ func TestOpsAuthGarbageSignature(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader([]byte("op")))
 		req.Header.Set("X-Sigil-Timestamp", now)
+		req.Header.Set("X-Sigil-Nonce", "n-garbage-sig")
 		req.Header.Set("X-Sigil-Signature", sig)
 		router.ServeHTTP(rec, req)
 		assertUnauthorized(t, rec)
@@ -167,7 +175,7 @@ func TestOpsAuthStaleTimestamp(t *testing.T) {
 	body := []byte("op")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
-	signOpsRequest(t, req, seed, stale, body)
+	signOpsRequest(t, req, seed, stale, "n-stale", body)
 	router.ServeHTTP(rec, req)
 	assertUnauthorized(t, rec)
 }
@@ -182,7 +190,7 @@ func TestOpsAuthFutureSkewTimestamp(t *testing.T) {
 	body := []byte("op")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
-	signOpsRequest(t, req, seed, future, body)
+	signOpsRequest(t, req, seed, future, "n-future", body)
 	router.ServeHTTP(rec, req)
 	assertUnauthorized(t, rec)
 }
@@ -198,7 +206,7 @@ func TestOpsAuthWrongKey(t *testing.T) {
 	body := []byte("op")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
-	signOpsRequest(t, req, otherSeed, now, body)
+	signOpsRequest(t, req, otherSeed, now, "n-wrongkey", body)
 	router.ServeHTTP(rec, req)
 	assertUnauthorized(t, rec)
 }
@@ -212,7 +220,7 @@ func TestOpsAuthTamperedBody(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader([]byte("actual-body")))
-	signOpsRequest(t, req, seed, now, []byte("signed-a-different-body"))
+	signOpsRequest(t, req, seed, now, "n-tamper", []byte("signed-a-different-body"))
 	router.ServeHTTP(rec, req)
 	assertUnauthorized(t, rec)
 }
@@ -229,6 +237,112 @@ func TestOpsAuthDisabledUnchangedNoHeaders(t *testing.T) {
 	list := getOps(t, router, "demo", "0") // helper asserts 200
 	if len(list.Ops) != 1 {
 		t.Fatalf("GET returned %d ops, want 1", len(list.Ops))
+	}
+}
+
+// TestOpsAuthReplayedNonceRejected: an identical signed request replayed within
+// the window is rejected by the nonce store even though its signature is valid.
+func TestOpsAuthReplayedNonceRejected(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	body := []byte("replay-me")
+
+	// First delivery: accepted (201).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+	signOpsRequest(t, req, seed, now, "n-replay", body)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("first delivery status = %d, want 201", rec.Code)
+	}
+
+	// Exact replay (same ts, nonce, body -> byte-identical signature): 401.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+	signOpsRequest(t, req, seed, now, "n-replay", body)
+	router.ServeHTTP(rec, req)
+	assertUnauthorized(t, rec)
+}
+
+// TestOpsAuthMissingNonceHeaderRejected: valid timestamp+signature but no
+// X-Sigil-Nonce is rejected.
+func TestOpsAuthMissingNonceHeaderRejected(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	body := []byte("op")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+	signOpsRequest(t, req, seed, now, "n-present", body)
+	req.Header.Del("X-Sigil-Nonce")
+	router.ServeHTTP(rec, req)
+	assertUnauthorized(t, rec)
+}
+
+// TestOpsAuthMalformedNonceRejected: a nonce with a control byte, over the length
+// cap, or empty is rejected before signature verification.
+func TestOpsAuthMalformedNonceRejected(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	body := []byte("op")
+
+	for _, bad := range []string{"has\nnewline", strings.Repeat("x", opsAuthNonceMaxLen+1), ""} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+		signOpsRequest(t, req, seed, now, bad, body)
+		router.ServeHTTP(rec, req)
+		assertUnauthorized(t, rec)
+	}
+}
+
+// TestOpsAuthV1MessageRejected: a request signed under the OLD v1 domain (no
+// nonce line) no longer verifies against the v2 server — a deliberate hard cutover.
+func TestOpsAuthV1MessageRejected(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	tsStr := strconv.FormatInt(now, 10)
+	body := []byte("op")
+
+	var msg []byte
+	msg = append(msg, "sigil-oplog-auth-v1\n"...)
+	msg = append(msg, "POST\n"...)
+	msg = append(msg, "/v1/vaults/demo/ops\n"...)
+	msg = append(msg, '\n') // empty query
+	msg = append(msg, tsStr...)
+	msg = append(msg, '\n')
+	msg = append(msg, body...)
+	priv := ed25519.NewKeyFromSeed(seed)
+	sig := ed25519.Sign(priv, msg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+	req.Header.Set("X-Sigil-Timestamp", tsStr)
+	req.Header.Set("X-Sigil-Nonce", "n-v1")
+	req.Header.Set("X-Sigil-Signature", base64.StdEncoding.EncodeToString(sig))
+	router.ServeHTTP(rec, req)
+	assertUnauthorized(t, rec)
+}
+
+// TestOpsAuthDistinctNoncesBothAccepted: two requests with the SAME timestamp but
+// DIFFERENT nonces both verify — distinct nonces are not replays of each other.
+func TestOpsAuthDistinctNoncesBothAccepted(t *testing.T) {
+	seed, pub := newKeypair(t)
+	router := authedRouter(t, pub)
+	now := time.Now().Unix()
+	body := []byte("op")
+
+	for _, nonce := range []string{"n-distinct-1", "n-distinct-2"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/demo/ops", bytes.NewReader(body))
+		signOpsRequest(t, req, seed, now, nonce, body)
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("nonce %q status = %d, want 201", nonce, rec.Code)
+		}
 	}
 }
 

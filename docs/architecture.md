@@ -88,10 +88,13 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   unchanged. The op-log is **unauthenticated by default**; when started with
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 Ed25519 public key) it additionally
   requires each request to carry an Ed25519 signature over a canonical
-  `(method, path, query, timestamp, body)` message — a **single static dev
-  device key**, replay-window-bounded (not nonce-tracked); real multi-device
-  enrollment / JWT auth remains **future** (see
-  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
+  `(method, path, query, timestamp, nonce, body)` message (contract **v2**) plus a
+  per-request `X-Sigil-Nonce`; a bounded, **in-memory nonce store** then rejects
+  in-window replays — a **single static dev device key** whose replay guard is
+  dev-only (the store is lost on restart, not shared across instances); real
+  multi-device enrollment / JWT auth remains **future** (see
+  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)
+  and [`decisions/0012-nonce-replay-protection.md`](decisions/0012-nonce-replay-protection.md)).
   The op-log sits behind a `VaultLog` seam with
   **two dev backends**: an **in-memory, non-durable** map (the default) and an
   optional **file-backed** one selected via `SIGILD_OPLOG_DIR` for local-dev
@@ -198,9 +201,10 @@ depend on the server (this is the property the threat model leans on for the
 rogue-employee and compromised-server adversaries — see
 [`threat-model.md`](threat-model.md)). Note the current dev op-log is *also*
 non-durable and unauthenticated by default — optionally guarded by a single
-static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, replay-window-bounded, not
-nonce-tracked; real multi-device auth is still future) — which is why it is
-dev-gated-off and must never be exposed or hold real secrets.
+static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, with a per-request nonce +
+in-memory nonce store that rejects in-window replays, but lost on restart; real
+multi-device auth is still future) — which is why it is dev-gated-off and must
+never be exposed or hold real secrets.
 
 ---
 
@@ -293,8 +297,10 @@ authoritative list, with rationale, is the **defer ledger** in
   directories.
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
-  device-key signature check (replay-window-bounded, not nonce-tracked), but
-  there is no device enrollment, no multi-device registry, no JWT auth, and no
+  device-key signature check, with a per-request nonce + in-memory nonce store
+  that rejects in-window replays (dev-only: lost on restart, not shared across
+  instances), but there is no device enrollment, no multi-device registry, no JWT
+  auth, and no
   per-vault membership check
   ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log

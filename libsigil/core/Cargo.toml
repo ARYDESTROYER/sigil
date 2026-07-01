@@ -35,3 +35,18 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 # keypair), `sign`, and `verify_strict` are all RNG-free. The `alloc` feature is
 # not needed by these fixed-size raw-byte calls.
 ed25519-dalek = { version = "2", default-features = false }
+# Classical X25519 (RFC 7748) key agreement (pre-audit) — the X25519 half of the
+# hybrid X25519&ML-KEM-768 KEM (the ML-KEM-768 PQ half is future/unimplemented).
+# `default-features = false` drops the default `alloc`, `precomputed-tables`, and
+# `zeroize` features, and we never opt into the optional `getrandom`-backed
+# `static_secrets` typed API — so no system RNG is pulled and the
+# `wasm32-unknown-unknown` build is preserved. We call only the always-available,
+# RNG-free free function `x25519()` plus the `X25519_BASEPOINT_BYTES` constant.
+# The caller supplies the 32-byte secret scalar; X25519 clamps it internally. It
+# shares the same `curve25519-dalek` as ed25519-dalek (a single copy in the lock).
+x25519-dalek = { version = "2", default-features = false }
+# Constant-time primitives (pre-audit). Already present transitively via
+# curve25519-dalek; declared directly so `kex::is_contributory` can do a
+# constant-time all-zero check on the shared secret. `default-features = false`
+# keeps it `no_std` and pulls in no RNG.
+subtle = { version = "2", default-features = false }

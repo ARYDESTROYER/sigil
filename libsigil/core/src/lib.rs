@@ -18,6 +18,12 @@
 //! provides the classical half of the hybrid Ed25519&ML-DSA-65 signature suite;
 //! the post-quantum ML-DSA-65 half is reserved/future and not yet implemented.
 //!
+//! A classical X25519 key-agreement primitive ([`x25519_public_key`] /
+//! [`x25519_shared_secret`], [`mod@kex`]) provides the classical half of the
+//! hybrid X25519&ML-KEM-768 KEM; the post-quantum ML-KEM-768 half is
+//! reserved/future and not yet implemented, so the two shared secrets are not yet
+//! combined.
+//!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
 //! used for authenticated encryption:
@@ -37,11 +43,16 @@ extern crate alloc;
 mod aead;
 mod envelope;
 mod kdf;
+mod kex;
 mod record;
 mod sig;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
+pub use kex::{
+    is_contributory, x25519_public_key, x25519_shared_secret, KEX_PUBLIC_KEY_LEN, KEX_SECRET_LEN,
+    KEX_SHARED_SECRET_LEN,
+};
 pub use record::{open_record, seal_record, RecordError};
 pub use sig::{
     public_key_from_seed, sign, verify, SigError, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,

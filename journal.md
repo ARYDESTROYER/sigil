@@ -1109,6 +1109,81 @@ Servers killed cleanly; temp dir + binaries removed.
   this entry finalizes the remaining living docs (this file, `CLAUDE.md`,
   `README.md`).
 
+## 2026-07-01 — Phase 13 (X25519 key-agreement primitive in libsigil-core)
+
+### Context & mandate
+- Goal: add the **classical X25519** (RFC 7748) key-agreement half of the planned
+  hybrid KEM (X25519 & ML-KEM-768, suite `0x12`) to `libsigil-core` as a real,
+  standalone cryptographic primitive — public-key derivation and Diffie-Hellman —
+  mirroring the Phase-11 Ed25519 primitive, without touching the existing
+  KDF/AEAD/sig code and without breaking the wasm-pure / no-RNG / getrandom-0
+  invariants.
+- ⚠️ This is the **KEX PRIMITIVE only**. The **ML-KEM-768 post-quantum half stays
+  FUTURE/unimplemented**, and the two shared secrets are **not** combined — there
+  is still **no post-quantum KEM** and **no hybrid** in this repo. Not wired into
+  any product/KEM flow. Real but **UNAUDITED**.
+- Method: research fan-out (43 opus agents over disjoint design questions) →
+  synthesized brief; I implemented; adversarial-review fan-out; **I re-ran the
+  full gate myself before committing.**
+
+### core — `core/src/kex.rs` ✅
+- New module, re-exported from `lib.rs`:
+  `x25519_public_key(&[u8;32]) -> [u8;32]` (= `x25519(secret, BASEPOINT)`),
+  `x25519_shared_secret(&[u8;32], &[u8;32]) -> [u8;32]` (raw DH scalar-mult), and
+  a constant-time `is_contributory(&[u8;32]) -> bool` all-zero/low-order check,
+  plus the length constants `KEX_SECRET_LEN`/`KEX_PUBLIC_KEY_LEN`/
+  `KEX_SHARED_SECRET_LEN` (all 32).
+- **Caller-supplied entropy:** takes a 32-byte secret scalar from the caller —
+  exactly like the KDF salt, the AEAD nonce, and the Ed25519 seed. **core still
+  generates NO randomness.** X25519 clamps the scalar internally.
+- **Raw primitive, caller owns policy.** `x25519_shared_secret` returns the raw
+  result and is total (never panics for any 32-byte input); the contributory
+  (all-zero) policy is surfaced via `is_contributory`, not decided for the caller
+  (RFC 7748 §6.1 stance, matching `sig.rs`). `is_contributory` uses `subtle`'s
+  constant-time `ct_eq` so it does not leak which bytes are zero.
+- ⚠️ **classical only** — documented as future/unimplemented for ML-KEM-768 in the
+  module docs, `lib.rs`, crypto-spec, architecture, and ADR 0010. **UNAUDITED**
+  throughout. Cross-primitive caveat added: do NOT reuse the same 32 bytes as both
+  an Ed25519 seed and an X25519 secret.
+
+### Dependency & the WASM/GETRANDOM gate ✅
+- Added **`x25519-dalek = { version = "2", default-features = false }`** (+
+  `subtle` declared directly, `default-features = false`, already transitive via
+  `curve25519-dalek`). `default-features = false` is load-bearing: it drops the
+  `getrandom`/`rand_core`, `zeroize`, and `static_secrets` paths — we use only the
+  RNG-free free function `x25519()` and the `X25519_BASEPOINT_BYTES` constant.
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (before and after), `cargo build -p sigil-core --target wasm32-unknown-unknown`
+  **succeeds**, and there is still exactly **1** `curve25519-dalek` in the lock
+  (shared with `ed25519-dalek`, no duplicate). `#![forbid(unsafe_code)]` and
+  `no_std` intact.
+
+### Tests ✅
+- **RFC 7748 §6.1 KAT** (Alice/Bob): derive both public keys from the given
+  secrets and compute the shared secret both directions — a real interop vector.
+- **RFC 7748 §5.2 KAT**: single scalar·u-coordinate multiplication — an
+  independent vector for the raw path.
+- Plus: symmetric agreement for self-derived keys, distinct-peer secrets differ,
+  determinism, `u=0` and `u=1` low-order points → all-zero + non-contributory, and
+  a direct `is_contributory` all-zero/non-zero test, and constant lengths.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 60 PASS** (9 new kex), sigil-ffi 7 PASS · wasm build
+  OK · getrandom count **0**.
+
+### docs — crypto-spec.md / architecture.md / ADR 0010 ✅
+- New **ADR 0010** (X25519 key-agreement primitive — classical KEM half,
+  caller-supplied secret, raw primitive + `is_contributory` policy hook,
+  cross-linked 0004/0007). `crypto-spec.md` hybrid-construction status now names
+  the classical X25519 half implemented (ML-KEM-768 half + combine still not);
+  `architecture.md` §1 lists the primitive and §6 splits the KEM/signature
+  half-built status. `README.md` + `CLAUDE.md` repo-map lines name the X25519 KEX
+  primitive. Decisions index updated.
+
+### ➡️ Still NOT done (honest)
+- **No PQ, no hybrid, not wired in.** ML-KEM-768 remains unimplemented; the two
+  shared secrets are not combined; the primitive is a standalone building block,
+  not part of any KEM/record/product flow. No zeroization. Real but UNAUDITED.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

@@ -42,3 +42,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0007](0007-caller-supplied-entropy-in-core.md) | Caller-supplied entropy in `sigil-core` | Accepted (2026-06) |
 | [0008](0008-device-key-request-auth.md) | Device-key request auth for the dev op-log (`SIGILD_OPLOG_PUBKEY`) | Accepted (2026-06) |
 | [0009](0009-manual-gated-deploy-and-publish.md) | Manual / human-gated deploy and publish | Accepted (2026-06) |
+| [0010](0010-x25519-key-agreement-primitive.md) | X25519 key-agreement primitive (classical KEM half) | Accepted (2026-07) |

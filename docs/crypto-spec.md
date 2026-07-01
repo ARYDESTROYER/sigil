@@ -82,16 +82,31 @@ breaking both X25519 and ML-KEM.
 **Signatures**: `Ed25519.Sign(m) || ML-DSA-65.Sign(m)`; verification requires
 **both** to validate.
 
-**Implementation status (pre-audit, UNAUDITED).** The **classical Ed25519 half**
-is now **implemented** in `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):
+**Implementation status (pre-audit, UNAUDITED).**
+
+*Key encapsulation.* The **classical X25519 half** is now **implemented** in
+`sigil-core` ([`libsigil/core/src/kex.rs`](../libsigil/core/src/kex.rs)): a raw
+RFC 7748 X25519 key-agreement primitive — `x25519_public_key` and
+`x25519_shared_secret` over a **caller-supplied 32-byte secret scalar** (the core
+generates no key material — see
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md) and
+[ADR 0010](decisions/0010-x25519-key-agreement-primitive.md)), plus a
+constant-time `is_contributory` check for the low-order-point all-zero case
+(RFC 7748 §6.1). Its output is exactly `ss_x` above. It is **real but NOT YET
+AUDITED** and **not wired into a KEM/product flow**. The **ML-KEM-768 post-quantum
+half remains specified-but-not-implemented**, and the two shared secrets are **not**
+combined — so the hybrid `X25519 & ML-KEM-768` encapsulation above is **not**
+available and provides no post-quantum protection today.
+
+*Signatures.* The **classical Ed25519 half** is likewise **implemented** in
+`sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):
 a deterministic RFC 8032 Ed25519 `sign`/`verify` primitive over a
-**caller-supplied 32-byte secret seed** (the core generates no key material — see
-[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). It is **real but
-NOT YET AUDITED**, and it is **not yet wired into the hybrid signature
-construction or any product flow** — it stands as a standalone primitive. The
-**ML-DSA-65 post-quantum half remains specified-but-not-implemented**, so the
-hybrid `Ed25519 & ML-DSA-65` signature above is **not** available: there is no
-post-quantum signature in this repo yet, and no combined hybrid `Sign`/`Verify`.
+**caller-supplied 32-byte secret seed**. It is **real but NOT YET AUDITED**, and
+it is **not yet wired into the hybrid signature construction or any product
+flow** — it stands as a standalone primitive. The **ML-DSA-65 post-quantum half
+remains specified-but-not-implemented**, so the hybrid `Ed25519 & ML-DSA-65`
+signature above is **not** available: there is no post-quantum signature in this
+repo yet, and no combined hybrid `Sign`/`Verify`.
 
 ## Migration plan (intended)
 

@@ -1404,6 +1404,30 @@ with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
   not yet under test (would need jsdom / an integration harness) — a reasonable
   next step, deliberately deferred to keep the dependency surface minimal.
 
+## 2026-07-01 — PR #14 to `main` + Phase 15 review follow-up
+
+- Opened **PR arydestroyer/sigil#14** (`claude/continuous-dev-workflow-qvk3wd` →
+  `main`) covering Phases 13–16. CI (path-filtered libsigil/sigild/cli/web +
+  security) green on first checks (gitleaks/govulncheck/builds); subscribed to PR
+  activity for CI/review events.
+- **Copilot review** (1 inline comment): the `nonceStore.ttl` field comment said
+  "== the auth skew window" while the store is configured with `2× opsAuthSkew`.
+  Valid nit — fixed the comment (`aa3d431`), thread resolved.
+- **Phase 15 adversarial review** (22 dimensions × 3 voters = 66) found **one
+  genuine defect** (LOW, unanimous 3/3): a **1-second under-retention off-by-one**
+  at the 2×-skew boundary. The skew gate is inclusive at `+opsAuthSkew` (skew==+300
+  passes) but the store's replay check is strict (`exp > now`); at the earliest
+  first receipt (`ts−300`) the guard expired one tick before the last
+  timestamp-valid replay (`ts+300`). Fixed with **`nonceStoreTTL = 2*opsAuthSkew +
+  1` (601)** so retention covers the full closed interval `[ts−skew, ts+skew]`
+  (`2a512cd`); proved the new `TestNonceStoreCoversFullSkewWindow` fails at 600 and
+  passes at 601. Added the review's should-fix coverage: concurrent same-nonce
+  single-winner (TOCTOU guard), GET-path replay, base64-alphabet nonce accept, and
+  the exact-`opsAuthNonceMaxLen` accept boundary. ADR 0012 + code comments synced.
+- Both adversarial reviews (Phases 13/14 earlier, Phase 15 here) found **no
+  shipped correctness bug beyond this one boundary nit**; the live cross-language
+  interop test remains the strongest evidence the replay guard works end-to-end.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

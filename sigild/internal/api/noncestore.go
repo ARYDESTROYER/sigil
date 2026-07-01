@@ -28,7 +28,7 @@ const nonceStoreMaxEntries = 65536
 // This closes the in-window replay gap for a single running dev process only.
 type nonceStore struct {
 	mu   sync.Mutex
-	ttl  int64            // seconds a nonce is retained (== the auth skew window)
+	ttl  int64            // seconds a nonce is retained (set to nonceStoreTTL = 2× the skew window)
 	max  int              // hard cap on retained nonces (flood bound)
 	seen map[string]int64 // nonce -> unix-seconds expiry
 }

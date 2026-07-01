@@ -75,6 +75,7 @@ public, make no security claims, until the audit completes and trademark clears.
   stores/returns the exact client bytes. Endpoint reference in
   [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
+  Vitest (node env, vitest-only dep) covers the waitlist API route + robots policy.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices).
@@ -133,9 +134,10 @@ $go -C sigild build ./...
 # sigild container (multi-stage → distroless, ~14 MB) — needs the Docker daemon
 docker build --build-arg VERSION=$(git rev-parse --short HEAD) -t sigild:dev sigild
 
-# Web — typecheck / lint / build (NEXT_TELEMETRY_DISABLED=1)
+# Web — typecheck / lint / test / build (NEXT_TELEMETRY_DISABLED=1)
 corepack pnpm -C web typecheck
 corepack pnpm -C web lint
+corepack pnpm -C web test     # vitest: waitlist route + robots (node env, vitest-only dep)
 corepack pnpm -C web build
 ```
 

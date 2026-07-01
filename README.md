@@ -61,7 +61,8 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   per-vault cursor is kept in the out-dir, so repeat pulls fetch only new ops.
   Standalone crate; unaudited; not for real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
-  privacy/terms/imprint stubs. **No-index, password-wallable.**
+  privacy/terms/imprint stubs. **No-index, password-wallable.** Vitest covers the
+  waitlist API route (validation/honeypot/consent) and the robots policy.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.
@@ -106,7 +107,7 @@ cargo test  --manifest-path cli/Cargo.toml
 ( cd sigild && gofmt -l . && go vet ./... && go test ./... && go build ./... )
 
 # Web (marketing)
-( cd web && pnpm install && pnpm lint && pnpm typecheck && pnpm build )
+( cd web && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm build )
 ```
 
 ## Licensing

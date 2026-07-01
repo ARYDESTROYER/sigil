@@ -1358,6 +1358,52 @@ with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
   plain-HTTP, dev-gated-off by default. Enrollment / multi-device / JWT remain
   future.
 
+## 2026-07-01 — Phase 16 (web marketing test coverage — the last untested surface)
+
+### Context & mandate
+- Goal: close the one surface with **zero automated tests** — `web/apps/marketing`.
+  The waitlist API route carries real, security-relevant validation logic (email
+  format, honeypot, consent gating, "not persisted" skeleton contract) and the
+  robots policy encodes the stealth posture; both were untested. Add a minimal,
+  low-dependency test harness and cover them.
+
+### web — vitest, node-env, vitest-only dependency ✅
+- Added **vitest** (`^2.1.8`) as the marketing app's only new devDependency, a
+  `test: "vitest run"` script (marketing + root `web` passthrough), and
+  `vitest.config.ts` (environment `node`, `include: app/**/*.test.ts`). No jsdom,
+  no React-testing libs — the tested logic is pure server code, so the dependency
+  surface stays tiny.
+- `app/api/waitlist/route.test.ts` — 8 tests over the `POST` handler: non-JSON →
+  `400 invalid_json`; honeypot (`website` non-empty) → `200 ok` and
+  short-circuits before email/consent; missing/malformed email (incl. `undefined`,
+  non-string, `""`, no-`@`, no-dot, space, trailing-dot) → `400 invalid_email`;
+  over-254-char email → `400 invalid_email`; `consent !== true` (incl. `"true"`,
+  `1`, `false`) → `400 consent_required`; valid signup → `202` with a note that
+  asserts **it was validated, NOT persisted** (guards the no-un-backed-up-PII
+  posture); empty object body → `invalid_email`.
+- `app/robots.test.ts` — 1 test asserting the pre-launch policy disallows all
+  crawling (`{ userAgent: "*", disallow: "/" }`), so a regression that opens
+  indexing fails CI.
+- `NextResponse` works in the plain node test env (Node 22 globals), so the route
+  is tested exactly as shipped — no logic extraction/duplication.
+
+### CI ✅
+- `.github/workflows/web.yml` gains a `pnpm test` step (after typecheck, before
+  build). `README.md` / `CLAUDE.md` web build commands updated to include `test`.
+
+### Verification (independently re-run) ✅
+- `pnpm install` (frozen) reaches the registry fine; **`pnpm test` → 9 tests pass
+  (2 files)**. Regression: `pnpm typecheck` clean (the new `.test.ts` +
+  `vitest.config.ts` typecheck), `pnpm lint` clean, `pnpm build` OK (8 routes; the
+  colocated `.test.ts` files are correctly ignored by the Next router). No product
+  code changed — tests only (+ tooling).
+
+### ⛔ Scope (honest)
+- Tests cover the marketing app's **pure server logic** only. The React
+  components (`page.tsx`, `waitlist-form.tsx`) and the Basic-Auth middleware are
+  not yet under test (would need jsdom / an integration harness) — a reasonable
+  next step, deliberately deferred to keep the dependency surface minimal.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

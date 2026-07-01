@@ -92,7 +92,10 @@ generates no key material — see
 [ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md) and
 [ADR 0010](decisions/0010-x25519-key-agreement-primitive.md)), plus a
 constant-time `is_contributory` check for the low-order-point all-zero case
-(RFC 7748 §6.1). Its output is exactly `ss_x` above. It is **real but NOT YET
+(RFC 7748 §6.1). Its output is exactly `ss_x` above. (Note: X25519 public keys
+are **not canonically encoded** — bit 255 is masked and `u` reduced mod p — so any
+`transcript_hash` that folds in raw peer-key bytes MUST normalize them first;
+derive from the shared secret, not the raw encoding.) It is **real but NOT YET
 AUDITED** and **not wired into a KEM/product flow**. The **ML-KEM-768 post-quantum
 half remains specified-but-not-implemented**, and the two shared secrets are **not**
 combined — so the hybrid `X25519 & ML-KEM-768` encapsulation above is **not**

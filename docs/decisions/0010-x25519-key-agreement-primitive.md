@@ -39,12 +39,16 @@ Add [`../../libsigil/core/src/kex.rs`](../../libsigil/core/src/kex.rs): a real
   constants `KEX_SECRET_LEN` / `KEX_PUBLIC_KEY_LEN` / `KEX_SHARED_SECRET_LEN`
   (all 32).
 - **Dependency:** `x25519-dalek = { version = "2", default-features = false }`.
-  `default-features = false` drops the `getrandom`/`rand_core`, `zeroize`, and
-  `static_secrets` features; we call only the always-available RNG-free free
-  function `x25519()` and the `X25519_BASEPOINT_BYTES` constant. It reuses the
-  same `curve25519-dalek` that `ed25519-dalek` already pulls in (a single copy in
-  the lockfile). The constant-time check uses `subtle` (also already transitive
-  via `curve25519-dalek`), declared directly, `default-features = false`.
+  `default-features = false` drops the default `alloc`, `precomputed-tables`, and
+  `zeroize` features; the `getrandom`/`static_secrets` features are opt-in and are
+  never enabled, so no system RNG is pulled. (`rand_core` remains a *non-optional*
+  transitive dependency in the lockfile, but without its `getrandom` feature — that
+  is the actual reason the `getrandom` count stays `0`, not the removal of a
+  feature.) We call only the always-available, RNG-free free function `x25519()`
+  and the `X25519_BASEPOINT_BYTES` constant. It reuses the same `curve25519-dalek`
+  that `ed25519-dalek` already pulls in (a single copy in the lockfile). The
+  constant-time check uses `subtle` (also already transitive via
+  `curve25519-dalek`), declared directly, `default-features = false`.
 - **Caller-supplied secret, no in-core RNG** — exactly as for the Argon2id salt,
   the AEAD nonce, and the Ed25519 seed
   ([ADR 0007](0007-caller-supplied-entropy-in-core.md)). The core never generates

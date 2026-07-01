@@ -57,6 +57,17 @@
 //! - X25519 clamps the secret scalar internally (RFC 7748 §5): the three lowest
 //!   bits and the top two bits of the caller's secret are forced, so distinct raw
 //!   secrets can clamp to the same scalar; do not rely on the raw bit pattern.
+//! - **Public keys are not canonically encoded.** X25519 masks bit 255 of the
+//!   peer u-coordinate and reduces it mod p (RFC 7748 §5), so *distinct* 32-byte
+//!   strings can denote the *same* public key and yield the *same* shared secret.
+//!   The raw peer-key bytes therefore MUST NOT be used as a canonical identity
+//!   (e.g. hashed into a key-agreement transcript) without first normalizing them;
+//!   compare/derive from the shared secret, not the raw encoding.
+//! - **Argument order matters and is not type-checked.** Both
+//!   [`x25519_shared_secret`] parameters are `&[u8; 32]`; transposing `secret` and
+//!   `peer_public` silently returns a plausible-but-wrong 32 bytes (the function is
+//!   total and never panics). The raw-bytes API is a deliberate FFI-friendliness
+//!   choice that forgoes the typed-key safety of dalek's higher-level DH API.
 //! - This is unaudited and is not wired into any KEM/hybrid/product flow.
 
 use subtle::ConstantTimeEq;
@@ -265,5 +276,54 @@ mod tests {
         one[KEX_SHARED_SECRET_LEN - 1] = 0x01;
         assert!(is_contributory(&one));
         assert!(is_contributory(&SHARED));
+    }
+
+    #[test]
+    fn non_canonical_public_key_encoding_agrees() {
+        // X25519 masks bit 255 of the peer u-coordinate, so a peer key with the
+        // high bit set denotes the same point and yields the same shared secret.
+        // This documents that raw peer-key bytes are NOT a canonical identity.
+        let mut noncanonical = BOB_PUBLIC;
+        noncanonical[KEX_PUBLIC_KEY_LEN - 1] |= 0x80;
+        assert_ne!(noncanonical, BOB_PUBLIC); // genuinely different bytes
+        assert_eq!(
+            x25519_shared_secret(&ALICE_SECRET, &noncanonical),
+            x25519_shared_secret(&ALICE_SECRET, &BOB_PUBLIC),
+        );
+    }
+
+    #[test]
+    fn clamping_equivalence_is_locked() {
+        // X25519 clamps the secret (clears the low 3 bits of byte 0 and bit 7 of
+        // byte 31, sets bit 6 of byte 31). A secret differing only in those forced
+        // bits must derive the SAME public key and SAME shared secret — locking the
+        // documented clamping contract against a future refactor/dep change.
+        let mut variant = ALICE_SECRET;
+        variant[0] ^= 0x07; // the three clamped low bits of byte 0
+        variant[KEX_SECRET_LEN - 1] ^= 0xC0; // bits 6 and 7 of byte 31
+        assert_ne!(variant, ALICE_SECRET); // genuinely different raw bytes
+        assert_eq!(
+            x25519_public_key(&variant),
+            x25519_public_key(&ALICE_SECRET)
+        );
+        assert_eq!(
+            x25519_shared_secret(&variant, &BOB_PUBLIC),
+            x25519_shared_secret(&ALICE_SECRET, &BOB_PUBLIC),
+        );
+    }
+
+    #[test]
+    fn non_trivial_low_order_point_is_non_contributory() {
+        // A non-trivial low-order (order-8) peer point from the standard
+        // Curve25519 low-order set also forces an all-zero shared secret — the
+        // adversarial case is_contributory exists to catch.
+        let order8: [u8; KEX_PUBLIC_KEY_LEN] = [
+            0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+            0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+            0x5f, 0x49, 0xb8, 0x00,
+        ];
+        let ss = x25519_shared_secret(&ALICE_SECRET, &order8);
+        assert_eq!(ss, [0u8; KEX_SHARED_SECRET_LEN]);
+        assert!(!is_contributory(&ss));
     }
 }

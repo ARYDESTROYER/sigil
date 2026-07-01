@@ -1184,6 +1184,68 @@ Servers killed cleanly; temp dir + binaries removed.
   shared secrets are not combined; the primitive is a standalone building block,
   not part of any KEM/record/product flow. No zeroization. Real but UNAUDITED.
 
+## 2026-07-01 — Phase 14 (FFI expansion: Ed25519 sign/verify + X25519 over the C-ABI)
+
+### Context & mandate
+- Goal: expose the Phase-11 Ed25519 and Phase-13 X25519 primitives across the
+  `sigil-ffi` C-ABI so the native clients (separate repos) can call them, without
+  touching the existing `seal`/`open`/`buffer_free` surface and without adding any
+  dependency or RNG to the FFI.
+- Method: 35-agent research fan-out → synthesized FFI design brief (the first
+  synthesis run returned placeholder junk; re-ran just the synthesis from the
+  cached research with a strengthened prompt) → I implemented → gate re-run myself.
+
+### ffi — six new fixed-size exports ✅
+- **New calling convention** (ADR 0011): because every output is a **fixed size**
+  (32/64 bytes), these write into a **caller-allocated** out buffer and return an
+  `int32_t` status — **no heap `SigilBuffer`, nothing to `sigil_buffer_free`**.
+  `seal`/`open`/`buffer_free` are unchanged. New exports:
+  `sigil_ed25519_public_key`, `sigil_ed25519_sign`, `sigil_ed25519_verify`,
+  `sigil_x25519_public_key`, `sigil_x25519_shared_secret`,
+  `sigil_x25519_is_contributory`.
+- **One new status code `SIGIL_ERR_VERIFY = -4`.** `sigil_ed25519_verify` returns
+  `SIGIL_OK` (0) for a valid signature and collapses **all** `SigError` variants
+  (BadPublicKey/BadSignature/Verification) into `SIGIL_ERR_VERIFY` — no
+  structure leak, same stance as `sigil_open`→`SIGIL_ERR_OPEN`, but a distinct
+  code. `0 == valid` is documented loudly (opposite of a C bool).
+- **Guard-first, copy-first, alias-safe.** All required pointers null-checked
+  before any write; each fixed input copied into a local array before the output
+  is written, so out buffers may overlap inputs; `msg` reuses `optional_slice`
+  (null iff `len == 0`). `sigil_x25519_shared_secret` returns the **raw** DH result
+  (all-zero for a low-order peer → still `SIGIL_OK`); contributory policy is the
+  separate `sigil_x25519_is_contributory` **predicate** (1/0/-1, not a status code).
+- Algorithm-qualified names leave room for future `sigil_mldsa65_*` /
+  `sigil_mlkem768_*`. `#![deny(unsafe_op_in_unsafe_fn)]`, per-block `// SAFETY:`
+  notes, and `# Safety` doc sections on every export, matching the crate style.
+
+### hand-written header + docs ✅
+- `sigil.h` kept in sync **by hand**: new `#define SIGIL_ERR_VERIFY (-4)`, a new
+  banner section + the six prototypes (C99 sized-array params `uint8_t x[32]`),
+  broadened top/status-code comments. **Symbol parity verified**: the 10
+  `extern "C" fn` names in `lib.rs` == the 10 prototype names in `sigil.h`, and the
+  `SIGIL_*` codes match. New **ADR 0011** (fixed-size out-buffer convention);
+  `architecture.md` (ffi bullet + ASCII diagram), README, CLAUDE, decisions index,
+  and this journal updated in the same change.
+
+### Tests + gate (independently re-run) ✅
+- 15 new `#[test]`s (total **sigil-ffi 22**, sigil-core 60): Ed25519 round-trip,
+  tamper-sig/tamper-msg/wrong-key → `SIGIL_ERR_VERIFY`, malformed-pubkey collapses
+  (no crash), empty-message sign+verify, null-arg matrix, **RFC 8032 TEST 1 driven
+  through the C-ABI**; X25519 agreement, pubkey-matches-core, **RFC 7748 §6.1
+  through the C-ABI**, null-arg matrix, low-order peer → all-zero + `SIGIL_OK` +
+  non-contributory, `is_contributory` predicate, and a `status_code_values_are_stable`
+  regression pin (0,-1,-2,-3,-4).
+- `cargo fmt --check` clean · `clippy --all-targets -D warnings` clean · `cargo
+  test` 60 + 22 pass · wasm build OK · **getrandom count 0** (no new dep — ffi's
+  only dep stays `sigil-core`; `libsigil/Cargo.lock` unchanged by this phase).
+
+### ➡️ Still NOT done (honest)
+- **Classical-only, UNAUDITED, no keygen in FFI.** The PQ halves (ML-DSA-65 /
+  ML-KEM-768) are unimplemented, so nothing here is post-quantum; the host supplies
+  seeds/secrets (no RNG in the FFI, per ADR 0007); none of it is wired into an
+  account/key-management flow. Optional `panic = "abort"` hardening left as a noted
+  future option (the wrapped core fns are already panic-free for fixed inputs).
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

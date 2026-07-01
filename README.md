@@ -30,7 +30,10 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   low-order-point check, over a caller-supplied 32-byte secret — the KEX half of
   the planned X25519&ML-KEM-768 hybrid KEM, the ML-KEM-768 post-quantum half is
   **not yet implemented** and the shared secrets are not combined), plus a
-  `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`) for the clients.
+  `sigil-ffi` C-ABI for the clients: the AEAD `seal`/`open`/`buffer_free` (heap
+  `SigilBuffer`) and the fixed-size, caller-buffer Ed25519 (`sign`/`verify`/
+  `public_key`) and X25519 (`shared_secret`/`public_key`/`is_contributory`)
+  primitives (classical-only, UNAUDITED).
 - `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a

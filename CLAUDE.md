@@ -45,8 +45,10 @@ public, make no security claims, until the audit completes and trademark clears.
   32-byte secret, no in-core RNG; the KEX half of the future X25519&ML-KEM-768
   hybrid KEM — the ML-KEM-768 PQ half stays unimplemented and the shared secrets
   are not combined; not wired into a flow);
-  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, hand-written
-  `sigil.h`).
+  `ffi` = C-ABI over core: AEAD `seal`/`open`/`buffer_free` (heap `SigilBuffer`)
+  + suite smoke export, and fixed-size caller-buffer `ed25519_{public_key,sign,
+  verify}` / `x25519_{public_key,shared_secret,is_contributory}` (classical-only,
+  UNAUDITED; new `SIGIL_ERR_VERIFY`), hand-written `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
   request-ID/access-log/recover middleware, in-memory `store`; distroless
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an

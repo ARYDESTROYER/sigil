@@ -61,11 +61,20 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   `getrandom`-free (see
   [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
 - **`libsigil/ffi`** ([`../libsigil/ffi/`](../libsigil/ffi/)) — a thin, hand-written
-  **C-ABI** over the AEAD layer: `sigil_seal` / `sigil_open` / `sigil_buffer_free`
-  (plus `sigil_current_suite` as a link/smoke check), with a hand-maintained
-  [`sigil.h`](../libsigil/ffi/include/sigil.h). This is the seam the native
-  clients (in separate repos) will link against. It is the only crate with
-  `unsafe` (the FFI boundary); `core` forbids it.
+  **C-ABI** over `core`, with a hand-maintained
+  [`sigil.h`](../libsigil/ffi/include/sigil.h). It exposes two calling
+  conventions: the **symmetric AEAD** (`sigil_seal` / `sigil_open` /
+  `sigil_buffer_free`, plus `sigil_current_suite`), whose variable-size output
+  rides in a heap `SigilBuffer` the caller frees; and the **fixed-size asymmetric
+  primitives** (`sigil_ed25519_public_key` / `sigil_ed25519_sign` /
+  `sigil_ed25519_verify` / `sigil_x25519_public_key` / `sigil_x25519_shared_secret`
+  / `sigil_x25519_is_contributory`), which write a fixed 32/64-byte result into a
+  **caller-provided** buffer and never allocate (nothing to free) — see
+  [`decisions/0011-fixed-size-out-buffer-ffi-convention.md`](decisions/0011-fixed-size-out-buffer-ffi-convention.md).
+  The asymmetric exports are classical-only and UNAUDITED (the PQ halves are
+  unimplemented). This is the seam the native clients (in separate repos) will
+  link against. It is the only crate with `unsafe` (the FFI boundary); `core`
+  forbids it.
 - **`cli`** ([`../cli/`](../cli/)) — `sigil`, a **pre-audit demonstration** binary.
   `seal`/`open` wrap one file in a self-describing container via the real
   `sigil-core` record API; `push`/`pull` move that **opaque** container to/from a
@@ -106,13 +115,13 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   envelope codec (encode/decode)                                │    │
    │   │   Argon2id KDF  →  XChaCha20-Poly1305 + HKDF AEAD               │    │
    │   │   record API: seal_record / open_record                        │    │
-   │   │   Ed25519 sign / verify  (seed caller-supplied; no RNG)         │    │
+   │   │   Ed25519 sign/verify · X25519 key agreement (caller-supplied)  │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
    │      │ cli  (sigil)           │        │ libsigil/ffi  + sigil.h    │     │
-   │      │ seal/open file         │        │ sigil_seal / sigil_open /  │     │
-   │      │ push/pull (dev HTTP)   │        │ sigil_buffer_free          │     │
+   │      │ seal/open file         │        │ seal / open / buffer_free  │     │
+   │      │ push/pull (dev HTTP)   │        │ ed25519_* · x25519_* (C)   │     │
    │      └────────────┬───────────┘        └───────────┬───────────────┘     │
    │                   │                                 │                     │
    └───────────────────┼─────────────────────────────────┼────────────────────┘

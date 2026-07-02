@@ -1506,6 +1506,69 @@ with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
   bound under the AEAD. ML-DSA-65 remains unimplemented (no PQ signature).
   Nothing is audited; no product flow uses any of it.
 
+## 2026-07-02 — Phase 18 (X-Wing hybrid KEM — the combine)
+
+### Context & the load-bearing decision
+- Goal: combine the two now-real KEM halves (X25519, Phase 13; ML-KEM-768,
+  Phase 17) into the suite-`0x12` hybrid so breaking it requires breaking BOTH.
+- **Decision (ADR 0014): implement X-Wing** (draft-connolly-cfrg-xwing-kem-10),
+  composed from our existing `kex`/`mlkem` modules + the already-in-tree `sha3`,
+  and **drop the brief's bespoke `sigil-hybrid-v1` HKDF sketch** (undefined
+  transcript, no proof, no vectors). Spec follows analysis: X-Wing is a named
+  CFRG construction with a formal IND-CCA proof and official test vectors — an
+  auditor reviews a known construction against published KATs. The RustCrypto
+  `x-wing` crate was **rejected on hard facts** (MSRV 1.85 + edition 2024 vs our
+  1.81; pins a duplicate pre-release copy of half our crypto tree). 26-agent
+  research fan-out settled it; a critical drift-trap was caught there: the
+  combiner label moved to the END in draft -05 — label-first descriptions (like
+  our own planning notes) are the obsolete ≤-04 form.
+
+### core — `core/src/hybrid.rs` ✅
+- `xwing_keygen(&seed[32]) -> ek[1216]` (the **seed IS the decapsulation key**;
+  SHAKE-256-expanded to ML-KEM `(d,z)` ‖ X25519 sk, components re-derived and
+  never stored), `xwing_encapsulate(&ek, &eseed[64]) -> (ct[1120], ss[32])`
+  (eseed = ML-KEM `m` ‖ ephemeral X25519 secret; only reachable error = the
+  §7.2 ek modulus check via `XWingError::MlKem`), `xwing_decapsulate` (total;
+  implicit rejection inherited — never a CCA oracle). Combiner:
+  `SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)`, label = `\.//^\` hashed LAST.
+- Per the draft: **no contributory/low-order check inside the hybrid** (the
+  proof binds `ct_X ‖ pk_X`; adding a rejection would deviate from the analyzed
+  construction). ML-KEM pk/ct deliberately not hashed (FO-specific shortcut —
+  documented as non-generic).
+
+### Verification — official KATs, first-hand ✅
+- Re-downloaded the official vectors myself (`dconnolly/draft-connolly-cfrg-
+  xwing-kem`, `spec/test-vectors.json`) and confirmed byte-identical to the
+  research-vendored copy; literals generated mechanically; the SHAKE-256
+  seed-expansion split independently verified with python `hashlib.shake_256`.
+- **`xwing_official_known_answer` passes all 3 official vectors in both
+  directions** (ek digest, ct digest, ss verbatim; encaps AND decaps). Plus 14
+  more tests: round-trip, keygen/encaps determinism, seed-expansion KAT, both
+  tamper halves (ML-KEM half → implicit rejection; X25519 half → ss changes,
+  proving the combiner binds ct_X), wrong-seed, distinct-seeds/eseeds, all-zero
+  totality, label pin, §7.2 rejection through the hybrid, constants.
+- Gate: fmt/clippy clean · **sigil-core 90 + sigil-ffi 25 tests** · wasm32 green
+  · **getrandom 0** · lock delta = ONE line (sha3 added to sigil-core's dep
+  list; zero new packages) · MSRV unchanged at 1.81.
+
+### docs ✅
+- **ADR 0014** (the X-Wing adoption + proof shape + crate rejection + the
+  FO-specific-shortcut warning). `crypto-spec.md`: the bespoke construction
+  block REPLACED with the X-Wing definition (marked superseding the sketch);
+  status paragraph flipped (combined at the primitive level; still not wired;
+  records still no PQ). `architecture.md` §1 (hybrid bullet + diagram) and §6;
+  `README`/`CLAUDE` repo-maps; `kex.rs`/`mlkem.rs`/Cargo.toml comment flips;
+  decisions index; **MARKETING-CLAIMS**: added "standards-based hybrid"/
+  "NIST-standard encryption" to the forbidden list (X-Wing is a pre-RFC draft,
+  not a standard).
+
+### ⛔ Still NOT done (honest)
+- The hybrid exists **as a primitive only**: `kem_ct` stays reserved/`None` —
+  wiring it into the envelope/record needs a recipient static-key model, an
+  ss→record-key wrap, and rotation semantics (future ADR). **Records sealed
+  today still get no post-quantum protection.** No PQ signature (ML-DSA-65).
+  Everything UNAUDITED.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

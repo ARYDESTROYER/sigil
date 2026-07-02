@@ -21,12 +21,11 @@
 //! [`crate::AlgorithmSuite::HybridPq`] (suite `0x12`, the current suite) names a
 //! **hybrid** KEM: classical X25519 **and** post-quantum ML-KEM-768. Only the
 //! **classical X25519** half is implemented here; the **ML-KEM-768** half is now
-//! implemented as its own standalone primitive ([`crate::mlkem`]), but the two
-//! shared secrets are **not** yet combined — so the key agreement provided by
-//! this module alone is **not** post-quantum and offers no protection against a
-//! cryptographically-relevant quantum computer. A complete hybrid KEM will
-//! encapsulate under both and combine the two shared secrets with an HKDF (see
-//! `docs/crypto-spec.md`).
+//! implemented as its own standalone primitive ([`crate::mlkem`]), and the
+//! **X-Wing hybrid** ([`crate::hybrid`]) combines the two at the primitive
+//! level. This module alone is still **not** post-quantum and offers no
+//! protection against a cryptographically-relevant quantum computer — use the
+//! hybrid for that property (though no product flow is wired to it yet).
 //!
 //! ## The secret is the caller's responsibility
 //!
@@ -69,7 +68,8 @@
 //!   `peer_public` silently returns a plausible-but-wrong 32 bytes (the function is
 //!   total and never panics). The raw-bytes API is a deliberate FFI-friendliness
 //!   choice that forgoes the typed-key safety of dalek's higher-level DH API.
-//! - This is unaudited and is not wired into any KEM/hybrid/product flow.
+//! - This is unaudited. It is consumed by the X-Wing hybrid ([`crate::hybrid`])
+//!   but not wired into any product flow.
 
 use subtle::ConstantTimeEq;
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};

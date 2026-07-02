@@ -594,6 +594,7 @@ dependencies = [
  "hkdf",
  "ml-kem",
  "sha2",
+ "sha3",
  "subtle",
  "x25519-dalek",
 ]

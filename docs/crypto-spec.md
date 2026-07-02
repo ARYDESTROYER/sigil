@@ -67,21 +67,31 @@ the frame parses unambiguously (the brief's prose left nonce/ciphertext/tag
 boundaries implicit-by-suite). It is **serialization only — no encryption** — and
 is covered by round-trip + negative-case tests.
 
-## Hybrid construction (intended)
+## Hybrid construction
 
-**Key encapsulation** (per RFC 9794 / NIST SP 800-56C Rev. 2):
+**Key encapsulation — X-Wing** (draft-connolly-cfrg-xwing-kem-10, an IETF CFRG
+individual draft, pre-RFC):
 
 ```
-ss_x        = X25519(sk_x, pk_x_peer)
-ss_kem      = ML-KEM-768.Decap(sk_kem, ct_kem)
-ss_combined = HKDF-SHA-256(ss_x || ss_kem || transcript_hash, "sigil-hybrid-v1")
+ss_M = ML-KEM-768.Decap(dk_M, ct_M)      ss_X = X25519(sk_X, ct_X)
+ss   = SHA3-256( ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ XWingLabel )
+XWingLabel = "\.//^\"   (6 bytes, hex 5c 2e 2f 2f 5e 5c — hashed LAST)
 ```
 
-Secure if **either** component is secure: breaking the construction requires
-breaking both X25519 and ML-KEM.
+Keys: `pk = pk_M ‖ pk_X` (1216 B), `ct = ct_M ‖ ct_X` (1120 B; `ct_X` is the
+ephemeral X25519 public key), `sk` = a 32-byte seed expanded via
+`SHAKE-256(·, 96 B)` → ML-KEM `(d, z)` ‖ `sk_X`. IND-CCA if **either** component
+holds (proof: Barbosa–Connolly–Duarte–Kaiser–Schwabe–Varner–Westerbaan, IACR
+CiC 1(1):21): breaking the construction requires breaking both X25519 and
+ML-KEM-768. The ML-KEM `pk_M`/`ct_M` are deliberately **not** hashed — safe by
+ML-KEM's ciphertext binding; this shortcut is **not** valid for other PQ KEMs.
+*Supersedes the earlier bespoke `HKDF-SHA-256(ss_x ‖ ss_kem ‖ transcript_hash,
+"sigil-hybrid-v1")` sketch, which had no analysis, no test vectors, and an
+undefined transcript — see
+[ADR 0014](decisions/0014-xwing-hybrid-kem.md).*
 
-**Signatures**: `Ed25519.Sign(m) || ML-DSA-65.Sign(m)`; verification requires
-**both** to validate.
+**Signatures** (intended): `Ed25519.Sign(m) || ML-DSA-65.Sign(m)`; verification
+requires **both** to validate.
 
 **Implementation status (pre-audit, UNAUDITED).**
 
@@ -113,11 +123,17 @@ secret 32 B. Callers may persist the 64-byte `d ‖ z` seed instead of the
 seed is exactly as secret as the key). Per FIPS 203, decapsulation uses
 **implicit rejection**: a tampered ciphertext yields a *different* shared secret,
 **not an error** — callers MUST NOT treat successful decapsulation as
-authentication. It too is **real but NOT YET AUDITED** and **not wired into any
-KEM/product flow**. The two shared secrets are **still not combined** —
-`ss_combined` above does not exist in code — so the hybrid `X25519 & ML-KEM-768`
-encapsulation is **not** available, suite `0x12` remains **not fully
-implemented**, and records still get **no post-quantum protection today**.
+authentication. It too is **real but NOT YET AUDITED**. The two halves are now
+**combined at the primitive level** by the **X-Wing hybrid**
+([`libsigil/core/src/hybrid.rs`](../libsigil/core/src/hybrid.rs)) — `xwing_keygen`
+over a caller-supplied 32-byte seed, `xwing_encapsulate` over caller-supplied
+64-byte one-time randomness, `xwing_decapsulate` (implicit rejection inherited) —
+verified against the official X-Wing test vectors (see
+[ADR 0014](decisions/0014-xwing-hybrid-kem.md)). But the hybrid is **not wired
+into the envelope, `seal_record`/`open_record`, or any product flow** (the
+envelope's `kem_ct` stays reserved/`None`), so suite `0x12` remains **not fully
+implemented** and records still get **no post-quantum protection today**.
+Everything is UNAUDITED.
 
 *Signatures.* The **classical Ed25519 half** is likewise **implemented** in
 `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):

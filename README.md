@@ -32,9 +32,11 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   (`mlkem768_keygen`/`mlkem768_encapsulate`/`mlkem768_decapsulate`, fully
   deterministic over caller-supplied 32-byte seeds `d`/`z`/`m` — the core
   generates no randomness; decapsulation uses FIPS 203 implicit rejection).
-  X25519 and ML-KEM-768 are the two halves of the planned X25519&ML-KEM-768
-  hybrid KEM (suite 0x12) but are **not yet combined into a hybrid** — records
-  still get no post-quantum protection — and neither is wired into a flow. Plus a
+  The **X-Wing hybrid** (`xwing_keygen`/`xwing_encapsulate`/`xwing_decapsulate`,
+  per the pre-RFC IETF draft, verified against its official test vectors)
+  combines the two at the primitive level — but it is **not wired into the
+  envelope or any flow** (`kem_ct` stays reserved), so records still get no
+  post-quantum protection. Plus a
   `sigil-ffi` C-ABI for the clients: the AEAD `seal`/`open`/`buffer_free` (heap
   `SigilBuffer`) and the fixed-size, caller-buffer Ed25519 (`sign`/`verify`/
   `public_key`) and X25519 (`shared_secret`/`public_key`/`is_contributory`)

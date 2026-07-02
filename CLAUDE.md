@@ -45,9 +45,11 @@ public, make no security claims, until the audit completes and trademark clears.
   32-byte secret, no in-core RNG), and a post-quantum **ML-KEM-768** (FIPS 203)
   KEM primitive (`mlkem768_keygen`/`mlkem768_encapsulate`/`mlkem768_decapsulate`,
   caller-supplied 32-byte `d`/`z`/`m` seeds, no in-core RNG, implicit rejection
-  on decapsulate; with X25519 these are the two halves of the future
-  X25519&ML-KEM-768 hybrid KEM of suite 0x12 — halves **still NOT combined**,
-  secrets never mixed, not wired into a flow);
+  on decapsulate), combined by the **X-Wing hybrid** (`hybrid.rs`:
+  `xwing_{keygen,encapsulate,decapsulate}`, draft-connolly-cfrg-xwing-kem-10,
+  official-KAT-verified, caller-supplied 32-byte seed / 64-byte eseed — the
+  hybrid exists as a primitive but is **not wired into the envelope or any
+  flow**, `kem_ct` stays reserved, records still get no PQ protection);
   `ffi` = C-ABI over core: AEAD `seal`/`open`/`buffer_free` (heap `SigilBuffer`)
   + suite smoke export, and fixed-size caller-buffer `ed25519_{public_key,sign,
   verify}` / `x25519_{public_key,shared_secret,is_contributory}` (classical-only,

@@ -20,12 +20,15 @@
 //!
 //! A classical X25519 key-agreement primitive ([`x25519_public_key`] /
 //! [`x25519_shared_secret`], [`mod@kex`]) provides the classical half of the
-//! hybrid X25519&ML-KEM-768 KEM, and a post-quantum ML-KEM-768 primitive
+//! hybrid X25519&ML-KEM-768 KEM, a post-quantum ML-KEM-768 primitive
 //! ([`mlkem768_encapsulate`] / [`mlkem768_decapsulate`], [`mod@mlkem`],
-//! FIPS 203) provides the post-quantum half. Both halves are standalone
-//! primitives — their shared secrets are **not yet combined**, so the hybrid
-//! KEM of suite `0x12` still does not exist and nothing in this crate is
-//! post-quantum protected yet.
+//! FIPS 203) provides the post-quantum half, and the **X-Wing hybrid**
+//! ([`xwing_encapsulate`] / [`xwing_decapsulate`], [`mod@hybrid`],
+//! draft-connolly-cfrg-xwing-kem-10) combines them at the primitive level —
+//! breaking it requires breaking both. The hybrid is **not wired into the
+//! envelope, `seal_record`/`open_record`, or any product flow** (the envelope's
+//! `kem_ct` stays reserved), so sealed records still gain no post-quantum
+//! protection, and there is still no post-quantum signature.
 //!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
@@ -45,6 +48,7 @@ extern crate alloc;
 
 mod aead;
 mod envelope;
+mod hybrid;
 mod kdf;
 mod kex;
 mod mlkem;
@@ -52,6 +56,11 @@ mod record;
 mod sig;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
+pub use hybrid::{
+    xwing_decapsulate, xwing_encapsulate, xwing_keygen, XWingError, XWING_CIPHERTEXT_LEN,
+    XWING_DECAP_KEY_LEN, XWING_ENCAP_KEY_LEN, XWING_ENCAP_SEED_LEN, XWING_LABEL, XWING_SEED_LEN,
+    XWING_SHARED_SECRET_LEN,
+};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 pub use kex::{
     is_contributory, x25519_public_key, x25519_shared_secret, KEX_PUBLIC_KEY_LEN, KEX_SECRET_LEN,

@@ -7,16 +7,15 @@
 //! account/key-management flow — treat it as a building block, not a finished
 //! secure system.
 //!
-//! ## The PQ half is now real — the hybrid still does not exist
+//! ## The PQ half is real — use the hybrid, not this module alone
 //!
 //! [`crate::AlgorithmSuite::HybridPq`] (suite `0x12`) names a **hybrid** KEM:
 //! classical X25519 ([`crate::kex`]) **and** post-quantum ML-KEM-768 (this
-//! module). Both halves now exist as primitives, but their shared secrets are
-//! **NOT combined** — the hybrid module (the HKDF combine per
-//! `docs/crypto-spec.md`) does not exist yet. Until it lands, sealed records
-//! gain **no** post-quantum protection, and using this module alone forfeits
-//! the hybrid's belt-and-suspenders property: security would rest on
-//! ML-KEM-768 by itself.
+//! module). The **X-Wing hybrid** ([`crate::hybrid`]) combines the two at the
+//! primitive level; using this module alone forfeits the hybrid's
+//! belt-and-suspenders property (security would rest on ML-KEM-768 by itself).
+//! No product flow is wired to either yet, so sealed records still gain **no**
+//! post-quantum protection.
 //!
 //! ## Randomness is the caller's responsibility
 //!
@@ -75,9 +74,9 @@
 //!   feature scrubs its internal decapsulation key on drop; our stack copies of
 //!   the encoded byte arrays are not scrubbed).
 //! - Encoded sizes are large and fixed: ek = 1184, dk = 2400, ct = 1088, ss = 32.
-//! - This is unaudited and is not wired into the hybrid KEM, the envelope, or
-//!   any product flow; sealed records gain no post-quantum protection until the
-//!   hybrid combine lands.
+//! - This is unaudited. It is consumed by the X-Wing hybrid ([`crate::hybrid`])
+//!   but not wired into the envelope or any product flow; sealed records still
+//!   gain no post-quantum protection.
 
 use ml_kem::kem::Decapsulate;
 use ml_kem::{EncapsulateDeterministic, Encoded, EncodedSizeUser, KemCore, MlKem768, B32};

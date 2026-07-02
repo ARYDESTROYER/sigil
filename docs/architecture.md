@@ -50,10 +50,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   - the **classical X25519 key-agreement primitive** (`x25519_public_key` /
     `x25519_shared_secret`, plus a constant-time `is_contributory` low-order-point
     check) — a raw RFC 7748 Diffie-Hellman over a **caller-supplied 32-byte secret
-    scalar** (real but UNAUDITED; a standalone primitive, **not yet** wired into the
-    hybrid `X25519 & ML-KEM-768` KEM of suite `0x12` — the ML-KEM-768 post-quantum
-    half now exists as its own standalone primitive below, but the two are **NOT
-    combined**; see
+    scalar** (real but UNAUDITED; consumed by the X-Wing hybrid below; see
     [`decisions/0010-x25519-key-agreement-primitive.md`](decisions/0010-x25519-key-agreement-primitive.md));
   - the **post-quantum ML-KEM-768 KEM primitive** (`mlkem768_keygen` /
     `mlkem768_encapsulate` / `mlkem768_decapsulate`, FIPS 203) — deterministic
@@ -61,9 +58,18 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     encapsulation), with FIPS 203 implicit rejection on decapsulation (a tampered
     ciphertext yields a *different* shared secret, not an error) and a §7.2
     encapsulation-key modulus check the underlying crate omits (real but
-    UNAUDITED; a standalone primitive, **not** combined with X25519, so **records
-    sealed today still have NO post-quantum protection**; see
-    [`decisions/0013-ml-kem-768-pq-kem-primitive.md`](decisions/0013-ml-kem-768-pq-kem-primitive.md)).
+    UNAUDITED; consumed by the X-Wing hybrid below; see
+    [`decisions/0013-ml-kem-768-pq-kem-primitive.md`](decisions/0013-ml-kem-768-pq-kem-primitive.md));
+  - the **X-Wing hybrid KEM primitive** (`xwing_keygen` / `xwing_encapsulate` /
+    `xwing_decapsulate`, draft-connolly-cfrg-xwing-kem-10, pre-RFC) — combines
+    the two halves above at the primitive level
+    (`ss = SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)`; ek 1216 B, ct 1120 B,
+    dk = a 32-byte seed), verified against the official X-Wing test vectors —
+    breaking it requires breaking **both** X25519 and ML-KEM-768 (real but
+    UNAUDITED; **not wired into the envelope or any product flow** — `kem_ct`
+    stays reserved, so **records sealed today still have NO post-quantum
+    protection**; see
+    [`decisions/0014-xwing-hybrid-kem.md`](decisions/0014-xwing-hybrid-kem.md)).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
   the AEAD nonce, the Ed25519 signing seed, the X25519 secret scalar, and the
@@ -130,7 +136,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   envelope codec (encode/decode)                                │    │
    │   │   Argon2id KDF  →  XChaCha20-Poly1305 + HKDF AEAD               │    │
    │   │   record API: seal_record / open_record                        │    │
-   │   │   Ed25519 · X25519 · ML-KEM-768 (all entropy caller-supplied)   │    │
+   │   │   Ed25519 · X25519 · ML-KEM-768 · X-Wing hybrid (caller entropy)│    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
@@ -317,17 +323,14 @@ authoritative list, with rationale, is the **defer ledger** in
   ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **No hybrid KEM, and no hybrid signature, in a flow.** Both classical halves
-  **and the post-quantum KEM half** now exist as standalone, UNAUDITED
-  primitives, but **neither hybrid is complete** and none is wired into a
-  record/product flow:
-  - *KEM.* **Both halves now exist** — the classical `x25519_shared_secret`
-    primitive and the post-quantum `mlkem768_*` primitive (FIPS 203) — but their
-    shared secrets are **not combined**: the HKDF combine of suite `0x12`
-    (`ss_combined`) does not exist in code, and the envelope's `kem_ct` field
-    stays reserved/unused. **Every record Sigil produces today therefore has NO
-    post-quantum protection**; the hybrid combine is the next planned crypto
-    increment.
+- **No hybrid KEM in a flow, and no hybrid signature at all.**
+  - *KEM.* The **X-Wing hybrid now exists as a primitive** (`xwing_*`,
+    combining X25519 + ML-KEM-768 with a proven combiner and official test
+    vectors), but it is **not wired into the envelope, the record API, or any
+    product flow**: the envelope's `kem_ct` field stays reserved/`None`
+    (populating it without a real recipient-key/rotation flow would be a dead
+    path that *looks* like PQ protection). **Every record Sigil produces today
+    therefore still has NO post-quantum protection.**
   - *Signatures.* The **classical Ed25519 half is implemented** as a standalone
     `sign`/`verify` primitive (caller-supplied seed; UNAUDITED), but the
     **ML-DSA-65 post-quantum half is not**, so the combined hybrid signature does

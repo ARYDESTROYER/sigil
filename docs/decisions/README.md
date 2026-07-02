@@ -42,3 +42,8 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0007](0007-caller-supplied-entropy-in-core.md) | Caller-supplied entropy in `sigil-core` | Accepted (2026-06) |
 | [0008](0008-device-key-request-auth.md) | Device-key request auth for the dev op-log (`SIGILD_OPLOG_PUBKEY`) | Accepted (2026-06) |
 | [0009](0009-manual-gated-deploy-and-publish.md) | Manual / human-gated deploy and publish | Accepted (2026-06) |
+| [0010](0010-x25519-key-agreement-primitive.md) | X25519 key-agreement primitive (classical KEM half) | Accepted (2026-07) |
+| [0011](0011-fixed-size-out-buffer-ffi-convention.md) | Fixed-size out-buffer convention for the asymmetric C-ABI | Accepted (2026-07) |
+| [0012](0012-nonce-replay-protection.md) | Per-request nonce replay protection for the dev op-log (v2) | Accepted (2026-07) |
+| [0013](0013-ml-kem-768-pq-kem-primitive.md) | ML-KEM-768 primitive (post-quantum KEM half, caller-supplied seeds) | Accepted (2026-07) |
+| [0014](0014-xwing-hybrid-kem.md) | X-Wing as the suite-0x12 hybrid KEM (drop the bespoke combiner) | Accepted (2026-07) |

@@ -1109,6 +1109,503 @@ Servers killed cleanly; temp dir + binaries removed.
   this entry finalizes the remaining living docs (this file, `CLAUDE.md`,
   `README.md`).
 
+## 2026-07-01 — Phase 13 (X25519 key-agreement primitive in libsigil-core)
+
+### Context & mandate
+- Goal: add the **classical X25519** (RFC 7748) key-agreement half of the planned
+  hybrid KEM (X25519 & ML-KEM-768, suite `0x12`) to `libsigil-core` as a real,
+  standalone cryptographic primitive — public-key derivation and Diffie-Hellman —
+  mirroring the Phase-11 Ed25519 primitive, without touching the existing
+  KDF/AEAD/sig code and without breaking the wasm-pure / no-RNG / getrandom-0
+  invariants.
+- ⚠️ This is the **KEX PRIMITIVE only**. The **ML-KEM-768 post-quantum half stays
+  FUTURE/unimplemented**, and the two shared secrets are **not** combined — there
+  is still **no post-quantum KEM** and **no hybrid** in this repo. Not wired into
+  any product/KEM flow. Real but **UNAUDITED**.
+- Method: research fan-out (43 opus agents over disjoint design questions) →
+  synthesized brief; I implemented; adversarial-review fan-out; **I re-ran the
+  full gate myself before committing.**
+
+### core — `core/src/kex.rs` ✅
+- New module, re-exported from `lib.rs`:
+  `x25519_public_key(&[u8;32]) -> [u8;32]` (= `x25519(secret, BASEPOINT)`),
+  `x25519_shared_secret(&[u8;32], &[u8;32]) -> [u8;32]` (raw DH scalar-mult), and
+  a constant-time `is_contributory(&[u8;32]) -> bool` all-zero/low-order check,
+  plus the length constants `KEX_SECRET_LEN`/`KEX_PUBLIC_KEY_LEN`/
+  `KEX_SHARED_SECRET_LEN` (all 32).
+- **Caller-supplied entropy:** takes a 32-byte secret scalar from the caller —
+  exactly like the KDF salt, the AEAD nonce, and the Ed25519 seed. **core still
+  generates NO randomness.** X25519 clamps the scalar internally.
+- **Raw primitive, caller owns policy.** `x25519_shared_secret` returns the raw
+  result and is total (never panics for any 32-byte input); the contributory
+  (all-zero) policy is surfaced via `is_contributory`, not decided for the caller
+  (RFC 7748 §6.1 stance, matching `sig.rs`). `is_contributory` uses `subtle`'s
+  constant-time `ct_eq` so it does not leak which bytes are zero.
+- ⚠️ **classical only** — documented as future/unimplemented for ML-KEM-768 in the
+  module docs, `lib.rs`, crypto-spec, architecture, and ADR 0010. **UNAUDITED**
+  throughout. Cross-primitive caveat added: do NOT reuse the same 32 bytes as both
+  an Ed25519 seed and an X25519 secret.
+
+### Dependency & the WASM/GETRANDOM gate ✅
+- Added **`x25519-dalek = { version = "2", default-features = false }`** (+
+  `subtle` declared directly, `default-features = false`, already transitive via
+  `curve25519-dalek`). `default-features = false` is load-bearing: it drops the
+  `getrandom`/`rand_core`, `zeroize`, and `static_secrets` paths — we use only the
+  RNG-free free function `x25519()` and the `X25519_BASEPOINT_BYTES` constant.
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (before and after), `cargo build -p sigil-core --target wasm32-unknown-unknown`
+  **succeeds**, and there is still exactly **1** `curve25519-dalek` in the lock
+  (shared with `ed25519-dalek`, no duplicate). `#![forbid(unsafe_code)]` and
+  `no_std` intact.
+
+### Tests ✅
+- **RFC 7748 §6.1 KAT** (Alice/Bob): derive both public keys from the given
+  secrets and compute the shared secret both directions — a real interop vector.
+- **RFC 7748 §5.2 KAT**: single scalar·u-coordinate multiplication — an
+  independent vector for the raw path.
+- Plus: symmetric agreement for self-derived keys, distinct-peer secrets differ,
+  determinism, `u=0` and `u=1` low-order points → all-zero + non-contributory, and
+  a direct `is_contributory` all-zero/non-zero test, and constant lengths.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 60 PASS** (9 new kex), sigil-ffi 7 PASS · wasm build
+  OK · getrandom count **0**.
+
+### docs — crypto-spec.md / architecture.md / ADR 0010 ✅
+- New **ADR 0010** (X25519 key-agreement primitive — classical KEM half,
+  caller-supplied secret, raw primitive + `is_contributory` policy hook,
+  cross-linked 0004/0007). `crypto-spec.md` hybrid-construction status now names
+  the classical X25519 half implemented (ML-KEM-768 half + combine still not);
+  `architecture.md` §1 lists the primitive and §6 splits the KEM/signature
+  half-built status. `README.md` + `CLAUDE.md` repo-map lines name the X25519 KEX
+  primitive. Decisions index updated.
+
+### ➡️ Still NOT done (honest)
+- **No PQ, no hybrid, not wired in.** ML-KEM-768 remains unimplemented; the two
+  shared secrets are not combined; the primitive is a standalone building block,
+  not part of any KEM/record/product flow. No zeroization. Real but UNAUDITED.
+
+## 2026-07-01 — Phase 14 (FFI expansion: Ed25519 sign/verify + X25519 over the C-ABI)
+
+### Context & mandate
+- Goal: expose the Phase-11 Ed25519 and Phase-13 X25519 primitives across the
+  `sigil-ffi` C-ABI so the native clients (separate repos) can call them, without
+  touching the existing `seal`/`open`/`buffer_free` surface and without adding any
+  dependency or RNG to the FFI.
+- Method: 35-agent research fan-out → synthesized FFI design brief (the first
+  synthesis run returned placeholder junk; re-ran just the synthesis from the
+  cached research with a strengthened prompt) → I implemented → gate re-run myself.
+
+### ffi — six new fixed-size exports ✅
+- **New calling convention** (ADR 0011): because every output is a **fixed size**
+  (32/64 bytes), these write into a **caller-allocated** out buffer and return an
+  `int32_t` status — **no heap `SigilBuffer`, nothing to `sigil_buffer_free`**.
+  `seal`/`open`/`buffer_free` are unchanged. New exports:
+  `sigil_ed25519_public_key`, `sigil_ed25519_sign`, `sigil_ed25519_verify`,
+  `sigil_x25519_public_key`, `sigil_x25519_shared_secret`,
+  `sigil_x25519_is_contributory`.
+- **One new status code `SIGIL_ERR_VERIFY = -4`.** `sigil_ed25519_verify` returns
+  `SIGIL_OK` (0) for a valid signature and collapses **all** `SigError` variants
+  (BadPublicKey/BadSignature/Verification) into `SIGIL_ERR_VERIFY` — no
+  structure leak, same stance as `sigil_open`→`SIGIL_ERR_OPEN`, but a distinct
+  code. `0 == valid` is documented loudly (opposite of a C bool).
+- **Guard-first, copy-first, alias-safe.** All required pointers null-checked
+  before any write; each fixed input copied into a local array before the output
+  is written, so out buffers may overlap inputs; `msg` reuses `optional_slice`
+  (null iff `len == 0`). `sigil_x25519_shared_secret` returns the **raw** DH result
+  (all-zero for a low-order peer → still `SIGIL_OK`); contributory policy is the
+  separate `sigil_x25519_is_contributory` **predicate** (1/0/-1, not a status code).
+- Algorithm-qualified names leave room for future `sigil_mldsa65_*` /
+  `sigil_mlkem768_*`. `#![deny(unsafe_op_in_unsafe_fn)]`, per-block `// SAFETY:`
+  notes, and `# Safety` doc sections on every export, matching the crate style.
+
+### hand-written header + docs ✅
+- `sigil.h` kept in sync **by hand**: new `#define SIGIL_ERR_VERIFY (-4)`, a new
+  banner section + the six prototypes (C99 sized-array params `uint8_t x[32]`),
+  broadened top/status-code comments. **Symbol parity verified**: the 10
+  `extern "C" fn` names in `lib.rs` == the 10 prototype names in `sigil.h`, and the
+  `SIGIL_*` codes match. New **ADR 0011** (fixed-size out-buffer convention);
+  `architecture.md` (ffi bullet + ASCII diagram), README, CLAUDE, decisions index,
+  and this journal updated in the same change.
+
+### Tests + gate (independently re-run) ✅
+- 15 new `#[test]`s (total **sigil-ffi 22**, sigil-core 60): Ed25519 round-trip,
+  tamper-sig/tamper-msg/wrong-key → `SIGIL_ERR_VERIFY`, malformed-pubkey collapses
+  (no crash), empty-message sign+verify, null-arg matrix, **RFC 8032 TEST 1 driven
+  through the C-ABI**; X25519 agreement, pubkey-matches-core, **RFC 7748 §6.1
+  through the C-ABI**, null-arg matrix, low-order peer → all-zero + `SIGIL_OK` +
+  non-contributory, `is_contributory` predicate, and a `status_code_values_are_stable`
+  regression pin (0,-1,-2,-3,-4).
+- `cargo fmt --check` clean · `clippy --all-targets -D warnings` clean · `cargo
+  test` 60 + 22 pass · wasm build OK · **getrandom count 0** (no new dep — ffi's
+  only dep stays `sigil-core`; `libsigil/Cargo.lock` unchanged by this phase).
+
+### ➡️ Still NOT done (honest)
+- **Classical-only, UNAUDITED, no keygen in FFI.** The PQ halves (ML-DSA-65 /
+  ML-KEM-768) are unimplemented, so nothing here is post-quantum; the host supplies
+  seeds/secrets (no RNG in the FFI, per ADR 0007); none of it is wired into an
+  account/key-management flow. Optional `panic = "abort"` hardening left as a noted
+  future option (the wrapped core fns are already panic-free for fixed inputs).
+
+## 2026-07-01 — Phases 13 & 14 adversarial review follow-ups
+
+Both phases went through large multi-agent adversarial review passes after commit;
+**must-fix was empty in both** (no code defects, UB, or invariant violations —
+the code was verified sound, KATs pass, constant-time check confirmed, alias-safety
+confirmed genuinely sound). The surviving items were doc-accuracy and test-coverage
+gaps, applied as follow-up commits:
+
+- **Phase 13 review** (35 reviewers) → commit `2999c76`: corrected ADR 0010's
+  `default-features` description (matches the Cargo.toml comment now); documented +
+  tested two X25519 properties — non-canonical public-key encoding (bit-255 mask /
+  mod-p) and the argument-order footgun; added `clamping_equivalence` and a
+  non-trivial order-8 low-order-point test (sigil-core → 63 tests).
+- **Phase 14 review** (22 dimensions × 3 independent voters = 66) → this commit:
+  the loudly-documented FFI alias-safety guarantee (out may overlap in) was tested
+  by zero tests; added three in-place aliasing regression tests
+  (`ed25519_public_key_in_place_alias`, `ed25519_sign_out_overlaps_seed`,
+  `x25519_shared_secret_in_place_alias`) that pin the copy-before-write ordering
+  against a known-answer vector (sigil-ffi → 25 tests). The review explicitly
+  discarded two suggested "missing" tests as non-issues (a wrong-length verify is
+  structurally impossible for fixed-size array params; is_contributory-on-real-DH is
+  already covered).
+
+Gate after both follow-ups: fmt/clippy clean; **sigil-core 63 + sigil-ffi 25** pass;
+wasm green; getrandom 0.
+
+## 2026-07-01 — Phase 15 (op-log replay protection: per-request nonce, contract v2)
+
+### Context & mandate
+- Goal: close the replay gap the docs/code explicitly flagged on the dev op-log's
+  optional Ed25519 auth ("the 300 s window bounds replay but does NOT prevent it —
+  there is no nonce/jti store"). Add a per-request **nonce** and a bounded
+  server-side nonce store so a captured signed request cannot be replayed within
+  the window. Cross-language (sigild Go + CLI Rust), byte-exact contract.
+- Method: 34-agent research fan-out → synthesized design brief (the first
+  schema-constrained synthesis failed the retry cap; re-ran the synthesis as
+  free-text from the cached research). I implemented; **I re-ran the gate and a
+  LIVE cross-language interop + replay test myself.**
+
+### The v2 contract (`sigil-oplog-auth-v2`)
+- Bumped the domain `v1`→`v2` and inserted a `NONCE` line **between TIMESTAMP and
+  BODY**: `MESSAGE = "sigil-oplog-auth-v2\n" + METHOD + "\n" + PATH + "\n" + QUERY
+  + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY`. A **hard cutover** — v1 and v2
+  are mutually unverifiable (domain + framing both differ). New required header
+  **`X-Sigil-Nonce`**; the CLI sends standard-base64 of 16 CSPRNG bytes.
+
+### sigild — nonce store + v2 verify ✅
+- New `internal/api/noncestore.go`: a bounded, TTL-evicting, in-memory
+  `nonceStore` (Go stdlib `sync.Mutex` + map). `checkAndRecord(nonce, now)` is an
+  atomic read-modify-write. **TTL = 2× the skew window (600 s), not 1×** — the
+  skew check is two-sided (a request may be signed up to 300 s in the future), so
+  a captured request stays replayable until `ts+300` = up to `now+600`; a 1× TTL
+  would evict the guard a window too early. Expiry anchors to the **server's**
+  receipt time (never the attacker-controlled client ts). Hard cap
+  (`nonceStoreMaxEntries = 65536`); at capacity, after sweeping expired entries,
+  it **fails closed**.
+- `opsauth.go` (v2): read all three headers; **validate the nonce BEFORE folding
+  it into the message** (`validNonce`: non-empty, ≤128 bytes, printable ASCII
+  `0x21`–`0x7E` so it can't contain `\n` and shift framing); fold nonce into the
+  message; `ed25519.Verify`; then — **only after a valid signature** — consult the
+  nonce store (so unauthenticated traffic can't populate/flood it). Nonce store
+  wired onto `handlers` and created in `NewRouter` only when auth is on.
+- Unchanged when auth is off (no pubkey → no nonce required, byte-for-byte the
+  same). `main.go` WARN updated. Still Go stdlib-only (no `go.sum`).
+
+### cli/ — v2 signing ✅
+- `sign_oplog_request` now generates a `fresh_nonce()` (16 CSPRNG bytes via the
+  already-present `getrandom`, standard-base64), folds it into the v2 message, and
+  returns `(timestamp, nonce, signature)`; `push`/`pull` attach `X-Sigil-Nonce`.
+  Unsigned path (no `--key`) unchanged. `libsigil/Cargo.lock` unchanged, getrandom
+  **0**; `cli/Cargo.lock` gained `x25519-dalek`/`subtle` transitively from Phase
+  13's `sigil-core` (expected; cli getrandom stays 1, `cli/Cargo.toml` unchanged).
+
+### Tests + gate (independently re-run) ✅
+- Go: `noncestore_test.go` (fresh/replay/expiry/cap-fail-closed/cap-reclaim/
+  concurrent, `-race`) + `opsauth_test.go` extended to v2 (replay→401, missing/
+  malformed nonce→401, v1-message→401, distinct-nonces→both accepted, plus all
+  existing cases updated). `gofmt`/`vet`/`build` clean; `go test -race ./internal/
+  api/` green.
+- Rust: `fresh_nonce` distinctness/framing test; `push/pull_with_key` updated to
+  verify over the v2 message + assert the nonce header. cli fmt/clippy clean, 27
+  lib + 2 integration tests. libsigil 63+25 unaffected.
+
+### Verification — LIVE cross-language interop + replay (the real gate) ✅
+Built `sigild` + the CLI. `keygen` → device.key (0600) + pubkey. Started sigild
+with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
+1. **Rust-signed v2 push → Go verify:** `sigil push --key` → "pushed vault demo
+   seq 1" (the byte-exact cross-language contract works over a real socket).
+2. Second signed push → **seq 2** (fresh nonce accepted).
+3. Unsigned push → **HTTP 401** `{"error":"unauthorized",…}`.
+4. **Replay (the point):** captured a real CLI-signed request (via a one-shot
+   capture server), then `curl`-replayed it twice to the live sigild — **first →
+   201, identical resend (same nonce, same still-fresh timestamp) → 401.** Because
+   the *same timestamp* succeeded on the first replay, the 401 is the **nonce
+   store** catching the replay, not staleness.
+5. Tampered nonce → **401**. Server killed; no leftover processes.
+
+### docs ✅
+- New **ADR 0012** (nonce replay protection, v2); `api.md` auth section rewritten
+  to v2 (3 headers, 6-line message, replay step, honest in-memory caveat);
+  `architecture.md` §1/§2/§6, `README.md`, `CLAUDE.md`, `cli/README.md`, and the
+  decisions index updated; the stale "not nonce-tracked" phrasing replaced (ADR
+  0008 and journal history left immutable).
+
+### ⛔ Still NOT production (honest)
+- The nonce store is **in-memory / per-process**: lost on restart (a captured
+  request could be replayed after a restart within its remaining window) and not
+  shared across instances (replicas don't dedupe). Production needs a
+  shared/persistent store (e.g. Redis `SET NX EX`). Still a SINGLE static dev key,
+  plain-HTTP, dev-gated-off by default. Enrollment / multi-device / JWT remain
+  future.
+
+## 2026-07-01 — Phase 16 (web marketing test coverage — the last untested surface)
+
+### Context & mandate
+- Goal: close the one surface with **zero automated tests** — `web/apps/marketing`.
+  The waitlist API route carries real, security-relevant validation logic (email
+  format, honeypot, consent gating, "not persisted" skeleton contract) and the
+  robots policy encodes the stealth posture; both were untested. Add a minimal,
+  low-dependency test harness and cover them.
+
+### web — vitest, node-env, vitest-only dependency ✅
+- Added **vitest** (`^2.1.8`) as the marketing app's only new devDependency, a
+  `test: "vitest run"` script (marketing + root `web` passthrough), and
+  `vitest.config.ts` (environment `node`, `include: app/**/*.test.ts`). No jsdom,
+  no React-testing libs — the tested logic is pure server code, so the dependency
+  surface stays tiny.
+- `app/api/waitlist/route.test.ts` — 8 tests over the `POST` handler: non-JSON →
+  `400 invalid_json`; honeypot (`website` non-empty) → `200 ok` and
+  short-circuits before email/consent; missing/malformed email (incl. `undefined`,
+  non-string, `""`, no-`@`, no-dot, space, trailing-dot) → `400 invalid_email`;
+  over-254-char email → `400 invalid_email`; `consent !== true` (incl. `"true"`,
+  `1`, `false`) → `400 consent_required`; valid signup → `202` with a note that
+  asserts **it was validated, NOT persisted** (guards the no-un-backed-up-PII
+  posture); empty object body → `invalid_email`.
+- `app/robots.test.ts` — 1 test asserting the pre-launch policy disallows all
+  crawling (`{ userAgent: "*", disallow: "/" }`), so a regression that opens
+  indexing fails CI.
+- `NextResponse` works in the plain node test env (Node 22 globals), so the route
+  is tested exactly as shipped — no logic extraction/duplication.
+
+### CI ✅
+- `.github/workflows/web.yml` gains a `pnpm test` step (after typecheck, before
+  build). `README.md` / `CLAUDE.md` web build commands updated to include `test`.
+
+### Verification (independently re-run) ✅
+- `pnpm install` (frozen) reaches the registry fine; **`pnpm test` → 9 tests pass
+  (2 files)**. Regression: `pnpm typecheck` clean (the new `.test.ts` +
+  `vitest.config.ts` typecheck), `pnpm lint` clean, `pnpm build` OK (8 routes; the
+  colocated `.test.ts` files are correctly ignored by the Next router). No product
+  code changed — tests only (+ tooling).
+
+### ⛔ Scope (honest)
+- Tests cover the marketing app's **pure server logic** only. The React
+  components (`page.tsx`, `waitlist-form.tsx`) and the Basic-Auth middleware are
+  not yet under test (would need jsdom / an integration harness) — a reasonable
+  next step, deliberately deferred to keep the dependency surface minimal.
+
+## 2026-07-01 — PR #14 to `main` + Phase 15 review follow-up
+
+- Opened **PR arydestroyer/sigil#14** (`claude/continuous-dev-workflow-qvk3wd` →
+  `main`) covering Phases 13–16. CI (path-filtered libsigil/sigild/cli/web +
+  security) green on first checks (gitleaks/govulncheck/builds); subscribed to PR
+  activity for CI/review events.
+- **Copilot review** (1 inline comment): the `nonceStore.ttl` field comment said
+  "== the auth skew window" while the store is configured with `2× opsAuthSkew`.
+  Valid nit — fixed the comment (`aa3d431`), thread resolved.
+- **Phase 15 adversarial review** (22 dimensions × 3 voters = 66) found **one
+  genuine defect** (LOW, unanimous 3/3): a **1-second under-retention off-by-one**
+  at the 2×-skew boundary. The skew gate is inclusive at `+opsAuthSkew` (skew==+300
+  passes) but the store's replay check is strict (`exp > now`); at the earliest
+  first receipt (`ts−300`) the guard expired one tick before the last
+  timestamp-valid replay (`ts+300`). Fixed with **`nonceStoreTTL = 2*opsAuthSkew +
+  1` (601)** so retention covers the full closed interval `[ts−skew, ts+skew]`
+  (`2a512cd`); proved the new `TestNonceStoreCoversFullSkewWindow` fails at 600 and
+  passes at 601. Added the review's should-fix coverage: concurrent same-nonce
+  single-winner (TOCTOU guard), GET-path replay, base64-alphabet nonce accept, and
+  the exact-`opsAuthNonceMaxLen` accept boundary. ADR 0012 + code comments synced.
+- Both adversarial reviews (Phases 13/14 earlier, Phase 15 here) found **no
+  shipped correctness bug beyond this one boundary nit**; the live cross-language
+  interop test remains the strongest evidence the replay guard works end-to-end.
+
+## 2026-07-02 — Phase 17 (ML-KEM-768 primitive — the post-quantum KEM half)
+
+### Context & mandate
+- Goal: implement the **post-quantum half** of suite `0x12`'s hybrid KEM —
+  **ML-KEM-768 (FIPS 203)** — as a standalone, real primitive in `libsigil-core`,
+  without breaking the wasm-pure / no-RNG / getrandom-0 invariants and without
+  claiming any hybrid exists (the combine is the next phase).
+- Method: **feasibility probe first** (a scratch crate proved ml-kem 0.2.3 with
+  `default-features=false, features=["deterministic"]` gives caller-seeded
+  deterministic keygen/encaps, builds no_std→wasm32, keeps getrandom at 0, and
+  round-trips with implicit rejection) → 38-agent research fan-out → synthesized
+  brief → I implemented; **I re-verified the KATs against NIST first-hand.**
+
+### core — `core/src/mlkem.rs` ✅
+- New module, re-exported from `lib.rs`:
+  `mlkem768_keygen(&d, &z) -> (ek[1184], dk[2400])` (FIPS 203 order, total),
+  `mlkem768_encapsulate(&ek, &m) -> Result<(ct[1088], ss[32])>`,
+  `mlkem768_decapsulate(&dk, &ct) -> Result<ss[32]>`, `MlKemError`, and the
+  seven `MLKEM768_*_LEN` constants.
+- **Caller-supplied entropy** (ADR 0007): the FIPS 203 seeds `d`/`z` (keygen) and
+  `m` (encapsulation) all come from the caller; the deterministic API is the same
+  FIPS 203 algorithm with the RNG hoisted out. Docs mandate fresh CSPRNG values
+  and explain why `m` reuse is dangerous; callers are steered to **store the
+  64-byte `d‖z` seed instead of the 2400-byte dk** (FIPS 203 permits re-derivation).
+- **We implement the FIPS 203 §7.2 modulus check ourselves** — the research pass
+  discovered ml-kem 0.2.3 does NOT validate encapsulation keys (it silently
+  reduces non-canonical coefficients mod q, diverging from conformant peers).
+  `mlkem768_encapsulate` re-encodes and compares; mismatch →
+  `MlKemError::BadEncapsulationKey` (the module's only reachable error).
+- **Implicit rejection preserved, loudly documented**: decapsulating a tampered
+  ciphertext returns `Ok` with a DIFFERENT pseudorandom secret, never an error
+  (an error would be a CCA oracle); dk integrity is the caller's responsibility.
+- ⚠️ Honest labeling everywhere: this is a REAL PQ primitive, but the **hybrid
+  still does not exist** — the two shared secrets are never mixed, `kem_ct` stays
+  reserved, and **records sealed today still get no post-quantum protection.**
+
+### Dependency & the WASM/GETRANDOM gate ✅
+- **`ml-kem = { version = "0.2", default-features = false, features =
+  ["deterministic", "zeroize"] }`** (RustCrypto, 0.2.3). New lock entries:
+  hybrid-array, kem, sha3, keccak — all RNG-free, build.rs-free. `rand_core`
+  stays trait-definitions-only. ✅ **getrandom count still 0**, wasm32 build
+  green, `#![forbid(unsafe_code)]`/no_std intact.
+- **MSRV bumped 1.74 → 1.81** in core/ffi/cli manifests (forced by hybrid-array,
+  a required ml-kem dep); local + CI toolchains unaffected. Recorded in ADR 0013.
+
+### KATs — first-hand verified against NIST ✅
+- Downloaded **usnistgov/ACVP-Server @ 65370b8** (the commit ml-kem's own tests
+  pin) myself: ML-KEM-768 keyGen tgId 2 **tcId 26** and encapDecap tcId 26.
+- Verified the research brief's every value against the official file (d, z, m,
+  SHA-256(ek), SHA-256(dk), 16-byte spot pins — all match), then ran ml-kem
+  locally with the official (d,z): **ek and dk byte-for-byte identical to NIST's
+  full-length official vectors** — a true interop proof, performed first-hand.
+- The chained encaps half (official ACVP `m` under that key → ct/ss) matched the
+  brief's cross-checked values exactly when computed locally. Rust KAT literals
+  were generated mechanically from the downloaded file (no hand transcription).
+- Tests (13 new; **sigil-core 76 + sigil-ffi 25 total, all green**): round-trip,
+  keygen/encaps determinism, d-sensitivity, z-only-changes-rejection-secret,
+  m-sensitivity, tampered-ct implicit rejection (Ok + different ss), wrong-dk,
+  all-zero-seed totality, non-canonical-ek rejection (§7.2), constants, the ACVP
+  keygen KAT, and the chained encaps/decaps KAT.
+
+### docs ✅
+- New **ADR 0013** (deterministic caller-seeded API justification, the §7.2
+  modulus-check decision, implicit-rejection consequence, MSRV bump, KAT
+  provenance). `crypto-spec.md` implementation status flipped honestly
+  (specified-but-not-implemented → implemented-but-NOT-combined);
+  `architecture.md` §1 (new bullet + no-randomness paragraph + diagram) and §6;
+  `README.md` / `CLAUDE.md` repo-maps; ffi banner wording tightened ("PQ halves
+  not implemented" → ML-DSA-65 unimplemented, ML-KEM-768 not exposed over the
+  ABI, no hybrid); `kex.rs` header cross-links `crate::mlkem`; decisions index.
+
+### ➡️ Still NOT done (honest)
+- **No hybrid, no PQ protection for records.** The combine
+  (`HKDF(ss_x‖ss_kem‖transcript, "sigil-hybrid-v1")`) is the next phase (18),
+  with its own ADR covering the transcript definition and how `kem_ct` gets
+  bound under the AEAD. ML-DSA-65 remains unimplemented (no PQ signature).
+  Nothing is audited; no product flow uses any of it.
+
+## 2026-07-02 — Phase 18 (X-Wing hybrid KEM — the combine)
+
+### Context & the load-bearing decision
+- Goal: combine the two now-real KEM halves (X25519, Phase 13; ML-KEM-768,
+  Phase 17) into the suite-`0x12` hybrid so breaking it requires breaking BOTH.
+- **Decision (ADR 0014): implement X-Wing** (draft-connolly-cfrg-xwing-kem-10),
+  composed from our existing `kex`/`mlkem` modules + the already-in-tree `sha3`,
+  and **drop the brief's bespoke `sigil-hybrid-v1` HKDF sketch** (undefined
+  transcript, no proof, no vectors). Spec follows analysis: X-Wing is a named
+  CFRG construction with a formal IND-CCA proof and official test vectors — an
+  auditor reviews a known construction against published KATs. The RustCrypto
+  `x-wing` crate was **rejected on hard facts** (MSRV 1.85 + edition 2024 vs our
+  1.81; pins a duplicate pre-release copy of half our crypto tree). 26-agent
+  research fan-out settled it; a critical drift-trap was caught there: the
+  combiner label moved to the END in draft -05 — label-first descriptions (like
+  our own planning notes) are the obsolete ≤-04 form.
+
+### core — `core/src/hybrid.rs` ✅
+- `xwing_keygen(&seed[32]) -> ek[1216]` (the **seed IS the decapsulation key**;
+  SHAKE-256-expanded to ML-KEM `(d,z)` ‖ X25519 sk, components re-derived and
+  never stored), `xwing_encapsulate(&ek, &eseed[64]) -> (ct[1120], ss[32])`
+  (eseed = ML-KEM `m` ‖ ephemeral X25519 secret; only reachable error = the
+  §7.2 ek modulus check via `XWingError::MlKem`), `xwing_decapsulate` (total;
+  implicit rejection inherited — never a CCA oracle). Combiner:
+  `SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)`, label = `\.//^\` hashed LAST.
+- Per the draft: **no contributory/low-order check inside the hybrid** (the
+  proof binds `ct_X ‖ pk_X`; adding a rejection would deviate from the analyzed
+  construction). ML-KEM pk/ct deliberately not hashed (FO-specific shortcut —
+  documented as non-generic).
+
+### Verification — official KATs, first-hand ✅
+- Re-downloaded the official vectors myself (`dconnolly/draft-connolly-cfrg-
+  xwing-kem`, `spec/test-vectors.json`) and confirmed byte-identical to the
+  research-vendored copy; literals generated mechanically; the SHAKE-256
+  seed-expansion split independently verified with python `hashlib.shake_256`.
+- **`xwing_official_known_answer` passes all 3 official vectors in both
+  directions** (ek digest, ct digest, ss verbatim; encaps AND decaps). Plus 14
+  more tests: round-trip, keygen/encaps determinism, seed-expansion KAT, both
+  tamper halves (ML-KEM half → implicit rejection; X25519 half → ss changes,
+  proving the combiner binds ct_X), wrong-seed, distinct-seeds/eseeds, all-zero
+  totality, label pin, §7.2 rejection through the hybrid, constants.
+- Gate: fmt/clippy clean · **sigil-core 90 + sigil-ffi 25 tests** · wasm32 green
+  · **getrandom 0** · lock delta = ONE line (sha3 added to sigil-core's dep
+  list; zero new packages) · MSRV unchanged at 1.81.
+
+### docs ✅
+- **ADR 0014** (the X-Wing adoption + proof shape + crate rejection + the
+  FO-specific-shortcut warning). `crypto-spec.md`: the bespoke construction
+  block REPLACED with the X-Wing definition (marked superseding the sketch);
+  status paragraph flipped (combined at the primitive level; still not wired;
+  records still no PQ). `architecture.md` §1 (hybrid bullet + diagram) and §6;
+  `README`/`CLAUDE` repo-maps; `kex.rs`/`mlkem.rs`/Cargo.toml comment flips;
+  decisions index; **MARKETING-CLAIMS**: added "standards-based hybrid"/
+  "NIST-standard encryption" to the forbidden list (X-Wing is a pre-RFC draft,
+  not a standard).
+
+### ⛔ Still NOT done (honest)
+- The hybrid exists **as a primitive only**: `kem_ct` stays reserved/`None` —
+  wiring it into the envelope/record needs a recipient static-key model, an
+  ss→record-key wrap, and rotation semantics (future ADR). **Records sealed
+  today still get no post-quantum protection.** No PQ signature (ML-DSA-65).
+  Everything UNAUDITED.
+
+## 2026-07-02 — Phases 17/18 adversarial review follow-ups
+
+The Phase 17 review ran 54/61 voters (18 of 20 dimensions complete) and the
+Phase 18 review 21/55 (7 of 18 dimensions) before hitting the session token
+limit; the consolidation steps died, so **I consolidated the raw votes myself**
+from the workflow journals. Honest coverage note: Phase 18's **seven completed
+dimensions were the most safety-critical ones** (combiner byte order vs the
+draft, seed expansion, eseed split, key/ct layout, panic-freedom, the
+no-contributory-check decision, error surface) — **all clean, zero flagged**;
+the unreviewed remainder is docs-accuracy/test-adequacy territory, and the KATs
+were already first-hand verified. Phase 17's three flagged dimensions (9
+voters), all real, all fixed here:
+
+- **MSRV was unbuildable as declared (MEDIUM, 3/3, empirically verified by the
+  reviewers):** `rust-version = "1.81"` landed in all three manifests, but
+  `cargo +1.81 build --locked` failed — both lockfiles pinned `base64ct 1.8.3`
+  (edition 2024, requires rustc 1.85; pulled via argon2→password-hash). Fixed:
+  precise-pinned **base64ct 1.6.0** (edition 2021, rust-version 1.60) in
+  `libsigil/Cargo.lock` and `cli/Cargo.lock`; swept the rest of the lock — no
+  other package requires > 1.81. Full gate re-run green after the pin.
+- **Stale negation on the web security page (LOW, 3/3):** `security/page.tsx`
+  still listed ML-KEM-768 as "planned" (the page's own legend: "not yet
+  started") — false since Phase 17. Fixed: ML-KEM-768 → "in development;
+  unaudited" (matching the equally-real X25519/Ed25519 rows) and added an
+  **X-Wing hybrid combine row** ("pre-RFC IETF draft", in development,
+  unaudited). ML-DSA-65 and TLS rows correctly stay "planned". Web
+  typecheck/lint/test/build green.
+- **Modulus-check hardening (LOW, 3/3):** the self-implemented FIPS 203 §7.2
+  check had no false-positive guard and no exact boundary test. Added
+  `every_keygen_ek_passes_modulus_check` (50 seeds — a decode/re-encode
+  non-identity for any honest key would wrongly reject valid peers) and
+  `modulus_check_exact_boundary` (first coefficient == q → rejected;
+  == q−1 → accepted). sigil-core → **92 tests**.
+
+Gate after all fixes: fmt/clippy clean · **sigil-core 92 + sigil-ffi 25 + cli
+27** · wasm32 green · getrandom 0.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

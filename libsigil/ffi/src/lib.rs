@@ -10,6 +10,8 @@
 //!
 //! ## Exports
 //!
+//! *Symmetric AEAD (variable-size output → heap [`SigilBuffer`]):*
+//!
 //! - [`sigil_current_suite`] — link/smoke check: returns the current
 //!   algorithm-suite byte.
 //! - [`sigil_seal`] — encrypt a plaintext under a caller-supplied master key
@@ -18,6 +20,19 @@
 //! - [`sigil_open`] — authenticate and decrypt encoded envelope bytes,
 //!   returning the recovered plaintext in a heap-allocated [`SigilBuffer`].
 //! - [`sigil_buffer_free`] — release a [`SigilBuffer`] produced by this library.
+//!
+//! *Asymmetric primitives (fixed-size output → caller-provided buffer,
+//! classical-only, UNAUDITED):*
+//!
+//! - [`sigil_ed25519_public_key`] — derive the 32-byte Ed25519 public key from a
+//!   caller-supplied 32-byte seed.
+//! - [`sigil_ed25519_sign`] — 64-byte Ed25519 signature over a message.
+//! - [`sigil_ed25519_verify`] — verify an Ed25519 signature (`SIGIL_OK` == valid).
+//! - [`sigil_x25519_public_key`] — derive the 32-byte X25519 public key from a
+//!   caller-supplied 32-byte secret scalar.
+//! - [`sigil_x25519_shared_secret`] — 32-byte X25519 Diffie-Hellman shared secret.
+//! - [`sigil_x25519_is_contributory`] — constant-time all-zero (low-order) check
+//!   on a shared secret (a predicate: `1`/`0`, not a status code).
 //!
 //! ## Ownership / memory contract
 //!
@@ -28,6 +43,16 @@
 //! free the `data` pointer with any other allocator (e.g. C `free`). The
 //! `SigilBuffer` struct itself is a plain value owned by the caller; only the
 //! heap slice it points at is reclaimed by [`sigil_buffer_free`].
+//!
+//! The **asymmetric primitives** ([`sigil_ed25519_public_key`] /
+//! [`sigil_ed25519_sign`] / [`sigil_ed25519_verify`] / [`sigil_x25519_public_key`]
+//! / [`sigil_x25519_shared_secret`] / [`sigil_x25519_is_contributory`]) use a
+//! **different, simpler contract**: their outputs are a fixed size (32 or 64
+//! bytes), so they write into a **caller-allocated** output array and return a
+//! status code. They **never heap-allocate**, so there is no [`SigilBuffer`] and
+//! nothing to free. Because each input is copied into a local array before any
+//! output is written, an output buffer may safely overlap an input buffer, and on
+//! any error path the output array is left untouched.
 //!
 //! ## Caller responsibilities (pre-audit caveats)
 //!
@@ -42,7 +67,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::slice;
-use sigil_core::{open, seal, AlgorithmSuite, Envelope, KEY_LEN, NONCE_LEN};
+use sigil_core::{
+    is_contributory, open, public_key_from_seed, seal, sign, verify, x25519_public_key,
+    x25519_shared_secret, AlgorithmSuite, Envelope, KEX_PUBLIC_KEY_LEN, KEX_SECRET_LEN,
+    KEX_SHARED_SECRET_LEN, KEY_LEN, NONCE_LEN, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
+};
 
 /// Success: the operation completed and (for seal/open) `*out` was written.
 pub const SIGIL_OK: i32 = 0;
@@ -59,6 +88,14 @@ pub const SIGIL_ERR_OPEN: i32 = -2;
 /// [`SIGIL_ERR_OPEN`] so as not to leak structure; this code is currently
 /// returned only for input-shape problems.
 pub const SIGIL_ERR_BAD_INPUT: i32 = -3;
+/// Ed25519 verification failed on [`sigil_ed25519_verify`]: a malformed public
+/// key, a malformed signature, or a well-formed-but-non-matching signature.
+/// Deliberately a **single** code — [`sigil_core::SigError`]'s `BadPublicKey`,
+/// `BadSignature`, and `Verification` variants all collapse here so the boundary
+/// never leaks which check failed (mirroring how [`sigil_open`] collapses to
+/// [`SIGIL_ERR_OPEN`]). Kept distinct from [`SIGIL_ERR_OPEN`] so callers never
+/// conflate the signature boundary with the AEAD open boundary.
+pub const SIGIL_ERR_VERIFY: i32 = -4;
 
 /// A heap buffer owned by libsigil until released with [`sigil_buffer_free`].
 ///
@@ -259,6 +296,264 @@ pub unsafe extern "C" fn sigil_open(
         out.write(buffer);
     }
     SIGIL_OK
+}
+
+// ---- Asymmetric primitives (fixed-size, caller-provided out buffers) --------
+//
+// STATUS: pre-audit, UNAUDITED. These wrap `sigil-core`'s classical-only
+// building blocks — Ed25519 signatures ([`sigil_core::sign`] / [`verify`]) and
+// X25519 key agreement ([`sigil_core::x25519_shared_secret`]). ML-DSA-65 is NOT
+// implemented, and ML-KEM-768 — while now a core primitive — is NOT exposed over
+// this ABI and NOT combined with X25519, so these exports are **not**
+// post-quantum and are **not** wired into any account / key-management flow.
+//
+// Unlike [`sigil_seal`] / [`sigil_open`], every output here is a **fixed size**
+// (32 or 64 bytes), so these write into a **caller-allocated** output array and
+// return a status code. They never heap-allocate: there is **no** [`SigilBuffer`]
+// and **nothing** to [`sigil_buffer_free`]. All seeds/secrets are
+// **caller-supplied** entropy — this layer generates no randomness (see
+// [`sigil_core`]'s caller-supplied-entropy stance). Every fixed-size pointer
+// argument must be non-null; `msg` may be null iff `msg_len == 0`. A null
+// required pointer yields [`SIGIL_ERR_NULL_ARG`] and no output array is written.
+// Because each input is copied into a local array before any output is written,
+// the output buffer MAY safely overlap an input buffer.
+
+/// Derive the 32-byte Ed25519 public key from a caller-supplied 32-byte `seed`,
+/// writing it into `out_pk` (32 bytes).
+///
+/// STATUS: pre-audit, UNAUDITED classical building block. The seed is the
+/// caller's secret; this layer generates no randomness.
+///
+/// # Returns
+/// - [`SIGIL_OK`] on success (`out_pk` is written with 32 bytes).
+/// - [`SIGIL_ERR_NULL_ARG`] if `seed` or `out_pk` is null; nothing is written.
+///
+/// # Safety
+/// `seed` must point at 32 readable bytes and `out_pk` at 32 writable bytes.
+/// `out_pk` may overlap `seed` (the seed is copied out before `out_pk` is
+/// written).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_ed25519_public_key(seed: *const u8, out_pk: *mut u8) -> i32 {
+    if seed.is_null() || out_pk.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+    let mut seed_bytes = [0u8; SIG_SEED_LEN];
+    // SAFETY: `seed` is non-null (checked above) and the caller guarantees it
+    // points at SIG_SEED_LEN readable bytes.
+    unsafe {
+        seed_bytes.copy_from_slice(slice::from_raw_parts(seed, SIG_SEED_LEN));
+    }
+    let pk = public_key_from_seed(&seed_bytes);
+    // SAFETY: `out_pk` is non-null (checked above) and the caller guarantees 32
+    // writable bytes. `pk` is a fresh local, so any overlap with `seed` is
+    // harmless.
+    unsafe {
+        core::ptr::copy_nonoverlapping(pk.as_ptr(), out_pk, SIG_PUBLIC_KEY_LEN);
+    }
+    SIGIL_OK
+}
+
+/// Produce a 64-byte Ed25519 signature over `msg` (`msg_len` bytes) using the
+/// caller-supplied 32-byte `seed`, writing it into `out_sig` (64 bytes).
+///
+/// Signing is deterministic (RFC 8032). `msg` may be null iff `msg_len == 0` (an
+/// empty message is signed). STATUS: pre-audit, UNAUDITED classical building
+/// block.
+///
+/// # Returns
+/// - [`SIGIL_OK`] on success (`out_sig` is written with 64 bytes).
+/// - [`SIGIL_ERR_NULL_ARG`] if `seed` or `out_sig` is null, or `msg` is null with
+///   `msg_len != 0`; nothing is written.
+///
+/// # Safety
+/// `seed` must point at 32 readable bytes, `out_sig` at 64 writable bytes, and
+/// `msg` at `msg_len` readable bytes when `msg_len != 0`. `out_sig` may overlap
+/// the inputs (they are copied/borrowed before `out_sig` is written).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_ed25519_sign(
+    seed: *const u8,
+    msg: *const u8,
+    msg_len: usize,
+    out_sig: *mut u8,
+) -> i32 {
+    if seed.is_null() || out_sig.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+    // SAFETY: `msg` may be null iff `msg_len == 0`; the helper enforces that.
+    let msg_slice = match unsafe { optional_slice(msg, msg_len) } {
+        Some(s) => s,
+        None => return SIGIL_ERR_NULL_ARG,
+    };
+    let mut seed_bytes = [0u8; SIG_SEED_LEN];
+    // SAFETY: `seed` is non-null (checked above); caller guarantees 32 readable
+    // bytes.
+    unsafe {
+        seed_bytes.copy_from_slice(slice::from_raw_parts(seed, SIG_SEED_LEN));
+    }
+    let sig = sign(&seed_bytes, msg_slice);
+    // SAFETY: `out_sig` is non-null (checked above); caller guarantees 64 writable
+    // bytes. `sig` is a fresh local, so overlap with `seed`/`msg` is harmless.
+    unsafe {
+        core::ptr::copy_nonoverlapping(sig.as_ptr(), out_sig, SIGNATURE_LEN);
+    }
+    SIGIL_OK
+}
+
+/// Verify a 64-byte Ed25519 `sig` over `msg` (`msg_len` bytes) against the
+/// 32-byte public key `pk`.
+///
+/// **`SIGIL_OK` (0) means the signature is VALID; a non-zero return means it is
+/// INVALID** — the opposite of a typical C boolean. Callers MUST test
+/// `rc == SIGIL_OK`, never `if (rc)`. `msg` may be null iff `msg_len == 0`.
+/// STATUS: pre-audit, UNAUDITED classical building block.
+///
+/// # Returns
+/// - [`SIGIL_OK`] if the signature is valid for this exact `pk` and `msg`.
+/// - [`SIGIL_ERR_VERIFY`] if it is not valid — a malformed public key, a
+///   malformed signature, or a well-formed-but-non-matching signature all
+///   collapse to this one code (no structure leak).
+/// - [`SIGIL_ERR_NULL_ARG`] if `pk` or `sig` is null, or `msg` is null with
+///   `msg_len != 0`.
+///
+/// # Safety
+/// `pk` must point at 32 readable bytes, `sig` at 64 readable bytes, and `msg` at
+/// `msg_len` readable bytes when `msg_len != 0`.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_ed25519_verify(
+    pk: *const u8,
+    msg: *const u8,
+    msg_len: usize,
+    sig: *const u8,
+) -> i32 {
+    if pk.is_null() || sig.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+    // SAFETY: `msg` may be null iff `msg_len == 0`; the helper enforces that.
+    let msg_slice = match unsafe { optional_slice(msg, msg_len) } {
+        Some(s) => s,
+        None => return SIGIL_ERR_NULL_ARG,
+    };
+    let mut pk_bytes = [0u8; SIG_PUBLIC_KEY_LEN];
+    let mut sig_bytes = [0u8; SIGNATURE_LEN];
+    // SAFETY: `pk`/`sig` are non-null (checked above); caller guarantees 32 / 64
+    // readable bytes respectively.
+    unsafe {
+        pk_bytes.copy_from_slice(slice::from_raw_parts(pk, SIG_PUBLIC_KEY_LEN));
+        sig_bytes.copy_from_slice(slice::from_raw_parts(sig, SIGNATURE_LEN));
+    }
+    match verify(&pk_bytes, msg_slice, &sig_bytes) {
+        Ok(()) => SIGIL_OK,
+        // Every SigError variant collapses to one code so the boundary never
+        // reveals which check failed.
+        Err(_) => SIGIL_ERR_VERIFY,
+    }
+}
+
+/// Derive the 32-byte X25519 public key from a caller-supplied 32-byte secret
+/// scalar `secret`, writing it into `out_pk` (32 bytes).
+///
+/// STATUS: pre-audit, UNAUDITED classical building block. The secret is the
+/// caller's; this layer generates no randomness. X25519 clamps the scalar
+/// internally.
+///
+/// # Returns
+/// - [`SIGIL_OK`] on success (`out_pk` is written with 32 bytes).
+/// - [`SIGIL_ERR_NULL_ARG`] if `secret` or `out_pk` is null; nothing is written.
+///
+/// # Safety
+/// `secret` must point at 32 readable bytes and `out_pk` at 32 writable bytes.
+/// `out_pk` may overlap `secret` (the secret is copied out first).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_x25519_public_key(secret: *const u8, out_pk: *mut u8) -> i32 {
+    if secret.is_null() || out_pk.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+    let mut secret_bytes = [0u8; KEX_SECRET_LEN];
+    // SAFETY: `secret` is non-null (checked above); caller guarantees 32 readable
+    // bytes.
+    unsafe {
+        secret_bytes.copy_from_slice(slice::from_raw_parts(secret, KEX_SECRET_LEN));
+    }
+    let pk = x25519_public_key(&secret_bytes);
+    // SAFETY: `out_pk` is non-null (checked above); caller guarantees 32 writable
+    // bytes. `pk` is a fresh local, so overlap with `secret` is harmless.
+    unsafe {
+        core::ptr::copy_nonoverlapping(pk.as_ptr(), out_pk, KEX_PUBLIC_KEY_LEN);
+    }
+    SIGIL_OK
+}
+
+/// Compute the 32-byte X25519 shared secret between the caller's 32-byte
+/// `secret` scalar and a `peer_pk`, writing it into `out_ss` (32 bytes).
+///
+/// The raw shared secret is **not** contributory-checked and **not** hashed
+/// here: a low-order `peer_pk` yields an all-zero (non-contributory) shared
+/// secret and STILL returns [`SIGIL_OK`]. Callers MUST run `out_ss` through a KDF
+/// and, if the protocol requires contributory behaviour, reject a
+/// non-contributory result (see [`sigil_x25519_is_contributory`]). STATUS:
+/// pre-audit, UNAUDITED classical building block.
+///
+/// # Returns
+/// - [`SIGIL_OK`] on success (`out_ss` is written with 32 bytes; possibly
+///   all-zero for a low-order `peer_pk`).
+/// - [`SIGIL_ERR_NULL_ARG`] if any pointer is null; nothing is written.
+///
+/// # Safety
+/// `secret` and `peer_pk` must point at 32 readable bytes each and `out_ss` at 32
+/// writable bytes. `out_ss` may overlap the inputs (they are copied out first).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_x25519_shared_secret(
+    secret: *const u8,
+    peer_pk: *const u8,
+    out_ss: *mut u8,
+) -> i32 {
+    if secret.is_null() || peer_pk.is_null() || out_ss.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+    let mut secret_bytes = [0u8; KEX_SECRET_LEN];
+    let mut peer_bytes = [0u8; KEX_PUBLIC_KEY_LEN];
+    // SAFETY: `secret`/`peer_pk` are non-null (checked above); caller guarantees
+    // 32 readable bytes each.
+    unsafe {
+        secret_bytes.copy_from_slice(slice::from_raw_parts(secret, KEX_SECRET_LEN));
+        peer_bytes.copy_from_slice(slice::from_raw_parts(peer_pk, KEX_PUBLIC_KEY_LEN));
+    }
+    let ss = x25519_shared_secret(&secret_bytes, &peer_bytes);
+    // SAFETY: `out_ss` is non-null (checked above); caller guarantees 32 writable
+    // bytes. `ss` is a fresh local, so overlap with the inputs is harmless.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ss.as_ptr(), out_ss, KEX_SHARED_SECRET_LEN);
+    }
+    SIGIL_OK
+}
+
+/// Constant-time predicate: is a 32-byte X25519 `shared_secret` *contributory*
+/// (i.e. not the all-zero value a low-order peer key forces)?
+///
+/// This is a **predicate**, not a status code: `1` means contributory, `0` means
+/// non-contributory (all-zero). Note `0` coincides numerically with [`SIGIL_OK`]
+/// but here it means "non-contributory", so callers must NOT test it as
+/// `rc == SIGIL_OK`. STATUS: pre-audit, UNAUDITED classical building block.
+///
+/// # Returns
+/// - `1` if `shared_secret` has at least one non-zero byte (contributory).
+/// - `0` if `shared_secret` is all-zero (non-contributory).
+/// - [`SIGIL_ERR_NULL_ARG`] (`-1`) if `shared_secret` is null.
+///
+/// # Safety
+/// `shared_secret` must point at 32 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_x25519_is_contributory(shared_secret: *const u8) -> i32 {
+    if shared_secret.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+    let mut ss = [0u8; KEX_SHARED_SECRET_LEN];
+    // SAFETY: `shared_secret` is non-null (checked above); caller guarantees 32
+    // readable bytes.
+    unsafe {
+        ss.copy_from_slice(slice::from_raw_parts(shared_secret, KEX_SHARED_SECRET_LEN));
+    }
+    i32::from(is_contributory(&ss))
 }
 
 /// Release a [`SigilBuffer`] previously produced by [`sigil_seal`] or
@@ -496,5 +791,383 @@ mod tests {
                 len: 0,
             });
         }
+    }
+
+    // ---- Asymmetric primitive tests (Phase 14) ----------------------------
+
+    // RFC 8032 §7.1 Ed25519 TEST 1 (empty message) — the same vector core's
+    // sig.rs asserts, driven here through the C-ABI to prove the boundary is
+    // transparent.
+    const RFC8032_SEED: [u8; SIG_SEED_LEN] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    const RFC8032_PK: [u8; SIG_PUBLIC_KEY_LEN] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+    const RFC8032_SIG: [u8; SIGNATURE_LEN] = [
+        0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72, 0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e, 0x82,
+        0x8a, 0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74, 0xd8, 0x73, 0xe0, 0x65, 0x22, 0x49,
+        0x01, 0x55, 0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac, 0xc6, 0x1e, 0x39, 0x70, 0x1c,
+        0xf9, 0xb4, 0x6b, 0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24, 0x65, 0x51, 0x41, 0x43,
+        0x8e, 0x7a, 0x10, 0x0b,
+    ];
+
+    // RFC 7748 §6.1 X25519 — the same vector core's kex.rs asserts.
+    const X_ALICE_SECRET: [u8; KEX_SECRET_LEN] = [
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66,
+        0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9,
+        0x2c, 0x2a,
+    ];
+    const X_BOB_PUBLIC: [u8; KEX_PUBLIC_KEY_LEN] = [
+        0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35,
+        0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88,
+        0x2b, 0x4f,
+    ];
+    const X_SHARED: [u8; KEX_SHARED_SECRET_LEN] = [
+        0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35, 0x0f,
+        0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0, 0x9b, 0x3c, 0x1e, 0x16,
+        0x17, 0x42,
+    ];
+
+    #[test]
+    fn ed25519_sign_verify_round_trip() {
+        let seed = [0x11u8; SIG_SEED_LEN];
+        let msg = b"sigil ffi ed25519 round trip";
+        let mut pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        let mut sig = [0u8; SIGNATURE_LEN];
+        unsafe {
+            assert_eq!(
+                sigil_ed25519_public_key(seed.as_ptr(), pk.as_mut_ptr()),
+                SIGIL_OK
+            );
+            assert_eq!(
+                sigil_ed25519_sign(seed.as_ptr(), msg.as_ptr(), msg.len(), sig.as_mut_ptr()),
+                SIGIL_OK
+            );
+            assert_eq!(
+                sigil_ed25519_verify(pk.as_ptr(), msg.as_ptr(), msg.len(), sig.as_ptr()),
+                SIGIL_OK
+            );
+        }
+    }
+
+    #[test]
+    fn ed25519_tamper_sig_fails() {
+        let seed = [0x22u8; SIG_SEED_LEN];
+        let msg = b"message";
+        let mut pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        let mut sig = [0u8; SIGNATURE_LEN];
+        unsafe {
+            sigil_ed25519_public_key(seed.as_ptr(), pk.as_mut_ptr());
+            sigil_ed25519_sign(seed.as_ptr(), msg.as_ptr(), msg.len(), sig.as_mut_ptr());
+        }
+        sig[0] ^= 0x01;
+        assert_eq!(
+            unsafe { sigil_ed25519_verify(pk.as_ptr(), msg.as_ptr(), msg.len(), sig.as_ptr()) },
+            SIGIL_ERR_VERIFY
+        );
+    }
+
+    #[test]
+    fn ed25519_tamper_msg_fails() {
+        let seed = [0x22u8; SIG_SEED_LEN];
+        let msg = b"message";
+        let mut pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        let mut sig = [0u8; SIGNATURE_LEN];
+        unsafe {
+            sigil_ed25519_public_key(seed.as_ptr(), pk.as_mut_ptr());
+            sigil_ed25519_sign(seed.as_ptr(), msg.as_ptr(), msg.len(), sig.as_mut_ptr());
+        }
+        let other = b"messagE";
+        assert_eq!(
+            unsafe { sigil_ed25519_verify(pk.as_ptr(), other.as_ptr(), other.len(), sig.as_ptr()) },
+            SIGIL_ERR_VERIFY
+        );
+    }
+
+    #[test]
+    fn ed25519_wrong_key_fails() {
+        let seed = [0x22u8; SIG_SEED_LEN];
+        let msg = b"message";
+        let mut sig = [0u8; SIGNATURE_LEN];
+        let mut other_pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        let other_seed = [0x33u8; SIG_SEED_LEN];
+        unsafe {
+            sigil_ed25519_sign(seed.as_ptr(), msg.as_ptr(), msg.len(), sig.as_mut_ptr());
+            sigil_ed25519_public_key(other_seed.as_ptr(), other_pk.as_mut_ptr());
+            assert_eq!(
+                sigil_ed25519_verify(other_pk.as_ptr(), msg.as_ptr(), msg.len(), sig.as_ptr()),
+                SIGIL_ERR_VERIFY
+            );
+        }
+    }
+
+    #[test]
+    fn ed25519_malformed_pubkey_collapses_to_verify() {
+        // y-coordinate 2 does not decompress to a curve point (BadPublicKey); it
+        // must collapse to SIGIL_ERR_VERIFY, not crash.
+        let mut bad_pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        bad_pk[0] = 0x02;
+        let sig = [0u8; SIGNATURE_LEN];
+        let msg = b"m";
+        assert_eq!(
+            unsafe { sigil_ed25519_verify(bad_pk.as_ptr(), msg.as_ptr(), msg.len(), sig.as_ptr()) },
+            SIGIL_ERR_VERIFY
+        );
+    }
+
+    #[test]
+    fn ed25519_empty_message_signs_and_verifies() {
+        let mut sig = [0u8; SIGNATURE_LEN];
+        unsafe {
+            // msg null with len 0 is a valid empty message.
+            assert_eq!(
+                sigil_ed25519_sign(
+                    RFC8032_SEED.as_ptr(),
+                    core::ptr::null(),
+                    0,
+                    sig.as_mut_ptr()
+                ),
+                SIGIL_OK
+            );
+            assert_eq!(
+                sigil_ed25519_verify(RFC8032_PK.as_ptr(), core::ptr::null(), 0, sig.as_ptr()),
+                SIGIL_OK
+            );
+        }
+    }
+
+    #[test]
+    fn ed25519_null_args_return_null_arg() {
+        let seed = [0x01u8; SIG_SEED_LEN];
+        let mut out = [0u8; SIGNATURE_LEN];
+        let mut pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        let sig = [0u8; SIGNATURE_LEN];
+        unsafe {
+            assert_eq!(
+                sigil_ed25519_public_key(core::ptr::null(), pk.as_mut_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_ed25519_public_key(seed.as_ptr(), core::ptr::null_mut()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_ed25519_sign(core::ptr::null(), core::ptr::null(), 0, out.as_mut_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_ed25519_sign(seed.as_ptr(), core::ptr::null(), 0, core::ptr::null_mut()),
+                SIGIL_ERR_NULL_ARG
+            );
+            // Non-zero msg_len paired with a null msg pointer.
+            assert_eq!(
+                sigil_ed25519_sign(seed.as_ptr(), core::ptr::null(), 4, out.as_mut_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_ed25519_verify(core::ptr::null(), core::ptr::null(), 0, sig.as_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_ed25519_verify(pk.as_ptr(), core::ptr::null(), 0, core::ptr::null()),
+                SIGIL_ERR_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn ed25519_rfc8032_test1_over_ffi() {
+        // The RFC 8032 §7.1 TEST 1 vector, driven THROUGH the C-ABI.
+        let mut pk = [0u8; SIG_PUBLIC_KEY_LEN];
+        let mut sig = [0u8; SIGNATURE_LEN];
+        unsafe {
+            assert_eq!(
+                sigil_ed25519_public_key(RFC8032_SEED.as_ptr(), pk.as_mut_ptr()),
+                SIGIL_OK
+            );
+            assert_eq!(
+                sigil_ed25519_sign(
+                    RFC8032_SEED.as_ptr(),
+                    core::ptr::null(),
+                    0,
+                    sig.as_mut_ptr()
+                ),
+                SIGIL_OK
+            );
+        }
+        assert_eq!(pk, RFC8032_PK);
+        assert_eq!(sig, RFC8032_SIG);
+    }
+
+    #[test]
+    fn x25519_agreement_over_ffi() {
+        let a_sec = [0x11u8; KEX_SECRET_LEN];
+        let b_sec = [0x22u8; KEX_SECRET_LEN];
+        let mut a_pub = [0u8; KEX_PUBLIC_KEY_LEN];
+        let mut b_pub = [0u8; KEX_PUBLIC_KEY_LEN];
+        let mut ss_a = [0u8; KEX_SHARED_SECRET_LEN];
+        let mut ss_b = [0u8; KEX_SHARED_SECRET_LEN];
+        unsafe {
+            sigil_x25519_public_key(a_sec.as_ptr(), a_pub.as_mut_ptr());
+            sigil_x25519_public_key(b_sec.as_ptr(), b_pub.as_mut_ptr());
+            assert_eq!(
+                sigil_x25519_shared_secret(a_sec.as_ptr(), b_pub.as_ptr(), ss_a.as_mut_ptr()),
+                SIGIL_OK
+            );
+            assert_eq!(
+                sigil_x25519_shared_secret(b_sec.as_ptr(), a_pub.as_ptr(), ss_b.as_mut_ptr()),
+                SIGIL_OK
+            );
+            assert_eq!(sigil_x25519_is_contributory(ss_a.as_ptr()), 1);
+        }
+        assert_eq!(ss_a, ss_b);
+    }
+
+    #[test]
+    fn x25519_public_key_matches_core() {
+        let sec = [0x44u8; KEX_SECRET_LEN];
+        let mut pk = [0u8; KEX_PUBLIC_KEY_LEN];
+        unsafe {
+            sigil_x25519_public_key(sec.as_ptr(), pk.as_mut_ptr());
+        }
+        assert_eq!(pk, x25519_public_key(&sec));
+    }
+
+    #[test]
+    fn x25519_rfc7748_61_over_ffi() {
+        // RFC 7748 §6.1 Alice·Bob.pub == shared, driven THROUGH the C-ABI.
+        let mut ss = [0u8; KEX_SHARED_SECRET_LEN];
+        assert_eq!(
+            unsafe {
+                sigil_x25519_shared_secret(
+                    X_ALICE_SECRET.as_ptr(),
+                    X_BOB_PUBLIC.as_ptr(),
+                    ss.as_mut_ptr(),
+                )
+            },
+            SIGIL_OK
+        );
+        assert_eq!(ss, X_SHARED);
+    }
+
+    #[test]
+    fn x25519_null_args_return_null_arg() {
+        let sec = [0x01u8; KEX_SECRET_LEN];
+        let mut out = [0u8; KEX_SHARED_SECRET_LEN];
+        unsafe {
+            assert_eq!(
+                sigil_x25519_public_key(core::ptr::null(), out.as_mut_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_x25519_public_key(sec.as_ptr(), core::ptr::null_mut()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_x25519_shared_secret(core::ptr::null(), sec.as_ptr(), out.as_mut_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_x25519_shared_secret(sec.as_ptr(), core::ptr::null(), out.as_mut_ptr()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_x25519_shared_secret(sec.as_ptr(), sec.as_ptr(), core::ptr::null_mut()),
+                SIGIL_ERR_NULL_ARG
+            );
+            assert_eq!(
+                sigil_x25519_is_contributory(core::ptr::null()),
+                SIGIL_ERR_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn x25519_low_order_peer_is_all_zero_and_ok() {
+        // A low-order peer key (u = 0) forces an all-zero shared secret; the call
+        // still returns SIGIL_OK (raw primitive, no policy), and the predicate
+        // reports non-contributory.
+        let sec = [0x09u8; KEX_SECRET_LEN];
+        let low_order = [0u8; KEX_PUBLIC_KEY_LEN];
+        let mut ss = [0xffu8; KEX_SHARED_SECRET_LEN];
+        assert_eq!(
+            unsafe {
+                sigil_x25519_shared_secret(sec.as_ptr(), low_order.as_ptr(), ss.as_mut_ptr())
+            },
+            SIGIL_OK
+        );
+        assert_eq!(ss, [0u8; KEX_SHARED_SECRET_LEN]);
+        assert_eq!(unsafe { sigil_x25519_is_contributory(ss.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn x25519_is_contributory_predicate() {
+        let all_zero = [0u8; KEX_SHARED_SECRET_LEN];
+        let mut one = [0u8; KEX_SHARED_SECRET_LEN];
+        one[KEX_SHARED_SECRET_LEN - 1] = 1;
+        unsafe {
+            assert_eq!(sigil_x25519_is_contributory(all_zero.as_ptr()), 0);
+            assert_eq!(sigil_x25519_is_contributory(one.as_ptr()), 1);
+        }
+    }
+
+    #[test]
+    fn status_code_values_are_stable() {
+        // Regression pin: renumbering any of these silently breaks every C caller.
+        assert_eq!(
+            (
+                SIGIL_OK,
+                SIGIL_ERR_NULL_ARG,
+                SIGIL_ERR_OPEN,
+                SIGIL_ERR_BAD_INPUT,
+                SIGIL_ERR_VERIFY
+            ),
+            (0, -1, -2, -3, -4)
+        );
+    }
+
+    // In-place / aliasing tests: the header + docs promise the out buffer may
+    // overlap an input (because each input is copied into a local before any
+    // output is written). These pin that copy-before-write ordering so a future
+    // refactor that read a raw input pointer after writing the output would fail.
+
+    #[test]
+    fn ed25519_public_key_in_place_alias() {
+        // out_pk aliases seed (same buffer). The seed is copied out first, so the
+        // in-place call still yields the RFC 8032 public key.
+        let mut buf = RFC8032_SEED;
+        let rc = unsafe { sigil_ed25519_public_key(buf.as_ptr(), buf.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(buf, RFC8032_PK);
+    }
+
+    #[test]
+    fn ed25519_sign_out_overlaps_seed() {
+        // out_sig (64 bytes) overlaps the seed region (its first 32 bytes). The
+        // seed is copied out before out_sig is written, so the RFC 8032 signature
+        // is still correct.
+        let mut buf = [0u8; SIGNATURE_LEN];
+        buf[..SIG_SEED_LEN].copy_from_slice(&RFC8032_SEED);
+        let rc =
+            unsafe { sigil_ed25519_sign(buf.as_ptr(), core::ptr::null(), 0, buf.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(buf, RFC8032_SIG);
+    }
+
+    #[test]
+    fn x25519_shared_secret_in_place_alias() {
+        // out_ss aliases secret (same buffer). The secret is copied out before
+        // out_ss is written, so the RFC 7748 §6.1 shared secret is still correct.
+        let mut sec = X_ALICE_SECRET;
+        let rc = unsafe {
+            sigil_x25519_shared_secret(sec.as_ptr(), X_BOB_PUBLIC.as_ptr(), sec.as_mut_ptr())
+        };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(sec, X_SHARED);
     }
 }

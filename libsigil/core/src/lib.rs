@@ -18,6 +18,18 @@
 //! provides the classical half of the hybrid Ed25519&ML-DSA-65 signature suite;
 //! the post-quantum ML-DSA-65 half is reserved/future and not yet implemented.
 //!
+//! A classical X25519 key-agreement primitive ([`x25519_public_key`] /
+//! [`x25519_shared_secret`], [`mod@kex`]) provides the classical half of the
+//! hybrid X25519&ML-KEM-768 KEM, a post-quantum ML-KEM-768 primitive
+//! ([`mlkem768_encapsulate`] / [`mlkem768_decapsulate`], [`mod@mlkem`],
+//! FIPS 203) provides the post-quantum half, and the **X-Wing hybrid**
+//! ([`xwing_encapsulate`] / [`xwing_decapsulate`], [`mod@hybrid`],
+//! draft-connolly-cfrg-xwing-kem-10) combines them at the primitive level —
+//! breaking it requires breaking both. The hybrid is **not wired into the
+//! envelope, `seal_record`/`open_record`, or any product flow** (the envelope's
+//! `kem_ct` stays reserved), so sealed records still gain no post-quantum
+//! protection, and there is still no post-quantum signature.
+//!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
 //! used for authenticated encryption:
@@ -36,12 +48,29 @@ extern crate alloc;
 
 mod aead;
 mod envelope;
+mod hybrid;
 mod kdf;
+mod kex;
+mod mlkem;
 mod record;
 mod sig;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
+pub use hybrid::{
+    xwing_decapsulate, xwing_encapsulate, xwing_keygen, XWingError, XWING_CIPHERTEXT_LEN,
+    XWING_DECAP_KEY_LEN, XWING_ENCAP_KEY_LEN, XWING_ENCAP_SEED_LEN, XWING_LABEL, XWING_SEED_LEN,
+    XWING_SHARED_SECRET_LEN,
+};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
+pub use kex::{
+    is_contributory, x25519_public_key, x25519_shared_secret, KEX_PUBLIC_KEY_LEN, KEX_SECRET_LEN,
+    KEX_SHARED_SECRET_LEN,
+};
+pub use mlkem::{
+    mlkem768_decapsulate, mlkem768_encapsulate, mlkem768_keygen, MlKemError,
+    MLKEM768_CIPHERTEXT_LEN, MLKEM768_DECAP_KEY_LEN, MLKEM768_ENCAP_KEY_LEN,
+    MLKEM768_ENCAP_SEED_LEN, MLKEM768_SEED_D_LEN, MLKEM768_SEED_Z_LEN, MLKEM768_SHARED_SECRET_LEN,
+};
 pub use record::{open_record, seal_record, RecordError};
 pub use sig::{
     public_key_from_seed, sign, verify, SigError, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,

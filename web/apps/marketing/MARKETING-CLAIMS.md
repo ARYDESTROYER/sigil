@@ -10,6 +10,9 @@ the marketing surface. CI and reviewers should reject PRs that violate it.
   and the report is published. (Currently: engagement only being scoped.)
 - "SOC 2", "SOC 2 compliant", "ISO 27001", "HIPAA" — until certified/attested.
 - "post-quantum secure", "quantum-proof", "unbreakable" — never; nothing is.
+- "standards-based hybrid", "NIST-standard encryption", or calling X-Wing a
+  "standard" — X-Wing is a pre-RFC individual IETF CFRG draft, not a standard;
+  only its FIPS 203 (ML-KEM-768) component is a NIST standard.
 - Unqualified "end-to-end encrypted" as a present-tense product claim — until
   libsigil exists, is correct, and ships. (No shipping client exists yet.)
 - "available now", "download today", pricing numbers, or launch dates — pricing

@@ -2,11 +2,16 @@
  * sigil.h — C-ABI surface for libsigil.
  *
  * STATUS: pre-audit, UNAUDITED building block. This header declares a thin
- * C-ABI over sigil-core's symmetric AEAD seal/open layer (XChaCha20-Poly1305 +
- * HKDF-SHA256). The underlying cryptography is real (vetted RustCrypto crates)
- * but has NOT been audited, and it is NOT wired into a complete account /
- * key-management / key-rotation flow. Treat these functions as building blocks,
- * not a finished secure system. Do not store real secrets.
+ * C-ABI over sigil-core: the symmetric AEAD seal/open layer (XChaCha20-Poly1305
+ * + HKDF-SHA256), plus classical-only Ed25519 signatures and X25519 key
+ * agreement. The underlying cryptography is real (vetted RustCrypto crates) but
+ * has NOT been audited. ML-DSA-65 is NOT implemented; ML-KEM-768 now exists in
+ * the core but is NOT exposed over this ABI and is not combined with X25519 —
+ * so nothing reachable through this header is post-quantum — and none of it is
+ * wired into a complete account / key-management / key-rotation flow. Treat these functions
+ * as building blocks, not a finished secure system. All seeds/secrets are
+ * caller-supplied — this library generates no randomness. Do not store real
+ * secrets.
  *
  * This file is hand-written (not generated) and kept in sync with
  * libsigil/ffi/src/lib.rs by hand.
@@ -22,12 +27,12 @@
 extern "C" {
 #endif
 
-/* ---- Status codes (returned as int32_t by sigil_seal / sigil_open) ---- */
+/* ---- Status codes (returned as int32_t by the functions below) ---- */
 
-/* Success: the operation completed and *out was written. */
+/* Success: the operation completed and the output (*out / out array) was written. */
 #define SIGIL_OK 0
 /* A required pointer argument was null (or a non-zero length was paired with a
- * null pointer where that is not allowed). *out is left untouched. */
+ * null pointer where that is not allowed). No output is written. */
 #define SIGIL_ERR_NULL_ARG (-1)
 /* Authentication or envelope decode failed on sigil_open. No plaintext is
  * produced. Envelope-decode and authentication failures both map here so the
@@ -36,6 +41,10 @@ extern "C" {
 /* Malformed input shape detected before the crypto step (reserved; not an
  * authentication failure). */
 #define SIGIL_ERR_BAD_INPUT (-3)
+/* Ed25519 verification failed on sigil_ed25519_verify: bad public key, bad
+ * signature, or a non-matching signature — all collapse to this one code (no
+ * structure leak), mirroring SIGIL_ERR_OPEN but kept distinct from it. */
+#define SIGIL_ERR_VERIFY (-4)
 
 /*
  * A heap buffer owned by libsigil until released with sigil_buffer_free().
@@ -114,6 +123,81 @@ int32_t sigil_open(const uint8_t *master_key, /* 32 bytes */
                    const uint8_t *envelope,
                    size_t         envelope_len,
                    SigilBuffer   *out);
+
+/* ---- Asymmetric primitives (fixed-size, caller-provided out buffers) --------
+ *
+ * STATUS: pre-audit, UNAUDITED. Classical-only building blocks (Ed25519
+ * signatures, X25519 key agreement); ML-DSA-65 is NOT implemented and
+ * ML-KEM-768, while now a core primitive, is NOT exposed over this ABI and NOT
+ * combined with X25519 — so these exports are NOT post-quantum and NOT wired
+ * into any account or key-management flow.
+ *
+ * These take CALLER-ALLOCATED fixed-size output arrays (out_pk[32] / out_sig[64]
+ * / out_ss[32]) and return an int32_t status; they NEVER heap-allocate, so there
+ * is NO SigilBuffer and NOTHING to sigil_buffer_free. All seeds/secrets are
+ * CALLER-SUPPLIED entropy — this layer generates no randomness. Fixed-size
+ * pointer args must be non-null (msg may be NULL iff msg_len == 0); a null
+ * pointer yields SIGIL_ERR_NULL_ARG and no out array is written. The out buffer
+ * may safely overlap the inputs (inputs are copied internally first).
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Derive the Ed25519 public key from a 32-byte seed.
+ * Returns SIGIL_OK, or SIGIL_ERR_NULL_ARG.
+ */
+int32_t sigil_ed25519_public_key(const uint8_t seed[32], uint8_t out_pk[32]);
+
+/*
+ * Ed25519-sign msg (msg_len bytes) under seed[32] -> out_sig[64]. Signing is
+ * deterministic (RFC 8032). msg may be NULL iff msg_len == 0 (an empty message
+ * is signed). Returns SIGIL_OK, or SIGIL_ERR_NULL_ARG.
+ */
+int32_t sigil_ed25519_sign(const uint8_t  seed[32],
+                           const uint8_t *msg,
+                           size_t         msg_len,
+                           uint8_t        out_sig[64]);
+
+/*
+ * Verify sig[64] over msg (msg_len bytes) under pk[32]. msg may be NULL iff
+ * msg_len == 0.
+ *
+ * WARNING: SIGIL_OK (0) == VALID, nonzero == INVALID — the OPPOSITE of a C bool.
+ * Test `rc == SIGIL_OK`, never `if (rc)`.
+ *
+ * Returns SIGIL_OK (valid), SIGIL_ERR_VERIFY (bad key/signature or a
+ * non-matching signature — all collapse to one code), or SIGIL_ERR_NULL_ARG.
+ */
+int32_t sigil_ed25519_verify(const uint8_t  pk[32],
+                             const uint8_t *msg,
+                             size_t         msg_len,
+                             const uint8_t  sig[64]);
+
+/*
+ * Derive the X25519 public key from a 32-byte secret scalar (X25519 clamps the
+ * scalar internally). Returns SIGIL_OK, or SIGIL_ERR_NULL_ARG.
+ */
+int32_t sigil_x25519_public_key(const uint8_t secret[32], uint8_t out_pk[32]);
+
+/*
+ * X25519 Diffie-Hellman: secret[32] x peer_pk[32] -> out_ss[32].
+ *
+ * The raw shared secret is NOT contributory-checked and NOT hashed here: a
+ * low-order peer_pk yields an all-zero (non-contributory) secret and STILL
+ * returns SIGIL_OK. Callers MUST run out_ss through a KDF and, if the protocol
+ * requires contributory behaviour, reject a non-contributory result (see
+ * sigil_x25519_is_contributory). Returns SIGIL_OK, or SIGIL_ERR_NULL_ARG.
+ */
+int32_t sigil_x25519_shared_secret(const uint8_t secret[32],
+                                   const uint8_t peer_pk[32],
+                                   uint8_t       out_ss[32]);
+
+/*
+ * Constant-time predicate: is a 32-byte X25519 shared secret contributory (i.e.
+ * NOT all-zero)? This is a PREDICATE, not a status code.
+ * Returns 1 if contributory, 0 if all-zero (non-contributory), or
+ * SIGIL_ERR_NULL_ARG (-1) if shared_secret is NULL.
+ */
+int32_t sigil_x25519_is_contributory(const uint8_t shared_secret[32]);
 
 /*
  * Release a SigilBuffer previously produced by sigil_seal or sigil_open.

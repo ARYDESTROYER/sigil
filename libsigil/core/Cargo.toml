@@ -2,7 +2,8 @@
 name = "sigil-core"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.74"
+# 1.81 is forced by hybrid-array (a required dep of ml-kem); see ADR 0013.
+rust-version = "1.81"
 publish = false
 license = "Apache-2.0 OR MIT"
 description = "Pure heart of libsigil: crypto-agility envelope + algorithm-suite registry, with a real-but-unaudited XChaCha20-Poly1305 AEAD layer and an Argon2id password-stretching KDF building block. Pre-audit skeleton."
@@ -35,3 +36,42 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 # keypair), `sign`, and `verify_strict` are all RNG-free. The `alloc` feature is
 # not needed by these fixed-size raw-byte calls.
 ed25519-dalek = { version = "2", default-features = false }
+# Classical X25519 (RFC 7748) key agreement (pre-audit) — the X25519 half of the
+# hybrid X25519&ML-KEM-768 KEM (the ML-KEM-768 PQ half lives in `mlkem.rs`;
+# the X-Wing hybrid combine lives in `hybrid.rs`).
+# `default-features = false` drops the default `alloc`, `precomputed-tables`, and
+# `zeroize` features, and we never opt into the optional `getrandom`-backed
+# `static_secrets` typed API — so no system RNG is pulled and the
+# `wasm32-unknown-unknown` build is preserved. We call only the always-available,
+# RNG-free free function `x25519()` plus the `X25519_BASEPOINT_BYTES` constant.
+# The caller supplies the 32-byte secret scalar; X25519 clamps it internally. It
+# shares the same `curve25519-dalek` as ed25519-dalek (a single copy in the lock).
+x25519-dalek = { version = "2", default-features = false }
+# Constant-time primitives (pre-audit). Already present transitively via
+# curve25519-dalek; declared directly so `kex::is_contributory` can do a
+# constant-time all-zero check on the shared secret. `default-features = false`
+# keeps it `no_std` and pulls in no RNG.
+subtle = { version = "2", default-features = false }
+# Post-quantum ML-KEM-768 (FIPS 203) key encapsulation (pre-audit) — the PQ half
+# of the hybrid X25519&ML-KEM-768 KEM. This is a REAL PQ primitive; the X-Wing
+# hybrid combine (`hybrid.rs`) composes it with X25519, but no product flow is
+# wired to either, so nothing here is "post-quantum secure" end to end. `default-features = false` drops the
+# default `std` feature (`sha3/std`), keeping the crate no_std. `rand_core` is a
+# hard dependency, but without its `getrandom` feature it is trait definitions
+# only — and we never call the RNG-driven `generate`/`encapsulate` API — so
+# `getrandom` stays out of the lock and the `wasm32-unknown-unknown` build is
+# preserved. The `deterministic` feature gates the caller-supplied-entropy API we
+# use instead: `generate_deterministic(d, z)` (two 32-byte seeds) and
+# `encapsulate_deterministic(m)` (one 32-byte value) — the caller supplies all
+# entropy, same rule as every other primitive here. The `zeroize` feature turns
+# on ml-kem's Drop scrub of its internal decapsulation key (free hygiene; zeroize
+# is already in the lock and pulls no RNG). New transitive deps (hybrid-array,
+# kem, sha3, keccak) are all RNG-free and build.rs-free.
+ml-kem = { version = "0.2", default-features = false, features = ["deterministic", "zeroize"] }
+# SHA3-256 + SHAKE-256 for the X-Wing hybrid combiner/seed-expansion in
+# `hybrid.rs` (pre-audit). Already in the tree transitively via ml-kem, so this
+# adds ZERO new lock packages; declared directly because hybrid.rs calls it.
+# `default-features = false` is mandatory — sha3's default enables `std` via
+# `digest/std`, which feature-unification would otherwise re-enable crate-wide
+# and break the no_std/wasm32 build. Pulls no RNG; getrandom stays 0.
+sha3 = { version = "0.10", default-features = false }

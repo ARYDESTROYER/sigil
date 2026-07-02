@@ -36,12 +36,24 @@ public, make no security claims, until the audit completes and trademark clears.
 
 - `libsigil/` — Rust crypto core (`core` = suite registry + envelope codec +
   real-but-unaudited Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, composed
-  `seal_record`/`open_record`, and a classical **Ed25519** sign/verify primitive
+  `seal_record`/`open_record`, a classical **Ed25519** sign/verify primitive
   (`public_key_from_seed`/`sign`/`verify`, caller-supplied 32-byte seed, no
   in-core RNG; the signature half of the future Ed25519&ML-DSA-65 hybrid — the
-  ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth);
-  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, hand-written
-  `sigil.h`).
+  ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth), and
+  a classical **X25519** key-agreement primitive (`x25519_public_key`/
+  `x25519_shared_secret` + constant-time `is_contributory`, caller-supplied
+  32-byte secret, no in-core RNG), and a post-quantum **ML-KEM-768** (FIPS 203)
+  KEM primitive (`mlkem768_keygen`/`mlkem768_encapsulate`/`mlkem768_decapsulate`,
+  caller-supplied 32-byte `d`/`z`/`m` seeds, no in-core RNG, implicit rejection
+  on decapsulate), combined by the **X-Wing hybrid** (`hybrid.rs`:
+  `xwing_{keygen,encapsulate,decapsulate}`, draft-connolly-cfrg-xwing-kem-10,
+  official-KAT-verified, caller-supplied 32-byte seed / 64-byte eseed — the
+  hybrid exists as a primitive but is **not wired into the envelope or any
+  flow**, `kem_ct` stays reserved, records still get no PQ protection);
+  `ffi` = C-ABI over core: AEAD `seal`/`open`/`buffer_free` (heap `SigilBuffer`)
+  + suite smoke export, and fixed-size caller-buffer `ed25519_{public_key,sign,
+  verify}` / `x25519_{public_key,shared_secret,is_contributory}` (classical-only,
+  UNAUDITED; new `SIGIL_ERR_VERIFY`), hand-written `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
   request-ID/access-log/recover middleware, in-memory `store`; distroless
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an
@@ -56,15 +68,19 @@ public, make no security claims, until the audit completes and trademark clears.
   NOT the production store** (production = Postgres/S3). When
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 of a 32-byte Ed25519 public key) is set,
   op-log requests are **Ed25519-authenticated** (`authorizeOps`, Go stdlib
-  `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` /
-  `X-Sigil-Timestamp` over a canonical `(method,path,query,timestamp,body)` message
-  (300 s window), else **401** `{"error":"unauthorized",…}`. **Default off** (no
-  pubkey → unauthenticated, behavior unchanged); a **SINGLE static dev key**,
-  replay-window-bounded (no nonce store), dev-only — enrollment / multi-device /
+  `crypto/ed25519`): both GET and POST verify `X-Sigil-Signature` /
+  `X-Sigil-Timestamp` / `X-Sigil-Nonce` over a canonical
+  `(method,path,query,timestamp,nonce,body)` message (contract **v2**, 300 s
+  window), else **401** `{"error":"unauthorized",…}`. A bounded **in-memory nonce
+  store** (`noncestore.go`, TTL = 2× window, checked after signature verify)
+  rejects in-window replays — but it is dev-only (lost on restart, not shared
+  across instances). **Default off** (no pubkey → unauthenticated, behavior
+  unchanged); a **SINGLE static dev key**, dev-only — enrollment / multi-device /
   JWT remain future. **No crypto on the blob**: the server never decodes it; it
   stores/returns the exact client bytes. Endpoint reference in
   [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
+  Vitest (node env, vitest-only dep) covers the waitlist API route + robots policy.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices).
@@ -123,9 +139,10 @@ $go -C sigild build ./...
 # sigild container (multi-stage → distroless, ~14 MB) — needs the Docker daemon
 docker build --build-arg VERSION=$(git rev-parse --short HEAD) -t sigild:dev sigild
 
-# Web — typecheck / lint / build (NEXT_TELEMETRY_DISABLED=1)
+# Web — typecheck / lint / test / build (NEXT_TELEMETRY_DISABLED=1)
 corepack pnpm -C web typecheck
 corepack pnpm -C web lint
+corepack pnpm -C web test     # vitest: waitlist route + robots (node env, vitest-only dep)
 corepack pnpm -C web build
 ```
 

@@ -46,18 +46,53 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     deterministic RFC 8032 sign/verify over a **caller-supplied 32-byte secret
     seed** (real but UNAUDITED; a standalone primitive, **not yet** wired into the
     hybrid `Ed25519 & ML-DSA-65` signature of suite `0x12` — the ML-DSA-65
-    post-quantum half stays unimplemented).
+    post-quantum half stays unimplemented);
+  - the **classical X25519 key-agreement primitive** (`x25519_public_key` /
+    `x25519_shared_secret`, plus a constant-time `is_contributory` low-order-point
+    check) — a raw RFC 7748 Diffie-Hellman over a **caller-supplied 32-byte secret
+    scalar** (real but UNAUDITED; consumed by the X-Wing hybrid below; see
+    [`decisions/0010-x25519-key-agreement-primitive.md`](decisions/0010-x25519-key-agreement-primitive.md));
+  - the **post-quantum ML-KEM-768 KEM primitive** (`mlkem768_keygen` /
+    `mlkem768_encapsulate` / `mlkem768_decapsulate`, FIPS 203) — deterministic
+    over **caller-supplied 32-byte seeds** (`d`, `z` for keygen; `m` for
+    encapsulation), with FIPS 203 implicit rejection on decapsulation (a tampered
+    ciphertext yields a *different* shared secret, not an error) and a §7.2
+    encapsulation-key modulus check the underlying crate omits (real but
+    UNAUDITED; consumed by the X-Wing hybrid below; see
+    [`decisions/0013-ml-kem-768-pq-kem-primitive.md`](decisions/0013-ml-kem-768-pq-kem-primitive.md));
+  - the **X-Wing hybrid KEM primitive** (`xwing_keygen` / `xwing_encapsulate` /
+    `xwing_decapsulate`, draft-connolly-cfrg-xwing-kem-10, pre-RFC) — combines
+    the two halves above at the primitive level
+    (`ss = SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)`; ek 1216 B, ct 1120 B,
+    dk = a 32-byte seed), verified against the official X-Wing test vectors —
+    breaking it requires breaking **both** X25519 and ML-KEM-768 (real but
+    UNAUDITED; **not wired into the envelope or any product flow** — `kem_ct`
+    stays reserved, so **records sealed today still have NO post-quantum
+    protection**; see
+    [`decisions/0014-xwing-hybrid-kem.md`](decisions/0014-xwing-hybrid-kem.md)).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
-  the AEAD nonce, and the Ed25519 signing seed are **all caller-supplied**, so the
-  core stays `wasm32-unknown-unknown`-pure and `getrandom`-free (see
+  the AEAD nonce, the Ed25519 signing seed, the X25519 secret scalar, and the
+  ML-KEM-768 keygen seeds (`d`, `z`) and encapsulation randomness (`m`) are **all
+  caller-supplied**, so the core stays `wasm32-unknown-unknown`-pure and
+  `getrandom`-free (see
   [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
 - **`libsigil/ffi`** ([`../libsigil/ffi/`](../libsigil/ffi/)) — a thin, hand-written
-  **C-ABI** over the AEAD layer: `sigil_seal` / `sigil_open` / `sigil_buffer_free`
-  (plus `sigil_current_suite` as a link/smoke check), with a hand-maintained
-  [`sigil.h`](../libsigil/ffi/include/sigil.h). This is the seam the native
-  clients (in separate repos) will link against. It is the only crate with
-  `unsafe` (the FFI boundary); `core` forbids it.
+  **C-ABI** over `core`, with a hand-maintained
+  [`sigil.h`](../libsigil/ffi/include/sigil.h). It exposes two calling
+  conventions: the **symmetric AEAD** (`sigil_seal` / `sigil_open` /
+  `sigil_buffer_free`, plus `sigil_current_suite`), whose variable-size output
+  rides in a heap `SigilBuffer` the caller frees; and the **fixed-size asymmetric
+  primitives** (`sigil_ed25519_public_key` / `sigil_ed25519_sign` /
+  `sigil_ed25519_verify` / `sigil_x25519_public_key` / `sigil_x25519_shared_secret`
+  / `sigil_x25519_is_contributory`), which write a fixed 32/64-byte result into a
+  **caller-provided** buffer and never allocate (nothing to free) — see
+  [`decisions/0011-fixed-size-out-buffer-ffi-convention.md`](decisions/0011-fixed-size-out-buffer-ffi-convention.md).
+  The asymmetric exports are classical-only and UNAUDITED (ML-DSA-65 is
+  unimplemented; the core's ML-KEM-768 primitive is not exposed over this ABI).
+  This is the seam the native clients (in separate repos) will
+  link against. It is the only crate with `unsafe` (the FFI boundary); `core`
+  forbids it.
 - **`cli`** ([`../cli/`](../cli/)) — `sigil`, a **pre-audit demonstration** binary.
   `seal`/`open` wrap one file in a self-describing container via the real
   `sigil-core` record API; `push`/`pull` move that **opaque** container to/from a
@@ -71,10 +106,13 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   unchanged. The op-log is **unauthenticated by default**; when started with
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 Ed25519 public key) it additionally
   requires each request to carry an Ed25519 signature over a canonical
-  `(method, path, query, timestamp, body)` message — a **single static dev
-  device key**, replay-window-bounded (not nonce-tracked); real multi-device
-  enrollment / JWT auth remains **future** (see
-  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
+  `(method, path, query, timestamp, nonce, body)` message (contract **v2**) plus a
+  per-request `X-Sigil-Nonce`; a bounded, **in-memory nonce store** then rejects
+  in-window replays — a **single static dev device key** whose replay guard is
+  dev-only (the store is lost on restart, not shared across instances); real
+  multi-device enrollment / JWT auth remains **future** (see
+  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)
+  and [`decisions/0012-nonce-replay-protection.md`](decisions/0012-nonce-replay-protection.md)).
   The op-log sits behind a `VaultLog` seam with
   **two dev backends**: an **in-memory, non-durable** map (the default) and an
   optional **file-backed** one selected via `SIGILD_OPLOG_DIR` for local-dev
@@ -98,13 +136,13 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   envelope codec (encode/decode)                                │    │
    │   │   Argon2id KDF  →  XChaCha20-Poly1305 + HKDF AEAD               │    │
    │   │   record API: seal_record / open_record                        │    │
-   │   │   Ed25519 sign / verify  (seed caller-supplied; no RNG)         │    │
+   │   │   Ed25519 · X25519 · ML-KEM-768 · X-Wing hybrid (caller entropy)│    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
    │      │ cli  (sigil)           │        │ libsigil/ffi  + sigil.h    │     │
-   │      │ seal/open file         │        │ sigil_seal / sigil_open /  │     │
-   │      │ push/pull (dev HTTP)   │        │ sigil_buffer_free          │     │
+   │      │ seal/open file         │        │ seal / open / buffer_free  │     │
+   │      │ push/pull (dev HTTP)   │        │ ed25519_* · x25519_* (C)   │     │
    │      └────────────┬───────────┘        └───────────┬───────────────┘     │
    │                   │                                 │                     │
    └───────────────────┼─────────────────────────────────┼────────────────────┘
@@ -181,9 +219,10 @@ depend on the server (this is the property the threat model leans on for the
 rogue-employee and compromised-server adversaries — see
 [`threat-model.md`](threat-model.md)). Note the current dev op-log is *also*
 non-durable and unauthenticated by default — optionally guarded by a single
-static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, replay-window-bounded, not
-nonce-tracked; real multi-device auth is still future) — which is why it is
-dev-gated-off and must never be exposed or hold real secrets.
+static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, with a per-request nonce +
+in-memory nonce store that rejects in-window replays, but lost on restart; real
+multi-device auth is still future) — which is why it is dev-gated-off and must
+never be exposed or hold real secrets.
 
 ---
 
@@ -276,20 +315,28 @@ authoritative list, with rationale, is the **defer ledger** in
   directories.
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
-  device-key signature check (replay-window-bounded, not nonce-tracked), but
-  there is no device enrollment, no multi-device registry, no JWT auth, and no
+  device-key signature check, with a per-request nonce + in-memory nonce store
+  that rejects in-window replays (dev-only: lost on restart, not shared across
+  instances), but there is no device enrollment, no multi-device registry, no JWT
+  auth, and no
   per-vault membership check
   ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **No KEM, and no hybrid signature, in a flow.** The hybrid X25519 & ML-KEM-768
-  key encapsulation of suite `0x12` is *specified* and *reserved* in the envelope
-  (`kem_ct`), but **not implemented**. For signatures, the **classical Ed25519
-  half is implemented** as a standalone `sign`/`verify` primitive (caller-supplied
-  seed; UNAUDITED), but the **ML-DSA-65 post-quantum half is not**, so the combined
-  hybrid signature does not yet exist — and neither the KEM nor any signature is
-  wired into a record/product flow. Only the symmetric path (Argon2id → AEAD →
-  envelope) actually runs end-to-end.
+- **No hybrid KEM in a flow, and no hybrid signature at all.**
+  - *KEM.* The **X-Wing hybrid now exists as a primitive** (`xwing_*`,
+    combining X25519 + ML-KEM-768 with a proven combiner and official test
+    vectors), but it is **not wired into the envelope, the record API, or any
+    product flow**: the envelope's `kem_ct` field stays reserved/`None`
+    (populating it without a real recipient-key/rotation flow would be a dead
+    path that *looks* like PQ protection). **Every record Sigil produces today
+    therefore still has NO post-quantum protection.**
+  - *Signatures.* The **classical Ed25519 half is implemented** as a standalone
+    `sign`/`verify` primitive (caller-supplied seed; UNAUDITED), but the
+    **ML-DSA-65 post-quantum half is not**, so the combined hybrid signature does
+    not yet exist — there is still no post-quantum signature in this repo.
+
+  Only the symmetric path (Argon2id → AEAD → envelope) actually runs end-to-end.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number — no signed ops, no Lamport/Merkle
   ordering, no conflict-free merge.

@@ -20,9 +20,12 @@
 //!
 //! A classical X25519 key-agreement primitive ([`x25519_public_key`] /
 //! [`x25519_shared_secret`], [`mod@kex`]) provides the classical half of the
-//! hybrid X25519&ML-KEM-768 KEM; the post-quantum ML-KEM-768 half is
-//! reserved/future and not yet implemented, so the two shared secrets are not yet
-//! combined.
+//! hybrid X25519&ML-KEM-768 KEM, and a post-quantum ML-KEM-768 primitive
+//! ([`mlkem768_encapsulate`] / [`mlkem768_decapsulate`], [`mod@mlkem`],
+//! FIPS 203) provides the post-quantum half. Both halves are standalone
+//! primitives — their shared secrets are **not yet combined**, so the hybrid
+//! KEM of suite `0x12` still does not exist and nothing in this crate is
+//! post-quantum protected yet.
 //!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
@@ -44,6 +47,7 @@ mod aead;
 mod envelope;
 mod kdf;
 mod kex;
+mod mlkem;
 mod record;
 mod sig;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
@@ -52,6 +56,11 @@ pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 pub use kex::{
     is_contributory, x25519_public_key, x25519_shared_secret, KEX_PUBLIC_KEY_LEN, KEX_SECRET_LEN,
     KEX_SHARED_SECRET_LEN,
+};
+pub use mlkem::{
+    mlkem768_decapsulate, mlkem768_encapsulate, mlkem768_keygen, MlKemError,
+    MLKEM768_CIPHERTEXT_LEN, MLKEM768_DECAP_KEY_LEN, MLKEM768_ENCAP_KEY_LEN,
+    MLKEM768_ENCAP_SEED_LEN, MLKEM768_SEED_D_LEN, MLKEM768_SEED_Z_LEN, MLKEM768_SHARED_SECRET_LEN,
 };
 pub use record::{open_record, seal_record, RecordError};
 pub use sig::{

@@ -5,9 +5,10 @@
  * C-ABI over sigil-core: the symmetric AEAD seal/open layer (XChaCha20-Poly1305
  * + HKDF-SHA256), plus classical-only Ed25519 signatures and X25519 key
  * agreement. The underlying cryptography is real (vetted RustCrypto crates) but
- * has NOT been audited, the post-quantum halves (ML-DSA-65 / ML-KEM-768) are NOT
- * implemented (so nothing here is post-quantum), and none of it is wired into a
- * complete account / key-management / key-rotation flow. Treat these functions
+ * has NOT been audited. ML-DSA-65 is NOT implemented; ML-KEM-768 now exists in
+ * the core but is NOT exposed over this ABI and is not combined with X25519 —
+ * so nothing reachable through this header is post-quantum — and none of it is
+ * wired into a complete account / key-management / key-rotation flow. Treat these functions
  * as building blocks, not a finished secure system. All seeds/secrets are
  * caller-supplied — this library generates no randomness. Do not store real
  * secrets.
@@ -126,9 +127,10 @@ int32_t sigil_open(const uint8_t *master_key, /* 32 bytes */
 /* ---- Asymmetric primitives (fixed-size, caller-provided out buffers) --------
  *
  * STATUS: pre-audit, UNAUDITED. Classical-only building blocks (Ed25519
- * signatures, X25519 key agreement); the ML-DSA-65 / ML-KEM-768 PQ halves are
- * NOT implemented, so these are NOT post-quantum and NOT wired into any account
- * or key-management flow.
+ * signatures, X25519 key agreement); ML-DSA-65 is NOT implemented and
+ * ML-KEM-768, while now a core primitive, is NOT exposed over this ABI and NOT
+ * combined with X25519 — so these exports are NOT post-quantum and NOT wired
+ * into any account or key-management flow.
  *
  * These take CALLER-ALLOCATED fixed-size output arrays (out_pk[32] / out_sig[64]
  * / out_ss[32]) and return an int32_t status; they NEVER heap-allocate, so there

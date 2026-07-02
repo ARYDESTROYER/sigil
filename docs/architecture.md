@@ -52,11 +52,22 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     check) — a raw RFC 7748 Diffie-Hellman over a **caller-supplied 32-byte secret
     scalar** (real but UNAUDITED; a standalone primitive, **not yet** wired into the
     hybrid `X25519 & ML-KEM-768` KEM of suite `0x12` — the ML-KEM-768 post-quantum
-    half stays unimplemented and the two shared secrets are not combined; see
-    [`decisions/0010-x25519-key-agreement-primitive.md`](decisions/0010-x25519-key-agreement-primitive.md)).
+    half now exists as its own standalone primitive below, but the two are **NOT
+    combined**; see
+    [`decisions/0010-x25519-key-agreement-primitive.md`](decisions/0010-x25519-key-agreement-primitive.md));
+  - the **post-quantum ML-KEM-768 KEM primitive** (`mlkem768_keygen` /
+    `mlkem768_encapsulate` / `mlkem768_decapsulate`, FIPS 203) — deterministic
+    over **caller-supplied 32-byte seeds** (`d`, `z` for keygen; `m` for
+    encapsulation), with FIPS 203 implicit rejection on decapsulation (a tampered
+    ciphertext yields a *different* shared secret, not an error) and a §7.2
+    encapsulation-key modulus check the underlying crate omits (real but
+    UNAUDITED; a standalone primitive, **not** combined with X25519, so **records
+    sealed today still have NO post-quantum protection**; see
+    [`decisions/0013-ml-kem-768-pq-kem-primitive.md`](decisions/0013-ml-kem-768-pq-kem-primitive.md)).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
-  the AEAD nonce, the Ed25519 signing seed, and the X25519 secret scalar are **all
+  the AEAD nonce, the Ed25519 signing seed, the X25519 secret scalar, and the
+  ML-KEM-768 keygen seeds (`d`, `z`) and encapsulation randomness (`m`) are **all
   caller-supplied**, so the core stays `wasm32-unknown-unknown`-pure and
   `getrandom`-free (see
   [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
@@ -71,8 +82,9 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   / `sigil_x25519_is_contributory`), which write a fixed 32/64-byte result into a
   **caller-provided** buffer and never allocate (nothing to free) — see
   [`decisions/0011-fixed-size-out-buffer-ffi-convention.md`](decisions/0011-fixed-size-out-buffer-ffi-convention.md).
-  The asymmetric exports are classical-only and UNAUDITED (the PQ halves are
-  unimplemented). This is the seam the native clients (in separate repos) will
+  The asymmetric exports are classical-only and UNAUDITED (ML-DSA-65 is
+  unimplemented; the core's ML-KEM-768 primitive is not exposed over this ABI).
+  This is the seam the native clients (in separate repos) will
   link against. It is the only crate with `unsafe` (the FFI boundary); `core`
   forbids it.
 - **`cli`** ([`../cli/`](../cli/)) — `sigil`, a **pre-audit demonstration** binary.
@@ -118,7 +130,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   envelope codec (encode/decode)                                │    │
    │   │   Argon2id KDF  →  XChaCha20-Poly1305 + HKDF AEAD               │    │
    │   │   record API: seal_record / open_record                        │    │
-   │   │   Ed25519 sign/verify · X25519 key agreement (caller-supplied)  │    │
+   │   │   Ed25519 · X25519 · ML-KEM-768 (all entropy caller-supplied)   │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
@@ -305,19 +317,21 @@ authoritative list, with rationale, is the **defer ledger** in
   ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **No hybrid KEM, and no hybrid signature, in a flow.** Both *classical* halves
-  now exist as standalone, UNAUDITED primitives, but neither hybrid is complete and
-  neither is wired into a record/product flow:
-  - *KEM.* The **classical X25519 half is implemented** as a standalone
-    `x25519_public_key` / `x25519_shared_secret` key-agreement primitive
-    (caller-supplied secret scalar; UNAUDITED), but the **ML-KEM-768 post-quantum
-    half is not**, and the two shared secrets are **not combined** — so the hybrid
-    X25519 & ML-KEM-768 encapsulation of suite `0x12` (reserved in the envelope as
-    `kem_ct`) does not yet exist and provides no post-quantum protection.
+- **No hybrid KEM, and no hybrid signature, in a flow.** Both classical halves
+  **and the post-quantum KEM half** now exist as standalone, UNAUDITED
+  primitives, but **neither hybrid is complete** and none is wired into a
+  record/product flow:
+  - *KEM.* **Both halves now exist** — the classical `x25519_shared_secret`
+    primitive and the post-quantum `mlkem768_*` primitive (FIPS 203) — but their
+    shared secrets are **not combined**: the HKDF combine of suite `0x12`
+    (`ss_combined`) does not exist in code, and the envelope's `kem_ct` field
+    stays reserved/unused. **Every record Sigil produces today therefore has NO
+    post-quantum protection**; the hybrid combine is the next planned crypto
+    increment.
   - *Signatures.* The **classical Ed25519 half is implemented** as a standalone
     `sign`/`verify` primitive (caller-supplied seed; UNAUDITED), but the
     **ML-DSA-65 post-quantum half is not**, so the combined hybrid signature does
-    not yet exist.
+    not yet exist — there is still no post-quantum signature in this repo.
 
   Only the symmetric path (Argon2id → AEAD → envelope) actually runs end-to-end.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read

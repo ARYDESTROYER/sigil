@@ -5,8 +5,9 @@
 > blocks — the algorithm-suite registry, the envelope codec, an Argon2id KDF, an
 > XChaCha20-Poly1305 + HKDF AEAD, a composed `seal_record`/`open_record`, and a
 > standalone classical **Ed25519 sign/verify** primitive — none wired into a
-> finished product. The **KEM and the ML-DSA-65 post-quantum signature halves of
-> the hybrid construction remain specified-but-not-implemented.** Condensed from
+> finished product. Both KEM halves (X25519 and ML-KEM-768) now exist as
+> standalone UNAUDITED primitives, but the **hybrid *combine* and the ML-DSA-65
+> post-quantum signature half remain specified-but-not-implemented.** Condensed from
 > the product brief §11/§20/§21. Subject to change. A Cure53 audit of the hybrid
 > construction is to be commissioned before public beta.
 
@@ -97,9 +98,26 @@ are **not canonically encoded** — bit 255 is masked and `u` reduced mod p — 
 `transcript_hash` that folds in raw peer-key bytes MUST normalize them first;
 derive from the shared secret, not the raw encoding.) It is **real but NOT YET
 AUDITED** and **not wired into a KEM/product flow**. The **ML-KEM-768 post-quantum
-half remains specified-but-not-implemented**, and the two shared secrets are **not**
-combined — so the hybrid `X25519 & ML-KEM-768` encapsulation above is **not**
-available and provides no post-quantum protection today.
+half** is now **also implemented** in `sigil-core`
+([`libsigil/core/src/mlkem.rs`](../libsigil/core/src/mlkem.rs)): a raw FIPS 203
+ML-KEM-768 primitive — `mlkem768_keygen` over **caller-supplied 32-byte `d` and
+`z` seeds**, `mlkem768_encapsulate` over **caller-supplied 32-byte randomness
+`m`** (the core still generates no key material —
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)), and
+`mlkem768_decapsulate` — backed by the RustCrypto `ml-kem` crate (`no_std`,
+deterministic API, no `getrandom`); see
+[ADR 0013](decisions/0013-ml-kem-768-pq-kem-primitive.md). Encoded sizes:
+encapsulation key 1184 B, decapsulation key 2400 B, ciphertext 1088 B, shared
+secret 32 B. Callers may persist the 64-byte `d ‖ z` seed instead of the
+2400-byte decapsulation key and re-derive on demand (FIPS 203 permits this; the
+seed is exactly as secret as the key). Per FIPS 203, decapsulation uses
+**implicit rejection**: a tampered ciphertext yields a *different* shared secret,
+**not an error** — callers MUST NOT treat successful decapsulation as
+authentication. It too is **real but NOT YET AUDITED** and **not wired into any
+KEM/product flow**. The two shared secrets are **still not combined** —
+`ss_combined` above does not exist in code — so the hybrid `X25519 & ML-KEM-768`
+encapsulation is **not** available, suite `0x12` remains **not fully
+implemented**, and records still get **no post-quantum protection today**.
 
 *Signatures.* The **classical Ed25519 half** is likewise **implemented** in
 `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):

@@ -16,16 +16,17 @@
 //! fixed-size byte API (arrays in, arrays out) so they are FFI-friendly and can be
 //! exposed across the `sigil-ffi` C-ABI later, exactly like [`crate::sign`].
 //!
-//! ## Classical only — the PQ half is future
+//! ## Classical only — the hybrid is still future
 //!
 //! [`crate::AlgorithmSuite::HybridPq`] (suite `0x12`, the current suite) names a
 //! **hybrid** KEM: classical X25519 **and** post-quantum ML-KEM-768. Only the
-//! **classical X25519** half is implemented here. The **ML-KEM-768** half is
-//! reserved/future and **not** implemented, and the two shared secrets are **not**
-//! yet combined — so the key agreement provided by this module is **not**
-//! post-quantum and offers no protection against a cryptographically-relevant
-//! quantum computer. A complete hybrid KEM will encapsulate under both and combine
-//! the two shared secrets with an HKDF (see `docs/crypto-spec.md`).
+//! **classical X25519** half is implemented here; the **ML-KEM-768** half is now
+//! implemented as its own standalone primitive ([`crate::mlkem`]), but the two
+//! shared secrets are **not** yet combined — so the key agreement provided by
+//! this module alone is **not** post-quantum and offers no protection against a
+//! cryptographically-relevant quantum computer. A complete hybrid KEM will
+//! encapsulate under both and combine the two shared secrets with an HKDF (see
+//! `docs/crypto-spec.md`).
 //!
 //! ## The secret is the caller's responsibility
 //!

@@ -27,9 +27,14 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   implemented**, and the primitive is not yet wired into any auth flow), and a
   real (unaudited) **classical X25519** key-agreement primitive
   (`x25519_public_key`/`x25519_shared_secret` + a constant-time `is_contributory`
-  low-order-point check, over a caller-supplied 32-byte secret — the KEX half of
-  the planned X25519&ML-KEM-768 hybrid KEM, the ML-KEM-768 post-quantum half is
-  **not yet implemented** and the shared secrets are not combined), plus a
+  low-order-point check, over a caller-supplied 32-byte secret), and a real
+  (unaudited) **post-quantum ML-KEM-768 (FIPS 203)** KEM primitive
+  (`mlkem768_keygen`/`mlkem768_encapsulate`/`mlkem768_decapsulate`, fully
+  deterministic over caller-supplied 32-byte seeds `d`/`z`/`m` — the core
+  generates no randomness; decapsulation uses FIPS 203 implicit rejection).
+  X25519 and ML-KEM-768 are the two halves of the planned X25519&ML-KEM-768
+  hybrid KEM (suite 0x12) but are **not yet combined into a hybrid** — records
+  still get no post-quantum protection — and neither is wired into a flow. Plus a
   `sigil-ffi` C-ABI for the clients: the AEAD `seal`/`open`/`buffer_free` (heap
   `SigilBuffer`) and the fixed-size, caller-buffer Ed25519 (`sign`/`verify`/
   `public_key`) and X25519 (`shared_secret`/`public_key`/`is_contributory`)

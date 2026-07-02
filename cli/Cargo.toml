@@ -16,7 +16,7 @@
 name = "sigil-cli"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.81"
 publish = false
 license = "Apache-2.0 OR MIT"
 description = "Pre-audit demonstration CLI that seals/opens a file with the real-but-unaudited libsigil sigil-core record API. Not for real secrets."

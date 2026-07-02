@@ -45,3 +45,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0010](0010-x25519-key-agreement-primitive.md) | X25519 key-agreement primitive (classical KEM half) | Accepted (2026-07) |
 | [0011](0011-fixed-size-out-buffer-ffi-convention.md) | Fixed-size out-buffer convention for the asymmetric C-ABI | Accepted (2026-07) |
 | [0012](0012-nonce-replay-protection.md) | Per-request nonce replay protection for the dev op-log (v2) | Accepted (2026-07) |
+| [0013](0013-ml-kem-768-pq-kem-primitive.md) | ML-KEM-768 primitive (post-quantum KEM half, caller-supplied seeds) | Accepted (2026-07) |

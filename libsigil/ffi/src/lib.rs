@@ -302,8 +302,9 @@ pub unsafe extern "C" fn sigil_open(
 //
 // STATUS: pre-audit, UNAUDITED. These wrap `sigil-core`'s classical-only
 // building blocks — Ed25519 signatures ([`sigil_core::sign`] / [`verify`]) and
-// X25519 key agreement ([`sigil_core::x25519_shared_secret`]). The ML-DSA-65 /
-// ML-KEM-768 post-quantum halves are NOT implemented, so these are **not**
+// X25519 key agreement ([`sigil_core::x25519_shared_secret`]). ML-DSA-65 is NOT
+// implemented, and ML-KEM-768 — while now a core primitive — is NOT exposed over
+// this ABI and NOT combined with X25519, so these exports are **not**
 // post-quantum and are **not** wired into any account / key-management flow.
 //
 // Unlike [`sigil_seal`] / [`sigil_open`], every output here is a **fixed size**

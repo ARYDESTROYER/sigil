@@ -1428,6 +1428,84 @@ with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
   shipped correctness bug beyond this one boundary nit**; the live cross-language
   interop test remains the strongest evidence the replay guard works end-to-end.
 
+## 2026-07-02 — Phase 17 (ML-KEM-768 primitive — the post-quantum KEM half)
+
+### Context & mandate
+- Goal: implement the **post-quantum half** of suite `0x12`'s hybrid KEM —
+  **ML-KEM-768 (FIPS 203)** — as a standalone, real primitive in `libsigil-core`,
+  without breaking the wasm-pure / no-RNG / getrandom-0 invariants and without
+  claiming any hybrid exists (the combine is the next phase).
+- Method: **feasibility probe first** (a scratch crate proved ml-kem 0.2.3 with
+  `default-features=false, features=["deterministic"]` gives caller-seeded
+  deterministic keygen/encaps, builds no_std→wasm32, keeps getrandom at 0, and
+  round-trips with implicit rejection) → 38-agent research fan-out → synthesized
+  brief → I implemented; **I re-verified the KATs against NIST first-hand.**
+
+### core — `core/src/mlkem.rs` ✅
+- New module, re-exported from `lib.rs`:
+  `mlkem768_keygen(&d, &z) -> (ek[1184], dk[2400])` (FIPS 203 order, total),
+  `mlkem768_encapsulate(&ek, &m) -> Result<(ct[1088], ss[32])>`,
+  `mlkem768_decapsulate(&dk, &ct) -> Result<ss[32]>`, `MlKemError`, and the
+  seven `MLKEM768_*_LEN` constants.
+- **Caller-supplied entropy** (ADR 0007): the FIPS 203 seeds `d`/`z` (keygen) and
+  `m` (encapsulation) all come from the caller; the deterministic API is the same
+  FIPS 203 algorithm with the RNG hoisted out. Docs mandate fresh CSPRNG values
+  and explain why `m` reuse is dangerous; callers are steered to **store the
+  64-byte `d‖z` seed instead of the 2400-byte dk** (FIPS 203 permits re-derivation).
+- **We implement the FIPS 203 §7.2 modulus check ourselves** — the research pass
+  discovered ml-kem 0.2.3 does NOT validate encapsulation keys (it silently
+  reduces non-canonical coefficients mod q, diverging from conformant peers).
+  `mlkem768_encapsulate` re-encodes and compares; mismatch →
+  `MlKemError::BadEncapsulationKey` (the module's only reachable error).
+- **Implicit rejection preserved, loudly documented**: decapsulating a tampered
+  ciphertext returns `Ok` with a DIFFERENT pseudorandom secret, never an error
+  (an error would be a CCA oracle); dk integrity is the caller's responsibility.
+- ⚠️ Honest labeling everywhere: this is a REAL PQ primitive, but the **hybrid
+  still does not exist** — the two shared secrets are never mixed, `kem_ct` stays
+  reserved, and **records sealed today still get no post-quantum protection.**
+
+### Dependency & the WASM/GETRANDOM gate ✅
+- **`ml-kem = { version = "0.2", default-features = false, features =
+  ["deterministic", "zeroize"] }`** (RustCrypto, 0.2.3). New lock entries:
+  hybrid-array, kem, sha3, keccak — all RNG-free, build.rs-free. `rand_core`
+  stays trait-definitions-only. ✅ **getrandom count still 0**, wasm32 build
+  green, `#![forbid(unsafe_code)]`/no_std intact.
+- **MSRV bumped 1.74 → 1.81** in core/ffi/cli manifests (forced by hybrid-array,
+  a required ml-kem dep); local + CI toolchains unaffected. Recorded in ADR 0013.
+
+### KATs — first-hand verified against NIST ✅
+- Downloaded **usnistgov/ACVP-Server @ 65370b8** (the commit ml-kem's own tests
+  pin) myself: ML-KEM-768 keyGen tgId 2 **tcId 26** and encapDecap tcId 26.
+- Verified the research brief's every value against the official file (d, z, m,
+  SHA-256(ek), SHA-256(dk), 16-byte spot pins — all match), then ran ml-kem
+  locally with the official (d,z): **ek and dk byte-for-byte identical to NIST's
+  full-length official vectors** — a true interop proof, performed first-hand.
+- The chained encaps half (official ACVP `m` under that key → ct/ss) matched the
+  brief's cross-checked values exactly when computed locally. Rust KAT literals
+  were generated mechanically from the downloaded file (no hand transcription).
+- Tests (13 new; **sigil-core 76 + sigil-ffi 25 total, all green**): round-trip,
+  keygen/encaps determinism, d-sensitivity, z-only-changes-rejection-secret,
+  m-sensitivity, tampered-ct implicit rejection (Ok + different ss), wrong-dk,
+  all-zero-seed totality, non-canonical-ek rejection (§7.2), constants, the ACVP
+  keygen KAT, and the chained encaps/decaps KAT.
+
+### docs ✅
+- New **ADR 0013** (deterministic caller-seeded API justification, the §7.2
+  modulus-check decision, implicit-rejection consequence, MSRV bump, KAT
+  provenance). `crypto-spec.md` implementation status flipped honestly
+  (specified-but-not-implemented → implemented-but-NOT-combined);
+  `architecture.md` §1 (new bullet + no-randomness paragraph + diagram) and §6;
+  `README.md` / `CLAUDE.md` repo-maps; ffi banner wording tightened ("PQ halves
+  not implemented" → ML-DSA-65 unimplemented, ML-KEM-768 not exposed over the
+  ABI, no hybrid); `kex.rs` header cross-links `crate::mlkem`; decisions index.
+
+### ➡️ Still NOT done (honest)
+- **No hybrid, no PQ protection for records.** The combine
+  (`HKDF(ss_x‖ss_kem‖transcript, "sigil-hybrid-v1")`) is the next phase (18),
+  with its own ADR covering the transcript definition and how `kem_ct` gets
+  bound under the AEAD. ML-DSA-65 remains unimplemented (no PQ signature).
+  Nothing is audited; no product flow uses any of it.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

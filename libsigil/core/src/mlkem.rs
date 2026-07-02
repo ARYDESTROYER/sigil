@@ -379,6 +379,47 @@ mod tests {
     }
 
     #[test]
+    fn every_keygen_ek_passes_modulus_check() {
+        // False-positive guard for the self-implemented FIPS 203 §7.2 check: a
+        // decode/re-encode non-identity for ANY honest key would wrongly reject
+        // valid peers. 50 distinct seeds must all encapsulate Ok.
+        for i in 0..50u8 {
+            let d = [i; 32];
+            let z = [i.wrapping_add(1); 32];
+            let (ek, _dk) = mlkem768_keygen(&d, &z);
+            assert!(
+                mlkem768_encapsulate(&ek, &M).is_ok(),
+                "honest ek from seed {i} failed the modulus check (false positive)"
+            );
+        }
+    }
+
+    #[test]
+    fn modulus_check_exact_boundary() {
+        // The first 12-bit coefficient is ek[0] | ((ek[1] & 0x0F) << 8). Exactly
+        // q (3329) must be rejected as non-canonical; exactly q-1 (3328) is a
+        // canonical value and must be accepted.
+        let (ek, _dk) = mlkem768_keygen(&D, &Z);
+
+        let mut at_q = ek;
+        at_q[0] = 0x01; // 3329 = 0xD01
+        at_q[1] = (at_q[1] & 0xf0) | 0x0d;
+        assert_eq!(
+            mlkem768_encapsulate(&at_q, &M),
+            Err(MlKemError::BadEncapsulationKey),
+            "coefficient == q must be rejected"
+        );
+
+        let mut at_q_minus_1 = ek;
+        at_q_minus_1[0] = 0x00; // 3328 = 0xD00
+        at_q_minus_1[1] = (at_q_minus_1[1] & 0xf0) | 0x0d;
+        assert!(
+            mlkem768_encapsulate(&at_q_minus_1, &M).is_ok(),
+            "coefficient == q-1 is canonical and must be accepted"
+        );
+    }
+
+    #[test]
     fn non_canonical_encapsulation_key_is_rejected() {
         let (mut ek, _dk) = mlkem768_keygen(&D, &Z);
         // A keygen-produced ek passes the FIPS 203 §7.2 modulus check.

@@ -1569,6 +1569,43 @@ with `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pub> :18111`.
   today still get no post-quantum protection.** No PQ signature (ML-DSA-65).
   Everything UNAUDITED.
 
+## 2026-07-02 — Phases 17/18 adversarial review follow-ups
+
+The Phase 17 review ran 54/61 voters (18 of 20 dimensions complete) and the
+Phase 18 review 21/55 (7 of 18 dimensions) before hitting the session token
+limit; the consolidation steps died, so **I consolidated the raw votes myself**
+from the workflow journals. Honest coverage note: Phase 18's **seven completed
+dimensions were the most safety-critical ones** (combiner byte order vs the
+draft, seed expansion, eseed split, key/ct layout, panic-freedom, the
+no-contributory-check decision, error surface) — **all clean, zero flagged**;
+the unreviewed remainder is docs-accuracy/test-adequacy territory, and the KATs
+were already first-hand verified. Phase 17's three flagged dimensions (9
+voters), all real, all fixed here:
+
+- **MSRV was unbuildable as declared (MEDIUM, 3/3, empirically verified by the
+  reviewers):** `rust-version = "1.81"` landed in all three manifests, but
+  `cargo +1.81 build --locked` failed — both lockfiles pinned `base64ct 1.8.3`
+  (edition 2024, requires rustc 1.85; pulled via argon2→password-hash). Fixed:
+  precise-pinned **base64ct 1.6.0** (edition 2021, rust-version 1.60) in
+  `libsigil/Cargo.lock` and `cli/Cargo.lock`; swept the rest of the lock — no
+  other package requires > 1.81. Full gate re-run green after the pin.
+- **Stale negation on the web security page (LOW, 3/3):** `security/page.tsx`
+  still listed ML-KEM-768 as "planned" (the page's own legend: "not yet
+  started") — false since Phase 17. Fixed: ML-KEM-768 → "in development;
+  unaudited" (matching the equally-real X25519/Ed25519 rows) and added an
+  **X-Wing hybrid combine row** ("pre-RFC IETF draft", in development,
+  unaudited). ML-DSA-65 and TLS rows correctly stay "planned". Web
+  typecheck/lint/test/build green.
+- **Modulus-check hardening (LOW, 3/3):** the self-implemented FIPS 203 §7.2
+  check had no false-positive guard and no exact boundary test. Added
+  `every_keygen_ek_passes_modulus_check` (50 seeds — a decode/re-encode
+  non-identity for any honest key would wrongly reject valid peers) and
+  `modulus_check_exact_boundary` (first coefficient == q → rejected;
+  == q−1 → accepted). sigil-core → **92 tests**.
+
+Gate after all fixes: fmt/clippy clean · **sigil-core 92 + sigil-ffi 25 + cli
+27** · wasm32 green · getrandom 0.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

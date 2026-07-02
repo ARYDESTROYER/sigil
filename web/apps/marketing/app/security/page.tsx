@@ -36,7 +36,12 @@ const rows: Posture[] = [
   {
     layer: "Post-quantum KEM",
     primitive: "ML-KEM-768 (FIPS 203)",
-    status: "Designed; planned; pre-audit",
+    status: "Designed; in development; unaudited",
+  },
+  {
+    layer: "Hybrid KEM combine",
+    primitive: "X-Wing (X25519 + ML-KEM-768, pre-RFC IETF draft)",
+    status: "Designed; in development; unaudited",
   },
   {
     layer: "Classical signature",

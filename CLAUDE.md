@@ -40,8 +40,9 @@ public, make no security claims, until the audit completes and trademark clears.
   (`public_key_from_seed`/`sign`/`verify`, caller-supplied 32-byte seed, no
   in-core RNG; the signature half of the future Ed25519&ML-DSA-65 hybrid — the
   ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth);
-  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, hand-written
-  `sigil.h`).
+  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
+  Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
+  (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
   request-ID/access-log/recover middleware, in-memory `store`; distroless
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an
@@ -55,13 +56,19 @@ public, make no security claims, until the audit completes and trademark clears.
   path-traversal-safe filename). The file backend is a **local-dev convenience,
   NOT the production store** (production = Postgres/S3). When
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 of a 32-byte Ed25519 public key) is set,
-  op-log requests are **Ed25519-authenticated** (`authorizeOps`, Go stdlib
-  `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` /
-  `X-Sigil-Timestamp` over a canonical `(method,path,query,timestamp,body)` message
-  (300 s window), else **401** `{"error":"unauthorized",…}`. **Default off** (no
-  pubkey → unauthenticated, behavior unchanged); a **SINGLE static dev key**,
-  replay-window-bounded (no nonce store), dev-only — enrollment / multi-device /
-  JWT remain future. **No crypto on the blob**: the server never decodes it; it
+  op-log requests are **Ed25519-authenticated — contract v2** (`authorizeOps`, Go
+  stdlib `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` over a
+  canonical `(method,path,query,timestamp,nonce,body)` message that now includes a
+  fresh per-request **`X-Sigil-Nonce`** (300 s window), else **401**
+  `{"error":"unauthorized",…}`. A **time-bounded, in-memory seen-nonce cache**
+  (`nonceCache`; concurrency-safe, evicts entries past the window + a hard size cap)
+  rejects a **replayed** request inside the window with a distinct **401**
+  `"replayed request"`. **v2 supersedes v1** (nonce added to the signed message +
+  domain prefix `…-v1`→`…-v2`; v1-signed requests no longer verify). **Default off**
+  (no pubkey → unauthenticated, behavior unchanged); a **SINGLE static dev key** and
+  the replay cache is **per-process/in-memory** (multi-instance needs a shared store,
+  e.g. Redis), dev-only — enrollment / multi-device / JWT remain future. **No crypto
+  on the blob**: the server never decodes it; it
   stores/returns the exact client bytes. Endpoint reference in
   [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.

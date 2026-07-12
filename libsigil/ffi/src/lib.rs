@@ -18,6 +18,14 @@
 //! - [`sigil_open`] — authenticate and decrypt encoded envelope bytes,
 //!   returning the recovered plaintext in a heap-allocated [`SigilBuffer`].
 //! - [`sigil_buffer_free`] — release a [`SigilBuffer`] produced by this library.
+//! - [`sigil_public_key_from_seed`] / [`sigil_sign`] / [`sigil_verify`] — the
+//!   classical **Ed25519** signature primitive (derive public key, sign,
+//!   verify) over the C-ABI. These produce **fixed-size** outputs into
+//!   caller-provided buffers, so — unlike seal/open — there is no heap
+//!   [`SigilBuffer`] and nothing to free. This is the classical half of the
+//!   future Ed25519 & ML-DSA-65 hybrid; the post-quantum ML-DSA-65 half is
+//!   **not** implemented here. Raw signature primitive, UNAUDITED, and not an
+//!   enrollment / multi-device / key-rotation system.
 //!
 //! ## Ownership / memory contract
 //!
@@ -42,7 +50,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::slice;
-use sigil_core::{open, seal, AlgorithmSuite, Envelope, KEY_LEN, NONCE_LEN};
+use sigil_core::{
+    open, seal, AlgorithmSuite, Envelope, KEY_LEN, NONCE_LEN, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN,
+    SIG_SEED_LEN,
+};
 
 /// Success: the operation completed and (for seal/open) `*out` was written.
 pub const SIGIL_OK: i32 = 0;
@@ -59,6 +70,12 @@ pub const SIGIL_ERR_OPEN: i32 = -2;
 /// [`SIGIL_ERR_OPEN`] so as not to leak structure; this code is currently
 /// returned only for input-shape problems.
 pub const SIGIL_ERR_BAD_INPUT: i32 = -3;
+/// The Ed25519 signature did not verify (returned by [`sigil_verify`]). Every
+/// verification-path failure from `sigil-core` — an invalid public-key point, a
+/// structurally malformed signature, or a well-formed signature that simply
+/// does not verify — collapses to this single code so the boundary does not
+/// distinguish those cases.
+pub const SIGIL_ERR_VERIFY: i32 = -4;
 
 /// A heap buffer owned by libsigil until released with [`sigil_buffer_free`].
 ///
@@ -289,6 +306,180 @@ pub unsafe extern "C" fn sigil_buffer_free(buf: SigilBuffer) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ed25519 signature primitive (classical half of the future Ed25519 & ML-DSA-65
+// hybrid).
+//
+// STATUS: pre-audit, UNAUDITED. These wrap `sigil-core`'s classical Ed25519
+// sign/verify across the C-ABI so a native client can derive a device public
+// key, sign a message, and verify a signature. The signatures are plain
+// Ed25519 (RFC 8032); the post-quantum ML-DSA-65 half is future work and is NOT
+// present here. This is a raw signature primitive, not an enrollment /
+// multi-device / key-rotation system.
+//
+// Unlike seal/open these produce FIXED-SIZE outputs, so there is no heap
+// `SigilBuffer` and nothing to free: the caller provides the output buffers
+// (32-byte public key, 64-byte signature) and owns them.
+// ---------------------------------------------------------------------------
+
+/// Derive the 32-byte Ed25519 public key from the caller-supplied 32-byte
+/// secret `seed`, writing it into `out_public_key`.
+///
+/// STATUS: pre-audit, unaudited building block. Classical Ed25519 only (the
+/// ML-DSA-65 post-quantum half is future work). Deterministic and RNG-free: the
+/// `seed` is the caller's secret and is never generated here.
+///
+/// # Returns
+/// - [`SIGIL_OK`] on success (`out_public_key` written with
+///   [`SIG_PUBLIC_KEY_LEN`] bytes).
+/// - [`SIGIL_ERR_NULL_ARG`] if `seed` or `out_public_key` is null;
+///   `out_public_key` is left untouched.
+///
+/// # Safety
+/// `seed` must point at [`SIG_SEED_LEN`] (32) readable bytes and
+/// `out_public_key` at [`SIG_PUBLIC_KEY_LEN`] (32) writable bytes. Both buffers
+/// are owned by the caller and must stay valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_public_key_from_seed(
+    seed: *const u8,
+    out_public_key: *mut u8,
+) -> i32 {
+    if seed.is_null() || out_public_key.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+
+    let mut seed_bytes = [0u8; SIG_SEED_LEN];
+    // SAFETY: `seed` is non-null (checked above) and the caller guarantees it
+    // points at SIG_SEED_LEN readable bytes.
+    unsafe {
+        seed_bytes.copy_from_slice(slice::from_raw_parts(seed, SIG_SEED_LEN));
+    }
+
+    let public_key = sigil_core::public_key_from_seed(&seed_bytes);
+
+    // SAFETY: `out_public_key` is non-null (checked above) and the caller
+    // guarantees it points at SIG_PUBLIC_KEY_LEN writable bytes.
+    unsafe {
+        slice::from_raw_parts_mut(out_public_key, SIG_PUBLIC_KEY_LEN).copy_from_slice(&public_key);
+    }
+    SIGIL_OK
+}
+
+/// Produce a 64-byte Ed25519 signature over `message` using the caller-supplied
+/// 32-byte secret `seed`, writing it into `out_signature`.
+///
+/// STATUS: pre-audit, unaudited building block. Classical Ed25519 only (RFC
+/// 8032; signing is deterministic, so no randomness is drawn). The ML-DSA-65
+/// post-quantum half is future work.
+///
+/// `message` may be null **iff** `message_len == 0` (an empty message is signed
+/// in that case). `seed` and `out_signature` must be non-null.
+///
+/// # Returns
+/// - [`SIGIL_OK`] on success (`out_signature` written with [`SIGNATURE_LEN`]
+///   bytes).
+/// - [`SIGIL_ERR_NULL_ARG`] if `seed` or `out_signature` is null, or
+///   `message_len != 0` is paired with a null `message`; `out_signature` is
+///   left untouched.
+///
+/// # Safety
+/// `seed` must point at [`SIG_SEED_LEN`] (32) readable bytes and
+/// `out_signature` at [`SIGNATURE_LEN`] (64) writable bytes. `message` must
+/// point at `message_len` readable bytes when `message_len != 0`. All buffers
+/// are owned by the caller and must stay valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_sign(
+    seed: *const u8,
+    message: *const u8,
+    message_len: usize,
+    out_signature: *mut u8,
+) -> i32 {
+    if seed.is_null() || out_signature.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+
+    // SAFETY: `message` is allowed to be null iff `message_len == 0`; this
+    // helper enforces that and only dereferences for non-zero lengths.
+    let message_slice = match unsafe { optional_slice(message, message_len) } {
+        Some(s) => s,
+        None => return SIGIL_ERR_NULL_ARG,
+    };
+
+    let mut seed_bytes = [0u8; SIG_SEED_LEN];
+    // SAFETY: `seed` is non-null (checked above) and the caller guarantees it
+    // points at SIG_SEED_LEN readable bytes.
+    unsafe {
+        seed_bytes.copy_from_slice(slice::from_raw_parts(seed, SIG_SEED_LEN));
+    }
+
+    let signature = sigil_core::sign(&seed_bytes, message_slice);
+
+    // SAFETY: `out_signature` is non-null (checked above) and the caller
+    // guarantees it points at SIGNATURE_LEN writable bytes.
+    unsafe {
+        slice::from_raw_parts_mut(out_signature, SIGNATURE_LEN).copy_from_slice(&signature);
+    }
+    SIGIL_OK
+}
+
+/// Strictly verify a 64-byte Ed25519 `signature` over `message` against the
+/// 32-byte `public_key`.
+///
+/// STATUS: pre-audit, unaudited building block. Classical Ed25519 only; strict
+/// verification rejects non-canonical encodings and small-order keys. The
+/// ML-DSA-65 post-quantum half is future work.
+///
+/// `message` may be null **iff** `message_len == 0`. `public_key` and
+/// `signature` must be non-null.
+///
+/// # Returns
+/// - [`SIGIL_OK`] if the signature is valid for this exact public key and
+///   message.
+/// - [`SIGIL_ERR_VERIFY`] if it does not verify. An invalid public-key point, a
+///   malformed signature, and a well-formed signature that does not verify all
+///   collapse to this single code.
+/// - [`SIGIL_ERR_NULL_ARG`] if `public_key` or `signature` is null, or
+///   `message_len != 0` is paired with a null `message`.
+///
+/// # Safety
+/// `public_key` must point at [`SIG_PUBLIC_KEY_LEN`] (32) readable bytes and
+/// `signature` at [`SIGNATURE_LEN`] (64) readable bytes. `message` must point
+/// at `message_len` readable bytes when `message_len != 0`. All buffers are
+/// owned by the caller and must stay valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_verify(
+    public_key: *const u8,
+    message: *const u8,
+    message_len: usize,
+    signature: *const u8,
+) -> i32 {
+    if public_key.is_null() || signature.is_null() {
+        return SIGIL_ERR_NULL_ARG;
+    }
+
+    // SAFETY: `message` is allowed to be null iff `message_len == 0`; this
+    // helper enforces that and only dereferences for non-zero lengths.
+    let message_slice = match unsafe { optional_slice(message, message_len) } {
+        Some(s) => s,
+        None => return SIGIL_ERR_NULL_ARG,
+    };
+
+    let mut public_key_bytes = [0u8; SIG_PUBLIC_KEY_LEN];
+    let mut signature_bytes = [0u8; SIGNATURE_LEN];
+    // SAFETY: both pointers are non-null (checked above) and the caller
+    // guarantees they point at SIG_PUBLIC_KEY_LEN / SIGNATURE_LEN readable
+    // bytes.
+    unsafe {
+        public_key_bytes.copy_from_slice(slice::from_raw_parts(public_key, SIG_PUBLIC_KEY_LEN));
+        signature_bytes.copy_from_slice(slice::from_raw_parts(signature, SIGNATURE_LEN));
+    }
+
+    match sigil_core::verify(&public_key_bytes, message_slice, &signature_bytes) {
+        Ok(()) => SIGIL_OK,
+        Err(_) => SIGIL_ERR_VERIFY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +687,237 @@ mod tests {
                 len: 0,
             });
         }
+    }
+
+    // ---- Ed25519 signature primitive (classical, unaudited) ----
+
+    /// Derive a public key, sign a message, and verify the signature — the full
+    /// FFI round-trip returns SIGIL_OK.
+    #[test]
+    fn sign_then_verify_round_trip() {
+        let seed = [0x11u8; SIG_SEED_LEN];
+        let message = b"authenticate this op-log request";
+
+        let mut public_key = [0u8; SIG_PUBLIC_KEY_LEN];
+        let rc = unsafe { sigil_public_key_from_seed(seed.as_ptr(), public_key.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+
+        let mut signature = [0u8; SIGNATURE_LEN];
+        let rc = unsafe {
+            sigil_sign(
+                seed.as_ptr(),
+                message.as_ptr(),
+                message.len(),
+                signature.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_OK);
+
+        let rc = unsafe {
+            sigil_verify(
+                public_key.as_ptr(),
+                message.as_ptr(),
+                message.len(),
+                signature.as_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_OK);
+    }
+
+    /// A signature with one flipped byte fails verification with
+    /// SIGIL_ERR_VERIFY.
+    #[test]
+    fn tampered_signature_fails_verify() {
+        let seed = [0x22u8; SIG_SEED_LEN];
+        let message = b"do not tamper";
+
+        let mut public_key = [0u8; SIG_PUBLIC_KEY_LEN];
+        let rc = unsafe { sigil_public_key_from_seed(seed.as_ptr(), public_key.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+
+        let mut signature = [0u8; SIGNATURE_LEN];
+        let rc = unsafe {
+            sigil_sign(
+                seed.as_ptr(),
+                message.as_ptr(),
+                message.len(),
+                signature.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_OK);
+        signature[SIGNATURE_LEN - 1] ^= 0x01;
+
+        let rc = unsafe {
+            sigil_verify(
+                public_key.as_ptr(),
+                message.as_ptr(),
+                message.len(),
+                signature.as_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_ERR_VERIFY);
+    }
+
+    /// A valid signature verified against a different public key fails with
+    /// SIGIL_ERR_VERIFY.
+    #[test]
+    fn wrong_public_key_fails_verify() {
+        let seed = [0x33u8; SIG_SEED_LEN];
+        let other_seed = [0x44u8; SIG_SEED_LEN];
+        let message = b"bound to one key";
+
+        let mut signature = [0u8; SIGNATURE_LEN];
+        let rc = unsafe {
+            sigil_sign(
+                seed.as_ptr(),
+                message.as_ptr(),
+                message.len(),
+                signature.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_OK);
+
+        let mut other_public_key = [0u8; SIG_PUBLIC_KEY_LEN];
+        let rc = unsafe {
+            sigil_public_key_from_seed(other_seed.as_ptr(), other_public_key.as_mut_ptr())
+        };
+        assert_eq!(rc, SIGIL_OK);
+
+        let rc = unsafe {
+            sigil_verify(
+                other_public_key.as_ptr(),
+                message.as_ptr(),
+                message.len(),
+                signature.as_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_ERR_VERIFY);
+    }
+
+    /// Null required pointers on the signature functions yield
+    /// SIGIL_ERR_NULL_ARG (including a non-zero length paired with a null
+    /// message).
+    #[test]
+    fn sig_null_args_return_null_arg() {
+        let seed = [0x55u8; SIG_SEED_LEN];
+        let mut public_key = [0u8; SIG_PUBLIC_KEY_LEN];
+        let mut signature = [0u8; SIGNATURE_LEN];
+
+        // public_key_from_seed: null seed, then null out.
+        let rc = unsafe { sigil_public_key_from_seed(core::ptr::null(), public_key.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+        let rc = unsafe { sigil_public_key_from_seed(seed.as_ptr(), core::ptr::null_mut()) };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+
+        // sign: null seed, null out, and a non-zero len with a null message.
+        let rc = unsafe {
+            sigil_sign(
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+                signature.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+        let rc = unsafe { sigil_sign(seed.as_ptr(), core::ptr::null(), 0, core::ptr::null_mut()) };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+        let rc = unsafe { sigil_sign(seed.as_ptr(), core::ptr::null(), 4, signature.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+
+        // verify: null public_key, null signature, and a non-zero len with a
+        // null message.
+        let rc = unsafe { sigil_public_key_from_seed(seed.as_ptr(), public_key.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        let rc =
+            unsafe { sigil_verify(core::ptr::null(), core::ptr::null(), 0, signature.as_ptr()) };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+        let rc =
+            unsafe { sigil_verify(public_key.as_ptr(), core::ptr::null(), 0, core::ptr::null()) };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+        let rc = unsafe {
+            sigil_verify(
+                public_key.as_ptr(),
+                core::ptr::null(),
+                4,
+                signature.as_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_ERR_NULL_ARG);
+    }
+
+    /// An empty message (null pointer, len 0) signs and verifies through the
+    /// FFI.
+    #[test]
+    fn empty_message_signs_and_verifies() {
+        let seed = [0x66u8; SIG_SEED_LEN];
+
+        let mut public_key = [0u8; SIG_PUBLIC_KEY_LEN];
+        let rc = unsafe { sigil_public_key_from_seed(seed.as_ptr(), public_key.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+
+        let mut signature = [0u8; SIGNATURE_LEN];
+        let rc = unsafe { sigil_sign(seed.as_ptr(), core::ptr::null(), 0, signature.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+
+        let rc = unsafe {
+            sigil_verify(
+                public_key.as_ptr(),
+                core::ptr::null(),
+                0,
+                signature.as_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_OK);
+    }
+
+    /// RFC 8032 §7.1, Ed25519 TEST 1 (empty message) driven THROUGH the FFI: the
+    /// derived public key, the produced signature, and the verify result all
+    /// match the official known-answer vector. Proves the C-ABI wraps
+    /// interop-correct Ed25519, not just internal self-consistency.
+    #[test]
+    fn rfc8032_test1_through_ffi() {
+        // SECRET KEY (32-byte seed):
+        let seed: [u8; SIG_SEED_LEN] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        // PUBLIC KEY:
+        let expected_pk: [u8; SIG_PUBLIC_KEY_LEN] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        // SIGNATURE (over the empty message):
+        let expected_sig: [u8; SIGNATURE_LEN] = [
+            0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72, 0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e,
+            0x82, 0x8a, 0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74, 0xd8, 0x73, 0xe0, 0x65,
+            0x22, 0x49, 0x01, 0x55, 0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac, 0xc6, 0x1e,
+            0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b, 0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+            0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+        ];
+
+        // Derived public key matches the vector.
+        let mut public_key = [0u8; SIG_PUBLIC_KEY_LEN];
+        let rc = unsafe { sigil_public_key_from_seed(seed.as_ptr(), public_key.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(public_key, expected_pk, "RFC 8032 pubkey through FFI");
+
+        // Signature over the empty message matches the vector.
+        let mut signature = [0u8; SIGNATURE_LEN];
+        let rc = unsafe { sigil_sign(seed.as_ptr(), core::ptr::null(), 0, signature.as_mut_ptr()) };
+        assert_eq!(rc, SIGIL_OK);
+        assert_eq!(signature, expected_sig, "RFC 8032 signature through FFI");
+
+        // Verifying the known-answer vector through the FFI succeeds.
+        let rc = unsafe {
+            sigil_verify(
+                expected_pk.as_ptr(),
+                core::ptr::null(),
+                0,
+                expected_sig.as_ptr(),
+            )
+        };
+        assert_eq!(rc, SIGIL_OK, "RFC 8032 verify through FFI");
     }
 }

@@ -91,12 +91,15 @@ DEVICE-KEY SIGNING (push/pull) — DEV-ONLY, single device key:
     sigil push --vault demo --in secret.sigil --key device.key
     SIGIL_DEVICE_KEY=device.key sigil pull --vault demo --out-dir ./inbox
 
-  HONEST SCOPE: this is a SINGLE device key, DEV-ONLY, over plain HTTP. The
-  signature is bound to the method, path, query, a unix-seconds timestamp, and the
-  body; sigild rejects timestamps skewed more than 300s. That window BOUNDS replay
-  but does NOT fully prevent it (no per-request nonce). Device enrollment, a
-  multi-device registry, and JWT bearer tokens are all FUTURE work. The signing
-  primitive (Ed25519) is REAL but UNAUDITED.
+  HONEST SCOPE: this is a SINGLE device key, DEV-ONLY, over plain HTTP. Requests
+  are signed under the CONTRACT v2 message, which binds the method, path, query, a
+  unix-seconds timestamp, a FRESH per-request nonce, and the body; sigild rejects
+  timestamps skewed more than 300s AND, when it tracks seen nonces, rejects a
+  replayed nonce within that window — so a captured request is replay-resistant.
+  That replay cache is per-process/in-memory on the server (a multi-instance deploy
+  would need a shared store). Device enrollment, a multi-device registry, and JWT
+  bearer tokens are all FUTURE work. The signing primitive (Ed25519) is REAL but
+  UNAUDITED.
 
 INCREMENTAL PULL (pull only):
   Pulled ops are written to <out-dir>/<vault>/op-<seq>.sigil — a PER-VAULT subdir,

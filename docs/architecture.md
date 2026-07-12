@@ -54,7 +54,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   core stays `wasm32-unknown-unknown`-pure and `getrandom`-free (see
   [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
 - **`libsigil/ffi`** ([`../libsigil/ffi/`](../libsigil/ffi/)) — a thin, hand-written
-  **C-ABI** over the AEAD layer: `sigil_seal` / `sigil_open` / `sigil_buffer_free`
+  **C-ABI** over the core: the AEAD layer `sigil_seal` / `sigil_open` /
+  `sigil_buffer_free`, and — alongside it — the classical **Ed25519** primitive
+  `sigil_public_key_from_seed` / `sigil_sign` / `sigil_verify`, so the same
+  standalone, UNAUDITED sign/verify the CLI uses is reachable over the C-ABI too
   (plus `sigil_current_suite` as a link/smoke check), with a hand-maintained
   [`sigil.h`](../libsigil/ffi/include/sigil.h). This is the seam the native
   clients (in separate repos) will link against. It is the only crate with
@@ -72,10 +75,13 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   unchanged. The op-log is **unauthenticated by default**; when started with
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 Ed25519 public key) it additionally
   requires each request to carry an Ed25519 signature over a canonical
-  `(method, path, query, timestamp, body)` message — a **single static dev
-  device key**, replay-window-bounded (not nonce-tracked); real multi-device
-  enrollment / JWT auth remains **future** (see
-  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
+  `(method, path, query, timestamp, nonce, body)` message — **op-log auth
+  contract v2** — a **single static dev device key** whose **per-request nonce**
+  is checked against a time-bounded, **in-memory / per-process seen-nonce cache**
+  so a captured request cannot be replayed inside the 300 s window; real
+  multi-device enrollment / JWT auth remains **future** (see
+  [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)
+  and [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
   The op-log sits behind a `VaultLog` seam with
   **two dev backends**: an **in-memory, non-durable** map (the default) and an
   optional **file-backed** one selected via `SIGILD_OPLOG_DIR` for local-dev
@@ -182,9 +188,10 @@ depend on the server (this is the property the threat model leans on for the
 rogue-employee and compromised-server adversaries — see
 [`threat-model.md`](threat-model.md)). Note the current dev op-log is *also*
 non-durable and unauthenticated by default — optionally guarded by a single
-static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, replay-window-bounded, not
-nonce-tracked; real multi-device auth is still future) — which is why it is
-dev-gated-off and must never be exposed or hold real secrets.
+static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, contract v2: a per-request
+nonce checked against a time-bounded in-memory replay cache; real multi-device
+auth is still future) — which is why it is dev-gated-off and must never be
+exposed or hold real secrets.
 
 ---
 
@@ -277,10 +284,12 @@ authoritative list, with rationale, is the **defer ledger** in
   directories.
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
-  device-key signature check (replay-window-bounded, not nonce-tracked), but
-  there is no device enrollment, no multi-device registry, no JWT auth, and no
-  per-vault membership check
-  ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)).
+  device-key signature check (contract v2: a per-request nonce plus a
+  time-bounded, **per-process** in-memory replay cache — a multi-instance deploy
+  would need a shared store), but there is no device enrollment, no multi-device
+  registry, no JWT auth, and no per-vault membership check
+  ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md),
+  [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
 - **No KEM, and no hybrid signature, in a flow.** The hybrid X25519 & ML-KEM-768

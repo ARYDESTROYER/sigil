@@ -37,14 +37,17 @@ type Config struct {
 	// OpLogPubKey, when non-nil AND DevOpsEnabled is true, turns on Ed25519
 	// request-authentication for the dev op-log: every GET/POST
 	// /v1/vaults/{vaultID}/ops must carry a valid X-Sigil-Timestamp +
-	// X-Sigil-Signature per the op-log auth contract (see opsauth.go). nil
-	// (the default) means NO auth — unchanged, UNAUTHENTICATED behaviour.
+	// X-Sigil-Nonce + X-Sigil-Signature per the op-log auth contract v2 (see
+	// opsauth.go). nil (the default) means NO auth — unchanged, UNAUTHENTICATED
+	// behaviour.
 	//
-	// HONEST SCOPE: this is a SINGLE configured DEV device key. The timestamp
-	// window bounds replay but does NOT fully prevent it (no nonce/jti
-	// tracking). Real device enrollment, a multi-device registry, and JWT
-	// bearer tokens (see internal/auth) remain FUTURE. Dev-only; do NOT expose
-	// publicly.
+	// HONEST SCOPE: this is a SINGLE configured DEV device key. Each request
+	// carries a fresh nonce and the server keeps a PER-PROCESS/in-memory replay
+	// cache, so a captured request cannot be replayed within the timestamp
+	// window against this instance — but a multi-instance deploy needs a shared
+	// store (e.g. Redis). Real device enrollment, a multi-device registry, and
+	// JWT bearer tokens (see internal/auth) remain FUTURE. Dev-only; do NOT
+	// expose publicly.
 	OpLogPubKey ed25519.PublicKey
 }
 
@@ -54,6 +57,14 @@ func NewRouter(cfg Config) http.Handler {
 		cfg.Logger = slog.Default()
 	}
 	h := &handlers{cfg: cfg}
+	// Op-log request-auth enabled => attach the in-memory replay cache so a
+	// captured, validly-signed request cannot be replayed within the timestamp
+	// window. Per-process/in-memory only (a multi-instance deploy needs a shared
+	// store, e.g. Redis); dev-only. nil when auth is off (authorizeOps returns
+	// before touching it).
+	if cfg.OpLogPubKey != nil {
+		h.nonces = newNonceCache()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)

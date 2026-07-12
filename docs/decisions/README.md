@@ -2,7 +2,8 @@
 
 > **STATUS: pre-audit.** These ADRs describe the **current pre-launch skeleton**
 > (the 72-hour foundation sprint, through the dev-gated op-log, the Ed25519
-> sign/verify primitive and device-key request auth, the file-backed dev backend,
+> sign/verify primitive and device-key request auth (v2, nonce/replay-hardened),
+the file-backed dev backend,
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -44,3 +45,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0007](0007-caller-supplied-entropy-in-core.md) | Caller-supplied entropy in `sigil-core` | Accepted (2026-06) |
 | [0008](0008-device-key-request-auth.md) | Device-key request auth for the dev op-log (`SIGILD_OPLOG_PUBKEY`) | Accepted (2026-06) |
 | [0009](0009-manual-gated-deploy-and-publish.md) | Manual / human-gated deploy and publish | Accepted (2026-06) |
+| [0010](0010-op-log-auth-v2-nonce-replay.md) | Op-log request auth v2 — signed per-request nonce + replay cache | Accepted (2026-06) |

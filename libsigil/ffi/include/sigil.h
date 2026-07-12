@@ -3,10 +3,13 @@
  *
  * STATUS: pre-audit, UNAUDITED building block. This header declares a thin
  * C-ABI over sigil-core's symmetric AEAD seal/open layer (XChaCha20-Poly1305 +
- * HKDF-SHA256). The underlying cryptography is real (vetted RustCrypto crates)
- * but has NOT been audited, and it is NOT wired into a complete account /
- * key-management / key-rotation flow. Treat these functions as building blocks,
- * not a finished secure system. Do not store real secrets.
+ * HKDF-SHA256) plus the classical Ed25519 signature primitive (derive public
+ * key / sign / verify). The underlying cryptography is real (vetted RustCrypto
+ * crates) but has NOT been audited, and it is NOT wired into a complete account
+ * / key-management / key-rotation flow. The signatures are plain Ed25519 (RFC
+ * 8032) — the post-quantum ML-DSA-65 half of the future hybrid is NOT present
+ * here. Treat these functions as building blocks, not a finished secure system.
+ * Do not store real secrets.
  *
  * This file is hand-written (not generated) and kept in sync with
  * libsigil/ffi/src/lib.rs by hand.
@@ -36,6 +39,19 @@ extern "C" {
 /* Malformed input shape detected before the crypto step (reserved; not an
  * authentication failure). */
 #define SIGIL_ERR_BAD_INPUT (-3)
+/* The Ed25519 signature did not verify (returned by sigil_verify). An invalid
+ * public-key point, a malformed signature, and a well-formed signature that
+ * does not verify all collapse to this single code. */
+#define SIGIL_ERR_VERIFY (-4)
+
+/* ---- Ed25519 signature primitive: fixed buffer sizes (bytes) ---- */
+
+/* Length of the caller-supplied Ed25519 secret seed. */
+#define SIGIL_SIG_SEED_LEN 32
+/* Length of an Ed25519 public key. */
+#define SIGIL_SIG_PUBLIC_KEY_LEN 32
+/* Length of an Ed25519 signature. */
+#define SIGIL_SIGNATURE_LEN 64
 
 /*
  * A heap buffer owned by libsigil until released with sigil_buffer_free().
@@ -124,6 +140,75 @@ int32_t sigil_open(const uint8_t *master_key, /* 32 bytes */
  * SigilBuffer value itself; this reclaims only the heap slice it points at.
  */
 void sigil_buffer_free(SigilBuffer buf);
+
+/* ---- Ed25519 signature primitive (classical half of the future hybrid) ----
+ *
+ * STATUS: pre-audit, UNAUDITED. Classical Ed25519 only (RFC 8032); the
+ * post-quantum ML-DSA-65 half is future work and is NOT present here. This is a
+ * raw signature primitive, not an enrollment / multi-device / key-rotation
+ * system.
+ *
+ * Unlike sigil_seal / sigil_open, these produce FIXED-SIZE outputs into
+ * caller-provided buffers, so there is NO heap SigilBuffer and nothing to free:
+ * the caller owns the output buffers (public key / signature).
+ */
+
+/*
+ * Derive the 32-byte Ed25519 public key from the caller-supplied 32-byte secret
+ * `seed`, writing it into `out_public_key`. Deterministic and RNG-free.
+ *
+ * Pointer rules: `seed` and `out_public_key` must both be non-null. `seed`
+ * points at SIGIL_SIG_SEED_LEN (32) readable bytes; `out_public_key` points at
+ * SIGIL_SIG_PUBLIC_KEY_LEN (32) writable bytes. Both buffers are owned by the
+ * caller.
+ *
+ * Returns SIGIL_OK on success (out_public_key written), or SIGIL_ERR_NULL_ARG
+ * if `seed` or `out_public_key` is null (out_public_key left untouched).
+ */
+int32_t sigil_public_key_from_seed(const uint8_t *seed,           /* 32 bytes */
+                                   uint8_t       *out_public_key); /* 32 bytes */
+
+/*
+ * Produce a 64-byte Ed25519 signature over `message` using the caller-supplied
+ * 32-byte secret `seed`, writing it into `out_signature`. Signing is
+ * deterministic (RFC 8032), so no randomness is drawn.
+ *
+ * Pointer rules: `seed` and `out_signature` must be non-null. `seed` points at
+ * SIGIL_SIG_SEED_LEN (32) readable bytes; `out_signature` points at
+ * SIGIL_SIGNATURE_LEN (64) writable bytes. `message` may be NULL iff
+ * message_len is 0 (an empty message is signed); otherwise it points at
+ * message_len readable bytes. All buffers are owned by the caller.
+ *
+ * Returns SIGIL_OK on success (out_signature written), or SIGIL_ERR_NULL_ARG if
+ * `seed`/`out_signature` is null or message_len != 0 with a null `message`
+ * (out_signature left untouched).
+ */
+int32_t sigil_sign(const uint8_t *seed, /* 32 bytes */
+                   const uint8_t *message,
+                   size_t         message_len,
+                   uint8_t       *out_signature); /* 64 bytes */
+
+/*
+ * Strictly verify a 64-byte Ed25519 `signature` over `message` against the
+ * 32-byte `public_key`. Strict verification rejects non-canonical encodings and
+ * small-order keys.
+ *
+ * Pointer rules: `public_key` and `signature` must be non-null. `public_key`
+ * points at SIGIL_SIG_PUBLIC_KEY_LEN (32) readable bytes; `signature` points at
+ * SIGIL_SIGNATURE_LEN (64) readable bytes. `message` may be NULL iff message_len
+ * is 0; otherwise it points at message_len readable bytes.
+ *
+ * Returns:
+ *   - SIGIL_OK if the signature is valid for this exact public key and message.
+ *   - SIGIL_ERR_VERIFY if it does not verify (invalid public-key point,
+ *     malformed signature, or a well-formed signature that does not verify).
+ *   - SIGIL_ERR_NULL_ARG if `public_key`/`signature` is null or message_len != 0
+ *     with a null `message`.
+ */
+int32_t sigil_verify(const uint8_t *public_key, /* 32 bytes */
+                     const uint8_t *message,
+                     size_t         message_len,
+                     const uint8_t *signature); /* 64 bytes */
 
 #ifdef __cplusplus
 } /* extern "C" */

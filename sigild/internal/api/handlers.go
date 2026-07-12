@@ -18,6 +18,10 @@ type handlers struct {
 	// in which case NewRouter wires an in-memory MemVaultLog and routes
 	// opsAppend/opsList here instead of the 501 stub.
 	log store.VaultLog
+	// nonces is the op-log request-auth replay cache. NewRouter constructs it
+	// only when cfg.OpLogPubKey is set (auth enabled); it is nil otherwise, and
+	// authorizeOps returns before touching it when auth is off.
+	nonces *nonceCache
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -126,12 +130,12 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "could not read request body")
 		return
 	}
-	// Verify the op-log request signature over (method, path, query, ts, body).
-	// No-op (returns nil) unless cfg.OpLogPubKey is set. Must run AFTER the body
-	// is read (it is part of the signed message) and BEFORE we append.
+	// Verify the op-log request signature over (method, path, query, ts, nonce,
+	// body) and reject replays. No-op (returns nil) unless cfg.OpLogPubKey is
+	// set. Must run AFTER the body is read (it is part of the signed message) and
+	// BEFORE we append.
 	if err := h.authorizeOps(r, blob); err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized",
-			"missing or invalid op-log request signature")
+		writeOpsAuthError(w, err)
 		return
 	}
 	if len(blob) == 0 {
@@ -165,12 +169,11 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the op-log request signature over (method, path, query, ts, "").
-	// GET carries no body, so the signed body is empty. No-op (returns nil)
-	// unless cfg.OpLogPubKey is set. Must run BEFORE we list.
+	// Verify the op-log request signature over (method, path, query, ts, nonce,
+	// "") and reject replays. GET carries no body, so the signed body is empty.
+	// No-op (returns nil) unless cfg.OpLogPubKey is set. Must run BEFORE we list.
 	if err := h.authorizeOps(r, nil); err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized",
-			"missing or invalid op-log request signature")
+		writeOpsAuthError(w, err)
 		return
 	}
 

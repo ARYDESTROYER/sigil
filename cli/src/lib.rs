@@ -258,17 +258,20 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
 // them (the op-log REQUEST-AUTH contract).
 //
 // STATUS: pre-audit, DEV-ONLY. This implements the CLIENT side of the
-// `sigil-oplog-auth-v1` request-auth contract. sigild enables it ONLY when it is
+// `sigil-oplog-auth-v2` request-auth contract. sigild enables it ONLY when it is
 // configured with SIGILD_OPLOG_PUBKEY = standard-base64 of this device's 32-byte
 // Ed25519 PUBLIC key. When sigild has no pubkey configured, the dev op-log is
 // UNAUTHENTICATED and these signatures are simply ignored.
 //
-// HONEST SCOPE: this is a SINGLE device key, DEV-ONLY. The contract's timestamp
-// window (sigild rejects skew/staleness beyond 300s) BOUNDS replay but does NOT
-// fully prevent it — there is no nonce/jti tracking, so a captured request can be
-// replayed within the window. Real device enrollment, a multi-device registry,
-// per-request nonces, and JWT bearer tokens all remain FUTURE work. The signing
-// uses sigil_core's REAL but UNAUDITED Ed25519 primitive.
+// HONEST SCOPE: this is a SINGLE device key, DEV-ONLY. Each request now carries a
+// FRESH random per-request NONCE (>=16 CSPRNG bytes, std-base64) that is BOTH
+// signed into the message AND sent as the X-Sigil-Nonce header; a sigild that
+// remembers seen nonces (for as long as the 300s timestamp window lets a request
+// pass) will REJECT a replayed request, so within the window replay is prevented,
+// not merely bounded. That replay cache is PER-PROCESS/in-memory on the server, so
+// a multi-instance production deploy would need a shared store (e.g. Redis). Real
+// device enrollment, a multi-device registry, and JWT bearer tokens all remain
+// FUTURE work. The signing uses sigil_core's REAL but UNAUDITED Ed25519 primitive.
 // ---------------------------------------------------------------------------
 
 /// The version byte written into every device key file. The only version this
@@ -276,12 +279,17 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
 pub const KEY_FILE_VERSION: u8 = 1;
 
 /// The fixed domain-separation prefix that opens the signed op-log auth message.
-/// It MUST match sigild's verifier byte-for-byte (the `sigil-oplog-auth-v1`
+/// It MUST match sigild's verifier byte-for-byte (the `sigil-oplog-auth-v2`
 /// contract).
-const OPLOG_AUTH_PREFIX: &[u8] = b"sigil-oplog-auth-v1\n";
+const OPLOG_AUTH_PREFIX: &[u8] = b"sigil-oplog-auth-v2\n";
+
+/// Number of random bytes drawn for each per-request auth nonce, before base64.
+/// The v2 contract requires at least 16 bytes of CSPRNG output; the base64 text
+/// of these bytes is what is signed and sent as `X-Sigil-Nonce`.
+const OPLOG_NONCE_LEN: usize = 16;
 
 /// A LOCAL, DEV-ONLY device key file: a single Ed25519 key pair used to sign
-/// op-log requests under the `sigil-oplog-auth-v1` contract.
+/// op-log requests under the `sigil-oplog-auth-v2` contract.
 ///
 /// On disk this is JSON `{"version":1,"seed":"<b64>","public_key":"<b64>"}`,
 /// where `seed` is standard-base64 of the 32-byte Ed25519 secret seed and
@@ -406,34 +414,50 @@ fn unix_timestamp_secs() -> Result<String, CliError> {
     Ok(now.as_secs().to_string())
 }
 
-/// Build and sign the `sigil-oplog-auth-v1` message for one request, returning the
-/// `(X-Sigil-Timestamp value, X-Sigil-Signature value)` header pair.
+/// Build and sign the `sigil-oplog-auth-v2` message for one request, returning the
+/// `(X-Sigil-Timestamp value, X-Sigil-Nonce value, X-Sigil-Signature value)`
+/// header triple.
+///
+/// A FRESH random nonce is drawn per call: [`OPLOG_NONCE_LEN`] (>= 16) bytes from
+/// the OS CSPRNG, standard-base64-encoded to the ASCII `X-Sigil-Nonce` value. That
+/// exact base64 text is bound into the signed message AND returned as the header,
+/// so a sigild that remembers seen nonces can REJECT a replayed request within the
+/// timestamp window.
 ///
 /// The signed MESSAGE is, byte-for-byte (lines joined by a single `\n`, with a
-/// trailing `\n` after the timestamp, then the raw body):
+/// trailing `\n` after the nonce, then the raw body):
 ///
 /// ```text
-/// sigil-oplog-auth-v1\n
+/// sigil-oplog-auth-v2\n
 /// {METHOD}\n          (uppercase: "POST" or "GET")
 /// {PATH}\n            (URL path, no query — e.g. /v1/vaults/demo/ops)
 /// {QUERY}\n           (raw query string, or "" if none — e.g. since=0)
 /// {TIMESTAMP}\n       (unix seconds, decimal ASCII)
+/// {NONCE}\n           (the EXACT X-Sigil-Nonce base64 string, used verbatim)
 /// {BODY}              (raw request body bytes; empty for GET)
 /// ```
 ///
-/// i.e. `MESSAGE = b"sigil-oplog-auth-v1\n" + METHOD + b"\n" + PATH + b"\n" +
-/// QUERY + b"\n" + TIMESTAMP + b"\n" + BODY`. The `(method, path, query, body)`
-/// passed here MUST be exactly what the HTTP request will send (see [`push_op`] /
-/// [`pull_ops`]), or the server's reconstruction will not match and verification
-/// fails. The signature is standard-base64 of the 64-byte Ed25519 signature.
+/// i.e. `MESSAGE = b"sigil-oplog-auth-v2\n" + METHOD + b"\n" + PATH + b"\n" +
+/// QUERY + b"\n" + TIMESTAMP + b"\n" + NONCE + b"\n" + BODY`. The `(method, path,
+/// query, body)` passed here MUST be exactly what the HTTP request will send (see
+/// [`push_op`] / [`pull_ops`]), or the server's reconstruction will not match and
+/// verification fails. The signature is standard-base64 of the 64-byte Ed25519
+/// signature.
 fn sign_oplog_request(
     seed: &[u8; SIG_SEED_LEN],
     method: &str,
     path: &str,
     query: &str,
     body: &[u8],
-) -> Result<(String, String), CliError> {
+) -> Result<(String, String, String), CliError> {
     let timestamp = unix_timestamp_secs()?;
+
+    // Fresh per-request nonce: OPLOG_NONCE_LEN random bytes, std-base64-encoded.
+    // The base64 TEXT is both signed (verbatim, below) and sent as X-Sigil-Nonce,
+    // so the server reconstructs the identical bytes.
+    let mut nonce_bytes = [0u8; OPLOG_NONCE_LEN];
+    fill_random(&mut nonce_bytes)?;
+    let nonce = BASE64.encode(nonce_bytes);
 
     let mut message = Vec::with_capacity(
         OPLOG_AUTH_PREFIX.len()
@@ -441,8 +465,9 @@ fn sign_oplog_request(
             + path.len()
             + query.len()
             + timestamp.len()
+            + nonce.len()
             + body.len()
-            + 4, // the four interior '\n' separators
+            + 5, // the five interior '\n' separators
     );
     message.extend_from_slice(OPLOG_AUTH_PREFIX);
     message.extend_from_slice(method.as_bytes());
@@ -453,10 +478,12 @@ fn sign_oplog_request(
     message.push(b'\n');
     message.extend_from_slice(timestamp.as_bytes());
     message.push(b'\n');
+    message.extend_from_slice(nonce.as_bytes());
+    message.push(b'\n');
     message.extend_from_slice(body);
 
     let signature = sign(seed, &message);
-    Ok((timestamp, BASE64.encode(signature)))
+    Ok((timestamp, nonce, BASE64.encode(signature)))
 }
 
 // ---------------------------------------------------------------------------
@@ -530,13 +557,14 @@ fn finish(result: Result<ureq::Response, ureq::Error>) -> Result<String, CliErro
 /// `{server}/v1/vaults/{vault}/ops`. On `201` it parses `{"seq": <u64>}` and
 /// returns the sequence number.
 ///
-/// When `key` is `Some(seed)`, signs the request under the `sigil-oplog-auth-v1`
-/// contract and attaches the `X-Sigil-Timestamp` / `X-Sigil-Signature` headers,
-/// so a sigild configured with `SIGILD_OPLOG_PUBKEY` will accept the append. The
-/// signed `(method, path, query, body)` is exactly what this request sends:
-/// `POST`, `/v1/vaults/{vault}/ops`, an EMPTY query, and `container` as the body.
-/// When `key` is `None`, no signature headers are sent (the legacy
-/// unauthenticated dev path).
+/// When `key` is `Some(seed)`, signs the request under the `sigil-oplog-auth-v2`
+/// contract and attaches the `X-Sigil-Timestamp` / `X-Sigil-Nonce` /
+/// `X-Sigil-Signature` headers (a fresh nonce per call), so a sigild configured
+/// with `SIGILD_OPLOG_PUBKEY` will accept the append. The signed
+/// `(method, path, query, body)` is exactly what this request sends: `POST`,
+/// `/v1/vaults/{vault}/ops`, an EMPTY query, and `container` as the body. When
+/// `key` is `None`, no signature headers are sent (the legacy unauthenticated dev
+/// path).
 ///
 /// DEV/LOCALHOST/PLAIN-HTTP ONLY — see the module note above. This never sees
 /// plaintext; the container is opaque.
@@ -561,9 +589,10 @@ pub fn push_op(
     if let Some(seed) = key {
         // Sign EXACTLY what this request sends: POST, the op path, NO query,
         // body = container. The query is "" to match the server's r.URL.RawQuery.
-        let (ts, sig) = sign_oplog_request(seed, "POST", &ops_path(vault), "", container)?;
+        let (ts, nonce, sig) = sign_oplog_request(seed, "POST", &ops_path(vault), "", container)?;
         req = req
             .set("X-Sigil-Timestamp", &ts)
+            .set("X-Sigil-Nonce", &nonce)
             .set("X-Sigil-Signature", &sig);
     }
     let result = req.send_bytes(container);
@@ -584,12 +613,13 @@ pub fn push_op(
 /// base64-decodes each `blob` (standard alphabet) into the opaque container
 /// bytes. Returns them in the order the server sent them (seq-ascending).
 ///
-/// When `key` is `Some(seed)`, signs the request under the `sigil-oplog-auth-v1`
-/// contract and attaches the `X-Sigil-Timestamp` / `X-Sigil-Signature` headers,
-/// so a sigild configured with `SIGILD_OPLOG_PUBKEY` will accept the list. The
-/// signed `(method, path, query, body)` is exactly what this request sends:
-/// `GET`, `/v1/vaults/{vault}/ops`, the query `since={since}`, and an EMPTY body.
-/// The `since` value is rendered once and used both for the signed query and the
+/// When `key` is `Some(seed)`, signs the request under the `sigil-oplog-auth-v2`
+/// contract and attaches the `X-Sigil-Timestamp` / `X-Sigil-Nonce` /
+/// `X-Sigil-Signature` headers (a fresh nonce per call), so a sigild configured
+/// with `SIGILD_OPLOG_PUBKEY` will accept the list. The signed
+/// `(method, path, query, body)` is exactly what this request sends: `GET`,
+/// `/v1/vaults/{vault}/ops`, the query `since={since}`, and an EMPTY body. The
+/// `since` value is rendered once and used both for the signed query and the
 /// `?since=` parameter so the bytes match. When `key` is `None`, no signature
 /// headers are sent (the legacy unauthenticated dev path).
 ///
@@ -619,9 +649,10 @@ pub fn pull_ops(
     if let Some(seed) = key {
         // Sign EXACTLY what this request sends: GET, the op path, query
         // "since={since}", empty body — matching the server's r.URL.RawQuery.
-        let (ts, sig) = sign_oplog_request(seed, "GET", &ops_path(vault), &query, b"")?;
+        let (ts, nonce, sig) = sign_oplog_request(seed, "GET", &ops_path(vault), &query, b"")?;
         req = req
             .set("X-Sigil-Timestamp", &ts)
+            .set("X-Sigil-Nonce", &nonce)
             .set("X-Sigil-Signature", &sig);
     }
     let result = req.call();
@@ -998,6 +1029,7 @@ mod tests {
         assert_eq!(req.body, container);
         // No key -> no signature headers.
         assert!(req.header("x-sigil-timestamp").is_none());
+        assert!(req.header("x-sigil-nonce").is_none());
         assert!(req.header("x-sigil-signature").is_none());
     }
 
@@ -1020,6 +1052,7 @@ mod tests {
         assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
         // No key -> no signature headers.
         assert!(req.header("x-sigil-timestamp").is_none());
+        assert!(req.header("x-sigil-nonce").is_none());
         assert!(req.header("x-sigil-signature").is_none());
     }
 
@@ -1070,25 +1103,27 @@ mod tests {
 
     // --- Device-key + op-log signing tests -----------------------------------
     //
-    // These exercise the CLIENT side of the `sigil-oplog-auth-v1` contract and
+    // These exercise the CLIENT side of the `sigil-oplog-auth-v2` contract and
     // close the loop IN-PROCESS: the push/pull tests reconstruct the EXACT
-    // message bytes the server would build from the captured request, then
-    // verify the captured `X-Sigil-Signature` against the key's public key with
-    // `sigil_core::verify`. If the client signs the wrong bytes, verify fails.
+    // message bytes the server would build from the captured request (including
+    // the captured X-Sigil-Nonce), then verify the captured `X-Sigil-Signature`
+    // against the key's public key with `sigil_core::verify`. If the client signs
+    // the wrong bytes, verify fails.
 
     use sigil_core::verify;
 
-    /// Reconstruct the contract MESSAGE the server builds, exactly as documented
+    /// Reconstruct the v2 contract MESSAGE the server builds, exactly as documented
     /// in [`sign_oplog_request`], so a test can verify the captured signature.
     fn rebuild_oplog_message(
         method: &str,
         path: &str,
         query: &str,
         timestamp: &str,
+        nonce: &str,
         body: &[u8],
     ) -> Vec<u8> {
         let mut m = Vec::new();
-        m.extend_from_slice(b"sigil-oplog-auth-v1\n");
+        m.extend_from_slice(b"sigil-oplog-auth-v2\n");
         m.extend_from_slice(method.as_bytes());
         m.push(b'\n');
         m.extend_from_slice(path.as_bytes());
@@ -1096,6 +1131,8 @@ mod tests {
         m.extend_from_slice(query.as_bytes());
         m.push(b'\n');
         m.extend_from_slice(timestamp.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(nonce.as_bytes());
         m.push(b'\n');
         m.extend_from_slice(body);
         m
@@ -1146,13 +1183,6 @@ mod tests {
 
     #[test]
     fn push_with_key_sets_headers_and_signature_verifies() {
-        let response = "HTTP/1.1 201 Created\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 23\r\n\
-             \r\n\
-             {\"vaultID\":\"v\",\"seq\":7}";
-        let (base, handle) = spawn_mock(response);
-
         let kf = generate_key().expect("keygen");
         let seed: [u8; SIG_SEED_LEN] = BASE64
             .decode(kf.seed.as_bytes())
@@ -1166,33 +1196,62 @@ mod tests {
             .unwrap();
 
         let container = b"\x00\x01\x02opaque-container-bytes";
-        let seq = push_op(&base, "v", container, Some(&seed)).expect("push ok");
-        assert_eq!(seq, 7);
 
-        let req = handle.join().expect("server thread");
-        assert_eq!(req.request_line, "POST /v1/vaults/v/ops HTTP/1.1");
-        let ts = req.header("x-sigil-timestamp").expect("timestamp header");
-        let sig_b64 = req.header("x-sigil-signature").expect("signature header");
+        // One signed push against a fresh one-shot mock -> the captured
+        // (timestamp, nonce, signature) header triple.
+        let do_push = || {
+            let response = "HTTP/1.1 201 Created\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 23\r\n\
+                 \r\n\
+                 {\"vaultID\":\"v\",\"seq\":7}";
+            let (base, handle) = spawn_mock(response);
+            let seq = push_op(&base, "v", container, Some(&seed)).expect("push ok");
+            assert_eq!(seq, 7);
+            let req = handle.join().expect("server thread");
+            assert_eq!(req.request_line, "POST /v1/vaults/v/ops HTTP/1.1");
+            let ts = req
+                .header("x-sigil-timestamp")
+                .expect("timestamp header")
+                .to_string();
+            let nonce = req
+                .header("x-sigil-nonce")
+                .expect("nonce header")
+                .to_string();
+            let sig = req
+                .header("x-sigil-signature")
+                .expect("signature header")
+                .to_string();
+            (ts, nonce, sig)
+        };
 
-        // Reconstruct the server's message: POST, path, EMPTY query, body=container.
-        let msg = rebuild_oplog_message("POST", "/v1/vaults/v/ops", "", ts, container);
+        let (ts, nonce, sig_b64) = do_push();
+
+        // The nonce header must be present, non-empty, and decode to >= 16 bytes.
+        assert!(!nonce.is_empty(), "nonce header must be non-empty");
+        let nonce_bytes = BASE64.decode(nonce.as_bytes()).expect("nonce is base64");
+        assert!(
+            nonce_bytes.len() >= 16,
+            "nonce must decode to >= 16 bytes, got {}",
+            nonce_bytes.len()
+        );
+
+        // Reconstruct the v2 message: POST, path, EMPTY query, nonce, body=container.
+        let msg = rebuild_oplog_message("POST", "/v1/vaults/v/ops", "", &ts, &nonce, container);
         let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
             .decode(sig_b64.as_bytes())
             .expect("sig b64")
             .try_into()
             .expect("sig 64");
         verify(&public, &msg, &sig).expect("signature must verify over the contract message");
+
+        // Two successive signed pushes must use DIFFERENT (freshly drawn) nonces.
+        let (_, nonce2, _) = do_push();
+        assert_ne!(nonce, nonce2, "each request must use a fresh nonce");
     }
 
     #[test]
     fn pull_with_key_sets_headers_and_signature_verifies() {
-        let response = "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 56\r\n\
-             \r\n\
-             {\"vaultID\":\"v\",\"ops\":[{\"seq\":1,\"blob\":\"aGk=\"}],\"next\":1}";
-        let (base, handle) = spawn_mock(response);
-
         let kf = generate_key().expect("keygen");
         let seed: [u8; SIG_SEED_LEN] = BASE64
             .decode(kf.seed.as_bytes())
@@ -1205,22 +1264,57 @@ mod tests {
             .try_into()
             .unwrap();
 
-        let ops = pull_ops(&base, "v", 5, Some(&seed)).expect("pull ok");
-        assert_eq!(ops.len(), 1);
+        // One signed pull against a fresh one-shot mock -> the captured
+        // (timestamp, nonce, signature) header triple.
+        let do_pull = || {
+            let response = "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 56\r\n\
+                 \r\n\
+                 {\"vaultID\":\"v\",\"ops\":[{\"seq\":1,\"blob\":\"aGk=\"}],\"next\":1}";
+            let (base, handle) = spawn_mock(response);
+            let ops = pull_ops(&base, "v", 5, Some(&seed)).expect("pull ok");
+            assert_eq!(ops.len(), 1);
+            let req = handle.join().expect("server thread");
+            assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
+            let ts = req
+                .header("x-sigil-timestamp")
+                .expect("timestamp header")
+                .to_string();
+            let nonce = req
+                .header("x-sigil-nonce")
+                .expect("nonce header")
+                .to_string();
+            let sig = req
+                .header("x-sigil-signature")
+                .expect("signature header")
+                .to_string();
+            (ts, nonce, sig)
+        };
 
-        let req = handle.join().expect("server thread");
-        assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
-        let ts = req.header("x-sigil-timestamp").expect("timestamp header");
-        let sig_b64 = req.header("x-sigil-signature").expect("signature header");
+        let (ts, nonce, sig_b64) = do_pull();
 
-        // Reconstruct: GET, path, query "since=5", EMPTY body.
-        let msg = rebuild_oplog_message("GET", "/v1/vaults/v/ops", "since=5", ts, b"");
+        // The nonce header must be present, non-empty, and decode to >= 16 bytes.
+        assert!(!nonce.is_empty(), "nonce header must be non-empty");
+        let nonce_bytes = BASE64.decode(nonce.as_bytes()).expect("nonce is base64");
+        assert!(
+            nonce_bytes.len() >= 16,
+            "nonce must decode to >= 16 bytes, got {}",
+            nonce_bytes.len()
+        );
+
+        // Reconstruct: GET, path, query "since=5", nonce, EMPTY body.
+        let msg = rebuild_oplog_message("GET", "/v1/vaults/v/ops", "since=5", &ts, &nonce, b"");
         let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
             .decode(sig_b64.as_bytes())
             .expect("sig b64")
             .try_into()
             .expect("sig 64");
         verify(&public, &msg, &sig).expect("signature must verify over the contract message");
+
+        // Two successive signed pulls must use DIFFERENT (freshly drawn) nonces.
+        let (_, nonce2, _) = do_pull();
+        assert_ne!(nonce, nonce2, "each request must use a fresh nonce");
     }
 
     /// A self-cleaning unique temp dir under the OS temp dir (no tempfile dep).

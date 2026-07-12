@@ -88,7 +88,12 @@ a deterministic RFC 8032 Ed25519 `sign`/`verify` primitive over a
 **caller-supplied 32-byte secret seed** (the core generates no key material — see
 [ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). It is **real but
 NOT YET AUDITED**, and it is **not yet wired into the hybrid signature
-construction or any product flow** — it stands as a standalone primitive. The
+construction or any product flow** — it stands as a standalone primitive. It is
+also reachable over the **C-ABI** as `sigil_public_key_from_seed` / `sigil_sign` /
+`sigil_verify` ([`libsigil/ffi/`](../libsigil/ffi/), `sigil.h`), so native
+clients can call the same UNAUDITED sign/verify (still not wired into any product
+flow); the demo `cli` uses it in-crate to sign op-log requests (see
+[`api.md`](api.md) and [ADR 0008](decisions/0008-device-key-request-auth.md)). The
 **ML-DSA-65 post-quantum half remains specified-but-not-implemented**, so the
 hybrid `Ed25519 & ML-DSA-65` signature above is **not** available: there is no
 post-quantum signature in this repo yet, and no combined hybrid `Sign`/`Verify`.

@@ -1219,6 +1219,150 @@ exposure are deliberately **decoupled** — captured in the new **ADR 0009**.
 - Living docs finalized in this same change: `journal.md` (this entry), `CLAUDE.md`,
   and `README.md`; `docs/deployment.md` + ADR 0009 carry the operator detail.
 
+## 2026-06-22 — Phase 15 (op-log auth v2: signed nonce + replay cache; Ed25519 across the FFI)
+
+Theme: close the one honest gap ADR 0008 left open — the op-log's device-key auth
+(Phase 12) *bounded* replay by a 300 s window but did **not prevent** it (no nonce
+store, so a captured signed request could be resubmitted inside the window) — and,
+in parallel, finish exposing the Phase-11 Ed25519 primitive across the **C-ABI** so
+a client in any language can sign/verify. Two disjoint tracks (sigild+cli auth · the
+ffi sig exports), then an independent verifier; the gate plus a **live cross-language
+v2 interop + a live replay rejection + the RFC 8032 vector re-proven through the
+C-ABI** were all re-run first-hand. Production behaviour is unchanged (default ops
+still `501`; auth still off unless `SIGILD_OPLOG_PUBKEY` is set). ADR 0010 and
+`docs/{api,architecture,crypto-spec}.md` were updated by the docs track; this entry
+finalizes the remaining living docs (this file, `CLAUDE.md`, `README.md`).
+
+### The contract — op-log auth v2 (signed nonce + replay cache), a CLEAN break from v1 ✅
+- The signed MESSAGE gains a per-request **nonce** line and a new domain prefix, so
+  the exact bytes both sides now build are:
+  `"sigil-oplog-auth-v2\n" + METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY`
+  — METHOD uppercase, PATH = `r.URL.Path` (no query), QUERY = raw query (`""` if
+  none), TIMESTAMP = decimal unix seconds, NONCE = the **exact `X-Sigil-Nonce`
+  header text used verbatim** (so both sides agree byte-for-byte), BODY = raw body
+  (`""` for GET). Three headers now required: `X-Sigil-Timestamp`,
+  **`X-Sigil-Nonce`**, `X-Sigil-Signature`.
+- **v2 supersedes v1 outright** — a clean break, not a negotiated version: there are
+  **no external clients** (only the in-repo Go server + Rust CLI), so the domain
+  prefix simply moved `…-v1` → `…-v2` and a stale v1 signature (which lacks the
+  nonce line) now fails closed. A request with no `X-Sigil-Nonce` is rejected.
+- **Gate unchanged:** all of this is active **only** when `SIGILD_OPLOG_PUBKEY` is
+  set; unset → no auth, existing no-auth tests unchanged, prod default still `501`.
+
+### sigild — the time-bounded seen-nonce replay cache ✅
+- `internal/api/opsauth.go` (stdlib-only; adds `sync`) bumps `opsAuthDomain` to
+  `"sigil-oplog-auth-v2\n"` and, in `authorizeOps`, enforces the check in strict
+  order: (1) all three headers present/non-blank → else 401; (2) parse timestamp,
+  `abs(now-ts) > 300s` → 401; (3) reconstruct the v2 MESSAGE (with the **raw nonce
+  header**) and `ed25519.Verify` false → 401; (4) **only after a valid signature** —
+  so an unauthenticated probe never touches the cache — the nonce is
+  checked/recorded.
+- New `nonceCache`: an in-memory, **concurrency-safe** (`sync.Mutex`),
+  **time-bounded** `map[nonce]ts`. `checkAndRecord` first **evicts** every entry with
+  `ts < now-300` (a nonce is remembered exactly as long as its request could still
+  pass the timestamp window), then treats a still-present nonce as a **replay** (401),
+  else records it. A hard **size cap** (`nonceCacheMaxEntries = 50_000`) is a backstop
+  so the map cannot grow without bound under abuse (once at the cap, fresh nonces are
+  refused). Replay 401s keep the typed envelope with a **distinct detail** —
+  `{"error":"unauthorized","detail":"replayed request"}` — while generic signature
+  failures stay `"missing or invalid op-log request signature"`.
+
+### cli/ — v2 request signing (fresh CSPRNG nonce per request) ✅
+- `sigil push` / `sigil pull` (with `--key` / `SIGIL_DEVICE_KEY`) now generate a
+  **fresh ≥16-byte nonce from `getrandom`** per request, std-base64-encode it to the
+  `X-Sigil-Nonce` header, build the identical v2 MESSAGE, and sign with
+  `sigil_core::sign`. Every request carries a distinct nonce, so two otherwise-identical
+  pushes never collide in the server's cache. The loud DEV / plain-HTTP / PRE-AUDIT /
+  UNAUDITED banners are intact.
+
+### libsigil/ffi — Ed25519 across the C-ABI ✅
+- `ffi/src/lib.rs` now exports the Phase-11 primitive over the C-ABI:
+  `sigil_public_key_from_seed(seed → out_public_key)`,
+  `sigil_sign(seed, message, message_len, out_signature)`, and
+  `sigil_verify(public_key, message, message_len, signature)`, plus a new status code
+  **`SIGIL_ERR_VERIFY = -4`** (invalid point / malformed sig / well-formed-but-not-
+  verifying all collapse to it → no structure leak). `#![deny(unsafe_op_in_unsafe_fn)]`
+  intact; every `unsafe` block carries a `// SAFETY:` note. Hand-written
+  `ffi/include/sigil.h` mirrors the prototypes + the length `#define`s
+  (`SIGIL_SIG_SEED_LEN 32`, `SIGIL_SIG_PUBLIC_KEY_LEN 32`, `SIGIL_SIGNATURE_LEN 64`).
+  **core untouched this phase** — the ffi only *uses* existing core fns.
+
+### Verification — LIVE v2 interop + REPLAY rejected + RFC 8032 through the C-ABI (the real gate) ✅
+- **Live cross-language v2 interop (Rust signs → Go verifies).** Built
+  `/tmp/sigild_p15` + `cli/target/debug/sigil`; `sigil keygen --out device.key`
+  printed pubkey `90uYnRcWKVzlq3TCg9oXLFcnI6qcAFPJHLO59ruGFDg=`; started
+  `SIGILD_ENABLE_DEV_OPS=1 SIGILD_OPLOG_PUBKEY=<pubkey> SIGILD_ADDR=:18120` (health
+  200). Sealed a real 164-byte container. Results: (1) `sigil push --key` →
+  **"pushed vault demo seq 1"**, exit 0 (ACCEPTED); (2) push **without `--key`** →
+  **HTTP 401** `{"error":"unauthorized","detail":"missing or invalid op-log request
+  signature"}`, exit 1; (3) `sigil pull --key --since 0` → **"pulled seq 1"**, exit 0;
+  (4) pull **without `--key`** → **401**; (5) bogus `curl` ts/nonce/sig → **401**;
+  (6) **TAMPERED** (valid Ed25519 sig but changed body) → **401**; (7) **STALE** (valid
+  sig over ts = now-400s) → **401**; (8) `sigil open` the pulled `op-1.sigil` →
+  **ROUNDTRIP_EQUAL=YES** (decrypted `cmp`-equal to the original plaintext). A
+  **second** server on `:18121` with **no** `SIGILD_OPLOG_PUBKEY` accepted an
+  **unsigned** push (seq 1) — the unauthenticated path is unchanged.
+- **Replay REJECTED — unit + live.** Unit: `opsauth_test.go`'s
+  `TestOpsAuthReplayRejected` builds ONE signed request and submits it twice — the
+  POST subtest asserts rec1==201 then rec2 is a 401 with detail `"replayed request"`;
+  the GET subtest asserts rec1==200 then the same 401. Companions confirm the cache
+  semantics: `TestOpsAuthFreshNonceSucceedsTwice` (two requests differing only by
+  nonce both 201), `TestOpsAuthNonceOutsideWindowRejectedByTimestamp` (a stale ts is
+  rejected BEFORE the nonce is recorded), `TestNonceCacheEvictsExpired`,
+  `TestNonceCacheHardCap` — all PASS under `go test -race -count=1 ./internal/api/`
+  (ok, 1.309s, race-clean). Live: a small Go signer (asserting its derived pubkey ==
+  `device.key`'s `public_key`) signed a v2 message with a **FIXED nonce**, then the
+  identical request was curled TWICE at `:18120 /v1/vaults/replaytest/ops` → attempt
+  #1 **HTTP 201** `{"vaultID":"replaytest","seq":1}`, attempt #2 **HTTP 401**
+  `{"error":"unauthorized","detail":"replayed request"}` (access log shows 201 then
+  401 on the same path). **The Phase-12 / ADR-0008 replay caveat is closed.**
+- **RFC 8032 through the FFI.** `ffi/src/lib.rs`'s `rfc8032_test1_through_ffi` drives
+  RFC 8032 Ed25519 TEST 1 (empty message) entirely through the C-ABI:
+  `sigil_public_key_from_seed` → pubkey `d75a9801…511a`, `sigil_sign(NULL, 0)` → sig
+  `e5564300…100b`, `sigil_verify(pk, NULL, 0, sig)` → `SIGIL_OK`. All three assert in
+  `cargo test` (sigil-ffi **13 passed, 0 failed**). **C smoke (best-effort):** built
+  the staticlib (`libsigil_ffi.a`), compiled a C file that `#include "sigil.h"`,
+  derived the pubkey, signed the empty message, and verified — output "C SMOKE PASS:
+  pk+sig match RFC8032 TEST1, good verify=SIGIL_OK, tampered verify=SIGIL_ERR_VERIFY",
+  exit 0 (a one-byte-tampered sig returns `SIGIL_ERR_VERIFY` = -4).
+
+### Gate + isolation ✅
+- sigild: `gofmt -l` clean · `go vet ./...` clean · `go test ./...` pass ·
+  `go test -race -count=1 ./internal/api/` race-clean · `go build ./...` OK.
+- cli: `cargo fmt --check` · `clippy -D warnings` clean · **26 lib + 2 integration**
+  tests (incl. `push_with_key`/`pull_with_key` asserting a ≥16-byte fresh-per-request
+  nonce + the signature verifying over the reconstructed v2 message) · build OK.
+- libsigil: fmt · clippy -D warnings · **51 core + 13 ffi** tests · wasm32 build OK.
+  **core untouched:** `libsigil/Cargo.lock` unchanged, `getrandom` count still **0**,
+  `#![forbid(unsafe_code)]` + wasm-pure intact; `ffi` keeps
+  `#![deny(unsafe_op_in_unsafe_fn)]`. All 7 workflow YAMLs parse. Web untouched.
+- Over-claim scan CLEAN — every "audited"/"secure" hit across `opsauth.go`,
+  `ffi/src/lib.rs`, `sigil.h`, and the docs is a negation or an honest caveat
+  (pre-audit / UNAUDITED / "classical Ed25519" / RFC 8032 / "ML-DSA-65 PQ half is
+  future work"); no "post-quantum secure" / "SOC 2" / unqualified "end-to-end
+  encrypted". The auth is labeled **SINGLE configured DEV device key**, the cache
+  **per-process/in-memory**, **dev-only**, **plain-HTTP**.
+
+### ADR 0010 — op-log auth v2 (signed nonce + replay cache) ✅
+- New `docs/decisions/0010-op-log-auth-v2-nonce-replay.md` (Accepted — 2026-06)
+  records *why* v2 replaces v1 outright (no external clients → clean break, no
+  version negotiation) and closes the ADR-0008 replay caveat, with the honest
+  consequences below. The ADR set is now **0001–0010**.
+
+### ⛔ Still NOT production (honest scope)
+- Still a **SINGLE configured DEV device key** (`SIGILD_OPLOG_PUBKEY`), not a
+  registry. The replay cache is **per-process / in-memory** — it stops a replay
+  against **this** sigild instance only; a multi-instance production deploy needs a
+  **shared store** (e.g. Redis) so a request replayed against a *different* instance
+  is also caught, and would want it to survive restarts. **Device enrollment, a
+  multi-device key registry, key rotation, and JWT bearer tokens** (see
+  `sigild/internal/auth`) remain **FUTURE**. Transport is still **plain HTTP,
+  dev/localhost only**; auth stays **off by default** (no pubkey → the op-log is
+  unauthenticated exactly as before); the op-log is still opaque + dev-gated and the
+  prod ops default is `501`. The FFI sig exports are a **raw, classical, UNAUDITED
+  Ed25519** building block — the ML-DSA-65 PQ half of the planned hybrid stays
+  unimplemented and none of it is wired into an auth/enrollment flow.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:

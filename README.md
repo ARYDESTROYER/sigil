@@ -20,11 +20,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 - `libsigil/` — Rust crypto core. **Builds, lints, tests, and compiles to
   `wasm32`** — algorithm-suite registry, the crypto-agility envelope codec, a
   real (unaudited) Argon2id KDF and XChaCha20-Poly1305 + HKDF AEAD seal/open
-  layer, and a real (unaudited) **classical Ed25519** sign/verify primitive
+  layer, a real (unaudited) **classical Ed25519** sign/verify primitive
   (`public_key_from_seed`/`sign`/`verify` over a caller-supplied 32-byte seed —
   the core generates no randomness; this is the signature half of the planned
   Ed25519&ML-DSA-65 hybrid, the ML-DSA-65 post-quantum half is **not yet
-  implemented**, and the primitive is not yet wired into any auth flow), plus a
+  implemented**, and the primitive is not yet wired into any auth flow), and a
+  real (unaudited) **classical X25519** key-agreement primitive
+  (`x25519_public_key`/`x25519_shared_secret` over a caller-supplied 32-byte
+  secret scalar — again no in-core randomness; rejects non-contributory shared
+  secrets and the raw DH output must be run through a KDF before use; this is the
+  classical KEX half of the planned X25519&ML-KEM-768 hybrid, the ML-KEM-768
+  post-quantum KEM half is **not yet implemented**, and the primitive is not yet
+  wired into any key exchange), plus a
   `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`, and the classical Ed25519 sig
   exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify` with a
   `SIGIL_ERR_VERIFY` code) for the clients.

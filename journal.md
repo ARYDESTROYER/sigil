@@ -1386,3 +1386,100 @@ Recording the decision so the doc set stays coherent as the repo grows:
   decision (e.g. "why the salt+params live in the CLI container header, not the
   envelope", "why the client speaks plain HTTP only" remain good candidates to
   capture).
+
+## 2026-07-13 — Phase 16 (X25519 classical key-agreement in libsigil-core)
+
+### Context & mandate
+- Goal: add the **classical X25519** key-agreement half of the planned hybrid
+  KEX (X25519&ML-KEM-768) to `libsigil-core` as a standalone, real cryptographic
+  primitive — derive a public key and compute a shared secret — without touching
+  any existing KDF/AEAD/Ed25519 code and without breaking the wasm-pure / no-RNG
+  invariants.
+- ⚠️ This is the **key-agreement PRIMITIVE only**. It is **not** wired into any
+  product flow (no key exchange / session establishment). The **ML-KEM-768
+  post-quantum KEM half stays FUTURE/unimplemented** — there is still **no
+  post-quantum KEM** in this repo, and the hybrid (X25519 & ML-KEM-768 combined
+  via HKDF) does **not yet exist**. Real but **UNAUDITED**.
+
+### core — `core/src/kx.rs` ✅
+- New module exposing a **raw-bytes** X25519 API, re-exported from `lib.rs`
+  (`mod kx;` line 45; `pub use kx::{x25519_public_key, x25519_shared_secret,
+  KxError, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN, X25519_SHARED_SECRET_LEN}`
+  lines 51–54): `x25519_public_key(&[u8; 32]) -> [u8; 32]` (scalar-mult of the
+  caller's secret against the RFC 7748 basepoint) and
+  `x25519_shared_secret(&[u8; 32] secret, &[u8; 32] their_public) ->
+  Result<[u8; 32], KxError>`, plus the length constants
+  `X25519_SECRET_KEY_LEN`/`X25519_PUBLIC_KEY_LEN`/`X25519_SHARED_SECRET_LEN`
+  (all 32) and the `KxError` enum.
+- **Caller-supplied entropy:** the API takes a **32-byte secret SCALAR** from the
+  caller — exactly like the KDF takes the salt, the AEAD takes the nonce, and the
+  Ed25519 primitive takes the seed. **core still generates NO randomness** (no
+  RNG, no key-gen); `x25519_public_key` uses the `X25519_BASEPOINT_BYTES` const
+  and both functions call `x25519(scalar, point)` on caller-supplied bytes. The
+  secret scalar must come from a cryptographically secure source on the caller's
+  side.
+- **Non-contributory rejection.** `x25519_shared_secret` **rejects an all-zero /
+  low-order shared secret** — after the scalar-mult it checks `shared == [0u8; 32]`
+  (kx.rs lines 122–124) and returns `Err(KxError::NonContributory)` if so, so a
+  low-order/identity peer public key can't force a known all-zero shared secret.
+- ⚠️ **Raw DH output, not a key.** The 32-byte shared secret is the raw X25519
+  result and **must be run through a KDF** (e.g. the existing HKDF-SHA256 layer)
+  before use as a symmetric key — documented in the module docs and the crypto
+  spec. **classical only** — this is the X25519 half; the PQ ML-KEM-768 half is
+  documented as future/unimplemented in the module docs, `lib.rs`, the crypto
+  spec, the architecture map, and ADR 0007. Labeled **UNAUDITED** throughout.
+- **Deterministic.** X25519 is deterministic per RFC 7748, so a given
+  (secret, public) always yields the same shared secret — asserted by
+  `agreement_is_deterministic`. No per-exchange RNG is needed.
+
+### Dependency & the WASM/GETRANDOM gate
+- Chose **`x25519-dalek = { version = "2", default-features = false }`** — the
+  `default-features = false` is load-bearing: it drops the `rand_core`/`getrandom`
+  path (we use only the raw `x25519`/basepoint scalar-mult, never key-gen RNG).
+  As anticipated, x25519-dalek 2.0.1 **shares `curve25519-dalek`** with the
+  existing `ed25519-dalek`, so it added little and pulled in **no getrandom edge**.
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` =
+  **0** (before and after the change; `grep -c 'getrandom'` for any occurrence is
+  also **0**), and `cargo build -p sigil-core --target wasm32-unknown-unknown`
+  **succeeds** — the wasm-pure invariant is preserved. `#![forbid(unsafe_code)]`
+  (lib.rs line 37) and `no_std` (`core` + `alloc`) are intact.
+
+### Tests ✅
+- **RFC 7748 §6.1 Diffie–Hellman known-answer vector**
+  (`kx::tests::rfc7748_section_6_1_dh_known_answer_vector`): alice_priv
+  `77076d0a…`, alice_pub `8520f009…`, bob_priv `5dab087e…`, bob_pub `de9edb7d…`,
+  shared **K = `4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742`**.
+  It re-derives **both** public keys AND asserts **both DH directions**
+  (`alice_secret × bob_pub` and `bob_secret × alice_pub`) equal K — a real interop
+  vector plus the agreement symmetry, not just an internal round-trip.
+- **RFC 7748 §5.2 scalar-mult vector 1**
+  (`kx::tests::rfc7748_section_5_2_scalarmult_vector_1`): k = `a546e36b…`,
+  u = `e6db6867…`, out =
+  **`c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552`**.
+- **Non-contributory rejection asserted:** `all_zero_public_key_is_non_contributory`
+  (`x25519_shared_secret(secret, [0u8; 32])` → `Err(KxError::NonContributory)`) and
+  `known_order_eight_point_is_non_contributory` (a low-order order-8 point → the
+  same `Err`) both PASS.
+- Plus `agreement_is_deterministic` and a constants/lengths check — **6 kx tests**
+  in all.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 57 PASS**, sigil-ffi 13 PASS · wasm build OK ·
+  getrandom count **0**. Regression: cli fmt/clippy/**26 + 2** tests ✓
+  (`cli/Cargo.lock` unchanged — only `libsigil/Cargo.lock` moved); sigild
+  gofmt/vet/test/build ✓; all 7 workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0007 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and **ADR 0007**
+  (`0007-caller-supplied-entropy-in-core.md`) were updated by the docs track —
+  ADR 0007 now lists the **X25519 secret scalar** alongside the salt / nonce /
+  Ed25519 seed as caller-supplied entropy, notes the deterministic DH (no
+  per-exchange RNG), and names the ML-KEM-768 PQ KEM half as still unimplemented.
+  This entry finalizes the remaining living docs (this file, `CLAUDE.md`,
+  `README.md`).
+
+### ➡️ Still NOT wired in — future (honest)
+- This phase adds the **primitive only**. It is **not** connected to any key
+  exchange / session-establishment flow, and the raw shared secret still needs a
+  KDF pass before use. The hybrid X25519 & ML-KEM-768 KEM does **not yet exist** —
+  only the classical X25519 half, and it is unaudited; the ML-KEM-768 PQ half
+  stays future/unimplemented.

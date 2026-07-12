@@ -18,9 +18,11 @@ keeps the audit-bound core minimal and wasm-pure
 
 Several of the core's primitives nonetheless require fresh entropy *somewhere*:
 Argon2id needs a per-record **salt**, the XChaCha20-Poly1305 AEAD needs a
-**nonce**, and the newly added classical Ed25519 sign/verify primitive
+**nonce**, the classical Ed25519 sign/verify primitive
 ([`../../libsigil/core/src/sig.rs`](../../libsigil/core/src/sig.rs)) needs a
-32-byte secret **signing seed**. The question is *who* generates that entropy.
+32-byte secret **signing seed**, and the classical X25519 key-agreement primitive
+([`../../libsigil/core/src/kx.rs`](../../libsigil/core/src/kx.rs)) needs a 32-byte
+secret **scalar**. The question is *who* generates that entropy.
 
 ## Decision
 
@@ -30,7 +32,10 @@ entropy is **supplied by the caller**:
 - the **Argon2id salt** (KDF),
 - the **AEAD nonce** (XChaCha20-Poly1305),
 - the **Ed25519 signing seed** (the 32-byte secret key seed; signing itself is
-  deterministic per RFC 8032, so no per-signature RNG is needed either).
+  deterministic per RFC 8032, so no per-signature RNG is needed either),
+- the **X25519 secret scalar** (the 32-byte key-agreement secret; the
+  Diffie–Hellman is deterministic per RFC 7748, so no per-exchange RNG is needed
+  either).
 
 The core contains **no key-generation, no salt-generation, and no
 nonce-generation RNG** — not behind a feature flag, not on native targets. It
@@ -46,15 +51,16 @@ platforms.
   `getrandom`-count guard stays `0` in `libsigil/Cargo.lock`, and the web app /
   extension can link the core unchanged.
 - **Callers own entropy and storage.** The CLI, the native clients, and any FFI
-  host are responsible for generating a strong salt/nonce/seed and for storing
+  host are responsible for generating a strong salt/nonce/seed/scalar and for storing
   secret seeds and keys safely. A caller that supplies a weak or reused
-  salt/nonce/seed undermines the construction — this responsibility is **explicit
+  salt/nonce/seed/scalar undermines the construction — this responsibility is **explicit
   and by design**, surfaced at the API boundary, not hidden inside the core.
 - This is a **deliberate architectural boundary, not an oversight**: the core is a
   pure transform over caller-supplied inputs. It keeps the audit surface small and
   the wasm invariant mechanical.
 - **Pre-audit reality:** the primitives that consume this entropy (Argon2id, the
-  AEAD, and the standalone Ed25519 sign/verify) are **real but UNAUDITED** and not
-  wired into a finished product; the ML-DSA-65 post-quantum signature half stays
-  unimplemented. See [`../architecture.md`](../architecture.md) §1 and §6 and
+  AEAD, the standalone Ed25519 sign/verify, and the standalone X25519
+  key-agreement) are **real but UNAUDITED** and not wired into a finished product;
+  the ML-KEM-768 post-quantum KEM half and the ML-DSA-65 post-quantum signature
+  half stay unimplemented. See [`../architecture.md`](../architecture.md) §1 and §6 and
   [`../crypto-spec.md`](../crypto-spec.md).

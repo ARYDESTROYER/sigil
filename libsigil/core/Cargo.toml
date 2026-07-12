@@ -35,3 +35,16 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 # keypair), `sign`, and `verify_strict` are all RNG-free. The `alloc` feature is
 # not needed by these fixed-size raw-byte calls.
 ed25519-dalek = { version = "2", default-features = false }
+# Classical X25519 Diffie-Hellman key agreement (pre-audit) — the classical KEX
+# half of the hybrid X25519&ML-KEM-768 suite (the ML-KEM-768 PQ KEM half is
+# future/unimplemented). `default-features = false` keeps `getrandom` out: the
+# opt-in `getrandom` feature is the only thing that pulls it in (it is NOT a
+# default feature), and disabling defaults also drops `zeroize`, `alloc`, and the
+# precomputed base-point tables — none of which the raw path needs — so the
+# `wasm32-unknown-unknown` build is preserved. We use only the low-level
+# raw-bytes API: the free function `x25519(scalar, point)` and the
+# `X25519_BASEPOINT_BYTES` const, neither of which draws randomness. We never
+# generate keys here — the caller supplies the 32-byte secret scalar, exactly as
+# it supplies the Argon2id salt, AEAD nonce, and Ed25519 seed. This shares the
+# already-resolved `curve25519-dalek` 4.x with `ed25519-dalek`, so it adds little.
+x25519-dalek = { version = "2", default-features = false }

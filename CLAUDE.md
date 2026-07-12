@@ -39,7 +39,13 @@ public, make no security claims, until the audit completes and trademark clears.
   `seal_record`/`open_record`, and a classical **Ed25519** sign/verify primitive
   (`public_key_from_seed`/`sign`/`verify`, caller-supplied 32-byte seed, no
   in-core RNG; the signature half of the future Ed25519&ML-DSA-65 hybrid — the
-  ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth);
+  ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth), and
+  a classical **X25519** key-agreement primitive (`x25519_public_key`/
+  `x25519_shared_secret`, caller-supplied 32-byte secret scalar, no in-core RNG;
+  rejects non-contributory/all-zero shared secrets; raw DH output must go through
+  a KDF; RFC 7748 §6.1/§5.2 KATs; the classical KEX half of the future
+  X25519&ML-KEM-768 hybrid — the ML-KEM-768 PQ KEM half stays unimplemented;
+  primitive not yet wired into any key exchange);
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).

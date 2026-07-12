@@ -1592,3 +1592,128 @@ Recording the decision so the doc set stays coherent as the repo grows:
   *other* planned hybrid stays unimplemented. No over-claims: "post-quantum"
   describes the ML-KEM-768 algorithm family — the **system is NOT "post-quantum
   secure".**
+
+## 2026-07-13 — Phase 18 (hybrid KEM assembled: X25519 + ML-KEM-768 via HKDF)
+
+### Context & mandate
+- Goal: **combine** the two standalone KEM halves that Phases 16–17 left sitting
+  side by side — the classical X25519 DH agreement (`kx.rs`) and the post-quantum
+  ML-KEM-768 KEM (`mlkem.rs`) — into **one** hybrid KEM producing a single 32-byte
+  combined shared secret, without touching the existing KDF/AEAD/Ed25519/X25519/
+  ML-KEM code and without breaking the wasm-pure / no-RNG invariants. This is the
+  piece that was explicitly missing at the end of Phase 17: "nothing runs both
+  KEXes and folds their shared secrets through HKDF into `ss_combined`."
+- ⚠️ This assembles the **hybrid KEM PRIMITIVE only**. It is real but **UNAUDITED**
+  and **standalone** — it is **not** wired into any key exchange / session /
+  account / vault flow. The **ML-DSA-65 post-quantum signature** half of the
+  *other* planned hybrid stays unimplemented.
+
+### core — `core/src/hybrid.rs` ✅
+- New module that performs **no new low-level cryptography of its own** — it
+  *composes* the two existing building blocks. `hybrid_encapsulate` and
+  `hybrid_decapsulate` are the two sides, re-exported from `lib.rs` (`mod hybrid;`
+  line 53; `pub use hybrid::{hybrid_decapsulate, hybrid_encapsulate,
+  HybridEncapsulation, HybridError, HYBRID_SHARED_SECRET_LEN}` lines 61–64):
+  - `hybrid_encapsulate(recipient_x25519_pub, recipient_mlkem_encaps_key,
+    ephemeral_x25519_secret, mlkem_coin) -> Result<(eph_x25519_pub[32],
+    mlkem_ct[1088], combined[32]), HybridError>` — runs the X25519 DH against the
+    recipient's public key, derives the ephemeral public key, ML-KEM-encapsulates
+    to the recipient's encaps key, then `combine`s.
+  - `hybrid_decapsulate(recipient_x25519_secret, recipient_mlkem_decaps_key,
+    sender_eph_x25519_pub, mlkem_ct) -> Result<combined[32], HybridError>` — the
+    matching recover side.
+  - The raw-bytes fixed-size-array shape is deliberately FFI-friendly for a later
+    `sigil-ffi` C-ABI export.
+- **The combiner — `combine()` is real HKDF-SHA256, not XOR or a plain concat.**
+  `ss_combined = HKDF-SHA256(ikm = ss_x ‖ ss_kem ‖ transcript_hash, salt = None,
+  info = "sigil-hybrid-v1") → 32 bytes`, where `transcript_hash =
+  SHA256(eph_x25519_pub ‖ mlkem_ct)`. Both raw component secrets feed the HKDF
+  input keying material (the 96-byte `ikm`), so the combined key needs **both**
+  halves; the transcript hash binds the exact ciphertext material (ephemeral
+  public key + ML-KEM ciphertext) so the halves cannot be mixed-and-matched or
+  substituted across sessions; the fixed `"sigil-hybrid-v1"` `info` label is the
+  domain separation. `salt = None` because the concatenated raw secrets are
+  already high-entropy — HKDF is used purely as the combiner/labelling step. This
+  matches the RFC 9794 / NIST SP 800-56C Rev. 2-style concatenation-KDF combiner
+  documented in `docs/crypto-spec.md`.
+- **The hybrid property (honest design intent of an UNAUDITED primitive).**
+  Because both `ss_x` and `ss_kem` are concatenated into the HKDF input, the
+  combined secret is *designed* to stay secret if **either** the X25519 **or** the
+  ML-KEM-768 component remains secure — the standard hybrid-combiner property
+  (recovering the combined key requires breaking **both**). Stated as design
+  intent, not a proven or audited guarantee. Nothing here makes the system — or
+  even this primitive — "post-quantum secure"; "post-quantum" names the ML-KEM-768
+  component algorithm.
+- **Caller-supplied entropy — core still generates NO randomness.** The module
+  never generates the sender's ephemeral X25519 secret or the ML-KEM
+  encapsulation coin; the caller supplies both, exactly as it supplies the
+  Argon2id salt, the AEAD nonce, the X25519 scalar, and the Ed25519 seed elsewhere
+  (ADR 0007). A fresh ephemeral secret + coin per encapsulation is required; reuse
+  breaks ephemeral secrecy.
+- **`HybridError`** wraps the failure of either half so callers can tell which
+  primitive rejected the inputs: `Kx(KxError)` — reachable, a non-contributory /
+  low-order X25519 public key (RFC 7748 §6.1) — and `MlKem(MlKemError)` —
+  unreachable for the fixed-size arrays here, present so the raw-bytes contract
+  stays honest at the eventual FFI boundary. Both `From` impls are provided so the
+  `?` operator threads component errors up.
+
+### Dependency & the WASM/GETRANDOM gate — no new deps ✅
+- **No new dependencies.** `git diff libsigil/core/Cargo.toml` is empty; `hybrid.rs`
+  reuses `kx` (X25519), `mlkem` (ML-KEM-768), and the `hkdf` + `sha2` crates the
+  AEAD layer already depends on. The combiner is the same vetted HKDF-SHA256 used
+  elsewhere in the crate.
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (rechecked after the wasm build), and `cargo build -p sigil-core --target
+  wasm32-unknown-unknown` **succeeds** — the hybrid assembly stays wasm-pure with
+  no system entropy backend. `#![forbid(unsafe_code)]` (lib.rs) and `no_std`
+  (`core` + `alloc`) intact.
+
+### Tests ✅ — the round-trip capstone plus the four required properties
+- **8 hybrid tests, all PASS**, covering the four load-bearing properties:
+  - **(a) End-to-end round-trip agreement** — `round_trip_hybrid_kem_agrees` is
+    the capstone: the sender `hybrid_encapsulate`s to the recipient's
+    `(x25519_pub, ml_kem_encaps_key)`, the recipient `hybrid_decapsulate`s with its
+    `(x25519_secret, ml_kem_decaps_key)`, and **`k_sender == k_receiver`** — the two
+    halves compose into one agreed key.
+  - **(b) Transcript binding** — `tampered_ciphertext_yields_different_combined_secret`
+    (`ct[0] ^= 1`; ML-KEM decaps is total so it still returns `Ok` via implicit
+    rejection, but `assert_ne!` vs the sender's key) and
+    `tampered_ephemeral_pubkey_yields_different_combined_secret` (`eph_pub[0] ^= 1`
+    → `assert_ne!`). A flipped ciphertext or ephemeral public key changes the
+    combined key regardless.
+  - **(c) Both halves feed the output** — `both_halves_feed_the_combined_secret`
+    flips ONLY the ML-KEM half (holding X25519 + transcript fixed), then ONLY the
+    X25519 half — each changes the combined key, so neither half alone can
+    reproduce it.
+  - **(d) Non-contributory propagation** — `low_order_recipient_pub_is_non_contributory`:
+    an all-zero recipient public key makes `hybrid_encapsulate` return
+    `Err(HybridError::Kx(KxError::NonContributory))` rather than folding a known
+    shared secret into the combiner.
+  - Plus `encapsulate_is_deterministic`, `combine_is_deterministic`, and a
+    constants/length check.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 71 PASS** (incl. the 8 hybrid tests), sigil-ffi 13
+  PASS · wasm32 build OK · getrandom count **0** · `#![forbid(unsafe_code)]`
+  present. Regression: cli fmt/clippy/**26 + 2** tests ✓; sigild
+  gofmt/vet/test/build ✓; all 7 workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0011 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and **ADR 0011** were already
+  updated by the docs track — ADR 0011 records the hybrid-KEM combiner decision
+  (concatenation-KDF via HKDF-SHA256 with the `"sigil-hybrid-v1"` label and the
+  transcript binding). This entry finalizes the remaining living docs (this file,
+  `CLAUDE.md`, `README.md`).
+
+### ➡️ What this closes, and what's still open (honest)
+- This **closes the hybrid KEM**: both KEX halves — classical X25519 (Phase 16)
+  and post-quantum ML-KEM-768 (Phase 17) — now **combine into one 32-byte secret**
+  via HKDF-SHA256, designed to stay secret if either component holds. The gap
+  called out at the end of Phase 17 ("the hybrid combiner does NOT yet exist") is
+  filled.
+- Still open: (1) it is the **primitive only** — **UNAUDITED** and **standalone**,
+  not wired into any key exchange / session / account / vault flow; (2) the
+  **ML-DSA-65 post-quantum signature** half of the *other* planned hybrid
+  (Ed25519 & ML-DSA-65) stays unimplemented — the Ed25519 classical half exists,
+  the PQ half does not; (3) no over-claims: the **system is NOT "post-quantum
+  secure"** — "post-quantum" describes the ML-KEM-768 component algorithm and the
+  hybrid's *design intent*, on an unaudited building block.

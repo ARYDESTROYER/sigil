@@ -23,8 +23,14 @@
 //! classical KEX half of the hybrid X25519&ML-KEM-768 suite. Its post-quantum
 //! counterpart, an ML-KEM-768 (FIPS 203) KEM primitive ([`ml_kem768_keygen`] /
 //! [`ml_kem768_encapsulate`] / [`ml_kem768_decapsulate`], [`mod@mlkem`],
-//! deterministic/caller-supplied seed and coin), now exists as the PQ half — but
-//! it is **standalone**: the two are not yet combined into a hybrid shared secret.
+//! deterministic/caller-supplied seed and coin), is the PQ half. The two are now
+//! assembled into the **hybrid KEM** ([`hybrid_encapsulate`] /
+//! [`hybrid_decapsulate`], [`mod@hybrid`]): they are combined via HKDF-SHA256
+//! into one 32-byte shared secret designed to stay secret if **either** half
+//! remains secure (the standard concatenation-KDF hybrid-combiner property). It
+//! is a **real but UNAUDITED, standalone** primitive — the caller supplies the
+//! ephemeral X25519 secret and the ML-KEM coin, and it is not yet wired into the
+//! record/account/vault flow.
 //!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
@@ -44,6 +50,7 @@ extern crate alloc;
 
 mod aead;
 mod envelope;
+mod hybrid;
 mod kdf;
 mod kx;
 mod mlkem;
@@ -51,6 +58,10 @@ mod record;
 mod sig;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
+pub use hybrid::{
+    hybrid_decapsulate, hybrid_encapsulate, HybridEncapsulation, HybridError,
+    HYBRID_SHARED_SECRET_LEN,
+};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 pub use kx::{
     x25519_public_key, x25519_shared_secret, KxError, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,

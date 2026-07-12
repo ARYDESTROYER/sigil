@@ -35,10 +35,19 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   over a caller-supplied 64-byte `d‖z` keygen seed and 32-byte `m` encapsulation
   coin — still no in-core randomness; decapsulation is total per FIPS 203 implicit
   rejection; the raw shared secret must be run through a KDF before use; this is the
-  post-quantum KEM half of the planned X25519&ML-KEM-768 hybrid — **both hybrid-KEM
-  halves now exist as standalone primitives but are not yet combined into a hybrid
-  shared secret, the ML-DSA-65 signature half is still not implemented, and nothing
-  is wired into a key exchange**), plus a
+  post-quantum KEM half of the X25519&ML-KEM-768 hybrid), and — **now assembled** —
+  a real (unaudited) **hybrid KEM** that combines the two
+  (`hybrid_encapsulate`/`hybrid_decapsulate`) into a single 32-byte shared secret
+  via HKDF-SHA256 over `ss_x25519 ‖ ss_ml-kem ‖ SHA256(eph_pub ‖ ct)` under a
+  `"sigil-hybrid-v1"` domain label — caller-supplied ephemeral X25519 secret +
+  ML-KEM coin, no in-core randomness, no new deps; the transcript hash binds the
+  ciphertext material, and both halves feed the output so the combined key is
+  designed to stay secret if **either** the X25519 **or** the ML-KEM-768 component
+  holds (the standard hybrid-combiner property). **The hybrid KEM primitive now
+  exists but is UNAUDITED and standalone — NOT wired into any key-exchange /
+  session / account / vault flow; the ML-DSA-65 post-quantum *signature* half of
+  the other planned hybrid is still not implemented, and the system is NOT
+  "post-quantum secure"**), plus a
   `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`, and the classical Ed25519 sig
   exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify` with a
   `SIGIL_ERR_VERIFY` code) for the clients.

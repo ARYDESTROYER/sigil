@@ -50,10 +50,13 @@ public, make no security claims, until the audit completes and trademark clears.
   encaps coin, no in-core RNG; decapsulation is total/implicit-rejection; raw
   32-byte shared secret must go through a KDF; RustCrypto `ml-kem`,
   `default-features = false`, wasm-pure/getrandom-free; the PQ KEM half of the
-  future X25519&ML-KEM-768 hybrid). **Both hybrid-KEM halves now exist standalone
-  but are NOT yet combined into the hybrid `ss_combined`; the ML-DSA-65 PQ
-  signature half stays unimplemented; neither KEM primitive is wired into any key
-  exchange, and both are UNAUDITED.**
+  X25519&ML-KEM-768 hybrid). **Both KEM halves are now COMBINED into a hybrid KEM
+  (`hybrid_encapsulate`/`hybrid_decapsulate`, `hybrid.rs`): `ss_combined =
+  HKDF-SHA256(ss_x ‖ ss_kem ‖ SHA256(eph_pub ‖ ct), "sigil-hybrid-v1")` —
+  caller-supplied ephemeral entropy, transcript-bound, reusing kx/mlkem/hkdf (no
+  new deps); designed secure if EITHER half holds. Still STANDALONE + UNAUDITED
+  (not wired into any key exchange / session / vault flow); the ML-DSA-65 PQ
+  signature half stays unimplemented; the SYSTEM is not "post-quantum secure".**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).

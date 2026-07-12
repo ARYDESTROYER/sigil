@@ -6,12 +6,12 @@
 > XChaCha20-Poly1305 + HKDF AEAD, a composed `seal_record`/`open_record`, a
 > standalone classical **Ed25519 sign/verify** primitive, a standalone classical
 > **X25519 key-agreement** primitive, and a standalone **ML-KEM-768 (FIPS 203)
-> post-quantum KEM** primitive — none wired into a finished product. Both halves
-> of the hybrid KEM (X25519 + ML-KEM-768) now exist as **standalone** primitives,
-> but the **combined hybrid KEM is not yet assembled** — there is no combiner. The
-> **ML-DSA-65 post-quantum signature half of the hybrid signature remains
-> specified-but-not-implemented**, so neither the combined hybrid KEM nor the
-> combined hybrid signature exists yet. Condensed from
+> post-quantum KEM** primitive — none wired into a finished product. The
+> **combined hybrid KEM** (X25519 + ML-KEM-768, combined via HKDF-SHA-256) is now
+> **assembled as a standalone primitive** in `sigil-core` (`hybrid.rs`), joining
+> the two halves it composes. The **ML-DSA-65 post-quantum signature half of the
+> hybrid signature remains specified-but-not-implemented**, so the combined hybrid
+> signature does not exist yet. Condensed from
 > the product brief §11/§20/§21. Subject to change. A Cure53 audit of the hybrid
 > construction is to be commissioned before public beta.
 
@@ -109,12 +109,29 @@ key material and no coins — see
 rejection** shared secret (a deterministic pseudo-random value derived from the
 private key, never an error), so decaps never leaks a distinguishable failure.
 
-Both primitives are **real but NOT YET AUDITED**. Even so, the **combined hybrid
-KEM `ss_combined` is NOT yet available**: there is **no combiner** in this repo —
-no code computes `HKDF-SHA-256(ss_x || ss_kem || transcript_hash, …)`, and there
-is no combined hybrid encapsulation / decapsulation. X25519 and ML-KEM-768 each
-stand alone as KEM building blocks, **not yet combined into the hybrid and not yet
-wired into any product flow**.
+Both primitives are **real but NOT YET AUDITED**. The **combined hybrid KEM
+`ss_combined` is now IMPLEMENTED** in
+[`libsigil/core/src/hybrid.rs`](../libsigil/core/src/hybrid.rs) as
+`hybrid_encapsulate` / `hybrid_decapsulate`, the combiner that composes the two
+halves above. Encapsulation runs the ephemeral X25519 exchange (`kx.rs`) and an
+ML-KEM-768 encapsulation (`mlkem.rs`) — the **caller supplies the ephemeral X25519
+secret and the ML-KEM coin** ([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md);
+the core still generates no entropy) — computes the transcript binding
+`transcript_hash = SHA-256(ephemeral_x25519_pub || mlkem_ct)` over the ciphertext
+material, and mixes `ss_x || ss_kem || transcript_hash` through `HKDF-SHA-256`
+under the `"sigil-hybrid-v1"` label into one 32-byte `ss_combined`; decapsulation
+recomputes the same transcript from the received ciphertexts and reproduces the
+identical secret. It is **secure if EITHER component remains secure** — the
+standard hybrid-combiner property, so breaking it requires breaking **both** X25519
+and ML-KEM-768 — and the transcript binding stops an attacker splicing a
+ciphertext from one exchange onto material from another. This is **real but
+UNAUDITED and standalone**: it is **not wired into the record / vault / account
+flow**, the envelope's `kem_ct` field stays *reserved* but unused, and the
+**SYSTEM is still not "post-quantum secure"** (see
+[ADR 0011](decisions/0011-hybrid-kem-combiner.md)). The remaining hybrid-crypto
+gap is the **hybrid signature** (Ed25519 & ML-DSA-65) — per the
+signature-implementation-status note below, the ML-DSA-65 post-quantum half is
+still unimplemented.
 
 **Signature implementation status (pre-audit, UNAUDITED).** The **classical Ed25519 half**
 is now **implemented** in `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):

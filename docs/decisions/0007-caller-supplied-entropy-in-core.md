@@ -68,7 +68,10 @@ platforms.
 - **Pre-audit reality:** the primitives that consume this entropy (Argon2id, the
   AEAD, the standalone Ed25519 sign/verify, the standalone X25519 key-agreement,
   and the standalone ML-KEM-768 KEM) are **real but UNAUDITED** and not wired into
-  a finished product; both hybrid-KEM halves now exist standalone but no combiner
-  assembles the combined hybrid KEM yet, and the ML-DSA-65 post-quantum signature
-  half stays unimplemented. See [`../architecture.md`](../architecture.md) §1 and §6 and
+  a finished product; the two hybrid-KEM halves are now combined by the standalone
+  hybrid KEM combiner ([`../../libsigil/core/src/hybrid.rs`](../../libsigil/core/src/hybrid.rs);
+  [ADR 0011](0011-hybrid-kem-combiner.md)), which likewise consumes only
+  caller-supplied ephemeral entropy (the ephemeral X25519 secret and the ML-KEM
+  coin), and the ML-DSA-65 post-quantum signature half stays unimplemented. See
+  [`../architecture.md`](../architecture.md) §1 and §6 and
   [`../crypto-spec.md`](../crypto-spec.md).

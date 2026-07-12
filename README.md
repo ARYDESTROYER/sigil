@@ -52,10 +52,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   to zero, so it too draws no in-core randomness; FIPS 204 sizes
   pk=1952/sk=4032/sig=3309; RustCrypto `ml-dsa`, `default-features = false`,
   wasm-pure/getrandom-free — the **post-quantum signature half** of the planned
-  Ed25519&ML-DSA-65 hybrid. **Both signature halves (Ed25519 + ML-DSA-65) now
-  exist standalone, but the hybrid *signature* combiner is still future and
-  neither is wired into any auth flow; the system is NOT "post-quantum
-  secure"**), plus a
+  Ed25519&ML-DSA-65 hybrid), and — **now assembled** — a real (unaudited)
+  **hybrid signature** that composes the two
+  (`hybrid_sign`/`hybrid_verify`) into `ed25519_sig(64) ‖ ml_dsa65_sig(3309)` =
+  3373 bytes — a plain concatenation (no KDF: a signature already commits to the
+  message) whose verify requires **both** halves to validate, so forging a
+  signature is designed to require breaking **both** Ed25519 and ML-DSA-65;
+  two caller-supplied seeds, deterministic (RNG-free), reuses the sig/mldsa
+  primitives with no new deps. **With this, both planned hybrid constructions —
+  the hybrid KEM (X25519&ML-KEM-768) and the hybrid signature (Ed25519&ML-DSA-65)
+  — now exist as primitives, but both are UNAUDITED and standalone, NOT wired into
+  any key-exchange / session / account / vault / auth flow; the system is NOT
+  "post-quantum secure"**, plus a
   `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`, and the classical Ed25519 sig
   exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify` with a
   `SIGIL_ERR_VERIFY` code) for the clients.

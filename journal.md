@@ -1844,3 +1844,136 @@ Recording the decision so the doc set stays coherent as the repo grows:
   flow**.
 - No over-claims: "post-quantum" describes the ML-DSA-65 algorithm family — the
   **system is NOT "post-quantum secure".**
+
+## 2026-07-13 — Phase 20 (hybrid signature assembled: Ed25519 || ML-DSA-65)
+
+### Context & mandate
+- Goal: **assemble the hybrid signature** — compose the two existing signature
+  primitives, the classical Ed25519 (Phase 11) and the post-quantum ML-DSA-65
+  (Phase 19), into ONE signature that a verifier accepts **only if both halves
+  validate**. This is the signature counterpart to the hybrid KEM combiner
+  (Phase 18), and it **completes the hybrid crypto suite**: with it, **both**
+  planned hybrid constructions — the hybrid KEM (X25519 & ML-KEM-768) and the
+  hybrid signature (Ed25519 & ML-DSA-65) — now exist as standalone primitives.
+- ⚠️ Composition only — **no new low-level cryptography**. `hybrid_sig.rs` calls
+  the crate's existing `sign`/`verify` (sig.rs) and `ml_dsa65_*` (mldsa.rs); it
+  adds no new dep and mints no keys. Real but **UNAUDITED** and **standalone** —
+  NOT wired into any flow.
+
+### core — `core/src/hybrid_sig.rs` ✅
+- New module, re-exported from `lib.rs` (`mod hybrid_sig;` + `pub use
+  hybrid_sig::{hybrid_sign, hybrid_verify, HybridSigError, HYBRID_SIGNATURE_LEN}`):
+  `hybrid_sign(ed25519_seed[32], mldsa_keygen_seed[32], message) ->
+  Result<[u8; 3373], HybridSigError>` and `hybrid_verify(ed25519_public_key[32],
+  mldsa_public_key[1952], message, hybrid_signature[3373]) -> Result<(),
+  HybridSigError>`. The raw-bytes, fixed-size-array shape is deliberately
+  FFI-friendly for a later `sigil-ffi` export, matching sig/mldsa/kx/mlkem/hybrid.
+- **Layout — plain concatenation, `ed25519_sig(64) ‖ ml_dsa65_sig(3309)` = 3373
+  bytes.** `hybrid_sign` writes the Ed25519 signature to `out[..SIGNATURE_LEN]`
+  (bytes `0..64`) then the ML-DSA-65 signature to `out[SIGNATURE_LEN..]` (bytes
+  `64..3373`); `HYBRID_SIGNATURE_LEN = SIGNATURE_LEN(64) + ML_DSA65_SIGNATURE_LEN(3309)
+  = 3373` (pinned by the `constant_has_expected_length` test). **Unlike the hybrid
+  KEM there is NO KDF and NO transcript binding** — a signature is public and already
+  commits to the message, and both component signatures cover the SAME message
+  bytes, so the combiner is a plain concatenation plus an **AND over the two
+  verifications**. `hybrid_verify` splits the 3373 bytes back into the two
+  fixed-size halves and calls **both** `verify(ed25519_public_key, message,
+  &ed_sig)?` **and** `ml_dsa65_verify(mldsa_public_key, message, &mldsa_sig)?`
+  (Ed25519 checked first), returning `Ok(())` only if BOTH pass.
+- **The hybrid identity is two caller-supplied seeds; signing is deterministic —
+  core still generates NO randomness.** The signer holds a 32-byte Ed25519 seed AND
+  a 32-byte ML-DSA-65 keygen seed (`xi`); `hybrid_sign` recomputes the ML-DSA-65 key
+  pair from its seed on each call (via `ml_dsa65_keygen`) to recover the secret key
+  it signs with, discarding the public key. Both component signatures are
+  deterministic — Ed25519 per RFC 8032, ML-DSA-65 in its FIPS 204 deterministic
+  variant (`rnd = 0`) — so the **hybrid signature is a pure function of `(seed_ed,
+  seed_mldsa, message)`**: no per-signature entropy is drawn, and the crate needs no
+  RNG for signing. Same caller-supplied-entropy contract as the salt / AEAD nonce /
+  Ed25519 seed / X25519 scalar / ML-KEM seed+coin (ADR 0007). Whoever holds a seed
+  can forge that half.
+- **`HybridSigError`** (`#[non_exhaustive]`) wraps whichever half rejected the
+  inputs so a caller can tell which scheme failed: `Ed25519(SigError)` — reachable,
+  the classical half did not verify — and `MlDsa(MlDsaError)` — reachable on verify
+  (ML-DSA half did not verify), unreachable-in-practice on sign (guards the derived
+  secret-key length at the eventual FFI boundary). Both `From` impls are provided so
+  `?` threads component errors up. `hybrid_verify` checks Ed25519 first, so an input
+  that fails both halves surfaces as `Ed25519`.
+- **The hybrid property (honest design intent of an UNAUDITED primitive):** because
+  `hybrid_verify` returns `Ok(())` only when BOTH halves verify, a forgery over a
+  message requires forging **both** an Ed25519 signature **and** an ML-DSA-65
+  signature — the classical half still stands if ML-DSA-65 is broken, and the
+  post-quantum half still stands if Ed25519 is broken (e.g. by a
+  cryptographically-relevant quantum computer). Stated as design intent, not a
+  proven or audited guarantee. Nothing here makes the module — let alone the
+  **system** — "post-quantum secure" or "secure"; "post-quantum" names the ML-DSA-65
+  component algorithm.
+- Pre-audit caveats recorded in-module: `hybrid_sign` recomputes the 4032-byte
+  ML-DSA-65 secret key from the seed on every call (deterministic, keeps the API a
+  clean two-seed hybrid identity, but not free — a hot signer can cache the derived
+  secret key and call `ml_dsa65_sign` directly); no zeroization of seeds / derived
+  secret key / intermediates; unaudited; not wired into any product identity flow.
+
+### Dependency & the WASM/GETRANDOM gate — no new deps ✅
+- **No new dependencies.** `git diff libsigil/core/Cargo.toml` is empty; `hybrid_sig.rs`
+  reuses `sig` (Ed25519) and `mldsa` (ML-DSA-65) — both already in the crate. The
+  changed tree is only `lib.rs` (the `mod` + re-exports) plus the new `hybrid_sig.rs`
+  and ADR 0012.
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (rechecked after the wasm build), and `cargo build -p sigil-core --target
+  wasm32-unknown-unknown` **succeeds** — the hybrid signature stays wasm-pure with no
+  system entropy backend. `#![forbid(unsafe_code)]` (lib.rs) and `no_std` (`core` +
+  `alloc`) intact. MSRV unchanged (still 1.85 from the ml-dsa dep in Phase 19; the
+  machine is rustc 1.96).
+
+### Tests ✅ — the round-trip capstone plus the both-halves-required proofs
+- **9 hybrid_sig tests, all PASS**, covering the load-bearing properties:
+  - **Round-trip (capstone)** — `round_trip_hybrid_signature_verifies`:
+    `hybrid_sign(&ED_SEED, &MLDSA_SEED, MSG)` → `hybrid_verify(&ed_pub, &mldsa_pub,
+    MSG, &sig)` = **`Ok(())`** (and pins `sig.len() == HYBRID_SIGNATURE_LEN`). The two
+    halves compose into one signature a joint verifier accepts.
+  - **Both halves required — tamper the Ed25519 half** —
+    `tampered_ed25519_half_fails_even_with_valid_mldsa`: `sig[0] ^= 0x01` (Ed25519
+    half only; the ML-DSA-65 half at `64..` is intact and still valid) → verify
+    returns `Err(HybridSigError::Ed25519(_))`.
+  - **Both halves required — tamper the ML-DSA-65 half** —
+    `tampered_mldsa_half_fails_even_with_valid_ed25519`: `sig[SIGNATURE_LEN] ^= 0x01`
+    (i.e. `sig[64]`, ML-DSA-65 half only; the Ed25519 half at `0..64` is intact and
+    still valid) → verify returns `Err(HybridSigError::MlDsa(_))`. Tampering EITHER
+    half alone breaks the whole signature.
+  - **Determinism** — `signing_is_deterministic`: `hybrid_sign` twice over the same
+    `(seeds, message)` yields byte-identical 3373-byte output (`assert_eq!(a, b)`).
+  - Plus `constant_has_expected_length` (3373 = 64 + 3309), `wrong_message_fails`,
+    `wrong_ed25519_public_key_fails`, `wrong_mldsa_public_key_fails`, and
+    `empty_message_round_trips`.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 88 PASS** (incl. the 9 hybrid_sig tests), sigil-ffi
+  **13 PASS** · wasm32 build OK · getrandom count **0** · `#![forbid(unsafe_code)]`
+  present. Regression: cli fmt/clippy/**26 + 2** tests ✓ (`cli/Cargo.lock` getrandom
+  = 1 as ever — separate native crate outside the wasm gate; `libsigil/Cargo.lock`
+  is the one that must stay 0, and does); sigild gofmt/vet/test/build ✓; all 7
+  workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0012 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and **ADR 0012**
+  (`0012-hybrid-signature-combiner.md`) were already updated by the docs track — ADR
+  0012 records the combiner decision (plain concatenation `Ed25519.Sign(m) ‖
+  ML-DSA-65.Sign(m)` with verification requiring both halves; no KDF / no transcript
+  binding because a signature already commits to the message; both halves
+  deterministic so the combined signature is RNG-free). This entry finalizes the
+  remaining living docs (this file, `CLAUDE.md`, `README.md`).
+
+### ➡️ What this closes, and what's still open (honest)
+- This **assembles the hybrid signature** and thereby **COMPLETES the hybrid crypto
+  suite**: both planned hybrids now exist as standalone primitives — the hybrid KEM
+  (X25519 & ML-KEM-768 via HKDF, Phase 18) and the hybrid signature (Ed25519 &
+  ML-DSA-65 by concatenation + AND-verify, this phase). The "combiner still future"
+  gap called out at the end of Phase 19 is filled.
+- Still open — the SAME gap for both hybrids: they are **primitives only**, **UNAUDITED**
+  and **standalone**, **NOT wired into any flow**. The sigild op-log request auth
+  still uses the **classical Ed25519 signature only** (not the hybrid); the
+  record/account/vault path still uses the password-KDF → AEAD → envelope flow (no
+  KEM, no signature). The remaining crypto work is **wiring the hybrid primitives
+  into an actual account / session / record flow**, and then the eventual **audit**.
+- No over-claims: "post-quantum" describes the ML-DSA-65 (and ML-KEM-768) component
+  algorithms and the hybrids' *design intent* on unaudited building blocks — the
+  **system is NOT "post-quantum secure".**

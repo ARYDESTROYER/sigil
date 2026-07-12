@@ -63,10 +63,15 @@ public, make no security claims, until the audit completes and trademark clears.
   pk=1952/sk=4032/sig=3309; RustCrypto `ml-dsa` 0.1.1, `default-features = false`,
   wasm-pure/getrandom-free — this crate is edition-2024 and raised the core crate's
   MSRV `rust-version` 1.74→1.85, still below the machine's rustc 1.96; the PQ
-  signature half of the Ed25519&ML-DSA-65 hybrid). **Both signature halves (Ed25519 +
-  ML-DSA-65) now exist STANDALONE + UNAUDITED, but the hybrid *signature* combiner is
-  still future and neither is wired into any auth flow; the SYSTEM is not
-  "post-quantum secure".**
+  signature half of the Ed25519&ML-DSA-65 hybrid). **Both signature halves are now
+  ASSEMBLED into a hybrid signature (`hybrid_sign`/`hybrid_verify`, `hybrid_sig.rs`):
+  `ed25519_sig(64) ‖ ml_dsa65_sig(3309)` = 3373 bytes — a plain concatenation (no KDF,
+  a signature already commits to the message) whose verify requires BOTH halves to
+  validate, so a forgery needs breaking BOTH schemes; two caller-supplied seeds,
+  deterministic, reuses sig/mldsa (no new deps). This COMPLETES the hybrid crypto
+  suite alongside the hybrid KEM. Still STANDALONE + UNAUDITED — NOT wired into any
+  flow (the sigild op-log auth still uses the classical Ed25519 signature only); the
+  SYSTEM is not "post-quantum secure".**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).

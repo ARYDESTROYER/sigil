@@ -19,9 +19,16 @@
 //! Its post-quantum counterpart, an ML-DSA-65 (FIPS 204) signature primitive
 //! ([`ml_dsa65_keygen`] / [`ml_dsa65_sign`] / [`ml_dsa65_verify`], [`mod@mldsa`],
 //! deterministic/caller-supplied keygen seed, deterministic signing), is the PQ
-//! signature half. It is a **real but UNAUDITED, standalone** primitive — it is
-//! **not** yet combined with Ed25519 into the hybrid signature, and not wired into
-//! any identity/record flow.
+//! signature half. The two are now assembled into the **hybrid signature**
+//! ([`hybrid_sign`] / [`hybrid_verify`], [`mod@hybrid_sig`]): the signer produces
+//! `Ed25519.Sign(m) ‖ ML-DSA-65.Sign(m)` (64 + 3309 = 3373 bytes) under a
+//! two-seed hybrid identity, and the verifier accepts **only** if **both** halves
+//! validate — so a forgery requires breaking **both** Ed25519 **and** ML-DSA-65.
+//! Both halves are deterministic, so the hybrid signature is deterministic. It is
+//! a **real but UNAUDITED, standalone** primitive — the caller supplies the two
+//! signing seeds, and it is **not** wired into any identity/record/vault flow (the
+//! sigild op-log request auth still uses the classical Ed25519 signature only).
+//! This completes the hybrid suite alongside the hybrid KEM.
 //!
 //! A classical X25519 Diffie-Hellman key-agreement primitive
 //! ([`x25519_public_key`] / [`x25519_shared_secret`], [`mod@kx`]) provides the
@@ -56,6 +63,7 @@ extern crate alloc;
 mod aead;
 mod envelope;
 mod hybrid;
+mod hybrid_sig;
 mod kdf;
 mod kx;
 mod mldsa;
@@ -68,6 +76,7 @@ pub use hybrid::{
     hybrid_decapsulate, hybrid_encapsulate, HybridEncapsulation, HybridError,
     HYBRID_SHARED_SECRET_LEN,
 };
+pub use hybrid_sig::{hybrid_sign, hybrid_verify, HybridSigError, HYBRID_SIGNATURE_LEN};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 pub use kx::{
     x25519_public_key, x25519_shared_secret, KxError, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,

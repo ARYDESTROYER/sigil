@@ -46,9 +46,9 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   - the **classical Ed25519 signature primitive** (`sign`/`verify`) — a
     deterministic RFC 8032 sign/verify over a **caller-supplied 32-byte secret
     seed** (real but UNAUDITED; a standalone primitive). It is the classical half
-    of suite `0x12`'s hybrid `Ed25519 & ML-DSA-65` signature — now joined by its
-    ML-DSA-65 sibling (below), though the two are **not yet** combined into a
-    hybrid `Sign`/`Verify`;
+    of suite `0x12`'s hybrid `Ed25519 & ML-DSA-65` signature — now composed with
+    its ML-DSA-65 sibling (below) by the hybrid-signature combiner
+    (`hybrid_sig.rs`, further below);
   - the **ML-DSA-65 post-quantum signature primitive**
     ([`../libsigil/core/src/mldsa.rs`](../libsigil/core/src/mldsa.rs):
     `keygen`/`sign`/`verify`) — deterministic FIPS 204, on the RustCrypto `ml-dsa`
@@ -56,8 +56,8 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     core generates no key material). Signing is deterministic (FIPS 204 permits a
     zero randomizer, so `sign` is a pure function of `(sk, message)`), so it draws
     no per-signature entropy. Real but UNAUDITED. It is the post-quantum half of
-    the hybrid `Ed25519 & ML-DSA-65` signature — standalone, **not yet** combined
-    with the Ed25519 half above;
+    the hybrid `Ed25519 & ML-DSA-65` signature — now composed with the Ed25519
+    half above by the hybrid-signature combiner (`hybrid_sig.rs`, below);
   - the **classical X25519 key-agreement primitive**
     (`x25519_public_key`/`x25519_shared_secret`) — a raw-bytes RFC 7748
     Diffie–Hellman over a **caller-supplied 32-byte secret scalar** that rejects
@@ -89,12 +89,28 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     `0x12` or any record/vault/account flow (the envelope's `kem_ct` field stays
     reserved), and the system is still not "post-quantum secure". See
     [`decisions/0011-hybrid-kem-combiner.md`](decisions/0011-hybrid-kem-combiner.md).
+  - the **combined hybrid signature**
+    ([`../libsigil/core/src/hybrid_sig.rs`](../libsigil/core/src/hybrid_sig.rs):
+    `hybrid_sign` / `hybrid_verify`) — the **combiner** that assembles the Ed25519
+    and ML-DSA-65 halves above into one signature. `hybrid_sign` concatenates
+    `Ed25519.Sign(m)` (64 bytes) then `ML-DSA-65.Sign(m)` (3309 bytes) into a fixed
+    **3373-byte** signature over the **two caller-supplied 32-byte seeds** (the
+    Ed25519 signing seed and the ML-DSA-65 keygen seed `xi`); it is
+    **deterministic** (both halves are, so the core draws no per-signature entropy).
+    `hybrid_verify` splits the signature and requires **BOTH** halves to validate —
+    so a forgery requires breaking **both** Ed25519 and ML-DSA-65 (the
+    concatenate-and-require-both property; not a claim the system is "post-quantum
+    secure"). Real but UNAUDITED and **standalone** — not wired into suite `0x12` or
+    any record/vault/account/session flow (the `sigild` op-log request auth still
+    uses classical Ed25519 only), and the system is still not "post-quantum secure".
+    See [`decisions/0012-hybrid-signature-combiner.md`](decisions/0012-hybrid-signature-combiner.md).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
   the AEAD nonce, the Ed25519 signing seed, the ML-DSA-65 keygen seed (`xi`), the
   X25519 secret scalar, and the ML-KEM-768 keygen seed (`d || z`) and encapsulation
-  coin (`m`) — including the
-  ephemeral X25519 secret and ML-KEM coin the hybrid KEM combiner consumes — are
+  coin (`m`) — including the ephemeral X25519 secret and ML-KEM coin the hybrid KEM
+  combiner consumes and the two 32-byte seeds the hybrid signature combiner
+  consumes — are
   **all caller-supplied**, so the core stays `wasm32-unknown-unknown`-pure and
   `getrandom`-free (see
   [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
@@ -155,6 +171,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   X25519 key-agreement   (secret caller-supplied; no RNG)       │    │
    │   │   ML-KEM-768 KEM  (keygen d||z / m coin; caller-supplied)       │    │
    │   │   hybrid KEM: X25519 & ML-KEM-768 → HKDF combiner               │    │
+   │   │   hybrid signature: Ed25519 || ML-DSA-65 (verify needs both)    │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
@@ -267,11 +284,10 @@ decodable. The suite byte is additionally bound into the per-record HKDF `info`
 opened by deriving a key for another. **The full suite table, the intended
 hybrid X25519 & ML-KEM-768 / Ed25519 & ML-DSA-65 construction, and the migration
 timeline live in [`crypto-spec.md`](crypto-spec.md)** — not duplicated here. (The
-combined hybrid KEM now exists as a **standalone** primitive (`hybrid.rs`), but it
-and the individual KEM/signature primitives are **not yet wired into the suite
-frame** — the `kem_ct` envelope field stays *reserved* but unused — and although
-both signature halves (Ed25519 and ML-DSA-65) now exist standalone, the hybrid
-signature has **not yet been assembled**; see
+combined hybrid KEM (`hybrid.rs`) and combined hybrid signature (`hybrid_sig.rs`)
+now exist as **standalone** primitives, but they and the individual
+KEM/signature primitives are **not yet wired into the suite frame** — the
+`kem_ct` envelope field stays *reserved* but unused; see
 [§6](#6-what-is-deliberately-not-here-yet).)
 
 ---
@@ -345,30 +361,33 @@ authoritative list, with rationale, is the **defer ledger** in
   [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **The combined hybrid KEM is assembled but wired into no flow, and the hybrid
-  signature is not yet assembled.** For key agreement, the **combined hybrid KEM now exists
-  as a standalone primitive** (`hybrid.rs`: `hybrid_encapsulate` /
-  `hybrid_decapsulate`; [ADR 0011](decisions/0011-hybrid-kem-combiner.md)): the
-  combiner assembles the classical X25519 half (`x25519_public_key` /
-  `x25519_shared_secret`; caller-supplied 32-byte secret; RFC 7748; rejects the
-  all-zero / non-contributory shared secret) and the ML-KEM-768 post-quantum half
-  (`mlkem.rs`: deterministic FIPS 203 `keygen`/`encapsulate`/`decapsulate`;
-  caller-supplied `d || z` seed and `m` coin; total implicit-rejection decaps) into
+- **Both hybrid constructions are assembled, but wired into no flow.** For key
+  agreement, the **combined hybrid KEM exists as a standalone primitive**
+  (`hybrid.rs`: `hybrid_encapsulate` / `hybrid_decapsulate`;
+  [ADR 0011](decisions/0011-hybrid-kem-combiner.md)): the combiner assembles the
+  classical X25519 half (`x25519_public_key` / `x25519_shared_secret`;
+  caller-supplied 32-byte secret; RFC 7748; rejects the all-zero / non-contributory
+  shared secret) and the ML-KEM-768 post-quantum half (`mlkem.rs`: deterministic
+  FIPS 203 `keygen`/`encapsulate`/`decapsulate`; caller-supplied `d || z` seed and
+  `m` coin; total implicit-rejection decaps) into
   `ss_combined = HKDF-SHA-256(ss_x || ss_kem || transcript_hash, "sigil-hybrid-v1")`
-  with `transcript_hash = SHA-256(ephemeral_x25519_pub || mlkem_ct)`. It is real but
-  **UNAUDITED and standalone** — not wired into a record / vault / account / session
-  flow, and the envelope's `kem_ct` field stays *reserved* but unused. For
-  signatures, **both halves now exist as standalone primitives** — the classical
-  Ed25519 `sign`/`verify` (`sig.rs`; caller-supplied seed; UNAUDITED) and the
-  ML-DSA-65 post-quantum `keygen`/`sign`/`verify` (`mldsa.rs`: deterministic
-  FIPS 204 on the RustCrypto `ml-dsa` crate; caller-supplied 32-byte keygen seed
-  `xi`; deterministic signing; UNAUDITED) — but the **combined hybrid signature is
-  not yet assembled**: there is no combiner producing
-  `Ed25519.Sign(m) || ML-DSA-65.Sign(m)` and no `Verify` requiring both, so it does
-  not yet exist. The remaining crypto gaps are therefore the **hybrid-signature
-  combiner** and **wiring the hybrid primitives into an actual account/session
-  flow**; today only the symmetric path (Argon2id → AEAD → envelope) runs
-  end-to-end.
+  with `transcript_hash = SHA-256(ephemeral_x25519_pub || mlkem_ct)`. For
+  signatures, the **combined hybrid signature now exists as a standalone primitive**
+  too (`hybrid_sig.rs`: `hybrid_sign` / `hybrid_verify`;
+  [ADR 0012](decisions/0012-hybrid-signature-combiner.md)): the combiner assembles
+  the classical Ed25519 half (`sig.rs`; caller-supplied 32-byte seed; UNAUDITED) and
+  the ML-DSA-65 post-quantum half (`mldsa.rs`: deterministic FIPS 204 on the
+  RustCrypto `ml-dsa` crate; caller-supplied 32-byte keygen seed `xi`; deterministic
+  signing; UNAUDITED) into the fixed **3373-byte** `Ed25519.Sign(m) ||
+  ML-DSA-65.Sign(m)` (64 + 3309 bytes), where `hybrid_verify` requires **BOTH**
+  halves to validate — a forgery requires breaking **both** Ed25519 and ML-DSA-65.
+  Both combiners are real but **UNAUDITED and standalone**: neither is wired into a
+  record / vault / account / session flow (the envelope's `kem_ct` field stays
+  *reserved* but unused, and the `sigild` op-log request auth still uses classical
+  Ed25519 only), and the **system is still not "post-quantum secure"**. The
+  remaining crypto gap is therefore **wiring the hybrid primitives into an actual
+  account/session/record flow**; today only the symmetric path (Argon2id → AEAD →
+  envelope) runs end-to-end.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number — no signed ops, no Lamport/Merkle
   ordering, no conflict-free merge.

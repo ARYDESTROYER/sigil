@@ -47,3 +47,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0009](0009-manual-gated-deploy-and-publish.md) | Manual / human-gated deploy and publish | Accepted (2026-06) |
 | [0010](0010-op-log-auth-v2-nonce-replay.md) | Op-log request auth v2 — signed per-request nonce + replay cache | Accepted (2026-06) |
 | [0011](0011-hybrid-kem-combiner.md) | Hybrid KEM combiner (X25519 & ML-KEM-768 via HKDF) | Accepted (2026-07) |
+| [0012](0012-hybrid-signature-combiner.md) | Hybrid signature combiner (Ed25519 then ML-DSA-65) | Accepted (2026-07) |

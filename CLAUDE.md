@@ -68,7 +68,16 @@ public, make no security claims, until the audit completes and trademark clears.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices).
-- `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not applied).
+- `deploy/` — Terraform / Nomad / Caddy / systemd skeletons, **plus `local/`** (a
+  loopback-only `docker compose` Caddy→sigild topology smoke — no real TLS; brought
+  up + torn down, **not a deployment**) **and `preflight.sh`** (a read-only GO/NO-GO
+  deploy gate: DNS resolves / `EnvironmentFile` present / image ≠ PLACEHOLDER /
+  Docker present). **Nothing applied or exposed**: the offline IaC validators
+  (`caddy validate`, `terraform fmt -check`+`validate`, `nomad job validate`) pass;
+  `systemd-analyze` is macOS-N/A so the systemd unit stays by-eye. The manual,
+  human-gated container publish lives in `.github/workflows/publish-sigild.yml`
+  (`workflow_dispatch`-**only**; **private** GHCR `ghcr.io/<owner>/sigild`,
+  SHA-tagged) — see [ADR 0009](docs/decisions/0009-manual-gated-deploy-and-publish.md).
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
   **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
@@ -130,7 +139,10 @@ corepack pnpm -C web build
 ```
 
 **Always run the relevant suite after changes and record the result in
-`journal.md`.** CI mirrors these in `.github/workflows/`.
+`journal.md`.** CI mirrors these in `.github/workflows/` — **except**
+`publish-sigild.yml`, which is deliberately **not** a mirror: it is
+`workflow_dispatch`-only (no `push`/`pull_request` trigger) so nothing builds or
+publishes automatically while in stealth.
 
 ## Conventions & guardrails
 
@@ -151,7 +163,12 @@ corepack pnpm -C web build
 
 ## Git / deploy
 
-`main` is committed and pushed to `origin` (genesis → Phase 4); the human has
-authorized commits + pushes to `main`. **Still do not register domains or deploy
-publicly without explicit human approval** — those are outward-facing/irreversible.
-See [`docs/deployment.md`](docs/deployment.md) for the (not-yet-applied) deploy story.
+`main` is committed and pushed to `origin` (genesis → Phase 13); the human has
+authorized commits + pushes to `main`. **Still do not register domains, publish the
+container image, `terraform apply` / `nomad job run`, or deploy publicly without
+explicit human approval** — those are outward-facing/irreversible. Deploy readiness
+is verified **locally only** (offline IaC validators + a loopback compose smoke,
+then torn down); **nothing is published / applied / exposed** and there is **no
+domain**. Publish is a manual `workflow_dispatch` and all infra is human-gated (see
+[ADR 0009](docs/decisions/0009-manual-gated-deploy-and-publish.md)); the
+(not-yet-applied) deploy story is in [`docs/deployment.md`](docs/deployment.md).

@@ -1,8 +1,10 @@
 # Architecture Decision Records
 
 > **STATUS: pre-audit.** These ADRs describe the **current pre-launch skeleton**
-> (the 72-hour foundation sprint, through the dev-gated op-log and incremental
-> CLI pull). They record load-bearing decisions that have **actually been made
+> (the 72-hour foundation sprint, through the dev-gated op-log, the Ed25519
+> sign/verify primitive and device-key request auth, the file-backed dev backend,
+> and the manual / human-gated deploy & publish posture). They record load-bearing
+> decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
 > audited or production-ready; see [`../architecture.md`](../architecture.md) for
 > the current system shape and [`../../journal.md`](../../journal.md) for the

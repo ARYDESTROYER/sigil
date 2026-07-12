@@ -786,6 +786,9 @@ accurate); production behavior is **unchanged** (default ops still `501`).
   irreversible-ish, so it is **not** done — it awaits explicit human approval, same
   posture as domain purchase / public deploy. The image still only builds + is
   smoke-tested **locally** (Phase 4); nothing was published.
+  - ➡️ **Update (Phase 13):** the publish **mechanism** now exists as a manual,
+    `workflow_dispatch`-**only** workflow (`.github/workflows/publish-sigild.yml`,
+    private GHCR) — still intentionally **un-run**; no image has been published.
 
 ## 2026-06-08 — Phase 10 (file-backed durable dev op-log)
 
@@ -1109,6 +1112,113 @@ Servers killed cleanly; temp dir + binaries removed.
   this entry finalizes the remaining living docs (this file, `CLAUDE.md`,
   `README.md`).
 
+## 2026-06-22 — Phase 13 (deployment readiness — manual publish, local stack, IaC validation)
+
+Theme: make the deployment **verifiably READY without shipping anything** — a
+human-triggered container publish, a loopback-only edge→app topology smoke, and
+the offline IaC validators all green — while keeping the stealth/pre-audit posture
+intact (**nothing applied, nothing exposed, no domain**). The whole surface landed
+in commit **c493055**; this entry back-fills the journal for it. Readiness and
+exposure are deliberately **decoupled** — captured in the new **ADR 0009**.
+
+### The manual GHCR publish workflow — `.github/workflows/publish-sigild.yml` ✅
+- A `workflow_dispatch`-**ONLY** GitHub Actions workflow. There is intentionally
+  **NO `push` / `pull_request` / `schedule`** trigger — nothing builds or
+  publishes automatically; a human runs it by hand from the Actions tab. (The only
+  `push` token in the file is `push: true` inside the docker build-push step — a
+  step arg, **not** a workflow trigger.) Confirmed `workflow_dispatch`-only this
+  pass (`on:` has exactly one key).
+- It builds `sigild` from `sigild/Dockerfile` and pushes to
+  **`ghcr.io/${{ github.repository_owner }}/sigild`** (= `ghcr.io/<owner>/sigild`),
+  tagged with the git **short SHA** (+ an optional dispatch `tag` input), passing
+  `VERSION=<short_sha>` as a build-arg to match sigild's `-ldflags` version
+  injection. `permissions: packages: write`; logs into GHCR via `GITHUB_TOKEN`; a
+  final step **reminds the operator to set the GHCR package PRIVATE**.
+- ⚠️ **Not run here** — there is no GHCR auth on this machine and running it would
+  be an outward-facing action, so the YAML is reviewed by eye, not executed.
+  Because publish is manual-only + the package is private, **CI cannot leak the
+  project**.
+
+### deploy/local/ — loopback-only Caddy → sigild topology smoke ✅
+- New `deploy/local/{compose.yaml,Caddyfile.local,README.md}`: a compose stack
+  that stands up the production **Caddy → sigild** edge shape on the local box —
+  **NOT a deployment**. Hard guarantees baked into the artifacts: **loopback-only**
+  (Caddy publishes `127.0.0.1:8080→80`, never `0.0.0.0`; sigild is `expose`d on the
+  compose network only, never host-published), **no real TLS/ACME**
+  (`auto_https off` — never contacts Let's Encrypt, obtains no publicly-trusted
+  cert), **no PQ proof**, **disposable** (`down -v`).
+- Verified end-to-end this pass, then torn down:
+  `docker compose -f deploy/local/compose.yaml up -d --build` built `sigild:local`
+  from the distroless `Dockerfile` (~14 MB; VERSION defaults to `dev` — compose
+  passes no build-arg). `curl http://127.0.0.1:8080/healthz` **through Caddy** →
+  **HTTP 200** `{"status":"ok","version":"dev"}`, with `Via: 1.1 Caddy` and the
+  Caddyfile.local hardening headers (`X-Content-Type-Options: nosniff`, `Server`
+  stripped) + sigild's `X-Request-Id`, proving it traversed the proxy. `/readyz` →
+  **200** `{"checks":{"postgres":"unconfigured","redis":"unconfigured"},"version":"dev"}`
+  (no `status` field on readyz). `/v1/vaults/abc/ops` → **501** (dev op-log off =
+  production default; `SIGILD_ENABLE_DEV_OPS` unset). Caddy reverse-proxies to
+  `sigild:8080` over the compose **bridge network** (Docker DNS on the service
+  name); the `127.0.0.1:8080` is only the host→Caddy:80 hop — the loopback
+  Caddy→sigild hop is the *production* single-VM shape, not the local one.
+  `docker compose down -v` removed both containers + the network; re-curling
+  `127.0.0.1:8080` → connection-refused, `docker ps -a` shows no `local-*`.
+
+### Offline IaC validation — caddy / terraform / nomad all green ✅
+- Caddy, Terraform, and Nomad were **brew-installed** and their **offline**
+  validators run cleanly (all exit 0) — syntax/schema checks that contact no cloud
+  or cluster:
+  - **caddy v2.11.4** `caddy validate --adapter caddyfile`: `deploy/caddy/Caddyfile`
+    → "Valid configuration" (benign INFO only — auto_https adds a :443 TLS policy +
+    HTTP→HTTPS redirect); `deploy/local/Caddyfile.local` → "Valid configuration"
+    (auto_https fully off, as intended).
+  - **terraform v1.15.6**: `fmt -check -recursive` clean; `init -backend=false` OK
+    (reused hcloud provider 1.66.0 from the committed
+    `deploy/terraform/.terraform.lock.hcl` — added in c493055 so `validate` runs
+    offline); `validate` → "Success! The configuration is valid."
+  - **nomad v2.0.3**: `fmt -check` clean; `nomad job validate
+    deploy/nomad/sigild.nomad.hcl` → "Job validation successful" (with the expected
+    offline note that the driver config isn't validated without an agent; **no**
+    shutdown_delay warning — the jobspec's `shutdown_delay="5s"` silences it). The
+    jobspec still points at the `ghcr.io/PLACEHOLDER/sigild:latest` placeholder.
+- ⚠️ `systemd-analyze` is **N/A on macOS**, so `deploy/systemd/sigild.service`
+  stays **by-eye only** (run `systemd-analyze verify` on a Linux host).
+
+### deploy/preflight.sh — read-only GO/NO-GO gate ✅
+- New POSIX-sh `deploy/preflight.sh`: a **read-only** checklist that provisions /
+  exposes / mutates **nothing**. Four gates from `docs/deployment.md`
+  (§4 DNS/ACME, §5 secrets, §2 image flow, §8 toolchain): the target
+  `SIGIL_DEPLOY_HOST` A/AAAA **resolves**; the systemd `EnvironmentFile`
+  (`/etc/sigild/sigild.env`) is **present**; the Nomad jobspec image is **not the
+  `ghcr.io/PLACEHOLDER` placeholder**; **Docker present**. Exit 0 = GO; non-zero =
+  NO-GO (= count of failed gates).
+- Verified: with all prereqs unset → **3 FAIL** (DNS / secrets / placeholder image)
+  + 1 PASS (docker), verdict **"NO-GO — 3 gate(s) FAILED"**, exit 3; faking a
+  resolvable `SIGIL_DEPLOY_HOST=example.com` flips DNS to PASS → **2 FAIL**, exit 2.
+  It **correctly reports NO-GO** until a human stages DNS + secrets + a published
+  image.
+
+### ADR 0009 — manual / human-gated deploy and publish ✅
+- New `docs/decisions/0009-manual-gated-deploy-and-publish.md` (Accepted —
+  2026-06): records *why* nothing ships automatically — publish is
+  `workflow_dispatch`-only to a **private** GHCR package, no CI `terraform apply` /
+  `nomad job run`, local validation is **loopback-only + offline**, and a preflight
+  gate stands between "ready" and "deploy". Same house pattern as the op-log ADRs
+  (0003 / 0006 / 0008): default safe, gate the risky path behind an explicit human
+  opt-in, never expose it. The ADR set is now **0001–0009**.
+
+### ⛔ Still NOT deployed — nothing applied / published / exposed (LOUD + honest)
+- **Nothing outward-facing happened.** No image was pushed to GHCR (the workflow is
+  manual-only and was **not run** — no GHCR auth here); **no `terraform apply`, no
+  `nomad job run`**; **no domain** registered; the local compose stack was
+  **loopback-only and has been torn down**. The IaC is **validated but never
+  applied**; the Nomad jobspec still points at `ghcr.io/PLACEHOLDER/sigild` and
+  preflight still says **NO-GO**. Publish + apply await an **explicit human
+  trigger** with the prerequisites (purchased domain, staged secrets, a published
+  private image) that are **not present here** — exactly the stealth gate in
+  `docs/sprint-72h.md` / `deployment.md` §7 and ADR 0009.
+- Living docs finalized in this same change: `journal.md` (this entry), `CLAUDE.md`,
+  and `README.md`; `docs/deployment.md` + ADR 0009 carry the operator detail.
+
 ## Documentation strategy
 
 Recording the decision so the doc set stays coherent as the repo grows:
@@ -1116,9 +1226,10 @@ Recording the decision so the doc set stays coherent as the repo grows:
 - **`CLAUDE.md`** = the working guide (toolchains, known-green commands,
   guardrails) — read first by anyone (human or agent) doing work.
 - **`journal.md`** = this chronological log (what/why/next, per session/phase) —
-  the source of truth for non-obvious context. ~510 lines now; **fine for now**.
-  ➡️ If it keeps growing we will **rotate it per-month** (e.g. `journal/2026-06.md`)
-  rather than let one file sprawl.
+  the source of truth for non-obvious context. **~1.2k lines now** (13 phases) —
+  past the point where a single file is comfortable. ➡️ **Rotate per-month**
+  (e.g. `journal/2026-06.md`) at the next natural break rather than let it sprawl
+  further; the trigger has effectively been reached.
 - **`README.md`** = the front door (what the repo is, layout, build/test) for a
   first-time reader.
 - **`docs/`** = topic docs: `crypto-spec.md`, `threat-model.md`, `sprint-72h.md`,

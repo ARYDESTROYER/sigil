@@ -4,6 +4,9 @@
 kept behind the pre-launch wall and are **not** published publicly until the
 independent audit completes and trademark clears (brief, GTM Phase 1).
 
+- [`architecture.md`](architecture.md) — the system shape: the client-side-crypto
+  vs. zero-knowledge-server trust boundary and the life-of-one-record data flow
+  (the doc to read first after this index).
 - [`sprint-72h.md`](sprint-72h.md) — the 72-hour foundation sprint: definition
   of done, critical path, wall-clock gates, and the defer ledger.
 - [`threat-model.md`](threat-model.md) — adversary classes and the defense layer

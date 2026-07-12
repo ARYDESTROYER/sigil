@@ -12,7 +12,7 @@ future web app and browser extension can link it. On
 into the core would mean pulling [`getrandom`](https://docs.rs/getrandom), which
 has no `wasm32-unknown-unknown` backend without extra opt-in shims. That would
 **break the wasm build** and **violate the `getrandom`-count invariant** that
-keeps the audited core minimal and wasm-pure
+keeps the audit-bound core minimal and wasm-pure
 (`grep -c 'name = "getrandom"' libsigil/Cargo.lock` must stay `0` — see
 [ADR 0002](0002-standalone-cli-crate-for-getrandom-isolation.md)).
 

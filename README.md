@@ -55,7 +55,15 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.
-- `deploy/` — Terraform / Nomad / Caddy / systemd skeletons (not yet applied).
+- `deploy/` — Terraform / Nomad / Caddy / systemd skeletons, plus `local/` (a
+  loopback-only Caddy→sigild `docker compose` topology smoke — no real TLS, torn
+  down after) and `preflight.sh` (a read-only GO/NO-GO deploy gate). The offline
+  IaC validators (`caddy validate`, `terraform validate`, `nomad job validate`)
+  pass and the loopback topology was probed, but **nothing is published / applied /
+  exposed** and there is **no domain**. A manual, `workflow_dispatch`-only workflow
+  (`.github/workflows/publish-sigild.yml`) publishes the `sigild` image to a
+  **private** GHCR package only when a human triggers it — see
+  [ADR 0009](docs/decisions/0009-manual-gated-deploy-and-publish.md).
 
 ## Repository layout
 
@@ -65,7 +73,7 @@ sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
 web/             Next.js marketing (+ webapp/admin reserved), pnpm workspace
 extension/       Browser extension (reserved)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
-deploy/          terraform / nomad / helm / caddy / systemd
+deploy/          terraform / nomad / caddy / systemd + local/ (loopback smoke) + preflight.sh
 docs/            architecture, threat model, crypto spec, op-log API, sprint plan
 docs/decisions/  Architecture Decision Records (ADRs)
 ```

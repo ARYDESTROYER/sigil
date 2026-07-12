@@ -2,7 +2,8 @@
 
 > **STATUS: pre-audit skeleton.** This is the *system shape* of the repository
 > as it stands today (the 72-hour foundation sprint, through the dev-gated
-> op-log). It is **not** a shipping product. `libsigil` contains **real but
+> op-log and its optional Ed25519 device-key request auth). It is **not** a
+> shipping product. `libsigil` contains **real but
 > UNAUDITED** cryptographic building blocks — an Argon2id KDF, an
 > XChaCha20-Poly1305 + HKDF-SHA256 AEAD, a composed `seal_record`/`open_record`,
 > and a C-ABI over them — that are **not wired into a finished

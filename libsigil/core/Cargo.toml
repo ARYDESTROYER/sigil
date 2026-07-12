@@ -2,7 +2,11 @@
 name = "sigil-core"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.74"
+# MSRV bumped 1.74 -> 1.85 solely for the `ml-dsa` crate (see below): ml-dsa
+# 0.1.1 is `edition = "2024"` / `rust-version = "1.85"`, and no 1.74-compatible
+# release exists. Every other dep here still builds on 1.74; this bump is the
+# minimum ml-dsa requires. The actual toolchain is newer, so it compiles.
+rust-version = "1.85"
 publish = false
 license = "Apache-2.0 OR MIT"
 description = "Pure heart of libsigil: crypto-agility envelope + algorithm-suite registry, with a real-but-unaudited XChaCha20-Poly1305 AEAD layer and an Argon2id password-stretching KDF building block. Pre-audit skeleton."
@@ -63,3 +67,25 @@ x25519-dalek = { version = "2", default-features = false }
 # Decapsulation is deterministic and total (FIPS 203 implicit rejection). Keys and
 # ciphertexts cross our raw-bytes API as fixed-size arrays via `EncodedSizeUser`.
 ml-kem = { version = "0.2.3", default-features = false, features = ["deterministic"] }
+# Post-quantum ML-DSA-65 (FIPS 204) module-lattice digital signatures (pre-audit)
+# — the post-quantum SIGNATURE half of the hybrid Ed25519&ML-DSA-65 suite (the
+# classical Ed25519 half lives in `sig.rs`). `default-features = false` is what
+# keeps `getrandom` out: ml-dsa's randomness enters ONLY through its optional
+# `getrandom` (and `rand_core`) features, which we do NOT enable — with defaults
+# off, `getrandom` and `rand_core` are never selected, so nothing reaches for a
+# `wasm32-unknown-unknown` backend and the web/extension build is preserved
+# (`pkcs8` is likewise off). We enable ONLY `alloc` (heap-backs the large key
+# structures; it does NOT pull `getrandom`). We use the FIPS 204 DETERMINISTIC
+# entry points exclusively: `ExpandedSigningKey::from_seed(xi)` for keygen (caller
+# supplies the 32-byte seed xi) and `sign_deterministic(msg, &[])` for signing
+# (rnd = 0, so the signature is a pure function of `(sk, message)` — no RNG),
+# exactly as the caller supplies the Argon2id salt, AEAD nonce, X25519 scalar,
+# ML-KEM seed/coin, and Ed25519 seed elsewhere. `sigil-core` therefore still
+# generates NO randomness. This is `edition = "2024"` / MSRV 1.85 (the reason for
+# the rust-version bump above). Keys/signatures cross our raw-bytes API as
+# fixed-size arrays via the crate's `Encoded*`/`ExpandedSigningKeyBytes` types.
+# NOTE: ml-dsa 0.1.x pulls its own major versions of `hybrid-array` (0.4),
+# `signature` (3), and `crypto-common` (0.2) — distinct from ml-kem's 0.2.x /
+# ed25519's `signature` 2.x — so the tree carries both; none of them add
+# `getrandom`.
+ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }

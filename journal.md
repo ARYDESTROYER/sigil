@@ -1717,3 +1717,130 @@ Recording the decision so the doc set stays coherent as the repo grows:
   the PQ half does not; (3) no over-claims: the **system is NOT "post-quantum
   secure"** — "post-quantum" describes the ML-KEM-768 component algorithm and the
   hybrid's *design intent*, on an unaudited building block.
+
+## 2026-07-13 — Phase 19 (ML-DSA-65 post-quantum signature in libsigil-core)
+
+### Context & mandate
+- Goal: add the **post-quantum ML-DSA-65** (NIST FIPS 204 Module-Lattice Digital
+  Signature Algorithm, security category 3) half of the planned hybrid signature
+  (Ed25519&ML-DSA-65) to `libsigil-core` as a standalone, real cryptographic
+  primitive — deterministic key generation, signing, and verification — without
+  touching the existing KDF/AEAD/Ed25519/X25519/ML-KEM/hybrid code and without
+  breaking the wasm-pure / no-RNG invariants. This is the **second post-quantum
+  primitive** in the repo (ML-KEM-768 was the first, Phase 17) and the PQ
+  counterpart to the classical Ed25519 signer (Phase 11).
+- ⚠️ **SIGNATURE PRIMITIVE only.** It is **not** combined with the Phase-11
+  classical Ed25519 half into a hybrid signature, and **not** wired into any
+  identity / enrollment / device-key / auth flow. Real but **UNAUDITED**.
+
+### core — `core/src/mldsa.rs` ✅
+- New module exposing a **raw-bytes** ML-DSA-65 API, re-exported from `lib.rs`
+  (`mod mldsa;` line 61; `pub use` of the three functions, the four length
+  constants, and `MlDsaError`, lines 76–79): `ml_dsa65_keygen(&[u8; 32]) ->
+  (pk[1952], sk[4032])`, `ml_dsa65_sign(&sk, message) -> Result<sig[3309],
+  MlDsaError>`, and `ml_dsa65_verify(&pk, message, &sig) -> Result<(), MlDsaError>`.
+  FIPS 204 sizes are pinned as consts (`ML_DSA65_PUBLIC_KEY_LEN` 1952,
+  `_SECRET_KEY_LEN` 4032 — the standard `skEncode` form, `_SIGNATURE_LEN` 3309,
+  `_KEYGEN_SEED_LEN` 32). The fixed-size raw-bytes shape is deliberately
+  FFI-friendly for a later `sigil-ffi` C-ABI export, matching mlkem/kx/sig.
+- **Caller-supplied entropy — core still generates NO randomness, for a SIGNING
+  scheme this time.** keygen takes the 32-byte FIPS 204 keygen seed `xi` and drives
+  `ExpandedSigningKey::from_seed` (= `ML-DSA.KeyGen_internal`); signing uses the
+  FIPS 204 **deterministic** variant (`sign_deterministic(msg, &[])`, empty context,
+  randomizer `rnd` fixed to zero), so a signature is a pure function of
+  `(secret_key, message)` and NO per-signature entropy is drawn — the crate needs no
+  RNG for signing either. Exactly like the Argon2id salt, the AEAD nonce, the
+  Ed25519 seed, the X25519 scalar, and the ML-KEM seed/coin (ADR 0007). The caller
+  MUST draw `xi` from a CSPRNG and safeguard it and the secret key it produces;
+  whoever holds either can forge.
+- **`MlDsaError`** (`#[non_exhaustive]`): `BadPublicKey` / `BadSecretKey` — parse
+  guards, unreachable for the fixed-size arrays here (present so the raw-bytes
+  contract stays honest at the eventual FFI boundary); `BadSignature` — reachable,
+  `sigDecode`/`z`-norm/hint check rejected a structurally invalid signature;
+  `Verification` — reachable, a well-formed signature that did not verify (wrong
+  message, wrong key, tampered). keygen cannot fail so it returns a plain tuple, no
+  `Result`.
+- Honest caveat recorded in-module: the secret key crosses the API as the 4032-byte
+  `skEncode` (the crate marks the expanded encode/decode deprecated in favour of the
+  32-byte seed; we `#[allow(deprecated)]` it because our raw-bytes contract fixes the
+  standard form). `skDecode` is **structural** (no FIPS 204 validation), so a
+  *maliciously malformed* secret key is not gracefully rejected; every key from
+  `ml_dsa65_keygen` is well-formed, so signing one back is total and panic-free.
+- ⚠️ **post-quantum SIGNATURE only — standalone, NOT the hybrid.** A signature from
+  this module stands on its own and provides no classical protection if ML-DSA were
+  broken; a complete hybrid signer will produce BOTH an Ed25519 and an ML-DSA-65
+  signature and a verifier will require both. Labeled UNAUDITED / NOT-yet-hybrid
+  throughout the module docs, `lib.rs`, and the docs set. "post-quantum" names the
+  ML-DSA-65 algorithm family — it does **not** mean the module, let alone the
+  system, is "post-quantum secure".
+
+### Dependency, MSRV bump & the WASM/GETRANDOM gate — the second PQ crate ✅
+- Chose **`ml-dsa = { version = "0.1.1", default-features = false, features =
+  ["alloc"] }`** (RustCrypto). `default-features = false` keeps `getrandom` out —
+  ml-dsa's randomness enters only through its optional RNG-driven convenience API,
+  which we do not enable; we use the deterministic `from_seed` / `sign_deterministic`
+  entry points instead.
+- **MSRV bump (load-bearing, reported):** ml-dsa 0.1.1 is `edition = "2024"` /
+  `rust-version = "1.85"`, and **no 1.74-compatible release exists**, so
+  `libsigil/core/Cargo.toml`'s `rust-version` was raised **1.74 → 1.85** — the
+  minimum ml-dsa requires, documented in a Cargo.toml comment. This is the only dep
+  that forced it: **ml-kem stayed at 0.2.3** (its 1.74 pin), every other dep still
+  builds on 1.74. The machine toolchain is **rustc 1.96.0**, well above 1.85, so
+  fmt/clippy/test/wasm all pass. (Contrast Phase 17, where ml-kem was deliberately
+  pinned to 0.2.3 to *hold* 1.74; ml-dsa 0.1.x offered no such escape.)
+- ✅ **The gate HELD for the repo's SECOND post-quantum lattice crate.** `grep -c
+  'name = "getrandom"' libsigil/Cargo.lock` = **0** (ml-dsa pulls `rand_core`
+  without its `getrandom` feature), and `cargo build -p sigil-core --target
+  wasm32-unknown-unknown` **succeeds** — a full ML-DSA-65 signer compiles wasm-pure
+  with no system entropy backend. `#![forbid(unsafe_code)]` (lib.rs) and `no_std`
+  (`core` + `alloc`) intact. Note: ml-dsa 0.1.x pulls its own major versions of
+  `hybrid-array` (0.4), `signature` (3), and `crypto-common` (0.2), distinct from
+  ml-kem's 0.2.x lineage — both coexist in the lock without a getrandom edge.
+
+### Tests ✅
+- **8 mldsa tests, all PASS.** `round_trip_verifies` — keygen(SEED) → sign(sk, MSG)
+  → verify(pk, MSG, sig) = `Ok(())` (and pins the returned buffer sizes).
+  Determinism: `keygen_is_deterministic` (same seed → byte-identical (pk,sk); flipped
+  seed → different) and `signing_is_deterministic` (same (sk,msg) → byte-identical
+  sig — the FIPS 204 deterministic/`rnd=0` variant; different message → different
+  sig). Rejection: `wrong_message_fails` → `Verification`, `tampered_signature_fails`
+  (flip `sig[0]`) → `Verification | BadSignature`, `wrong_key_fails` (pk from a
+  different seed) → `Verification`. `empty_message_round_trips` (empty message
+  signs+verifies, and correctly rejects a non-empty one).
+  `constants_have_expected_lengths` pins pk=1952/sk=4032/sig=3309/seed=32.
+- ⚠️ **No official FIPS 204 / NIST ACVP KAT is embedded**, disclosed honestly in a
+  source NOTE (lines 335–339): reproducing one needs the exact (`xi -> pk, sk`) and
+  deterministic (`sk, M -> sig`) bytes, which we will **not fabricate**. Correctness
+  rests on the round-trip + determinism + rejection tests plus the upstream `ml-dsa`
+  crate's own ACVP vetting. An honest gap, not a faked vector — same posture as the
+  ML-KEM-768 module.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 79 PASS** (incl. the 8 mldsa tests), sigil-ffi 13
+  PASS · wasm32 build OK · getrandom count **0**. Regression: cli fmt/clippy/**26 +
+  2** tests ✓ (`cli/Cargo.lock` getrandom = 1 as ever — a separate native crate
+  outside the wasm gate; `libsigil/Cargo.lock` is the one that must stay 0, and
+  does); sigild gofmt/vet/test/build ✓; all 7 workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0007 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and **ADR 0007**
+  (`0007-caller-supplied-entropy-in-core.md`) were updated by the docs track —
+  ADR 0007 now lists the **ML-DSA-65 keygen seed `xi` (32 bytes)** alongside the
+  salt / AEAD nonce / Ed25519 seed / X25519 scalar / ML-KEM seed+coin as
+  caller-supplied entropy, and records that deterministic FIPS 204 signing (`rnd=0`)
+  keeps signing RNG-free too. This entry finalizes the remaining living docs (this
+  file, `CLAUDE.md`, `README.md`), and notes the MSRV 1.74→1.85 bump.
+
+### ➡️ What this adds, and what's still open (honest)
+- This adds the **signature primitive only**. With it, **both halves of the planned
+  hybrid signature now exist standalone** — classical Ed25519 (Phase 11) and
+  post-quantum ML-DSA-65 (this phase) — but the **hybrid *signature* combiner does
+  NOT yet exist**: nothing produces both signatures and requires both to verify. That
+  mirrors where the KEM stood after Phase 17, except the KEM has since been assembled
+  (the hybrid KEM combiner, Phase 18). So the crypto ledger now reads: **hybrid KEM =
+  assembled** (X25519 + ML-KEM-768 via HKDF, Phase 18); **hybrid signature = both
+  halves present, combiner still future**; and **none of it is wired into an actual
+  key-exchange / session / identity / vault flow**. The remaining crypto work is the
+  **hybrid signature combiner** and then **wiring the hybrid primitives into a real
+  flow**.
+- No over-claims: "post-quantum" describes the ML-DSA-65 algorithm family — the
+  **system is NOT "post-quantum secure".**

@@ -2,7 +2,8 @@
 name = "sigil-ffi"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.74"
+# 1.85: depends on sigil-core, which pulls ml-dsa 0.1.1 (edition 2024, MSRV 1.85).
+rust-version = "1.85"
 publish = false
 license = "Apache-2.0 OR MIT"
 description = "C-ABI surface for libsigil, consumed by the native clients via FFI. Pre-audit skeleton."

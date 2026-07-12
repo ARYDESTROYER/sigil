@@ -23,8 +23,8 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   layer, a real (unaudited) **classical Ed25519** sign/verify primitive
   (`public_key_from_seed`/`sign`/`verify` over a caller-supplied 32-byte seed —
   the core generates no randomness; this is the signature half of the planned
-  Ed25519&ML-DSA-65 hybrid, the ML-DSA-65 post-quantum half is **not yet
-  implemented**, and the primitive is not yet wired into any auth flow), and a
+  Ed25519&ML-DSA-65 hybrid, whose post-quantum ML-DSA-65 half now **also exists**
+  (below), and the primitive is not yet wired into any auth flow), and a
   real (unaudited) **classical X25519** key-agreement primitive
   (`x25519_public_key`/`x25519_shared_secret` over a caller-supplied 32-byte
   secret scalar — again no in-core randomness; rejects non-contributory shared
@@ -45,9 +45,17 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   designed to stay secret if **either** the X25519 **or** the ML-KEM-768 component
   holds (the standard hybrid-combiner property). **The hybrid KEM primitive now
   exists but is UNAUDITED and standalone — NOT wired into any key-exchange /
-  session / account / vault flow; the ML-DSA-65 post-quantum *signature* half of
-  the other planned hybrid is still not implemented, and the system is NOT
-  "post-quantum secure"**), plus a
+  session / account / vault flow**), and a real (unaudited) **post-quantum
+  ML-DSA-65** (FIPS 204) signature primitive
+  (`ml_dsa65_keygen`/`ml_dsa65_sign`/`ml_dsa65_verify`, deterministic over a
+  caller-supplied 32-byte keygen seed `xi` — signing fixes the FIPS 204 randomizer
+  to zero, so it too draws no in-core randomness; FIPS 204 sizes
+  pk=1952/sk=4032/sig=3309; RustCrypto `ml-dsa`, `default-features = false`,
+  wasm-pure/getrandom-free — the **post-quantum signature half** of the planned
+  Ed25519&ML-DSA-65 hybrid. **Both signature halves (Ed25519 + ML-DSA-65) now
+  exist standalone, but the hybrid *signature* combiner is still future and
+  neither is wired into any auth flow; the system is NOT "post-quantum
+  secure"**), plus a
   `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`, and the classical Ed25519 sig
   exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify` with a
   `SIGIL_ERR_VERIFY` code) for the clients.

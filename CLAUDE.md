@@ -39,7 +39,7 @@ public, make no security claims, until the audit completes and trademark clears.
   `seal_record`/`open_record`, and a classical **Ed25519** sign/verify primitive
   (`public_key_from_seed`/`sign`/`verify`, caller-supplied 32-byte seed, no
   in-core RNG; the signature half of the future Ed25519&ML-DSA-65 hybrid — the
-  ML-DSA-65 PQ half stays unimplemented; primitive not yet wired into auth), and
+  PQ ML-DSA-65 half now also exists (below); primitive not yet wired into auth), and
   a classical **X25519** key-agreement primitive (`x25519_public_key`/
   `x25519_shared_secret`, caller-supplied 32-byte secret scalar, no in-core RNG;
   rejects non-contributory/all-zero shared secrets; raw DH output must go through
@@ -55,8 +55,18 @@ public, make no security claims, until the audit completes and trademark clears.
   HKDF-SHA256(ss_x ‖ ss_kem ‖ SHA256(eph_pub ‖ ct), "sigil-hybrid-v1")` —
   caller-supplied ephemeral entropy, transcript-bound, reusing kx/mlkem/hkdf (no
   new deps); designed secure if EITHER half holds. Still STANDALONE + UNAUDITED
-  (not wired into any key exchange / session / vault flow); the ML-DSA-65 PQ
-  signature half stays unimplemented; the SYSTEM is not "post-quantum secure".**
+  (not wired into any key exchange / session / vault flow); the SYSTEM is not
+  "post-quantum secure".** A post-quantum **ML-DSA-65** (FIPS 204) signature
+  primitive (`ml_dsa65_keygen`/`ml_dsa65_sign`/`ml_dsa65_verify`, `mldsa.rs`,
+  deterministic over a caller-supplied 32-byte keygen seed `xi`; signing fixes the
+  FIPS 204 randomizer to zero, so it draws no in-core entropy either; FIPS 204 sizes
+  pk=1952/sk=4032/sig=3309; RustCrypto `ml-dsa` 0.1.1, `default-features = false`,
+  wasm-pure/getrandom-free — this crate is edition-2024 and raised the core crate's
+  MSRV `rust-version` 1.74→1.85, still below the machine's rustc 1.96; the PQ
+  signature half of the Ed25519&ML-DSA-65 hybrid). **Both signature halves (Ed25519 +
+  ML-DSA-65) now exist STANDALONE + UNAUDITED, but the hybrid *signature* combiner is
+  still future and neither is wired into any auth flow; the SYSTEM is not
+  "post-quantum secure".**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).

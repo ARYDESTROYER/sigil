@@ -15,8 +15,13 @@
 //! a complete account/key-management system.
 //!
 //! A classical Ed25519 signature primitive ([`sign`] / [`verify`], [`mod@sig`])
-//! provides the classical half of the hybrid Ed25519&ML-DSA-65 signature suite;
-//! the post-quantum ML-DSA-65 half is reserved/future and not yet implemented.
+//! provides the classical half of the hybrid Ed25519&ML-DSA-65 signature suite.
+//! Its post-quantum counterpart, an ML-DSA-65 (FIPS 204) signature primitive
+//! ([`ml_dsa65_keygen`] / [`ml_dsa65_sign`] / [`ml_dsa65_verify`], [`mod@mldsa`],
+//! deterministic/caller-supplied keygen seed, deterministic signing), is the PQ
+//! signature half. It is a **real but UNAUDITED, standalone** primitive — it is
+//! **not** yet combined with Ed25519 into the hybrid signature, and not wired into
+//! any identity/record flow.
 //!
 //! A classical X25519 Diffie-Hellman key-agreement primitive
 //! ([`x25519_public_key`] / [`x25519_shared_secret`], [`mod@kx`]) provides the
@@ -53,6 +58,7 @@ mod envelope;
 mod hybrid;
 mod kdf;
 mod kx;
+mod mldsa;
 mod mlkem;
 mod record;
 mod sig;
@@ -66,6 +72,10 @@ pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 pub use kx::{
     x25519_public_key, x25519_shared_secret, KxError, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
     X25519_SHARED_SECRET_LEN,
+};
+pub use mldsa::{
+    ml_dsa65_keygen, ml_dsa65_sign, ml_dsa65_verify, MlDsaError, ML_DSA65_KEYGEN_SEED_LEN,
+    ML_DSA65_PUBLIC_KEY_LEN, ML_DSA65_SECRET_KEY_LEN, ML_DSA65_SIGNATURE_LEN,
 };
 pub use mlkem::{
     ml_kem768_decapsulate, ml_kem768_encapsulate, ml_kem768_keygen, MlKemError,

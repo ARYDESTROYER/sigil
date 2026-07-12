@@ -4,14 +4,17 @@
 > `libsigil`. The code in this repo implements **real but UNAUDITED** building
 > blocks — the algorithm-suite registry, the envelope codec, an Argon2id KDF, an
 > XChaCha20-Poly1305 + HKDF AEAD, a composed `seal_record`/`open_record`, a
-> standalone classical **Ed25519 sign/verify** primitive, a standalone classical
-> **X25519 key-agreement** primitive, and a standalone **ML-KEM-768 (FIPS 203)
-> post-quantum KEM** primitive — none wired into a finished product. The
-> **combined hybrid KEM** (X25519 + ML-KEM-768, combined via HKDF-SHA-256) is now
-> **assembled as a standalone primitive** in `sigil-core` (`hybrid.rs`), joining
-> the two halves it composes. The **ML-DSA-65 post-quantum signature half of the
-> hybrid signature remains specified-but-not-implemented**, so the combined hybrid
-> signature does not exist yet. Condensed from
+> standalone classical **Ed25519 sign/verify** primitive, a standalone
+> **ML-DSA-65 (FIPS 204) post-quantum signature** primitive, a standalone
+> classical **X25519 key-agreement** primitive, and a standalone
+> **ML-KEM-768 (FIPS 203) post-quantum KEM** primitive — none wired into a
+> finished product. The **combined hybrid KEM** (X25519 + ML-KEM-768, combined via
+> HKDF-SHA-256) is now **assembled as a standalone primitive** in `sigil-core`
+> (`hybrid.rs`), joining the two halves it composes. With ML-DSA-65 landed, **both
+> halves of the hybrid signature now exist as standalone primitives** (Ed25519 in
+> `sig.rs`, ML-DSA-65 in `mldsa.rs`), but the **combined hybrid signature is still
+> not assembled** (no combiner yet), so it does not yet exist as a usable
+> construction. Condensed from
 > the product brief §11/§20/§21. Subject to change. A Cure53 audit of the hybrid
 > construction is to be commissioned before public beta.
 
@@ -129,25 +132,44 @@ UNAUDITED and standalone**: it is **not wired into the record / vault / account
 flow**, the envelope's `kem_ct` field stays *reserved* but unused, and the
 **SYSTEM is still not "post-quantum secure"** (see
 [ADR 0011](decisions/0011-hybrid-kem-combiner.md)). The remaining hybrid-crypto
-gap is the **hybrid signature** (Ed25519 & ML-DSA-65) — per the
-signature-implementation-status note below, the ML-DSA-65 post-quantum half is
-still unimplemented.
+gap is the **hybrid signature** (Ed25519 & ML-DSA-65): per the
+signature-implementation-status note below, **both** signature halves now exist as
+standalone primitives, but the combining `Sign`/`Verify` that requires both has
+not yet been assembled.
 
-**Signature implementation status (pre-audit, UNAUDITED).** The **classical Ed25519 half**
-is now **implemented** in `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):
-a deterministic RFC 8032 Ed25519 `sign`/`verify` primitive over a
-**caller-supplied 32-byte secret seed** (the core generates no key material — see
-[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). It is **real but
-NOT YET AUDITED**, and it is **not yet wired into the hybrid signature
-construction or any product flow** — it stands as a standalone primitive. It is
-also reachable over the **C-ABI** as `sigil_public_key_from_seed` / `sigil_sign` /
-`sigil_verify` ([`libsigil/ffi/`](../libsigil/ffi/), `sigil.h`), so native
-clients can call the same UNAUDITED sign/verify (still not wired into any product
-flow); the demo `cli` uses it in-crate to sign op-log requests (see
-[`api.md`](api.md) and [ADR 0008](decisions/0008-device-key-request-auth.md)). The
-**ML-DSA-65 post-quantum half remains specified-but-not-implemented**, so the
-hybrid `Ed25519 & ML-DSA-65` signature above is **not** available: there is no
-post-quantum signature in this repo yet, and no combined hybrid `Sign`/`Verify`.
+**Signature implementation status (pre-audit, UNAUDITED).** **Both halves of the
+hybrid signature now exist as standalone primitives in `sigil-core`.** The
+**classical Ed25519 half** is implemented in
+[`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs): a deterministic RFC 8032
+Ed25519 `sign`/`verify` over a **caller-supplied 32-byte secret seed** (the core
+generates no key material — see
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). It is also
+reachable over the **C-ABI** as `sigil_public_key_from_seed` / `sigil_sign` /
+`sigil_verify` ([`libsigil/ffi/`](../libsigil/ffi/), `sigil.h`), and the demo
+`cli` uses it in-crate to sign op-log requests (see [`api.md`](api.md) and
+[ADR 0008](decisions/0008-device-key-request-auth.md)).
+
+The **ML-DSA-65 post-quantum half** is now **implemented** in
+[`libsigil/core/src/mldsa.rs`](../libsigil/core/src/mldsa.rs): deterministic
+FIPS 204 **keygen / sign / verify** built on the RustCrypto `ml-dsa` crate, over a
+**caller-supplied 32-byte keygen seed** (the FIPS 204 `xi`; the core generates no
+key material — see
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). Signing is
+**deterministic**: FIPS 204 permits a zero (all-zeros) randomizer, so `sign` is a
+pure function of `(sk, message)` and needs no per-signature entropy — matching the
+core's no-RNG discipline. Both halves are **real but NOT YET AUDITED**.
+
+The **combined hybrid signature has NOT yet been assembled.** There is **no
+combiner** producing `Ed25519.Sign(m) || ML-DSA-65.Sign(m)` and no `Verify` that
+requires **both** halves to validate, and neither half is wired into a
+record / vault / account flow. So although both signature primitives now exist,
+the hybrid `Ed25519 & ML-DSA-65` signature of suite `0x12` is **still not
+available**. This lags the hybrid **KEM**, which **is** already assembled as a
+standalone combiner (`hybrid.rs`; see above and
+[ADR 0011](decisions/0011-hybrid-kem-combiner.md)). With ML-DSA-65 landed, the only
+remaining large crypto gap is the **hybrid-signature combiner and wiring the
+hybrid primitives into an actual flow**; the **SYSTEM is still not "post-quantum
+secure"**.
 
 ## Migration plan (intended)
 

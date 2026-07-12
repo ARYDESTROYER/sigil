@@ -16,7 +16,9 @@
 name = "sigil-cli"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.74"
+# 1.85: this path-depends on sigil-core, which pulls ml-dsa 0.1.1 (edition 2024,
+# MSRV 1.85). The machine toolchain is 1.96, so it builds; CI pins stable.
+rust-version = "1.85"
 publish = false
 license = "Apache-2.0 OR MIT"
 description = "Pre-audit demonstration CLI that seals/opens a file with the real-but-unaudited libsigil sigil-core record API. Not for real secrets."

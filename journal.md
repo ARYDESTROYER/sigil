@@ -1483,3 +1483,112 @@ Recording the decision so the doc set stays coherent as the repo grows:
   KDF pass before use. The hybrid X25519 & ML-KEM-768 KEM does **not yet exist** —
   only the classical X25519 half, and it is unaudited; the ML-KEM-768 PQ half
   stays future/unimplemented.
+
+## 2026-07-13 — Phase 17 (ML-KEM-768 post-quantum KEM in libsigil-core)
+
+### Context & mandate
+- Goal: add the **post-quantum ML-KEM-768** (NIST FIPS 203 Module-Lattice KEM)
+  half of the planned hybrid KEX (X25519&ML-KEM-768) to `libsigil-core` as a
+  standalone, real cryptographic primitive — deterministic key generation,
+  encapsulation, and decapsulation — without touching the existing
+  KDF/AEAD/Ed25519/X25519 code and without breaking the wasm-pure / no-RNG
+  invariants. This is the **FIRST post-quantum primitive in the repo.**
+- ⚠️ **KEM PRIMITIVE only.** It is **not** combined with the Phase-16 classical
+  X25519 half into the hybrid `ss_combined`, and **not** wired into any key
+  exchange / session establishment / enrollment flow. Real but **UNAUDITED**.
+
+### core — `core/src/mlkem.rs` ✅
+- New module exposing a **raw-bytes** ML-KEM-768 API, re-exported from `lib.rs`
+  (`mod mlkem;` + `pub use` of the three functions, the six length constants, and
+  `MlKemError`): `ml_kem768_keygen(&[u8; 64]) -> (ek[1184], dk[2400])`,
+  `ml_kem768_encapsulate(&ek, &coin[32]) -> Result<(ct[1088], ss[32]), MlKemError>`,
+  and `ml_kem768_decapsulate(&dk, &ct) -> Result<ss[32], MlKemError>`. The
+  FIPS 203 sizes are pinned as consts (`ML_KEM768_ENCAPS_KEY_LEN` 1184,
+  `_DECAPS_KEY_LEN` 2400, `_CIPHERTEXT_LEN` 1088, `_SHARED_SECRET_LEN` 32,
+  `_KEYGEN_SEED_LEN` 64, `_ENCAPS_COIN_LEN` 32). The fixed-size raw-bytes shape is
+  deliberately FFI-friendly for a later `sigil-ffi` C-ABI export.
+- **Caller-supplied entropy — core still generates NO randomness.** keygen takes a
+  64-byte `d‖z` seed and drives the FIPS 203 `generate_deterministic(d, z)`; encaps
+  takes a 32-byte coin `m` and drives `encapsulate_deterministic(m)`; decaps needs
+  no entropy. Exactly like the KDF salt, the AEAD nonce, the Ed25519 seed, and the
+  X25519 scalar — the caller MUST draw the seed and coin from a cryptographically
+  secure source (a predictable coin breaks encapsulation secrecy). No keygen or
+  encapsulation RNG runs inside core (ADR 0007).
+- **Decapsulation is total (FIPS 203 §6.3 implicit rejection).**
+  `ml_kem768_decapsulate` returns `Ok` for any well-formed ciphertext: a tampered
+  ciphertext yields a deterministic *pseudo-random* secret that differs from the
+  sender's rather than an error. `MlKemError`'s arms
+  (`BadEncapsKey`/`BadDecapsKey`/`BadCiphertext`) cover only structurally
+  unparseable inputs — unreachable for the fixed-size array inputs here, present so
+  the raw-bytes contract stays honest at the eventual FFI boundary. The core stays
+  panic-free (the crate's total ops have a `()` error that never fires; surfaced as
+  a parse error rather than an unwrap).
+- ⚠️ **Raw shared secret, NOT a key.** The 32-byte output is the raw ML-KEM secret
+  and **must be run through the hybrid HKDF combiner** (together with the X25519
+  shared secret, so breaking either scheme alone doesn't compromise the session
+  key) before use — the same rule the X25519 raw DH output already carries.
+  **post-quantum only** — standalone, providing no classical protection on its own
+  if ML-KEM were broken. Labeled UNAUDITED and NOT-yet-hybrid throughout the module
+  docs, `lib.rs`, and the docs set.
+
+### Dependency & the WASM/GETRANDOM gate — the make-or-break PQ milestone ✅
+- Chose **`ml-kem = { version = "0.2.3", default-features = false, features =
+  ["deterministic"] }`** (RustCrypto). The `deterministic` feature is what exposes
+  the caller-entropy `generate_deterministic` / `encapsulate_deterministic` entry
+  points; `default-features = false` keeps the RNG-driven convenience API out of
+  the tree.
+- ✅ **The gate HELD for a post-quantum lattice crate.** This was the
+  make-or-break question of the phase: `grep -c 'name = "getrandom"'
+  libsigil/Cargo.lock` = **0** (ml-kem pulls `rand_core` **without** its
+  `getrandom` feature), and `cargo build -p sigil-core --target
+  wasm32-unknown-unknown` **succeeds** — a full ML-KEM-768 implementation compiles
+  wasm-pure with no system entropy backend. A notable milestone: the
+  wasm-purity + getrandom-0 invariants survive the repo's **first PQ crate**.
+  `#![forbid(unsafe_code)]` (lib.rs) and `no_std` (`core` + `alloc`) intact.
+
+### Tests ✅
+- **6 mlkem tests, all PASS.** `round_trip_shared_secret_matches` does the real
+  KEM round-trip — keygen(SEED) → encapsulate(ek, COIN) → decapsulate(dk, ct) and
+  asserts `ss_sender == ss_receiver` (32-byte agreement). Determinism:
+  `keygen_is_deterministic` (same seed → byte-identical ek+dk; flipped seed →
+  different) and `encapsulate_is_deterministic` (same ek,coin → identical ct+ss;
+  different coin → different). Implicit rejection:
+  `tampered_ciphertext_is_implicitly_rejected` (flip `ct[0]`, decaps returns `Ok`
+  with a secret DIFFERENT from the sender's) and
+  `wrong_decaps_key_yields_different_secret` (a valid ct under the wrong dk also
+  returns `Ok`, different secret). `constants_have_expected_lengths` pins the
+  FIPS 203 sizes.
+- ⚠️ **No official FIPS 203 / NIST ACVP KAT is embedded**, and this is disclosed
+  honestly in a source NOTE: reproducing one needs the exact
+  (`d, z, m -> ek, dk, ct, K`) bytes, which we will **not fabricate**. Correctness
+  rests on the round-trip + determinism + implicit-rejection tests above plus the
+  upstream `ml-kem` crate's own ACVP vetting. An honest gap, not a faked vector.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 63 PASS** (incl. the 6 mlkem tests), sigil-ffi 13
+  PASS · wasm32 build OK · getrandom count **0**. Regression: cli
+  fmt/clippy/**26 + 2** tests ✓ (the shared `ml-kem` edge now appears in
+  `cli/Cargo.lock` — expected, a separate crate that may use getrandom;
+  `libsigil/Cargo.lock` is the one that must stay at 0, and does); sigild
+  gofmt/vet/test/build ✓; all 7 workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0007 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and **ADR 0007**
+  (`0007-caller-supplied-entropy-in-core.md`) were updated by the docs track —
+  ADR 0007 now lists the **ML-KEM-768 keygen seed (`d‖z`, 64 bytes) and
+  encapsulation coin (`m`, 32 bytes)** alongside the salt / AEAD nonce / Ed25519
+  seed / X25519 scalar as caller-supplied entropy, notes the deterministic FIPS 203
+  variants (decapsulation needs no entropy), and records that both hybrid-KEM halves
+  now exist standalone but no combiner assembles `ss_combined` yet. This entry
+  finalizes the remaining living docs (this file, `CLAUDE.md`, `README.md`).
+
+### ➡️ Still NOT wired in — future (honest)
+- This is the **primitive only**. **Both** classical (X25519, Phase 16) and
+  post-quantum (ML-KEM-768, this phase) hybrid-KEM halves now exist **standalone**,
+  but the **hybrid combiner does NOT yet exist** — nothing runs both KEXes and folds
+  their shared secrets through HKDF into `ss_combined`, so there is still no hybrid
+  KEM in the repo, only its two separate pieces. The raw ML-KEM secret still needs a
+  KDF pass before use. It is unaudited and not connected to any key exchange /
+  session / enrollment flow; the **ML-DSA-65 post-quantum signature** half of the
+  *other* planned hybrid stays unimplemented. No over-claims: "post-quantum"
+  describes the ML-KEM-768 algorithm family — the **system is NOT "post-quantum
+  secure".**

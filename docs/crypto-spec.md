@@ -4,12 +4,14 @@
 > `libsigil`. The code in this repo implements **real but UNAUDITED** building
 > blocks — the algorithm-suite registry, the envelope codec, an Argon2id KDF, an
 > XChaCha20-Poly1305 + HKDF AEAD, a composed `seal_record`/`open_record`, a
-> standalone classical **Ed25519 sign/verify** primitive, and a standalone
-> classical **X25519 key-agreement** primitive — none wired into a
-> finished product. The **ML-KEM-768 KEM half and the ML-DSA-65 post-quantum
-> signature half of the hybrid construction remain specified-but-not-implemented**,
-> so neither the combined hybrid KEM nor the combined hybrid signature exists yet.
-> Condensed from
+> standalone classical **Ed25519 sign/verify** primitive, a standalone classical
+> **X25519 key-agreement** primitive, and a standalone **ML-KEM-768 (FIPS 203)
+> post-quantum KEM** primitive — none wired into a finished product. Both halves
+> of the hybrid KEM (X25519 + ML-KEM-768) now exist as **standalone** primitives,
+> but the **combined hybrid KEM is not yet assembled** — there is no combiner. The
+> **ML-DSA-65 post-quantum signature half of the hybrid signature remains
+> specified-but-not-implemented**, so neither the combined hybrid KEM nor the
+> combined hybrid signature exists yet. Condensed from
 > the product brief §11/§20/§21. Subject to change. A Cure53 audit of the hybrid
 > construction is to be commissioned before public beta.
 
@@ -85,20 +87,34 @@ breaking both X25519 and ML-KEM.
 **Signatures**: `Ed25519.Sign(m) || ML-DSA-65.Sign(m)`; verification requires
 **both** to validate.
 
-**KEM implementation status (pre-audit, UNAUDITED).** The **classical X25519
-key-agreement half** (`ss_x` above) is now **implemented** in `sigil-core`
-([`libsigil/core/src/kx.rs`](../libsigil/core/src/kx.rs)): a raw-bytes
+**KEM implementation status (pre-audit, UNAUDITED).** **Both halves of the hybrid
+KEM now exist as standalone primitives in `sigil-core`.** The **classical X25519
+key-agreement half** (`ss_x` above) is **implemented** in
+[`libsigil/core/src/kx.rs`](../libsigil/core/src/kx.rs): a raw-bytes
 `x25519_public_key` / `x25519_shared_secret` Diffie–Hellman over a
 **caller-supplied 32-byte secret scalar** (the core generates no key material —
 see [ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)), per RFC 7748,
-that **rejects the all-zero / non-contributory shared secret**. It is **real but
-NOT YET AUDITED**. Crucially, the **raw X25519 output is not a key**: it must be
-run through HKDF — exactly as the `ss_combined` line above specifies — before use.
-The **ML-KEM-768 post-quantum half (`ss_kem`) remains
-specified-but-not-implemented**, so the **combined hybrid KEM `ss_combined` is
-NOT available**: there is no ML-KEM in this repo yet, and no combined hybrid
-encapsulation / decapsulation. The X25519 primitive stands alone as a
-key-agreement building block, **not yet wired into any product flow**.
+that **rejects the all-zero / non-contributory shared secret**. Crucially, the
+**raw X25519 output is not a key**: it must be run through HKDF — exactly as the
+`ss_combined` line above specifies — before use.
+
+The **ML-KEM-768 post-quantum half** (`ss_kem` above) is now **implemented** in
+[`libsigil/core/src/mlkem.rs`](../libsigil/core/src/mlkem.rs): deterministic
+FIPS 203 **keygen / encapsulate / decapsulate** built on the RustCrypto `ml-kem`
+crate, over **caller-supplied entropy** — key generation from the 64-byte
+`d || z` seed and encapsulation from the 32-byte `m` coin (the core generates no
+key material and no coins — see
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)). Decapsulation is
+**total**: on a malformed or wrong ciphertext it returns the FIPS 203 **implicit
+rejection** shared secret (a deterministic pseudo-random value derived from the
+private key, never an error), so decaps never leaks a distinguishable failure.
+
+Both primitives are **real but NOT YET AUDITED**. Even so, the **combined hybrid
+KEM `ss_combined` is NOT yet available**: there is **no combiner** in this repo —
+no code computes `HKDF-SHA-256(ss_x || ss_kem || transcript_hash, …)`, and there
+is no combined hybrid encapsulation / decapsulation. X25519 and ML-KEM-768 each
+stand alone as KEM building blocks, **not yet combined into the hybrid and not yet
+wired into any product flow**.
 
 **Signature implementation status (pre-audit, UNAUDITED).** The **classical Ed25519 half**
 is now **implemented** in `sigil-core` ([`libsigil/core/src/sig.rs`](../libsigil/core/src/sig.rs)):

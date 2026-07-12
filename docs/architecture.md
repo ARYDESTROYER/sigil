@@ -53,12 +53,23 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     Diffie–Hellman over a **caller-supplied 32-byte secret scalar** that rejects
     the all-zero / non-contributory shared secret (real but UNAUDITED; the raw DH
     output is not a key — it must be run through HKDF). It is a standalone
-    primitive, **not yet** wired into the hybrid `X25519 & ML-KEM-768` key
-    encapsulation of suite `0x12` — the ML-KEM-768 post-quantum half stays
-    unimplemented, so no combined hybrid KEM exists.
+    primitive, **not yet** combined with its ML-KEM-768 sibling (below) into the
+    hybrid `X25519 & ML-KEM-768` key encapsulation of suite `0x12`;
+  - the **ML-KEM-768 post-quantum KEM primitive**
+    ([`../libsigil/core/src/mlkem.rs`](../libsigil/core/src/mlkem.rs):
+    `keygen`/`encapsulate`/`decapsulate`) — deterministic FIPS 203, on the
+    RustCrypto `ml-kem` crate, over **caller-supplied entropy** (key generation
+    from the 64-byte `d || z` seed, encapsulation from the 32-byte `m` coin; the
+    core generates no key material and no coins), with **total, implicit-rejection**
+    decapsulation (a wrong/malformed ciphertext yields the FIPS 203 deterministic
+    reject secret, never an error). Real but UNAUDITED. It is a standalone
+    primitive: **both** KEM halves (X25519 + ML-KEM-768) now exist, but **no
+    combiner** assembles the hybrid `ss_combined`, so **no combined hybrid KEM
+    exists yet** and it is not wired into suite `0x12` or any flow.
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
-  the AEAD nonce, the Ed25519 signing seed, and the X25519 secret scalar are **all
+  the AEAD nonce, the Ed25519 signing seed, the X25519 secret scalar, and the
+  ML-KEM-768 keygen seed (`d || z`) and encapsulation coin (`m`) are **all
   caller-supplied**, so the core stays `wasm32-unknown-unknown`-pure and
   `getrandom`-free (see
   [`decisions/0007-caller-supplied-entropy-in-core.md`](decisions/0007-caller-supplied-entropy-in-core.md)).
@@ -116,6 +127,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   record API: seal_record / open_record                        │    │
    │   │   Ed25519 sign / verify  (seed caller-supplied; no RNG)         │    │
    │   │   X25519 key-agreement   (secret caller-supplied; no RNG)       │    │
+   │   │   ML-KEM-768 KEM  (keygen d||z / m coin; caller-supplied)       │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
@@ -302,12 +314,15 @@ authoritative list, with rationale, is the **defer ledger** in
   [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **No hybrid KEM, and no hybrid signature, in a flow.** For key agreement, the
-  **classical X25519 half is implemented** as a standalone `x25519_public_key` /
-  `x25519_shared_secret` primitive (caller-supplied 32-byte secret; RFC 7748;
-  rejects the all-zero / non-contributory shared secret; UNAUDITED), but the
-  **ML-KEM-768 post-quantum half is not**, so the combined hybrid KEM
-  (`ss_combined`) does not yet exist and the envelope's `kem_ct` field stays
+- **No *combined* hybrid KEM, and no hybrid signature, in a flow.** For key
+  agreement, **both halves now exist as standalone primitives** — the classical
+  X25519 half (`x25519_public_key` / `x25519_shared_secret`; caller-supplied
+  32-byte secret; RFC 7748; rejects the all-zero / non-contributory shared secret)
+  and the ML-KEM-768 post-quantum half (`mlkem.rs`: deterministic FIPS 203
+  `keygen`/`encapsulate`/`decapsulate`; caller-supplied `d || z` seed and `m`
+  coin; total implicit-rejection decaps; UNAUDITED) — but **no combiner assembles
+  them**: the combined hybrid KEM (`ss_combined = HKDF(ss_x || ss_kem ||
+  transcript)`) does not yet exist and the envelope's `kem_ct` field stays
   *reserved* but unused. For signatures, the **classical Ed25519 half is
   implemented** as a standalone `sign`/`verify` primitive (caller-supplied seed;
   UNAUDITED), but the **ML-DSA-65 post-quantum half is not**, so the combined

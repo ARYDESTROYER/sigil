@@ -44,8 +44,16 @@ public, make no security claims, until the audit completes and trademark clears.
   `x25519_shared_secret`, caller-supplied 32-byte secret scalar, no in-core RNG;
   rejects non-contributory/all-zero shared secrets; raw DH output must go through
   a KDF; RFC 7748 §6.1/§5.2 KATs; the classical KEX half of the future
-  X25519&ML-KEM-768 hybrid — the ML-KEM-768 PQ KEM half stays unimplemented;
-  primitive not yet wired into any key exchange);
+  X25519&ML-KEM-768 hybrid), and a post-quantum **ML-KEM-768** (FIPS 203) KEM
+  primitive (`ml_kem768_keygen`/`ml_kem768_encapsulate`/`ml_kem768_decapsulate`,
+  deterministic over a caller-supplied 64-byte `d‖z` keygen seed + 32-byte `m`
+  encaps coin, no in-core RNG; decapsulation is total/implicit-rejection; raw
+  32-byte shared secret must go through a KDF; RustCrypto `ml-kem`,
+  `default-features = false`, wasm-pure/getrandom-free; the PQ KEM half of the
+  future X25519&ML-KEM-768 hybrid). **Both hybrid-KEM halves now exist standalone
+  but are NOT yet combined into the hybrid `ss_combined`; the ML-DSA-65 PQ
+  signature half stays unimplemented; neither KEM primitive is wired into any key
+  exchange, and both are UNAUDITED.**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).

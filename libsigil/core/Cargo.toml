@@ -48,3 +48,18 @@ ed25519-dalek = { version = "2", default-features = false }
 # it supplies the Argon2id salt, AEAD nonce, and Ed25519 seed. This shares the
 # already-resolved `curve25519-dalek` 4.x with `ed25519-dalek`, so it adds little.
 x25519-dalek = { version = "2", default-features = false }
+# Post-quantum ML-KEM-768 (FIPS 203) key encapsulation (pre-audit) — the
+# post-quantum KEM half of the hybrid X25519&ML-KEM-768 suite (the classical
+# X25519 KEX half lives in `kx.rs`). `default-features = false` keeps `getrandom`
+# out: ml-kem's only randomness enters through `rand_core`, and with defaults off
+# `rand_core` is pulled WITHOUT its `getrandom` feature, so nothing reaches for a
+# `wasm32-unknown-unknown` backend and the web/extension build is preserved (the
+# `std` feature stays off too). We enable ONLY the `deterministic` feature, which
+# exposes the FIPS 203 KAT entry points — `KemCore::generate_deterministic(d, z)`
+# for keygen and `EncapsulateDeterministic::encapsulate_deterministic(m)` for
+# encapsulation — so the caller supplies the keygen seed (d‖z) and the encaps coin
+# (m), exactly as it supplies the Argon2id salt, AEAD nonce, X25519 scalar, and
+# Ed25519 seed elsewhere. `sigil-core` therefore still generates NO randomness.
+# Decapsulation is deterministic and total (FIPS 203 implicit rejection). Keys and
+# ciphertexts cross our raw-bytes API as fixed-size arrays via `EncodedSizeUser`.
+ml-kem = { version = "0.2.3", default-features = false, features = ["deterministic"] }

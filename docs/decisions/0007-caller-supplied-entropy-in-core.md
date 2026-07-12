@@ -20,9 +20,12 @@ Several of the core's primitives nonetheless require fresh entropy *somewhere*:
 Argon2id needs a per-record **salt**, the XChaCha20-Poly1305 AEAD needs a
 **nonce**, the classical Ed25519 sign/verify primitive
 ([`../../libsigil/core/src/sig.rs`](../../libsigil/core/src/sig.rs)) needs a
-32-byte secret **signing seed**, and the classical X25519 key-agreement primitive
+32-byte secret **signing seed**, the classical X25519 key-agreement primitive
 ([`../../libsigil/core/src/kx.rs`](../../libsigil/core/src/kx.rs)) needs a 32-byte
-secret **scalar**. The question is *who* generates that entropy.
+secret **scalar**, and the ML-KEM-768 post-quantum KEM primitive
+([`../../libsigil/core/src/mlkem.rs`](../../libsigil/core/src/mlkem.rs)) needs a
+64-byte **keygen seed** (`d || z`) and a 32-byte **encapsulation coin** (`m`). The
+question is *who* generates that entropy.
 
 ## Decision
 
@@ -35,7 +38,11 @@ entropy is **supplied by the caller**:
   deterministic per RFC 8032, so no per-signature RNG is needed either),
 - the **X25519 secret scalar** (the 32-byte key-agreement secret; the
   Diffie–Hellman is deterministic per RFC 7748, so no per-exchange RNG is needed
-  either).
+  either),
+- the **ML-KEM-768 keygen seed** (`d || z`, 64 bytes) **and encapsulation coin**
+  (`m`, 32 bytes) — the deterministic FIPS 203 variants consume this caller
+  entropy, so neither key generation nor encapsulation calls an RNG inside the
+  core (decapsulation is deterministic and needs no entropy).
 
 The core contains **no key-generation, no salt-generation, and no
 nonce-generation RNG** — not behind a feature flag, not on native targets. It
@@ -59,8 +66,9 @@ platforms.
   pure transform over caller-supplied inputs. It keeps the audit surface small and
   the wasm invariant mechanical.
 - **Pre-audit reality:** the primitives that consume this entropy (Argon2id, the
-  AEAD, the standalone Ed25519 sign/verify, and the standalone X25519
-  key-agreement) are **real but UNAUDITED** and not wired into a finished product;
-  the ML-KEM-768 post-quantum KEM half and the ML-DSA-65 post-quantum signature
-  half stay unimplemented. See [`../architecture.md`](../architecture.md) §1 and §6 and
+  AEAD, the standalone Ed25519 sign/verify, the standalone X25519 key-agreement,
+  and the standalone ML-KEM-768 KEM) are **real but UNAUDITED** and not wired into
+  a finished product; both hybrid-KEM halves now exist standalone but no combiner
+  assembles the combined hybrid KEM yet, and the ML-DSA-65 post-quantum signature
+  half stays unimplemented. See [`../architecture.md`](../architecture.md) §1 and §6 and
   [`../crypto-spec.md`](../crypto-spec.md).

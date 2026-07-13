@@ -17,6 +17,14 @@
 > [`architecture.md`](docs/architecture.md); crypto, [`crypto-spec.md`](docs/crypto-spec.md);
 > the deploy story, [`deployment.md`](docs/deployment.md); and record any
 > load-bearing decision as an ADR under [`docs/decisions/`](docs/decisions/).
+>
+> **Personal working memory:** also keep a **local, uncommitted** `memory.md` at
+> the repo root — a granular scratchpad of current state, hard invariants,
+> gotchas, the phase ledger (commit hashes), and what's next. It is excluded via
+> `.git/info/exclude` and **must never be committed** (it is not part of the
+> repo). Read it at session start — it survives context compaction — and keep it
+> current as you work; create it if absent. `journal.md` stays the committed
+> source of truth; `memory.md` is just the fast personal cache.
 
 ## What this is
 

@@ -279,9 +279,15 @@ To avoid any over-claim, the honest gaps:
   real Postgres via **`SIGILD_OPLOG_POSTGRES`** (a libpq DSN, on the `pgx`
   driver — `sigild`'s first third-party dependency, so the module now carries a
   `go.sum`) for a **durable, concurrent** dev backend
-  ([`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md)),
-  but production still needs an **auth / enrollment model, CRDT / merge
-  semantics, managed migrations, and backup / restore / replication** around it —
+  ([`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md)).
+  That backend now has **managed, versioned schema migrations**
+  ([§11](#11-schema-migrations-postgres-backend)) and a **backup / restore
+  runbook whose integrity is provable via the op-log hash chain**
+  ([§12](#12-backup--restore-postgres-backend);
+  [`decisions/0018-managed-oplog-migrations-and-backup-integrity.md`](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)),
+  but production persistence is **still broader and unbuilt** — an **auth /
+  enrollment model, CRDT / merge semantics**, and production-grade
+  **backup / PITR / replication** (Postgres + object store + Redis) around it —
   none of which exist. Redis / S3(R2) are still only env-var names and
   readiness-probe targets; the first RLS-posture migration is still in the
   stretch tier and **not done**. As with all dev-ops, **do not enable
@@ -397,3 +403,112 @@ preflight is **necessary but not sufficient** — it confirms the environment is
 *staged*, but the actual publish + apply still require the explicit human action
 described in [§2](#2-artifact-flow-build--image--run--probe) and the stealth gate
 in [§7](#7-what-is-not-yet-deployable).
+
+---
+
+## 11. Schema migrations (Postgres backend)
+
+The **durable Postgres op-log backend** (`SIGILD_OPLOG_POSTGRES`) manages its
+database schema with **versioned, embedded migrations** rather than the old
+ad-hoc `IF NOT EXISTS` DDL that construction used to run inline
+([`decisions/0018-managed-oplog-migrations-and-backup-integrity.md`](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)).
+This applies **only** to the Postgres backend; the in-memory and file-backed dev
+backends have no database and no migrations, and the whole thing is inert unless
+`SIGILD_ENABLE_DEV_OPS` is set (vault ops otherwise stay `501`).
+
+- **Embedded + versioned in the binary.** Each migration is an embedded
+  `NNNN_description.sql` file (`go:embed`, `sigild/internal/store/migrations/`);
+  the zero-padded leading integer is the version and migrations apply in ascending
+  order. The current set is a single baseline, **`0001_init.sql`** (version `1`),
+  which creates the `sigil_vault_ops` table (opaque `bytea` `blob` + `bytea`
+  `hash` + `(vault_id, seq)` primary key). A **`schema_migrations`** tracking
+  table (`version`, `name`, `applied_at`) records what has been applied, so a run
+  is idempotent and auditable.
+- **Auto-applied at boot by default.** When the Postgres backend starts it brings
+  the schema up to date automatically (a fresh DB is set up exactly as the old
+  inline DDL did — backward compatible; an up-to-date DB is a no-op).
+- **Opt out with `SIGILD_OPLOG_AUTO_MIGRATE=0`** (`0` / `false` / `no` / `off`,
+  case-insensitive). Then boot applies **nothing**; if the DB is behind the latest
+  embedded migration, `sigild` **fails fast at startup** with a clear message
+  telling the operator to run `sigild migrate`. This is the recommended posture
+  for a controlled deploy where migrations run as a separate, gated step.
+- **Operator CLI (not an HTTP endpoint).** `sigild migrate` applies all pending
+  migrations; `sigild migrate status` prints each known migration as `[applied]`
+  (with its `applied_at`) or `[pending]` and applies nothing. Both read the DSN
+  from `SIGILD_OPLOG_POSTGRES` and error clearly if it is unset.
+- **Safe concurrent boots.** The whole migration run is serialized across
+  instances by a **session-level `pg_advisory_lock`** on a fixed key, and each
+  pending migration commits in its **own transaction**, so two `sigild` instances
+  booting against the same database cannot double-apply — one migrates, the other
+  waits and then sees an up-to-date schema.
+- **Observability.** The applied version is exported as the
+  **`sigild_schema_version`** gauge on `GET /metrics` (0 for the mem/file
+  backends, which have no migrations). See [`api.md`](api.md#metrics).
+
+> **Scope.** These are **pure infrastructure (DDL)** — they create/alter the
+> table that holds **opaque client-encrypted blobs**; they never decode, parse, or
+> touch blob contents and perform **no cryptography** (zero-knowledge boundary
+> intact). This is a real, ordered, tracked migration system for the **dev**
+> Postgres backend; it is **not** a production change-management pipeline (no
+> down-migrations, no online/zero-downtime rewrites, no managed rollout tooling).
+
+---
+
+## 12. Backup & restore (Postgres backend)
+
+Because the Postgres op-log stores **opaque, already-client-encrypted blobs**, a
+backup is an ordinary database dump — the server holds no key and no plaintext, so
+there is nothing extra to protect beyond the database itself. Restore integrity is
+validated with the **existing tamper-evidence hash chain**, not a bespoke
+mechanism.
+
+**Back up** the op-log database with a standard logical dump:
+
+```bash
+# custom-format dump (recommended: parallelizable, selective restore)
+pg_dump --format=custom --dbname="$SIGILD_OPLOG_POSTGRES" --file=oplog.dump
+# or a plain-SQL dump restorable with psql
+pg_dump --dbname="$SIGILD_OPLOG_POSTGRES" > oplog.sql
+```
+
+**Restore** into a fresh database:
+
+```bash
+pg_restore --dbname="$TARGET_DSN" oplog.dump      # for the custom-format dump
+psql       --dbname="$TARGET_DSN" -f oplog.sql    # for the plain-SQL dump
+```
+
+Both the `blob` **and** the `hash` columns are `bytea` and are dumped
+**byte-for-byte**, and `schema_migrations` is dumped alongside — so a restore
+reproduces the op-log rows, their per-op hash-chain links, and the recorded schema
+version exactly. Because the hash chain commits each op to the previous one over
+the exact stored bytes, **the tamper-evidence chain survives a dump/restore
+unchanged**: an intact restore reproduces the same tip hash a live server would
+compute.
+
+**Post-restore integrity gate.** For each vault, call the server-side chain
+verifier and confirm it reports an intact chain with the **same `tip_hash`** as
+before the backup:
+
+```
+GET /v1/vaults/{vaultID}/ops/verify   →  { "ok": true, "count": N,
+                                           "tip_hash": "<hex>", "broken_at_seq": 0 }
+```
+
+(This route is dev-gated and auth-guarded exactly like the other op-log routes;
+see [`api.md`](api.md#get-v1vaultsvaultidopsverify--server-side-chain-check).) A
+`tip_hash` that matches the pre-backup value is strong evidence the restore is
+faithful; an `ok: false` / non-zero `broken_at_seq` means the restored data does
+**not** match its chain and must be investigated. **Phase 28 verification
+exercised exactly this cycle** — dump → drop → restore of the op-log database,
+then `/ops/verify` per vault returned `ok: true` with the **same `tip_hash`** the
+live server produced before the drop, confirming the chain is preserved across a
+real backup/restore round-trip.
+
+> **Honest scope.** This is a **dev backend** backup runbook: a logical `pg_dump`
+> of a single database with chain-verified restore. Production persistence is
+> broader and **unbuilt** — Postgres + object store (S3/R2) + Redis, point-in-time
+> recovery (WAL archiving / PITR), streaming replication, and periodic
+> restore-drills — none of which exist yet
+> ([§7](#7-what-is-not-yet-deployable)). The hash-chain check is
+> tamper-**evident**, not a cryptographic backup-authentication scheme.

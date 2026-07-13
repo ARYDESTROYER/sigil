@@ -100,7 +100,9 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   reason `sigild` now has **its first third-party dependency (`pgx`)** and a
   `go.sum`; the core server + the in-memory / file backends stay stdlib-only. All
   three are **dev-only, NOT a finished production store** (no auth / enrollment,
-  per-vault authorization, CRDT / merge, migrations, or backups). Op-log requests
+  per-vault authorization, or CRDT / merge; the Postgres backend now has managed
+  migrations and a chain-verified backup runbook (below), but no PITR / replication).
+  Op-log requests
   are **unauthenticated by default**, but
   when `SIGILD_OPLOG_PUBKEY` (std-base64 of a 32-byte Ed25519 public key) is set
   the server **verifies an Ed25519 signature (contract v2)** (Go stdlib
@@ -149,8 +151,16 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   than starting misconfigured. These are **dev-scale operability primitives** (an
   in-process limiter, process-local counters, boot-time validation) — **not** production
   SLOs, a distributed quota, or a durable metrics pipeline; the security posture is
-  unchanged (still dev-gated and `501` by default, still opaque blobs only). Ships a
-  distroless `Dockerfile`.
+  unchanged (still dev-gated and `501` by default, still opaque blobs only). The
+  **Postgres backend** now manages its schema with **versioned, embedded migrations**
+  (a `schema_migrations` table; applied under a session-level `pg_advisory_lock` so
+  concurrent boots are safe) — auto-applied at boot by default, or run/inspected with the
+  **`sigild migrate` / `sigild migrate status`** operator CLI, and disabled with
+  `SIGILD_OPLOG_AUTO_MIGRATE=0`; the applied version is exported as the
+  `sigild_schema_version` gauge. **Backup/restore** is a plain `pg_dump`/`pg_restore`
+  whose integrity is provable via the existing hash chain — because the `blob` and `hash`
+  columns dump byte-for-byte, `GET …/ops/verify` re-proves the same `tip_hash` after a
+  restore (dev backend only; no PITR/replication yet). Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

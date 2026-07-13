@@ -27,6 +27,12 @@ import (
 type Metrics struct {
 	version string
 
+	// schemaVersion is the applied op-log DB migration version reported by the
+	// sigild_schema_version gauge. It is a config-time value fixed at
+	// construction (0 when the backend is not Postgres), never mutated, so like
+	// version it needs no atomic.
+	schemaVersion int64
+
 	// httpRequestsTotal counts every HTTP response the server produced; the
 	// httpByClass buckets split that by status class (index = status/100, so
 	// index 2 == 2xx). Index 0 and any out-of-range class are never emitted.
@@ -54,10 +60,12 @@ var authDenyReasons = []authReason{
 }
 
 // newMetrics returns a fresh, zeroed Metrics for one router/server instance.
-func newMetrics(version string) *Metrics {
+// schemaVersion is the applied op-log DB migration version (0 for mem/file).
+func newMetrics(version string, schemaVersion int64) *Metrics {
 	m := &Metrics{
-		version:    version,
-		authDenied: make(map[authReason]*atomic.Int64, len(authDenyReasons)),
+		version:       version,
+		schemaVersion: schemaVersion,
+		authDenied:    make(map[authReason]*atomic.Int64, len(authDenyReasons)),
 	}
 	for _, r := range authDenyReasons {
 		m.authDenied[r] = new(atomic.Int64)
@@ -101,6 +109,12 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 	b.WriteString(`sigild_build_info{version="`)
 	b.WriteString(escapeLabelValue(m.version))
 	b.WriteString("\"} 1\n")
+
+	b.WriteString("# HELP sigild_schema_version Applied op-log DB migration version (0 when the backend is not Postgres).\n")
+	b.WriteString("# TYPE sigild_schema_version gauge\n")
+	b.WriteString("sigild_schema_version ")
+	b.WriteString(strconv.FormatInt(m.schemaVersion, 10))
+	b.WriteByte('\n')
 
 	b.WriteString("# HELP sigild_http_requests_total Total HTTP responses served, by status class.\n")
 	b.WriteString("# TYPE sigild_http_requests_total counter\n")

@@ -187,7 +187,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   production-store *adapter*, with concurrency-safe per-vault sequencing over
   opaque `bytea` blobs. All three are dev-only and opaque; the Postgres backend
   adds durability + concurrency but is **still not a finished production store**
-  (no auth model, enrollment, CRDT/merge, or backups) — see
+  (no auth model, enrollment, CRDT/merge, or production backup/replication) — see
   [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md)
   and [`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md).
   **Reliability & auditability hardening** (dev backend): the `VaultLog` seam now
@@ -232,6 +232,21 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   third-party dependency) and change **none** of the posture above — still
   dev-gated / opaque / unauthenticated-by-default (see
   [`decisions/0017-oplog-scale-and-observability.md`](decisions/0017-oplog-scale-and-observability.md)).
+  **Managed schema migrations (Postgres backend):** the Postgres backend now
+  manages its schema with **versioned, embedded migrations** tracked in a
+  `schema_migrations` table (`go:embed`'d `NNNN_*.sql`, applied in ascending
+  order under a session-level `pg_advisory_lock` so concurrent boots are safe),
+  replacing the old ad-hoc boot-time `IF NOT EXISTS` DDL. Migrations are
+  **auto-applied at boot by default** and can be run/inspected explicitly with the
+  `sigild migrate` / `sigild migrate status` operator CLI;
+  **`SIGILD_OPLOG_AUTO_MIGRATE=0`** disables auto-apply (boot then fails fast until
+  `sigild migrate` runs). They are **pure DDL** over the opaque `bytea` `blob` +
+  `hash` columns — no crypto, zero-knowledge intact — and `GET /metrics` exposes
+  the applied version as the **`sigild_schema_version`** gauge (0 for mem/file). A
+  logical `pg_dump` / `pg_restore` backup preserves the per-op hash chain
+  byte-for-byte, so **`GET …/ops/verify` re-proves the same `tip_hash` after a
+  restore** (see
+  [`decisions/0018-managed-oplog-migrations-and-backup-integrity.md`](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)).
   `sigild` performs **no cryptography** and never sees plaintext or keys. Full
   contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
@@ -483,9 +498,12 @@ authoritative list, with rationale, is the **defer ledger** in
   backend** (`SIGILD_OPLOG_POSTGRES`, on `pgx`;
   [ADR 0014](decisions/0014-postgres-durable-oplog-backend.md)) alongside the
   in-memory (default) and file-backed backends — so it *can* be durable and
-  concurrent in dev — but that is **not a production store**: no managed
-  migrations, no backup/restore, no replication, no Redis / object store, and no
-  auth / enrollment / CRDT around it.
+  concurrent in dev, now with **managed embedded migrations** (`schema_migrations`,
+  `sigild migrate`, `SIGILD_OPLOG_AUTO_MIGRATE`) and a **`pg_dump`/`pg_restore`
+  backup runbook whose restore integrity is proved by the op-log hash chain**
+  ([ADR 0018](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)) —
+  but that is **still not a production store**: no PITR / replication, no
+  Redis / object store, and no auth / enrollment / CRDT around it.
 - **Both hybrid constructions are assembled; the hybrid KEM now drives a
   crypto-level seal/open flow, but neither is in the product flow.** For key
   agreement, the **combined hybrid KEM exists as a standalone primitive**

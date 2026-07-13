@@ -90,12 +90,20 @@ the source of truth for the exact strings):
 | `sigild_oplog_verify_total` | counter | chain verifies run (`GET …/ops/verify`) |
 | `sigild_oplog_auth_denied_total{reason="…"}` | counter | op-log auth denials, **labelled by reason** (missing / invalid / stale / replayed) |
 | `sigild_oplog_ratelimit_rejected_total` | counter | appends rejected with `429` by the per-vault rate limiter |
+| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres) |
 | `sigild_build_info{version="…"}` | gauge (`1`) | build identity; the version label carries the injected build SHA |
 
 Counters are **process-lifetime and unlabelled by vault** (no per-vault
 cardinality blow-up, and no vault ID — itself client-chosen and potentially
 sensitive — is exported). The endpoint performs **no cryptography** and reads no
 stored bytes; it only reports aggregate counts.
+
+`sigild_schema_version` reflects the applied op-log database migration version for
+the **Postgres backend**; migrations are managed with an **operator CLI**, not an
+HTTP endpoint — `sigild migrate` applies pending migrations and `sigild migrate
+status` reports them (default auto-apply at boot, opt out with
+`SIGILD_OPLOG_AUTO_MIGRATE=0`). See
+[`deployment.md` §11](deployment.md#11-schema-migrations-postgres-backend).
 
 ---
 
@@ -126,7 +134,10 @@ stored bytes; it only reports aggregate counts.
 >     third-party dependency), with per-vault sequencing made concurrency-safe by
 >     a transaction / advisory lock. This adds durability and concurrency but is
 >     **NOT a finished production store**: it still has no auth model, no
->     enrollment, no CRDT/merge, and no backup/restore or managed migrations.
+>     enrollment, no CRDT/merge, and no production backup/replication (PITR).
+>     (Schema changes _are_ now **managed migrations**, and a **`pg_dump`/restore
+>     runbook** whose integrity gate is `/ops/verify` exists — see
+>     [`deployment.md` §11](deployment.md#11-schema-migrations-postgres-backend).)
 >
 >   All three are the **same opaque, dev-only, unauthenticated `VaultLog`** — the
 >   server does **no cryptography**, never decodes the bytes, and re-emits them

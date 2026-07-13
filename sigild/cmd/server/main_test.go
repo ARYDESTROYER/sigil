@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"io"
+	"strings"
 	"testing"
 )
 
@@ -98,6 +101,55 @@ func TestEffectiveBurst(t *testing.T) {
 		if got := effectiveBurst(c.rate, c.burst); got != c.want {
 			t.Errorf("effectiveBurst(%v, %d) = %d, want %d", c.rate, c.burst, got, c.want)
 		}
+	}
+}
+
+// TestParseMigrateArgs covers the (DB-free) migrate argument parsing: no args =>
+// apply, "status" => report-only, anything else => error.
+func TestParseMigrateArgs(t *testing.T) {
+	if statusOnly, err := parseMigrateArgs(nil); err != nil || statusOnly {
+		t.Errorf("parseMigrateArgs(nil) = (%v, %v), want (false, nil)", statusOnly, err)
+	}
+	if statusOnly, err := parseMigrateArgs([]string{}); err != nil || statusOnly {
+		t.Errorf("parseMigrateArgs([]) = (%v, %v), want (false, nil)", statusOnly, err)
+	}
+	if statusOnly, err := parseMigrateArgs([]string{"status"}); err != nil || !statusOnly {
+		t.Errorf("parseMigrateArgs([status]) = (%v, %v), want (true, nil)", statusOnly, err)
+	}
+	for _, bad := range [][]string{{"bogus"}, {"status", "extra"}, {"up"}} {
+		if _, err := parseMigrateArgs(bad); err == nil {
+			t.Errorf("parseMigrateArgs(%v) = nil error, want error", bad)
+		}
+	}
+}
+
+// TestRunSubcommandUnknown: an unknown subcommand returns an error (and does not
+// touch a database).
+func TestRunSubcommandUnknown(t *testing.T) {
+	if err := runSubcommand(context.Background(), []string{"frobnicate"}, io.Discard); err == nil {
+		t.Fatal("runSubcommand(frobnicate) = nil error, want error")
+	}
+}
+
+// TestRunMigrateMissingDSN: `sigild migrate` with SIGILD_OPLOG_POSTGRES unset
+// returns a clear error BEFORE any connection attempt (arg parsing succeeds, the
+// DSN check fails).
+func TestRunMigrateMissingDSN(t *testing.T) {
+	t.Setenv("SIGILD_OPLOG_POSTGRES", "")
+	err := runMigrate(context.Background(), nil, io.Discard)
+	if err == nil {
+		t.Fatal("runMigrate with no DSN = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "SIGILD_OPLOG_POSTGRES") {
+		t.Fatalf("runMigrate error = %q, want it to mention SIGILD_OPLOG_POSTGRES", err)
+	}
+	// `sigild migrate status` with no DSN also errors on the DSN, not a panic.
+	if err := runMigrate(context.Background(), []string{"status"}, io.Discard); err == nil {
+		t.Fatal("runMigrate status with no DSN = nil error, want error")
+	}
+	// A bad migrate arg errors regardless of the (unset) DSN.
+	if err := runMigrate(context.Background(), []string{"nope"}, io.Discard); err == nil {
+		t.Fatal("runMigrate with bad arg = nil error, want error")
 	}
 }
 

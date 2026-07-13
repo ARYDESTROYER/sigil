@@ -60,6 +60,11 @@ type Config struct {
 	// It is only consulted when OpLogRateLimit > 0; a value < 1 is clamped up to
 	// 1 by the limiter so single requests always pass.
 	OpLogRateBurst int
+	// SchemaVersion is the applied op-log DB migration version, surfaced by the
+	// sigild_schema_version metric. main.go sets it from the Postgres backend's
+	// applied migration version; it stays 0 for the mem/file backends (which
+	// have no migrations).
+	SchemaVersion int64
 }
 
 // NewRouter returns the sigild HTTP handler.
@@ -67,7 +72,7 @@ func NewRouter(cfg Config) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	h := &handlers{cfg: cfg, metrics: newMetrics(cfg.Version)}
+	h := &handlers{cfg: cfg, metrics: newMetrics(cfg.Version, cfg.SchemaVersion)}
 	// Op-log request-auth enabled => attach the in-memory replay cache so a
 	// captured, validly-signed request cannot be replayed within the timestamp
 	// window. Per-process/in-memory only (a multi-instance deploy needs a shared

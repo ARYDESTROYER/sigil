@@ -11,7 +11,15 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 27, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 28, `main` @ origin, clean tree).** Phase 28 gave
+the durable Postgres op-log **managed, versioned embedded migrations**
+(`schema_migrations`, applied under a session `pg_advisory_lock`; auto at boot or
+via the `sigild migrate` / `sigild migrate status` operator CLI; opt out with
+`SIGILD_OPLOG_AUTO_MIGRATE=0` → fail-fast), a **`sigild_schema_version`** gauge on
+`/metrics`, and a **`pg_dump`/`pg_restore` backup runbook** whose restore
+integrity is proved by the existing hash chain (`/ops/verify` re-yields the same
+`tip_hash`) — pure stdlib+`pgx`+`go:embed`, opaque/zero-knowledge intact, dev
+backend only (ADR 0018). libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -53,7 +61,15 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   **`GET /metrics`** Prometheus-text endpoint (counters only — appends/verify/ratelimit/
   auth-denied-by-reason/http-by-class/build_info; NO blob, key, or vault ID; never
   dev-gated); and **fail-fast config validation** (bad `SIGILD_ADDR`/rate/burst/pubkey →
-  exit 1 BEFORE binding). ADR 0017.
+  exit 1 BEFORE binding). ADR 0017. **Managed migrations (Phase 28, Postgres backend only):**
+  versioned embedded migrations (`go:embed` `internal/store/migrations/NNNN_*.sql`, baseline
+  `0001_init.sql`) tracked in a **`schema_migrations`** table, run under a session-level
+  **`pg_advisory_lock`** (each in its own tx → safe concurrent boots), replacing the old
+  inline DDL. Auto-applied at boot unless **`SIGILD_OPLOG_AUTO_MIGRATE=0`** (then fail-fast);
+  operator CLI **`sigild migrate`** / **`sigild migrate status`**. Applied version exported as
+  the **`sigild_schema_version`** gauge on `/metrics`. **Backup:** `pg_dump`/`pg_restore` dumps
+  `blob`+`hash` byte-for-byte → hash chain survives; post-restore gate is `GET …/ops/verify`
+  (`ok:true`, same `tip_hash`). ADR 0018.
 - `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing;
   plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
   device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
@@ -2931,3 +2947,84 @@ Recording the decision so the doc set stays coherent as the repo grows:
   CRDT / merge, managed migrations, backups-with-proven-restore, replication — and a signed
   / Merkle-root production audit log. Scale + observability are the **only** new properties;
   the **system is NOT "post-quantum secure".**
+
+---
+
+## 2026-07-14 — Phase 28 (managed op-log schema migrations + hash-chain-verified backup/restore)
+
+### Context & mandate
+- The durable Postgres op-log backend (Phase 24 / ADR 0014) created its schema with **ad-hoc
+  inline DDL** at construction (`CREATE TABLE IF NOT EXISTS` + an `ALTER … ADD COLUMN IF NOT
+  EXISTS` for the Phase 26 hash column). That worked for one evolving dev table but had no
+  notion of *version*, no record of *what was applied when*, no safe concurrent-apply story,
+  no operator control, and no documented/provable backup path.
+- Mandate: replace the inline DDL with a **managed, versioned migration system** for the
+  Postgres backend and document a **backup/restore runbook whose integrity is proved by the
+  EXISTING hash chain** — **no new dependency** (`pgx` stays the only third-party import;
+  new code is pure stdlib + `pgx` + `go:embed`), **opaque blobs / no crypto on plaintext**
+  preserved, and the **dev-gated / 501-by-default** posture unchanged (migrations only matter
+  when `SIGILD_OPLOG_POSTGRES` is set).
+
+### What shipped (code — implemented + verified GREEN before this doc pass)
+- **`internal/store/migrate.go` + `internal/store/migrations/0001_init.sql`:** `go:embed`'d
+  `NNNN_description.sql` migrations, ascending by the zero-padded version; baseline
+  `0001_init.sql` = version **1** (creates `sigil_vault_ops`: `vault_id`/`seq`/`blob bytea`/
+  `hash bytea`/`created_at`, PK `(vault_id, seq)`; cleanly adopts a legacy table). A
+  **`schema_migrations`** tracking table (`version`, `name`, `applied_at`). `Migrate` runs
+  under a **session-level `pg_advisory_lock`** (key `0x5347494C5F4D4752` = "SGIL_MGR") with
+  each pending migration in its **own transaction**; `Status` reports applied/pending;
+  `AppliedVersion` treats a missing table (SQLSTATE 42P01) as version 0.
+- **`internal/store/postgresvaultlog.go`:** `NewPostgresVaultLog` now calls `Migrate` at
+  construction when **auto-migrate is enabled** (the default). `autoMigrateEnabled()` reads
+  **`SIGILD_OPLOG_AUTO_MIGRATE`** — `0`/`false`/`no`/`off` (case-insensitive) ⇒ OFF, in
+  which case construction applies NOTHING and **fails fast** if `AppliedVersion < latest`
+  (message: "run `sigild migrate`"). New `SchemaVersion(ctx)` reads the applied version for
+  the metric.
+- **`cmd/server/main.go`:** subcommand dispatch — **`sigild migrate`** applies pending,
+  **`sigild migrate status`** reports (both require `SIGILD_OPLOG_POSTGRES`; arg-parse +
+  missing-DSN checks are unit-testable without a DB). On server start the applied version is
+  read via `pgLog.SchemaVersion` and threaded into the metrics config.
+- **`internal/api/metrics.go`:** new **`sigild_schema_version`** gauge — help "Applied op-log
+  DB migration version (0 when the backend is not Postgres)."; a config-time value fixed at
+  construction (0 for mem/file), rendered in the Prometheus text output.
+
+### How verified
+- `gofmt -l sigild` clean; `go -C sigild vet ./...`; **`go -C sigild test ./... -race`** green
+  (migration parse/sort/dup-version unit tests, fresh-DB apply, status, legacy-table adopt,
+  auto-migrate-off fail-fast, and **`TestMigrateConcurrentNoDoubleApply`** — concurrent
+  `Migrate` calls serialize on the advisory lock and apply each migration exactly once, no
+  data race). Postgres-backed tests gated on `SIGILD_TEST_POSTGRES`.
+- **Backup/restore integrity proof:** the verifier ran a **`pg_dump` → drop → `pg_restore`**
+  cycle against the op-log database and then hit **`GET /v1/vaults/{id}/ops/verify`** per
+  vault — it returned **`ok: true`** with the **same `tip_hash`** the live server produced
+  before the drop, confirming the per-op SHA-256 hash chain survives a real dump/restore
+  byte-for-byte (both `blob` and `hash` are `bytea`, dumped literally). So backup integrity
+  reuses the existing tamper-evidence chain rather than any bespoke mechanism.
+- **No new dep / core untouched:** `sigild/go.mod` direct require still only
+  `github.com/jackc/pgx/v5`; the migration runner/CLI import stdlib + `pgx` + `embed`.
+  `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**; no `libsigil/` or `cli/`
+  changes (sigild + docs only).
+
+### Docs (this pass)
+- `docs/deployment.md`: new **§11 Schema migrations** (embedded/versioned, auto-apply +
+  `SIGILD_OPLOG_AUTO_MIGRATE=0` opt-out + fail-fast, `sigild migrate`/`migrate status`,
+  advisory-lock-safe concurrent boots, `sigild_schema_version`) and **§12 Backup & restore**
+  (`pg_dump`/`pg_restore`, byte-for-byte `blob`+`hash`, `/ops/verify` post-restore gate citing
+  the tip_hash-survives-restore proof); §7 gap bullet updated to reference them.
+- `docs/architecture.md`: sigild component note + the "No production storage" limitation now
+  mention managed embedded migrations (`schema_migrations`), `sigild_schema_version` on
+  `/metrics`, and the chain-verified backup runbook.
+- `docs/api.md`: added `sigild_schema_version` (gauge) to the `/metrics` table; noted the
+  `sigild migrate` operator CLI (framed as CLI, not an HTTP endpoint).
+- `docs/decisions/0018-managed-oplog-migrations-and-backup-integrity.md` written
+  (Nygard-style) + indexed in `docs/decisions/README.md` (Accepted, 2026-07); ADR banner
+  extended. `CLAUDE.md` + `README.md` sigild sections extended; RESUME ANCHOR moved to
+  Phase 28.
+
+### ➡️ Still open (honest)
+- This is a **dev** backend migration + backup story: real, ordered, tracked migrations and a
+  chain-verified logical dump — **not** down-migrations, online/zero-downtime rewrites,
+  managed rollout tooling, PITR (WAL archiving), streaming replication, an object store, or
+  restore-drill automation. Production persistence (Postgres + S3/R2 + Redis) is still
+  broader and unbuilt. Posture unchanged: dev-gated / **501** by default, opaque blobs only,
+  no crypto on the plaintext; the **system is NOT "post-quantum secure".**

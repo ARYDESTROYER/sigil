@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
@@ -23,12 +24,26 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/ARYDESTROYER/sigil/sigild/internal/api"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/buildinfo"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
 )
 
 func main() {
+	// Subcommand dispatch BEFORE any server setup. sigild takes no flags (all
+	// config is env), so any first argument is a subcommand. `sigild migrate`
+	// and `sigild migrate status` operate on the Postgres op-log backend; no
+	// argument runs the server exactly as before.
+	if len(os.Args) > 1 {
+		if err := runSubcommand(context.Background(), os.Args[1:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "sigild:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	// Fail-fast config validation: reject malformed env BEFORE binding the
@@ -96,7 +111,17 @@ func main() {
 				os.Exit(1)
 			}
 			cfg.VaultLog = pgLog
-			logger.Warn("DEV op-log enabled: DURABLE POSTGRES backend active — UNAUTHENTICATED, dev-only, NOT a finished production store (no auth model / enrollment / CRDT / backups) — do NOT expose publicly")
+			// Surface the applied migration version via the sigild_schema_version
+			// metric (0 for the mem/file backends, which have no migrations).
+			svCtx, svCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			sv, err := pgLog.SchemaVersion(svCtx)
+			svCancel()
+			if err != nil {
+				logger.Error("failed to read op-log schema version", "err", err)
+				os.Exit(1)
+			}
+			cfg.SchemaVersion = sv
+			logger.Warn("DEV op-log enabled: DURABLE POSTGRES backend active — UNAUTHENTICATED, dev-only, NOT a finished production store (no auth model / enrollment / CRDT / backups) — do NOT expose publicly", "schema_version", sv)
 		case os.Getenv("SIGILD_OPLOG_DIR") != "":
 			// Optional durable LOCAL-DEV backend: persist the dev op-log to
 			// per-vault append-only files so it survives a restart. Still
@@ -169,6 +194,93 @@ func main() {
 		logger.Error("graceful shutdown failed", "err", err)
 		os.Exit(1)
 	}
+}
+
+// usageText documents the (few) sigild invocations. Printed on an unknown
+// subcommand.
+const usageText = `usage:
+  sigild                 run the sync server (config via environment)
+  sigild migrate         apply pending op-log database migrations
+  sigild migrate status  show migration status (applies nothing)`
+
+// runSubcommand dispatches a sigild subcommand. args is os.Args[1:]. It writes
+// human output to out and returns an error (main maps that to a non-zero exit).
+// It never calls os.Exit, so it is unit-testable.
+func runSubcommand(ctx context.Context, args []string, out io.Writer) error {
+	switch args[0] {
+	case "migrate":
+		return runMigrate(ctx, args[1:], out)
+	default:
+		return fmt.Errorf("unknown subcommand %q\n\n%s", args[0], usageText)
+	}
+}
+
+// parseMigrateArgs interprets the arguments after `migrate`. No args => apply
+// pending (statusOnly=false); the single arg "status" => report only
+// (statusOnly=true). Anything else is an error. Kept separate so arg parsing is
+// unit-testable without a database.
+func parseMigrateArgs(args []string) (statusOnly bool, err error) {
+	switch {
+	case len(args) == 0:
+		return false, nil
+	case len(args) == 1 && args[0] == "status":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unknown migrate argument %q (want: `sigild migrate` or `sigild migrate status`)",
+			strings.Join(args, " "))
+	}
+}
+
+// runMigrate applies pending op-log migrations (or, with "status", reports
+// them). Migrations only apply to the Postgres backend, so SIGILD_OPLOG_POSTGRES
+// must be set; otherwise it returns a clear error. Arg parsing and the
+// missing-DSN check happen BEFORE any connection, so those paths are unit-
+// testable without a database.
+func runMigrate(ctx context.Context, args []string, out io.Writer) error {
+	statusOnly, err := parseMigrateArgs(args)
+	if err != nil {
+		return err
+	}
+	dsn := os.Getenv("SIGILD_OPLOG_POSTGRES")
+	if dsn == "" {
+		return errors.New("migrations apply only to the Postgres backend: set SIGILD_OPLOG_POSTGRES to the database DSN")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("open postgres pool: %w", err)
+	}
+	defer pool.Close()
+
+	if statusOnly {
+		statuses, err := store.Status(ctx, pool)
+		if err != nil {
+			return fmt.Errorf("read migration status: %w", err)
+		}
+		for _, s := range statuses {
+			if s.Applied {
+				fmt.Fprintf(out, "[applied] %s  (%s)\n", s.Name, s.AppliedAt.UTC().Format(time.RFC3339))
+			} else {
+				fmt.Fprintf(out, "[pending] %s\n", s.Name)
+			}
+		}
+		return nil
+	}
+
+	applied, err := store.Migrate(ctx, pool)
+	if err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+	if len(applied) == 0 {
+		fmt.Fprintln(out, "op-log database is already up to date; no migrations applied")
+		return nil
+	}
+	for _, m := range applied {
+		fmt.Fprintf(out, "applied migration %d %s\n", m.Version, m.Name)
+	}
+	return nil
 }
 
 func getenv(key, def string) string {

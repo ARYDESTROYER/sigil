@@ -9,8 +9,11 @@ package store
 //
 // IT IS NOT A FINISHED PRODUCTION SYNC STORE. It adds durability and
 // concurrency, but the surrounding server still has NO real auth model, NO
-// device enrollment, NO CRDT/merge semantics, and NO backup/replication story.
-// The production persistence design (Postgres + S3 for large blobs + Redis) is
+// device enrollment, NO CRDT/merge semantics, and NO automated backup/replication
+// or PITR story. (The schema IS now managed by versioned migrations — see
+// migrate.go — and a manual pg_dump/restore runbook exists whose integrity gate
+// is the /ops/verify hash chain; automated backup/replication does not.) The
+// production persistence design (Postgres + S3 for large blobs + Redis) is
 // broader than this single table. Treat this as a durable DEV backend.
 //
 // Like every VaultLog it is OPAQUE: blobs are stored and returned byte-for-byte
@@ -20,12 +23,15 @@ package store
 // STATUS: pre-audit skeleton. Durable Postgres backend for the DEV op-log;
 // stores opaque client-encrypted blobs; no crypto; still UNAUTHENTICATED unless
 // SIGILD_OPLOG_PUBKEY is set / dev-gated by SIGILD_ENABLE_DEV_OPS; NOT a
-// finished production store (no auth model / enrollment / CRDT / backups).
+// finished production store (no auth model / enrollment / CRDT / automated
+// backup+replication, though schema migrations are now managed — see migrate.go).
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,27 +42,21 @@ import (
 // server can never block an Append/Since (or startup Ping/schema) forever.
 const opTimeout = 10 * time.Second
 
-// createSchemaSQL creates the op-log table if it does not already exist. The
-// (vault_id, seq) primary key enforces per-vault uniqueness of the sequence
-// number at the database level; blob is the opaque bytea; hash is the op's
-// tamper-evidence chain hash (32-byte SHA-256, see chainHash); created_at is
-// server-side bookkeeping only and never returned to clients.
-const createSchemaSQL = `
-CREATE TABLE IF NOT EXISTS sigil_vault_ops (
-	vault_id   text        NOT NULL,
-	seq        bigint      NOT NULL,
-	blob       bytea       NOT NULL,
-	hash       bytea       NOT NULL,
-	created_at timestamptz NOT NULL DEFAULT now(),
-	PRIMARY KEY (vault_id, seq)
-)`
-
-// addHashColumnSQL upgrades a pre-existing table (created before the hash chain)
-// by adding the hash column. It is a no-op on a fresh DB where createSchemaSQL
-// already includes the column. The column is added NULLABLE here (an existing
-// table may already hold rows that predate the chain); a fresh table gets it NOT
-// NULL via createSchemaSQL. Acceptable for a DEV backend with no real data.
-const addHashColumnSQL = `ALTER TABLE sigil_vault_ops ADD COLUMN IF NOT EXISTS hash bytea`
+// autoMigrateEnabled reports whether NewPostgresVaultLog should auto-apply
+// pending schema migrations at construction. It is controlled by
+// SIGILD_OPLOG_AUTO_MIGRATE: unset or truthy => ON (the default, backward
+// compatible — a fresh DB is migrated exactly as the old inline DDL did);
+// "0"/"false"/"no"/"off" (case-insensitive) => OFF, in which case construction
+// does NOT apply anything and instead fails fast if the DB is unmigrated/behind,
+// telling the operator to run `sigild migrate`.
+func autoMigrateEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SIGILD_OPLOG_AUTO_MIGRATE"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
 
 // Pool sizing/lifecycle for the dev Postgres backend. Op bodies are tiny (the
 // server caps a single op at 64 KiB) and each Append/Since is a short-lived
@@ -82,10 +82,18 @@ var (
 )
 
 // NewPostgresVaultLog opens a pooled connection to dsn, verifies it with a Ping,
-// and idempotently ensures the op-log schema exists. The supplied ctx bounds
-// only construction (pool open + ping + schema); it is NOT retained. Per-op
-// contexts derive from the CALLER's request context (see Append/Since), so a
-// cancelled/slow request cancels the underlying database work.
+// and brings the op-log schema up to date via the managed migration system (see
+// migrate.go). The supplied ctx bounds only construction (pool open + ping +
+// migrate); it is NOT retained. Per-op contexts derive from the CALLER's request
+// context (see Append/Since), so a cancelled/slow request cancels the underlying
+// database work.
+//
+// Migration behaviour is controlled by SIGILD_OPLOG_AUTO_MIGRATE (see
+// autoMigrateEnabled): ON by default, in which case pending migrations are
+// applied at construction (a fresh DB is set up exactly as the old inline DDL
+// did — backward compatible). When explicitly disabled, construction applies
+// NOTHING and fails fast if the DB is behind the latest embedded migration,
+// directing the operator to run `sigild migrate`.
 //
 // A returned pool must be released with Close.
 func NewPostgresVaultLog(ctx context.Context, dsn string) (*PostgresVaultLog, error) {
@@ -108,14 +116,33 @@ func NewPostgresVaultLog(ctx context.Context, dsn string) (*PostgresVaultLog, er
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	if _, err := pool.Exec(ctx, createSchemaSQL); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ensure op-log schema: %w", err)
-	}
-	// Idempotently add the hash column to a table created before the chain existed.
-	if _, err := pool.Exec(ctx, addHashColumnSQL); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ensure op-log hash column: %w", err)
+	if autoMigrateEnabled() {
+		// Apply pending migrations. On a fresh DB this creates the op-log schema
+		// exactly like the old inline DDL; on an up-to-date DB it is a no-op.
+		if _, err := Migrate(ctx, pool); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("apply op-log migrations: %w", err)
+		}
+	} else {
+		// Auto-migrate disabled: never apply here. Fail fast if the DB is behind
+		// the latest embedded migration so a misconfigured deploy is a clear
+		// startup error rather than a runtime surprise.
+		latest, err := latestMigrationVersion()
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("load op-log migrations: %w", err)
+		}
+		have, err := AppliedVersion(ctx, pool)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("read applied op-log migration version: %w", err)
+		}
+		if have < latest {
+			pool.Close()
+			return nil, fmt.Errorf("op-log database is at migration version %d but %d is required "+
+				"and SIGILD_OPLOG_AUTO_MIGRATE is disabled; run `sigild migrate` to apply pending migrations",
+				have, latest)
+		}
 	}
 
 	return &PostgresVaultLog{pool: pool}, nil
@@ -246,6 +273,15 @@ func (l *PostgresVaultLog) Ping(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	return l.pool.Ping(ctx)
+}
+
+// SchemaVersion returns the highest applied op-log migration version for this
+// backend, for observability (the sigild_schema_version metric). It bounds the
+// read with opTimeout on top of the caller's ctx.
+func (l *PostgresVaultLog) SchemaVersion(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	return AppliedVersion(ctx, l.pool)
 }
 
 // Close releases the underlying connection pool. It is safe to call once when

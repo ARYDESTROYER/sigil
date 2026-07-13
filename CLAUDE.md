@@ -118,7 +118,8 @@ public, make no security claims, until the audit completes and trademark clears.
   integration tests gated on `SIGILD_TEST_POSTGRES`, else skipped). The file backend
   is a **local-dev convenience** and the Postgres backend is the **first durable
   store adapter but still NOT a finished production store** (no auth / enrollment,
-  per-vault authorization, CRDT / merge, managed migrations, or backups). When
+  per-vault authorization, CRDT / merge, or production backup/replication/PITR — though
+  schema migrations are now managed and a `pg_dump`/restore runbook exists, see below). When
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 of a 32-byte Ed25519 public key) is set,
   op-log requests are **Ed25519-authenticated — contract v2** (`authorizeOps`, Go
   stdlib `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` over a
@@ -185,7 +186,25 @@ public, make no security claims, until the audit completes and trademark clears.
   binding** and exits non-zero on any malformed value. These are **dev-scale operability
   primitives** (in-process limiter, process-local counters, boot-time validation), NOT
   production SLOs; posture unchanged (still dev-gated/`501` by default, opaque, no crypto
-  on the blob). Endpoint reference in [`docs/api.md`](docs/api.md).
+  on the blob). Endpoint reference in [`docs/api.md`](docs/api.md). **Managed op-log schema
+  migrations (Phase 28, ADR 0018) — Postgres backend only:** the Postgres backend now
+  manages its schema with **versioned, embedded migrations** (`go:embed`'d
+  `internal/store/migrations/NNNN_*.sql`, baseline `0001_init.sql` = version 1) tracked in a
+  **`schema_migrations`** table, replacing the old inline `CREATE TABLE IF NOT EXISTS` DDL.
+  The run is serialized across instances by a **session-level `pg_advisory_lock`** (key
+  `0x5347494C5F4D4752`) with each migration in its own tx, so concurrent boots can't
+  double-apply. Migrations are **auto-applied at boot by default**; **`SIGILD_OPLOG_AUTO_MIGRATE=0`**
+  (`0`/`false`/`no`/`off`) disables that (boot then fails fast until migrations are applied).
+  Operator CLI (**not** an HTTP endpoint): **`sigild migrate`** applies pending, **`sigild
+  migrate status`** reports applied/pending. The applied version is exported as the
+  **`sigild_schema_version`** gauge on `GET /metrics` (0 for mem/file). Migrations are **pure
+  DDL** over the opaque `bytea` `blob`+`hash` columns — no crypto, zero-knowledge intact.
+  **Backup/restore:** a logical **`pg_dump`/`pg_restore`** (or `psql`) dumps `blob` AND
+  `hash` byte-for-byte, so the tamper-evidence hash chain survives a restore; the post-restore
+  integrity gate is **`GET /v1/vaults/{id}/ops/verify`** per vault (expect `ok:true` + the
+  same `tip_hash`) — the verifier proved a dump→drop→restore preserved the `tip_hash`. Still a
+  **dev** backend (no PITR/replication/object-store, no production change-management). Runbook
+  in [`docs/deployment.md`](docs/deployment.md) §11–§12.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —

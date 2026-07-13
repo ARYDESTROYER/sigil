@@ -60,6 +60,7 @@ func TestMetricsEndpointShape(t *testing.T) {
 	wantSubstrings := []string{
 		"# TYPE sigild_build_info gauge",
 		`sigild_build_info{version="metrics-ver"} 1`,
+		"# TYPE sigild_schema_version gauge",
 		"# TYPE sigild_http_requests_total counter",
 		"# TYPE sigild_oplog_appends_total counter",
 		"# TYPE sigild_oplog_verify_total counter",
@@ -71,6 +72,24 @@ func TestMetricsEndpointShape(t *testing.T) {
 		if !strings.Contains(body, s) {
 			t.Fatalf("/metrics body missing %q in:\n%s", s, body)
 		}
+	}
+}
+
+// TestMetricsSchemaVersion: the sigild_schema_version gauge renders the value
+// configured on the router (0 by default, the Postgres applied version when set).
+func TestMetricsSchemaVersion(t *testing.T) {
+	// Default (mem/file backend): 0.
+	r0 := NewRouter(Config{Version: "test", Logger: discardLogger()})
+	_, _, b0 := scrapeMetrics(t, r0)
+	if v := metricValue(t, b0, "sigild_schema_version"); v != 0 {
+		t.Fatalf("default sigild_schema_version = %d, want 0", v)
+	}
+
+	// Configured (as main would from the Postgres backend's applied version).
+	r7 := NewRouter(Config{Version: "test", Logger: discardLogger(), SchemaVersion: 7})
+	_, _, b7 := scrapeMetrics(t, r7)
+	if v := metricValue(t, b7, "sigild_schema_version"); v != 7 {
+		t.Fatalf("configured sigild_schema_version = %d, want 7", v)
 	}
 }
 

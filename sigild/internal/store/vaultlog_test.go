@@ -43,7 +43,7 @@ func TestMemVaultLogSinceZeroReturnsAll(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(ctx, "v1", 0)
+	ops, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestMemVaultLogSinceFilters(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(ctx, "v1", 3)
+	ops, err := l.Since(ctx, "v1", 3, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -77,9 +77,57 @@ func TestMemVaultLogSinceFilters(t *testing.T) {
 	}
 }
 
+// TestMemVaultLogSinceRespectsLimit verifies the pagination cap: a positive
+// limit returns at most that many (earliest) ops so a caller can page forward,
+// while a limit <= 0 is unbounded.
+func TestMemVaultLogSinceRespectsLimit(t *testing.T) {
+	ctx := t.Context()
+	l := NewMemVaultLog()
+	for i := 0; i < 5; i++ {
+		if _, err := l.Append(ctx, "v1", []byte{byte(i)}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	// Page 1: since=0, limit=2 -> seq 1,2.
+	page, err := l.Since(ctx, "v1", 0, 2)
+	if err != nil {
+		t.Fatalf("Since page1: %v", err)
+	}
+	if len(page) != 2 || page[0].Seq != 1 || page[1].Seq != 2 {
+		t.Fatalf("page1 = %+v, want seq 1,2", page)
+	}
+	// Page 2: since=2, limit=2 -> seq 3,4.
+	page, err = l.Since(ctx, "v1", 2, 2)
+	if err != nil {
+		t.Fatalf("Since page2: %v", err)
+	}
+	if len(page) != 2 || page[0].Seq != 3 || page[1].Seq != 4 {
+		t.Fatalf("page2 = %+v, want seq 3,4", page)
+	}
+	// Page 3: since=4, limit=2 -> only seq 5 (fewer than limit => last page).
+	page, err = l.Since(ctx, "v1", 4, 2)
+	if err != nil {
+		t.Fatalf("Since page3: %v", err)
+	}
+	if len(page) != 1 || page[0].Seq != 5 {
+		t.Fatalf("page3 = %+v, want only seq 5", page)
+	}
+	// Unbounded (limit 0 and negative) returns all five.
+	for _, lim := range []int{0, -1} {
+		all, err := l.Since(ctx, "v1", 0, lim)
+		if err != nil {
+			t.Fatalf("Since unbounded(%d): %v", lim, err)
+		}
+		if len(all) != 5 {
+			t.Fatalf("Since(0, %d) len = %d, want 5 (unbounded)", lim, len(all))
+		}
+	}
+}
+
 func TestMemVaultLogSinceUnknownVault(t *testing.T) {
 	l := NewMemVaultLog()
-	ops, err := l.Since(t.Context(), "nope", 0)
+	ops, err := l.Since(t.Context(), "nope", 0, 0)
 	if err != nil {
 		t.Fatalf("Since unknown vault err = %v, want nil", err)
 	}
@@ -99,7 +147,7 @@ func TestMemVaultLogDefensiveCopy(t *testing.T) {
 	}
 	in[0] = 'X' // mutate caller's slice after Append
 
-	ops, err := l.Since(ctx, "v1", 0)
+	ops, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -109,7 +157,7 @@ func TestMemVaultLogDefensiveCopy(t *testing.T) {
 
 	ops[0].Blob[0] = 'Y' // mutate returned slice
 
-	again, err := l.Since(ctx, "v1", 0)
+	again, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since again: %v", err)
 	}
@@ -129,12 +177,12 @@ func TestMemVaultLogContextCancelled(t *testing.T) {
 	if _, err := l.Append(ctx, "v1", []byte("op")); err != context.Canceled {
 		t.Fatalf("Append with cancelled ctx err = %v, want context.Canceled", err)
 	}
-	if _, err := l.Since(ctx, "v1", 0); err != context.Canceled {
+	if _, err := l.Since(ctx, "v1", 0, 0); err != context.Canceled {
 		t.Fatalf("Since with cancelled ctx err = %v, want context.Canceled", err)
 	}
 	// The cancelled Append must not have stored anything: a fresh live read is
 	// empty.
-	ops, err := l.Since(context.Background(), "v1", 0)
+	ops, err := l.Since(context.Background(), "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since after cancelled Append: %v", err)
 	}
@@ -168,7 +216,7 @@ func TestMemVaultLogConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	ops, err := l.Since(ctx, "v1", 0)
+	ops, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}

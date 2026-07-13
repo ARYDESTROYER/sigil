@@ -229,6 +229,25 @@ The Nomad jobspec health-checks `/healthz` (liveness). `/readyz` is the right
 probe for load-balancer draining once Postgres/Redis are actually wired, since it
 returns `503` when a configured dependency is down.
 
+**Metrics scrape target (`GET /metrics`).** Alongside the probes, `sigild`
+exposes an **always-available** `GET /metrics` in **Prometheus text format** for
+operational scraping — process counters only (HTTP requests, op-log appends,
+verifies, auth denials by reason, rate-limit rejections, and `build_info` with
+the build version). It is **stdlib-only** (no metrics client library), holds **no
+secrets** — no blob, key, signature, nonce, or vault ID — and does **no crypto**,
+so it is safe to scrape from an internal Prometheus without weakening the trust
+boundary. It is **not** a health probe (use `/healthz` / `/readyz` for that);
+keep it on the loopback / internal side of Caddy rather than exposing it
+publicly. Full metric list in [`api.md`](api.md#metrics).
+
+**Fail-fast config validation at boot.** `sigild` **validates its configuration
+at startup and refuses to boot on a malformed value** (e.g. a bad
+`SIGILD_ADDR`, a non-numeric `SIGILD_OPLOG_RATE_LIMIT` / `SIGILD_OPLOG_RATE_BURST`, or
+a `SIGILD_OPLOG_PUBKEY` that is not valid base64 of a 32-byte key), exiting
+non-zero with a clear message rather than starting misconfigured and failing
+later at request time. Under systemd (Shape 1) a bad `EnvironmentFile` therefore
+surfaces immediately as a failed unit start, not as silent misbehaviour.
+
 ---
 
 ## 7. What is NOT yet deployable
@@ -241,9 +260,16 @@ To avoid any over-claim, the honest gaps:
   setting the environment variable **`SIGILD_ENABLE_DEV_OPS`**; when enabled it
   is an **in-memory, non-durable, UNAUTHENTICATED** store of **opaque
   client-encrypted blobs** — the server does no crypto and never sees plaintext
-  or keys (POST → `201 {vaultID, seq}`; GET → the stored blobs base64-encoded).
-  Oversized bodies are capped at 64 KiB and rejected with **`413`**. There is
-  still **no auth, no durability, no Postgres**, and no real op/CRDT semantics.
+  or keys (POST → `201 {vaultID, seq}`; GET → the stored blobs base64-encoded,
+  **paginated** via `?limit` (default 500, max 1000) + a `has_more` flag).
+  Oversized bodies are capped at 64 KiB and rejected with **`413`**. Appends can
+  optionally be **rate-limited per vault** with **`SIGILD_OPLOG_RATE_LIMIT`**
+  (sustained appends/sec/vault) and **`SIGILD_OPLOG_RATE_BURST`** (bucket depth) — a
+  stdlib token-bucket that returns `429` + `Retry-After` when exceeded, **off by
+  default**; these are **dev-op knobs** that apply only when
+  `SIGILD_ENABLE_DEV_OPS` is set and do not change the production `501` default.
+  There is still **no auth, no durability, no Postgres**, and no real op/CRDT
+  semantics.
   **Do NOT set `SIGILD_ENABLE_DEV_OPS` on any exposed instance** — the dev
   op-log must never be reachable from the public internet, and no real secrets
   may be stored in it. This honours the "stub with `501` rather than poison the

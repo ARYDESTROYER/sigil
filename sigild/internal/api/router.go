@@ -49,6 +49,17 @@ type Config struct {
 	// JWT bearer tokens (see internal/auth) remain FUTURE. Dev-only; do NOT
 	// expose publicly.
 	OpLogPubKey ed25519.PublicKey
+	// OpLogRateLimit is the per-vault write rate cap for the dev op-log, in
+	// requests/second. 0 (the default) DISABLES rate limiting entirely (no
+	// wrapper is installed; behaviour is unchanged). A positive value, together
+	// with DevOpsEnabled, wraps POST /v1/vaults/{vaultID}/ops in a per-vault
+	// token-bucket limiter that returns 429 when a vault exceeds its rate. GET
+	// routes are never write-rate-limited. Dev-only.
+	OpLogRateLimit float64
+	// OpLogRateBurst is the token-bucket capacity (max burst) for OpLogRateLimit.
+	// It is only consulted when OpLogRateLimit > 0; a value < 1 is clamped up to
+	// 1 by the limiter so single requests always pass.
+	OpLogRateBurst int
 }
 
 // NewRouter returns the sigild HTTP handler.
@@ -56,7 +67,7 @@ func NewRouter(cfg Config) http.Handler {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	h := &handlers{cfg: cfg}
+	h := &handlers{cfg: cfg, metrics: newMetrics(cfg.Version)}
 	// Op-log request-auth enabled => attach the in-memory replay cache so a
 	// captured, validly-signed request cannot be replayed within the timestamp
 	// window. Per-process/in-memory only (a multi-instance deploy needs a shared
@@ -70,6 +81,9 @@ func NewRouter(cfg Config) http.Handler {
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
 	mux.HandleFunc("GET /version", h.version)
+	// Operational metrics: ALWAYS available (never dev-gated). It exposes only
+	// process counters and the build version — no secrets, no vault material.
+	mux.HandleFunc("GET /metrics", h.metricsHandler)
 
 	if cfg.DevOpsEnabled {
 		// DEV-ONLY op-log: UNAUTHENTICATED. Stores opaque client-encrypted
@@ -83,8 +97,16 @@ func NewRouter(cfg Config) http.Handler {
 		} else {
 			h.log = store.NewMemVaultLog()
 		}
-		mux.Handle("POST /v1/vaults/{vaultID}/ops",
-			limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsAppend)))
+		// POST append: body-capped, then (optionally) per-vault rate-limited.
+		// The rate limiter wraps OUTSIDE limitBody so an over-rate request is
+		// rejected with 429 before any body handling; it is installed only when a
+		// positive rate is configured (0 => no wrapper, behaviour unchanged). GET
+		// routes are never write-rate-limited.
+		var appendHandler http.Handler = limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsAppend))
+		if cfg.OpLogRateLimit > 0 {
+			appendHandler = rateLimitOps(newRateLimiter(cfg.OpLogRateLimit, cfg.OpLogRateBurst), h.metrics, appendHandler)
+		}
+		mux.Handle("POST /v1/vaults/{vaultID}/ops", appendHandler)
 		mux.Handle("GET /v1/vaults/{vaultID}/ops", http.HandlerFunc(h.opsList))
 		// Tamper-evidence: walk the op-log hash chain. Same dev-gate + auth-guard
 		// as the other ops routes.
@@ -102,8 +124,10 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("GET /v1/vaults/{vaultID}/ops/verify", http.HandlerFunc(h.opsNotImplemented))
 	}
 
-	// Outermost first: recover panics, assign a request ID, then access-log.
+	// Outermost first: count every response (even a recoverer-written 500),
+	// recover panics, assign a request ID, then access-log.
 	return chain(mux,
+		countRequests(h.metrics),
 		recoverer(cfg.Logger),
 		requestID,
 		accessLog(cfg.Logger),

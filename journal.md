@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 26, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 27, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -44,13 +44,22 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   response, and `GET …/ops/verify` (`VerifyChain{ok,count,tip_hash,broken_at_seq}`); File
   format bumped v1→v2 + Postgres gains a hash column. The chain fingerprints the OPAQUE
   ciphertext (zero-knowledge intact) and is tamper-**EVIDENT not tamper-proof** — a
-  hostile server can lie, so real verification is **client-side**.
+  hostile server can lie, so real verification is **client-side**. **Scaled + observable
+  (Phase 27, all stdlib):** `GET …/ops` is **paginated** (`?limit`, default 500 / max
+  1000, `has_more` + `next`; bad limit → `400 bad_limit`; `Since` cap pushed into every
+  backend incl. a Postgres `LIMIT`); optional **per-vault stdlib token-bucket rate limit**
+  (`SIGILD_OPLOG_RATE_LIMIT` + `SIGILD_OPLOG_RATE_BURST` → `429 rate_limited` +
+  `Retry-After`, off by default, bounded/evicting map); an **always-on** stdlib
+  **`GET /metrics`** Prometheus-text endpoint (counters only — appends/verify/ratelimit/
+  auth-denied-by-reason/http-by-class/build_info; NO blob, key, or vault ID; never
+  dev-gated); and **fail-fast config validation** (bad `SIGILD_ADDR`/rate/burst/pubkey →
+  exit 1 BEFORE binding). ADR 0017.
 - `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing;
   plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
   device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
   `hybrid_open` (Phase 23; FIRST user-facing use of the hybrid encryption path).
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0016.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0017.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
@@ -71,26 +80,41 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
   SAME change; commit + push to `main` per phase.
 
-**➡️ NEXT:** Phase 26 made the dev op-log **tamper-evident** without touching its
-security posture (**ADR 0016**). Every `VaultLog` backend now maintains a per-op
-**SHA-256 hash chain** via one canonical `chainHash` (`store/oplogchain.go`):
-`hash(seq) = SHA-256("sigil-oplog-chain-v1" ‖ uint32_be(len(vaultID)) ‖ vaultID ‖
-uint64_be(seq) ‖ prev_hash[32] ‖ blob)`, genesis `prev_hash` = 32 zero bytes — so
-altering / inserting / deleting / reordering any op changes that op's hash **and every
-hash after it**. `Op` gained `Hash`; `GET …/ops` returns each op's hex `hash`; a new
-**`GET …/ops/verify`** recomputes the chain server-side → `{ok, count, tip_hash,
-broken_at_seq}` (`VerifyChain`). FileVaultLog's on-disk format bumped **v1→v2** to persist
-the hash; the Postgres `sigil_vault_ops` table gained a hash column (assigned inside the
-same `pg_advisory_xact_lock` tx as `seq`); Mem carries it in-process. Proven live: against
-a real Postgres, corrupting a blob (`broken_at_seq=2`) or the hash column
-(`broken_at_seq=3`) flips `/ops/verify` to `ok=false` while an untampered control vault
-stays `ok=true`; Mem/File/Postgres produce identical per-op hashes for identical input.
-**Honest scope:** hashing the OPAQUE ciphertext preserves zero-knowledge (no key, no
-plaintext); this is tamper-**EVIDENT not tamper-proof** — a hostile server can still lie
-about `/ops/verify`, so the REAL guarantee is **client-side** (re-derive the chain from
-the returned per-op hashes). Still a **dev op-log** (dev-gated, default 501,
-unauthenticated unless `SIGILD_OPLOG_PUBKEY`), NOT a Byzantine / append-only-enforced /
-notarized log. It still owes the real data layer — auth / enrollment, per-vault
+**➡️ NEXT:** Phase 27 made the dev op-log **bounded, throttleable, and observable**
+without touching its security posture (**ADR 0017**) — four **pure-stdlib** features, no
+new dep (`pgx` stays the only one). (1) **Pagination:** `GET …/ops` takes `?limit`
+(default 500, clamped to `[1,1000]`; non-integer → `400 bad_limit`) and returns
+`has_more` beside `next`; the limit is a signature change on `VaultLog.Since(ctx, vaultID,
+since, limit)` pushed into every backend, so Postgres applies it as a SQL `LIMIT` (not a
+fetch-all-then-slice). A client drains a vault by looping `since = next` until
+`has_more=false`. (2) **Rate limiting:** when `SIGILD_OPLOG_RATE_LIMIT` (+ optional
+`SIGILD_OPLOG_RATE_BURST`) is set, each **vault ID** gets an independent stdlib
+token-bucket (`ratelimit.go`, `sync.Mutex`+map+`time`); an append over the refill rate →
+`429 rate_limited` + `Retry-After`; GET is never throttled; the map is bounded
+(`rateLimiterMaxVaults=10000` + idle eviction). **Off by default** — unset ⇒ no wrapper,
+behaviour unchanged. (3) **`/metrics`:** an **always-on** (NOT dev-gated), unauthenticated
+`GET /metrics` renders a hand-written Prometheus-text exposition of process counters
+(`sigild_oplog_appends_total`, `_verify_total`, `_ratelimit_rejected_total`,
+`_auth_denied_total{reason}`, `sigild_http_requests_total{class}`,
+`sigild_build_info{version}`) — counters + build version only, **never** a blob / key /
+signature / nonce / vault ID (proven: a posted secret blob is absent from `/metrics`).
+Counters are **per-router** (atomic, test-isolatable, not process-global). (4) **Fail-fast
+config validation:** the startup path parses/validates `SIGILD_ADDR`, `SIGILD_OPLOG_RATE_
+LIMIT`, `SIGILD_OPLOG_RATE_BURST`, and `SIGILD_OPLOG_PUBKEY` **before binding** and exits
+non-zero with a clear message on any malformed value (proven: bad rate/burst/pubkey/addr
+each → rc 1, port never bound). All proven live incl. real Postgres pagination
+(`LIMIT` honored in SQL) and **all prior features intact** — default (no dev-ops) still
+**501** on every ops verb, tamper-evidence still fires (`broken_at_seq=2` on a live PG
+`UPDATE`), audit log still leaks no blob. ✅ **Doc drift reconciled at the commit gate:**
+api.md / architecture.md / deployment.md / ADR 0017 had named the burst env
+`SIGILD_OPLOG_BURST`, and api.md's metric table had `sigild_oplog_{verifies,auth_denials,
+rate_limited}_total`; the code is authoritative (`SIGILD_OPLOG_RATE_BURST`;
+`sigild_oplog_{verify,auth_denied,ratelimit_rejected}_total`) and the docs were corrected
+in this same commit. Still a **dev op-log**
+(dev-gated, default 501, unauthenticated unless `SIGILD_OPLOG_PUBKEY`), opaque blobs only,
+no crypto on the plaintext; these are **dev-scale operability primitives** (in-process
+limiter, process-local counters, boot-time validation), NOT production SLOs / a distributed
+quota / a durable TSDB. It still owes the real data layer — auth / enrollment, per-vault
 authorization, CRDT / merge, managed migrations, backups-with-restore, replication, and a
 signed / Merkle-root production audit log. Next: **build that layer around the adapter**
 (start with a real device-enrollment / per-vault authorization model), OR resume the
@@ -101,7 +125,7 @@ ML-DSA, so op-log auth stays classical Ed25519 (v2) until we take a PQ-sig depen
 move the check off the Go server. No account/session model uses `hybrid_seal` yet. The
 full product is still early (~6% — see the completeness note); the mountain (7 native
 clients, real backend/auth, payments, Cure53 audit, SOC2) is mostly untouched —
-Phase 26 made one adapter's history verifiable, not the store.
+Phase 27 made one adapter bounded + observable, not the store.
 
 ---
 
@@ -2764,3 +2788,146 @@ Recording the decision so the doc set stays coherent as the repo grows:
   — and a signed / Merkle-root, replay-and-drop-detecting production audit log. Tamper-
   evidence is the **only** new property; the security posture is unchanged and the **system
   is NOT "post-quantum secure".**
+
+---
+
+## 2026-07-13 — Phase 27 (op-log pagination, rate limiting, /metrics, config validation)
+
+### Context & mandate
+- Phase 26 (ADR 0016) made the dev op-log tamper-evident and durable, but three
+  **operational** gaps + one **hardening** gap remained: reads were unbounded
+  (`GET …/ops?since=N` returned EVERY op after `N` in one response — a memory/latency
+  footgun as a vault grows, with no way to page), appends had no throttle (a single busy
+  or hostile vault could hammer the durable Postgres backend), there was no way to see
+  request/append/verify/denial volume without scraping logs, and a malformed env var was
+  ignored or blew up at first request instead of at boot.
+- Mandate: close all four **WITHOUT** touching the security posture — four **pure Go
+  stdlib** features, **no new dependency** (`pgx` stays the only third-party import), none
+  changing the dev-gated / opaque / unauthenticated-by-default posture. HARD RULES held:
+  the server stores **opaque blobs** and does **no crypto on the plaintext**; the op-log
+  stays **dev-gated** (default **501**) and **unauthenticated unless `SIGILD_OPLOG_PUBKEY`**;
+  Mem/File stay stdlib; `libsigil`/`cli` untouched. Recorded as **ADR 0017**.
+
+### (1) Bounded, paginated reads — `?limit` + `has_more` ✅
+- `VaultLog.Since` gained a **limit** parameter (`Since(ctx, vaultID, since, limit)`), a
+  signature change pushed into **all three backends** so the cap is applied where the data
+  lives — Postgres uses it as a SQL `LIMIT` (not fetch-all-then-slice), Mem/File truncate.
+- `GET …/ops` takes an optional **`?limit`** (default **500**, clamped to `[1,1000]`;
+  `limit=0` → 1) and returns **`has_more`** beside `next`; `has_more = (len(ops)==limit)`.
+  A non-integer `limit` → **`400 {"error":"bad_limit"}`**. A client drains a vault by
+  looping `since = next` until `has_more=false`.
+- Proven live (in-memory, :18101, 5 ops appended):
+  > `GET /ops?limit=2` ⇒ `seq[1,2]`, `has_more=true`, `next=2`; `GET /ops?since=2&limit=2`
+  > ⇒ `seq[3,4]`, `has_more=true`, `next=4`; `GET /ops?since=4&limit=2` ⇒ `seq[5]`,
+  > `has_more=false`, `next=5` (short last page ends the walk); `GET /ops?limit=abc` ⇒
+  > `400 {"error":"bad_limit"}`. Blobs round-trip opaquely (b64 decodes to the exact
+  > posted bytes) with the per-op hash present.
+
+  Gated PG test **`TestPostgresVaultLogSinceRespectsLimit`** PASSED against live Postgres
+  (the `LIMIT` is honored in SQL); `limit=0` clamps to 1 (unit test).
+
+### (2) Per-vault stdlib token-bucket rate limit → `429` ✅
+- New `internal/api/ratelimit.go`: a **per-vault** token bucket, pure stdlib
+  (`sync.Mutex` + `map` + `time`). When **`SIGILD_OPLOG_RATE_LIMIT`** (sustained
+  appends/sec/vault) is set — with optional **`SIGILD_OPLOG_RATE_BURST`** bucket depth —
+  an append over the vault's refill rate gets **`429 rate_limited`** + a **`Retry-After`**
+  header. Per-vault isolation means one busy vault cannot starve others. The limiter is
+  **bounded** (`rateLimiterMaxVaults=10000` + idle-bucket eviction) so a flood of distinct
+  vault IDs cannot grow the map without limit. It shapes append *rate* only and **never
+  inspects the opaque blob**. GET is **never** rate-limited.
+- Proven live (rate=2 burst=2, :18102):
+  > 10 rapid `POST`s to `vaultA` ⇒ first **2 = 201**, remaining **8 = 429** each with
+  > `Retry-After: 1`; a second vault `vaultB` still got **201** (independent bucket).
+  > Rate unset/0 (:18103): 20 rapid `POST`s ⇒ **20× 201, zero 429** (no wrapper installed,
+  > behaviour unchanged). Startup emits a dev-only warn line when the limiter is active.
+
+  `TestRateLimiterConcurrent` (+ others) **-race clean** on `internal/api`; a unit test
+  confirms GET routes are never throttled.
+
+### (3) A stdlib `/metrics` Prometheus-text endpoint ✅
+- New `internal/api/metrics.go` renders a **hand-written Prometheus exposition** (no client
+  library — stdlib only). **`GET /metrics`** is **always available** (registered OUTSIDE
+  the dev gate) and unauthenticated, exposing process counters:
+  `sigild_oplog_appends_total`, `_verify_total`, `_ratelimit_rejected_total`,
+  `_auth_denied_total{reason=…}` (5 reasons), `sigild_http_requests_total{class}`, and
+  `sigild_build_info{version}`. Counters are **per-router** (atomic, test-isolatable — NOT
+  process-global), so tests observe a clean delta.
+- **NO secrets exposed — the zero-knowledge boundary holds.** `/metrics` exports only
+  aggregate counts + the build version — **never** a blob, key, signature, nonce, vault
+  content, or vault ID (no per-vault cardinality either). Proven live:
+  > `GET /metrics` ⇒ **200**, `text/plain`, `version=0.0.4`. `appends_total` 0→1 after an
+  > append, `verify_total`→1 after a verify. With `SIGILD_OPLOG_PUBKEY` set, an unsigned
+  > `POST`+`GET` (each **401**) drove `sigild_oplog_auth_denied_total{reason="missing_
+  > headers"}` to **2**. A posted blob `"SECRETSAUCE-BLOB-9911"` is **absent** from
+  > `/metrics` (raw AND base64 = 0 hits); the configured pubkey is **absent** (0 hits).
+
+### (4) Fail-fast config validation ✅
+- The startup path (`cmd/server`) extracts `parseRateLimit` / `parseRateBurst` /
+  `effectiveBurst` / `parseOpLogPubKey` / `validateListenAddr` and **validates the config
+  BEFORE binding the listener**, exiting non-zero with a clear message on any malformed
+  value instead of starting misconfigured and failing later at request time.
+- Proven live:
+  > `SIGILD_OPLOG_RATE_LIMIT=notanumber` ⇒ **exit rc 1**, port **NOT bound** (connection
+  > refused), log `invalid SIGILD_OPLOG_RATE_LIMIT: must be a number`. Same fail-fast for
+  > `RATE_LIMIT=-5` (non-negative), `RATE_BURST=xyz` (integer), `OPLOG_PUBKEY` garbage
+  > (base64/length), and `SIGILD_ADDR=8080` bare-port (invalid TCP addr) — all **exit 1,
+  > none bind**. A good config (`rate=2.5`) binds and serves `/healthz` **200**.
+
+  `TestParseRateLimit` / `TestParseRateBurst` / `TestEffectiveBurst` / `TestParseOpLogPubKey`
+  / `TestValidateListenAddr` all PASS.
+
+### Regression — all prior features intact ✅
+- **Default op-log UNCHANGED** — no `SIGILD_ENABLE_DEV_OPS`: `GET`/`POST` `…/ops` **and**
+  `GET …/ops/verify` all ⇒ **501** `{"error":"not_implemented",…}` (POST body confirmed);
+  `/metrics` still **200** (it is always-on, never dev-gated). dev-ops in-memory:
+  append/list (3 ops, each a 32-byte hash as a 44-char b64) / verify `ok=true count=3` OK.
+- **Tamper-evidence still fires** (live Postgres, :18114): 3 durable appends, verify
+  `ok=true`; `UPDATE sigil_vault_ops … WHERE seq=2` ⇒ verify `ok=false, broken_at_seq=2`.
+  **Audit still leaks no blob**: `oplog.append ×3` / `.list` / `.verify` carry
+  `blob_sha256` + `size_bytes` only — the raw blob AND its base64 are **0 hits** in the log.
+  `/readyz` **200** `{oplog:ok,postgres:ok}` with PG up; **503** `{oplog:unreachable}` when
+  PG stopped. All 14 live `PostgresVaultLog` tests PASS incl. `SinceRespectsLimit`,
+  `VerifyChainDetectsTamper`, `DurabilityAcrossReconnect`, `ChainMatchesMem`.
+- `gofmt -l sigild` empty · `go vet ./...` clean · `go mod verify` OK · `go build ./...`
+  OK · `go test ./...` offline all packages ok (PG SKIP on the `SIGILD_TEST_POSTGRES` gate)
+  · `go test -race ./internal/api ./internal/store` clean (concurrent limiter / nonce /
+  metrics, no data races).
+- **No new deps:** `go.mod` direct require is still only `github.com/jackc/pgx/v5 v5.10.0`
+  (indirect all pgx-transitive); the new files import **stdlib only**
+  (`math`/`net/http`/`strconv`/`sync`/`sync/atomic`/`time`/`io`/`strings`).
+- **libsigil / CLI untouched:** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (re-confirmed twice); `git status` shows no `libsigil/` or `cli/` changes — this phase is
+  sigild + docs only.
+
+### docs — api.md / architecture.md / deployment.md / ADR 0017 + this finalizer ✅
+- The docs track already updated `docs/api.md` (the `?limit` / `has_more` pagination, the
+  `429 rate_limited` + `Retry-After`, and the `/metrics` endpoint), `docs/architecture.md`
+  (§1 + §4), and `docs/deployment.md` (§6–§7 — the scrape target, the rate-limit knobs, and
+  fail-fast config validation), and wrote **ADR 0017**. This entry finalizes the remaining
+  living docs (this file, `CLAUDE.md`, `README.md`) and updates the RESUME ANCHOR.
+- ✅ **Drift reconciled at the commit gate (same commit):** api.md / architecture.md /
+  deployment.md / ADR 0017 had named the burst env `SIGILD_OPLOG_BURST`, but the code reads
+  **`SIGILD_OPLOG_RATE_BURST`** (`os.Getenv` in `cmd/server/main.go`); additionally api.md's
+  `/metrics` table had listed `sigild_oplog_{verifies,auth_denials,rate_limited}_total`
+  where the code emits `sigild_oplog_{verify,auth_denied,ratelimit_rejected}_total`. The
+  **code is authoritative** — I corrected all four docs (env name + the three metric names)
+  in the Phase 27 commit itself, verified by grepping the doc tokens against
+  `metrics.go` / `cmd/server/main.go`.
+
+### ➡️ What this opens, and what's still open (honest)
+- The dev op-log is now **bounded** (paginated reads, optional per-vault append throttle),
+  **observable** (a stdlib `/metrics` scrape target), and **fail-fast** (a bad env var is a
+  failed boot, not a silently-wrong running instance) — all **pure stdlib**, no new dep,
+  with the zero-knowledge boundary intact (`/metrics` is counters + version only; the rate
+  limiter keys on the vault ID but never reads the blob).
+- **Not production SLOs — no over-claim.** These are **dev-scale operability primitives**:
+  an **in-process** rate limiter (per-process, not a distributed quota), **process-local**
+  counters (reset on restart, not a durable TSDB), and **boot-time** validation — not the
+  production build's rate-limit tier, metrics pipeline, or config management. The security
+  posture is unchanged: still `SIGILD_ENABLE_DEV_OPS`-gated + **501** by default, still
+  unauthenticated unless `SIGILD_OPLOG_PUBKEY`, still opaque blobs only, still no crypto on
+  the plaintext; `/metrics` is the only always-on addition, and it is counters-only.
+- Still owed by the real data layer (unchanged): auth / enrollment, per-vault authorization,
+  CRDT / merge, managed migrations, backups-with-proven-restore, replication — and a signed
+  / Merkle-root production audit log. Scale + observability are the **only** new properties;
+  the **system is NOT "post-quantum secure".**

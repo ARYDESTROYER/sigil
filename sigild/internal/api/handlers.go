@@ -24,6 +24,19 @@ type handlers struct {
 	// only when cfg.OpLogPubKey is set (auth enabled); it is nil otherwise, and
 	// authorizeOps returns before touching it when auth is off.
 	nonces *nonceCache
+	// metrics holds this router's observability counters. NewRouter always
+	// constructs it (non-nil), so every handler can increment without a guard.
+	metrics *Metrics
+}
+
+// denyOps records an op-log auth denial (audit line + metric) and writes the
+// typed 401. It is the single choke point shared by the three ops handlers so
+// the audit event, the auth-denied metric (by reason), and the response stay in
+// lockstep.
+func (h *handlers) denyOps(w http.ResponseWriter, r *http.Request, vaultID string, reason authReason) {
+	h.auditAuthDenied(r, vaultID, reason)
+	h.metrics.incAuthDenied(reason)
+	writeOpsAuthError(w, reason)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -155,8 +168,7 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 	// cfg.OpLogPubKey is set. Must run AFTER the body is read (it is part of the
 	// signed message) and BEFORE we append.
 	if reason := h.authorizeOps(r, blob); reason != "" {
-		h.auditAuthDenied(r, vaultID, reason)
-		writeOpsAuthError(w, reason)
+		h.denyOps(w, r, vaultID, reason)
 		return
 	}
 	if len(blob) == 0 {
@@ -170,15 +182,28 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.auditAppend(r, vaultID, op.Seq, blob)
+	h.metrics.incAppend()
 	writeJSON(w, http.StatusCreated, struct {
 		VaultID string `json:"vaultID"`
 		Seq     uint64 `json:"seq"`
 	}{VaultID: vaultID, Seq: op.Seq})
 }
 
+// Op-log listing page sizing. A GET never returns an unbounded response: the
+// handler always requests at most maxOpsPageLimit ops, defaulting to
+// defaultOpsPageLimit when the client omits ?limit=, and clamping any explicit
+// value into [1, maxOpsPageLimit]. A client pages forward with since=next until
+// has_more is false.
+const (
+	defaultOpsPageLimit = 500
+	maxOpsPageLimit     = 1000
+)
+
 // opsList returns a vault's operations with Seq greater than ?since= (default
-// 0), in ascending order. Next is the max returned Seq, or the `since` value
-// when nothing matched, so a caller can poll forward.
+// 0), in ascending order, capped at ?limit= (default defaultOpsPageLimit, clamped
+// to [1, maxOpsPageLimit]). Next is the max returned Seq, or the `since` value
+// when nothing matched, so a caller can poll forward. HasMore is true when the
+// page was filled exactly to the limit — i.e. more ops may remain.
 //
 // DEV-ONLY: wired ONLY when cfg.DevOpsEnabled is set. UNAUTHENTICATED,
 // IN-MEMORY, NON-DURABLE, performs NO cryptography. Each Op.Blob is the opaque
@@ -196,8 +221,7 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 	// Returns an empty reason (authorized) unless cfg.OpLogPubKey is set. Must run
 	// BEFORE we list.
 	if reason := h.authorizeOps(r, nil); reason != "" {
-		h.auditAuthDenied(r, vaultID, reason)
-		writeOpsAuthError(w, reason)
+		h.denyOps(w, r, vaultID, reason)
 		return
 	}
 
@@ -212,7 +236,28 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 		since = parsed
 	}
 
-	ops, err := h.log.Since(r.Context(), vaultID, since)
+	// limit: absent (or empty) => default; explicitly non-numeric => 400; a valid
+	// number is clamped into [1, maxOpsPageLimit] so a client can neither request
+	// an unbounded response nor a nonsensical page size.
+	limit := defaultOpsPageLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_limit",
+				"limit must be an integer")
+			return
+		}
+		switch {
+		case parsed < 1:
+			limit = 1
+		case parsed > maxOpsPageLimit:
+			limit = maxOpsPageLimit
+		default:
+			limit = parsed
+		}
+	}
+
+	ops, err := h.log.Since(r.Context(), vaultID, since, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "")
 		return
@@ -231,11 +276,15 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 			Hash: base64.StdEncoding.EncodeToString(op.Hash[:]),
 		}
 	}
+	// A page filled exactly to the limit MAY have more behind it; the client
+	// should fetch again with since=next.
+	hasMore := len(ops) == limit
 	writeJSON(w, http.StatusOK, struct {
 		VaultID string   `json:"vaultID"`
 		Ops     []opJSON `json:"ops"`
 		Next    uint64   `json:"next"`
-	}{VaultID: vaultID, Ops: wire, Next: next})
+		HasMore bool     `json:"has_more"`
+	}{VaultID: vaultID, Ops: wire, Next: next, HasMore: hasMore})
 }
 
 // opJSON is the wire shape of one op. Blob ([]byte) marshals to std-base64
@@ -267,8 +316,7 @@ func (h *handlers) opsVerify(w http.ResponseWriter, r *http.Request) {
 	// ""). GET carries no body. Returns an empty reason (authorized) unless
 	// cfg.OpLogPubKey is set.
 	if reason := h.authorizeOps(r, nil); reason != "" {
-		h.auditAuthDenied(r, vaultID, reason)
-		writeOpsAuthError(w, reason)
+		h.denyOps(w, r, vaultID, reason)
 		return
 	}
 
@@ -278,6 +326,7 @@ func (h *handlers) opsVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.auditVerify(r, vaultID, res.OK, res.Count)
+	h.metrics.incVerify()
 
 	writeJSON(w, http.StatusOK, struct {
 		VaultID string `json:"vaultID"`

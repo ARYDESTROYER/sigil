@@ -306,7 +306,7 @@ func TestFileVaultLogRejectsLegacyFile(t *testing.T) {
 		t.Fatalf("write legacy file: %v", err)
 	}
 
-	if _, err := l.Since(ctx, vault, 0); err == nil {
+	if _, err := l.Since(ctx, vault, 0, 0); err == nil {
 		t.Fatal("Since over a headerless (v1) file returned nil error, want a clear format error")
 	}
 	if _, err := l.Append(ctx, vault, []byte("x")); err == nil {
@@ -332,7 +332,7 @@ func TestFileVaultLogEmptyFileTolerated(t *testing.T) {
 		t.Fatalf("create empty file: %v", err)
 	}
 
-	ops, err := l.Since(ctx, vault, 0)
+	ops, err := l.Since(ctx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since over empty file: %v", err)
 	}

@@ -183,20 +183,28 @@ func (l *PostgresVaultLog) Append(ctx context.Context, vaultID string, blob []by
 
 // Since returns the vault's ops with Seq strictly greater than `since`, in
 // ascending Seq order, each carrying a fresh COPY of its blob so callers cannot
-// mutate stored bytes. An unknown vault (no matching rows) yields an empty
-// slice and nil error.
-func (l *PostgresVaultLog) Since(ctx context.Context, vaultID string, since uint64) ([]Op, error) {
+// mutate stored bytes. A limit > 0 pushes a SQL `LIMIT` into the query so the
+// database returns at most that many (earliest) rows; a limit <= 0 is unbounded
+// (used by VerifyChain, which needs the whole chain). An unknown vault (no
+// matching rows) yields an empty slice and nil error.
+func (l *PostgresVaultLog) Since(ctx context.Context, vaultID string, since uint64, limit int) ([]Op, error) {
 	// Derive from the CALLER's context (see Append) so a cancelled request
 	// cancels the query; opTimeout caps a wedged read.
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
-	rows, err := l.pool.Query(ctx,
-		`SELECT seq, blob, hash FROM sigil_vault_ops
+	const baseQuery = `SELECT seq, blob, hash FROM sigil_vault_ops
 		 WHERE vault_id = $1 AND seq > $2
-		 ORDER BY seq ASC`,
-		vaultID, int64(since),
+		 ORDER BY seq ASC`
+	var (
+		rows pgx.Rows
+		err  error
 	)
+	if limit > 0 {
+		rows, err = l.pool.Query(ctx, baseQuery+` LIMIT $3`, vaultID, int64(since), limit)
+	} else {
+		rows, err = l.pool.Query(ctx, baseQuery, vaultID, int64(since))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query ops: %w", err)
 	}

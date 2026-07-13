@@ -97,7 +97,9 @@ func verifyChain(vaultID string, ops []Op) VerifyResult {
 // (honouring ctx) and walk it. Every backend delegates here so the walk is
 // identical everywhere; only how the ops are fetched differs (all use Since(…,0)).
 func verifyChainVia(ctx context.Context, l VaultLog, vaultID string) (VerifyResult, error) {
-	ops, err := l.Since(ctx, vaultID, 0)
+	// limit 0 => UNBOUNDED: VerifyChain must walk the ENTIRE chain from seq 1, so
+	// it deliberately opts out of the pagination cap the HTTP handler applies.
+	ops, err := l.Since(ctx, vaultID, 0, 0)
 	if err != nil {
 		return VerifyResult{}, err
 	}

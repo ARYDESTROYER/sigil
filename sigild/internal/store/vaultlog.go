@@ -45,7 +45,14 @@ type VaultLog interface {
 	// Since returns the vault's ops with Seq strictly greater than `since`, in
 	// ascending Seq order. An unknown vault yields an empty slice and nil error.
 	// Each returned Op carries its stored chain Hash.
-	Since(ctx context.Context, vaultID string, since uint64) ([]Op, error)
+	//
+	// limit bounds the number of ops returned: a limit > 0 caps the result at
+	// that many ops (the earliest matching by Seq, so a caller pages forward with
+	// since = the last returned Seq); a limit <= 0 means UNBOUNDED — return every
+	// matching op. The unbounded form is for internal callers that need the whole
+	// chain (e.g. VerifyChain); the HTTP handler always passes a positive,
+	// clamped limit so a client can never request an unbounded response.
+	Since(ctx context.Context, vaultID string, since uint64, limit int) ([]Op, error)
 	// VerifyChain walks the vault's op hash chain (see oplogchain.go) and reports
 	// whether it is intact. It is tamper-EVIDENT verification: it DETECTS an
 	// insertion/deletion/modification of a stored op, but does not prevent one,
@@ -120,9 +127,10 @@ func (l *MemVaultLog) Append(ctx context.Context, vaultID string, blob []byte) (
 
 // Since returns ops for vaultID with Seq > since, ascending, each carrying a
 // defensive COPY of its blob so callers cannot mutate stored bytes through the
-// returned slices. An unknown vault yields an empty slice and nil error. ctx is
-// honoured as a cheap entry check (see Append).
-func (l *MemVaultLog) Since(ctx context.Context, vaultID string, since uint64) ([]Op, error) {
+// returned slices. A limit > 0 caps the result at that many (earliest) ops; a
+// limit <= 0 is unbounded. An unknown vault yields an empty slice and nil error.
+// ctx is honoured as a cheap entry check (see Append).
+func (l *MemVaultLog) Since(ctx context.Context, vaultID string, since uint64, limit int) ([]Op, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -131,10 +139,19 @@ func (l *MemVaultLog) Since(ctx context.Context, vaultID string, since uint64) (
 	defer l.mu.Unlock()
 
 	ops := l.logs[vaultID]
-	out := make([]Op, 0, len(ops))
+	// Ops are stored ascending with Seq == index+1, so at most len(ops) match;
+	// a positive limit caps the allocation tighter.
+	capHint := len(ops)
+	if limit > 0 && limit < capHint {
+		capHint = limit
+	}
+	out := make([]Op, 0, capHint)
 	for _, op := range ops {
 		if op.Seq <= since {
 			continue
+		}
+		if limit > 0 && len(out) >= limit {
+			break
 		}
 		cp := make([]byte, len(op.Blob))
 		copy(cp, op.Blob)

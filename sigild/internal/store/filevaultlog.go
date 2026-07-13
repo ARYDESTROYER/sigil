@@ -286,11 +286,12 @@ func (l *FileVaultLog) Append(ctx context.Context, vaultID string, blob []byte) 
 }
 
 // Since returns the vault's ops with Seq strictly greater than `since`, in
-// ascending Seq order, each carrying a defensive COPY of its blob. A missing
-// file (unknown vault) yields an empty slice and nil error. A truncated trailing
-// record is skipped gracefully (no error, no panic). ctx is honoured as a cheap
-// entry check (see Append).
-func (l *FileVaultLog) Since(ctx context.Context, vaultID string, since uint64) ([]Op, error) {
+// ascending Seq order, each carrying a defensive COPY of its blob. A limit > 0
+// caps the result at that many (earliest) ops and stops reading once the cap is
+// hit; a limit <= 0 is unbounded. A missing file (unknown vault) yields an empty
+// slice and nil error. A truncated trailing record is skipped gracefully (no
+// error, no panic). ctx is honoured as a cheap entry check (see Append).
+func (l *FileVaultLog) Since(ctx context.Context, vaultID string, since uint64, limit int) ([]Op, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -332,6 +333,9 @@ func (l *FileVaultLog) Since(ctx context.Context, vaultID string, since uint64) 
 		// readRecord already allocated a fresh slice per record, so it is an
 		// independent defensive copy; hand it straight to the caller.
 		out = append(out, Op{Seq: seq, Blob: blob, Hash: hash})
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 	}
 	return out, nil
 }

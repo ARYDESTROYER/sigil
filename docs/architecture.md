@@ -216,6 +216,22 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   `/ops/verify`, so the real check is **client-side** re-derivation from the
   returned per-op hashes; it is not a signed / Merkle / Byzantine-proof log (see
   [`decisions/0016-tamper-evident-oplog-hash-chain.md`](decisions/0016-tamper-evident-oplog-hash-chain.md)).
+  **Scale & observability (all Go stdlib):** op-log reads are now **bounded and
+  paginated** — `GET …/ops` takes a `?limit` (default 500, max 1000; invalid →
+  `400 bad_limit`) and returns `has_more`, so a client drains a vault by paging
+  with `since=next` instead of pulling an unbounded slice; `POST …/ops` can be
+  **rate-limited per vault** by a **stdlib token-bucket** (`SIGILD_OPLOG_RATE_LIMIT`
+  / `SIGILD_OPLOG_RATE_BURST` → `429 rate_limited` + `Retry-After`, off by default,
+  one bucket per vault ID so a busy vault can't starve others); an **always-on**
+  `GET /metrics` renders **Prometheus-text counters** (HTTP requests, op-log
+  appends, verifies, auth denials by reason, rate-limit rejections, and
+  `build_info`) exposing **only aggregate counts and the build version — no
+  secrets, no blob, no vault ID**; and `sigild` now **validates its configuration
+  fail-fast at startup**, refusing to boot on a malformed env var rather than
+  starting misconfigured. These four are **pure stdlib** (`pgx` is still the only
+  third-party dependency) and change **none** of the posture above — still
+  dev-gated / opaque / unauthenticated-by-default (see
+  [`decisions/0017-oplog-scale-and-observability.md`](decisions/0017-oplog-scale-and-observability.md)).
   `sigild` performs **no cryptography** and never sees plaintext or keys. Full
   contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
@@ -255,9 +271,11 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    ┌───────────────────────────────────────────────────────────────────────┐
    │  SERVER SIDE — sigild (Go)        NO CRYPTO · OPAQUE BLOBS ONLY         │
    │   /healthz · /readyz · /version   (probes; no secrets)                 │
+   │   /metrics  → Prometheus-text counters (always on; counts only)        │
    │   /v1/vaults/{id}/ops  →  501 by default                               │
    │     └─ SIGILD_ENABLE_DEV_OPS: op-log (mem/file/pg) of opaque ciphertext│
-   │        (append seq / read since; SHA-256 hash chain, tamper-evident)    │
+   │        (append seq / read since, paginated ?limit+has_more;            │
+   │         SHA-256 hash chain, tamper-evident; opt per-vault rate limit)  │
    │        unless SIGILD_OPLOG_PUBKEY sets a single Ed25519 dev device key  │
    └───────────────────────────────────────────────────────────────────────┘
 
@@ -409,8 +427,11 @@ between them are load-bearing:
 
 `sigild`'s **core server and its in-memory / file-backed dev backends are Go
 stdlib-only**, which keeps that surface reproducible and near-zero-dependency.
-The optional **Postgres** op-log backend (`SIGILD_OPLOG_POSTGRES`) is the one
-exception: it links the `pgx` driver — `sigild`'s **first third-party
+The **scale & observability** features — bounded/paginated reads, the per-vault
+token-bucket rate limiter, the Prometheus-text `/metrics` renderer, and fail-fast
+config validation — are **also pure stdlib** ([ADR 0017](decisions/0017-oplog-scale-and-observability.md)),
+so they add **no new dependency**. The optional **Postgres** op-log backend
+(`SIGILD_OPLOG_POSTGRES`) is the one exception: it links the `pgx` driver — `sigild`'s **first third-party
 dependency**, so the module now carries a `go.sum` — and is compiled in but
 dormant unless a DSN is configured. This is a deliberate, documented relaxation
 of the stdlib-only rule (partially superseding

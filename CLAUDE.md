@@ -163,8 +163,29 @@ public, make no security claims, until the audit completes and trademark clears.
   intact**) and is tamper-**EVIDENT, NOT tamper-proof**: a hostile server can still lie
   about `/ops/verify`, so the real guarantee is **client-side** (re-derive the chain from
   the returned per-op hashes); this stays a **dev op-log**, not a Byzantine /
-  append-only-enforced / notarized log. Endpoint reference in
-  [`docs/api.md`](docs/api.md).
+  append-only-enforced / notarized log. **Scaled + observable (Phase 27, ADR 0017 — four
+  pure-stdlib features, NO new dep):** (1) **paginated reads** — `GET …/ops` takes `?limit`
+  (default **500**, clamped `[1,1000]`; non-integer → **`400 bad_limit`**) and returns
+  **`has_more`** beside `next`; the cap is a `VaultLog.Since(ctx,vaultID,since,limit)`
+  signature change pushed into every backend (Postgres applies it as a SQL `LIMIT`), so a
+  client drains a vault by looping `since=next` until `has_more=false`; (2) **per-vault
+  rate limiting** — when **`SIGILD_OPLOG_RATE_LIMIT`** (sustained appends/sec/vault; +
+  optional **`SIGILD_OPLOG_RATE_BURST`** bucket depth) is set, each vault ID gets an
+  independent stdlib token-bucket (`internal/api/ratelimit.go`, `sync.Mutex`+map+`time`,
+  bounded via `rateLimiterMaxVaults`+idle eviction) and an over-rate append → **`429
+  rate_limited`** + `Retry-After`; **off by default** (unset ⇒ no throttle), GET is never
+  limited, and it **never inspects the blob**; (3) **`GET /metrics`** — an **always-on**
+  (NOT dev-gated), unauthenticated Prometheus-text endpoint (`internal/api/metrics.go`,
+  hand-written, no client lib) exposing **per-router** (atomic, test-isolatable) counters
+  only — `sigild_oplog_appends_total`/`_verify_total`/`_ratelimit_rejected_total`/
+  `_auth_denied_total{reason}`, `sigild_http_requests_total{class}`,
+  `sigild_build_info{version}` — **never** a blob / key / signature / nonce / vault ID;
+  (4) **fail-fast config validation** — `cmd/server` parses+validates `SIGILD_ADDR` /
+  `SIGILD_OPLOG_RATE_LIMIT` / `SIGILD_OPLOG_RATE_BURST` / `SIGILD_OPLOG_PUBKEY` **before
+  binding** and exits non-zero on any malformed value. These are **dev-scale operability
+  primitives** (in-process limiter, process-local counters, boot-time validation), NOT
+  production SLOs; posture unchanged (still dev-gated/`501` by default, opaque, no crypto
+  on the blob). Endpoint reference in [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —

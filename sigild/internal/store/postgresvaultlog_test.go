@@ -110,7 +110,7 @@ func TestPostgresVaultLogSinceZeroReturnsAll(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(ctx, vault, 0)
+	ops, err := l.Since(ctx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestPostgresVaultLogSinceFilters(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(ctx, vault, 3)
+	ops, err := l.Since(ctx, vault, 3, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -147,12 +147,55 @@ func TestPostgresVaultLogSinceFilters(t *testing.T) {
 
 func TestPostgresVaultLogSinceUnknownVault(t *testing.T) {
 	l, prefix := newTestLog(t)
-	ops, err := l.Since(context.Background(), prefix+"nope", 0)
+	ops, err := l.Since(context.Background(), prefix+"nope", 0, 0)
 	if err != nil {
 		t.Fatalf("Since unknown vault err = %v, want nil", err)
 	}
 	if len(ops) != 0 {
 		t.Fatalf("Since unknown vault len = %d, want 0", len(ops))
+	}
+}
+
+// TestPostgresVaultLogSinceRespectsLimit verifies the SQL LIMIT push-down: a
+// positive limit caps the rows returned by the database (earliest by seq), so a
+// caller pages forward; limit <= 0 is unbounded.
+func TestPostgresVaultLogSinceRespectsLimit(t *testing.T) {
+	ctx := context.Background()
+	l, prefix := newTestLog(t)
+	vault := prefix + "v"
+	for i := 0; i < 5; i++ {
+		if _, err := l.Append(ctx, vault, []byte{byte(i)}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	page, err := l.Since(ctx, vault, 0, 2)
+	if err != nil {
+		t.Fatalf("Since page1: %v", err)
+	}
+	if len(page) != 2 || page[0].Seq != 1 || page[1].Seq != 2 {
+		t.Fatalf("page1 = %+v, want seq 1,2", page)
+	}
+	page, err = l.Since(ctx, vault, 2, 2)
+	if err != nil {
+		t.Fatalf("Since page2: %v", err)
+	}
+	if len(page) != 2 || page[0].Seq != 3 || page[1].Seq != 4 {
+		t.Fatalf("page2 = %+v, want seq 3,4", page)
+	}
+	page, err = l.Since(ctx, vault, 4, 2)
+	if err != nil {
+		t.Fatalf("Since page3: %v", err)
+	}
+	if len(page) != 1 || page[0].Seq != 5 {
+		t.Fatalf("page3 = %+v, want only seq 5", page)
+	}
+	all, err := l.Since(ctx, vault, 0, 0)
+	if err != nil {
+		t.Fatalf("Since unbounded: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("Since(0, 0) len = %d, want 5 (unbounded)", len(all))
 	}
 }
 
@@ -169,7 +212,7 @@ func TestPostgresVaultLogDefensiveCopy(t *testing.T) {
 	}
 	in[0] = 'X' // mutate caller's slice after Append
 
-	ops, err := l.Since(ctx, vault, 0)
+	ops, err := l.Since(ctx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -179,7 +222,7 @@ func TestPostgresVaultLogDefensiveCopy(t *testing.T) {
 
 	ops[0].Blob[0] = 'Y' // mutate returned slice
 
-	again, err := l.Since(ctx, vault, 0)
+	again, err := l.Since(ctx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since again: %v", err)
 	}
@@ -199,7 +242,7 @@ func TestPostgresVaultLogOpaqueBinaryIntegrity(t *testing.T) {
 	if _, err := l.Append(ctx, vault, blob); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	ops, err := l.Since(ctx, vault, 0)
+	ops, err := l.Since(ctx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -238,7 +281,7 @@ func TestPostgresVaultLogConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	ops, err := l.Since(ctx, vault, 0)
+	ops, err := l.Since(ctx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -302,7 +345,7 @@ func TestPostgresVaultLogDurabilityAcrossReconnect(t *testing.T) {
 		l2.Close()
 	})
 
-	ops, err := l2.Since(opCtx, vault, 0)
+	ops, err := l2.Since(opCtx, vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since after reconnect: %v", err)
 	}
@@ -446,13 +489,13 @@ func TestPostgresVaultLogContextCancelled(t *testing.T) {
 	if _, err := l.Append(ctx, vault, []byte("op")); err == nil {
 		t.Fatal("Append with cancelled ctx returned nil error, want cancellation error")
 	}
-	if _, err := l.Since(ctx, vault, 0); err == nil {
+	if _, err := l.Since(ctx, vault, 0, 0); err == nil {
 		t.Fatal("Since with cancelled ctx returned nil error, want cancellation error")
 	}
 
 	// Sanity: with a live context the same log still works (nothing was persisted
 	// by the cancelled calls).
-	ops, err := l.Since(context.Background(), vault, 0)
+	ops, err := l.Since(context.Background(), vault, 0, 0)
 	if err != nil {
 		t.Fatalf("Since after cancelled calls: %v", err)
 	}

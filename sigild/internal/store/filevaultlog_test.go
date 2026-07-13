@@ -62,7 +62,7 @@ func TestFileVaultLogSinceZeroReturnsAll(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(ctx, "v1", 0)
+	ops, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestFileVaultLogSinceFilters(t *testing.T) {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(ctx, "v1", 3)
+	ops, err := l.Since(ctx, "v1", 3, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -99,12 +99,57 @@ func TestFileVaultLogSinceFilters(t *testing.T) {
 	}
 }
 
+// TestFileVaultLogSinceRespectsLimit verifies the pagination cap on the durable
+// file backend: a positive limit stops reading after that many (earliest) ops;
+// limit <= 0 is unbounded.
+func TestFileVaultLogSinceRespectsLimit(t *testing.T) {
+	ctx := t.Context()
+	l, err := NewFileVaultLog(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileVaultLog: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := l.Append(ctx, "v1", []byte{byte(i)}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	page, err := l.Since(ctx, "v1", 0, 2)
+	if err != nil {
+		t.Fatalf("Since page1: %v", err)
+	}
+	if len(page) != 2 || page[0].Seq != 1 || page[1].Seq != 2 {
+		t.Fatalf("page1 = %+v, want seq 1,2", page)
+	}
+	page, err = l.Since(ctx, "v1", 2, 2)
+	if err != nil {
+		t.Fatalf("Since page2: %v", err)
+	}
+	if len(page) != 2 || page[0].Seq != 3 || page[1].Seq != 4 {
+		t.Fatalf("page2 = %+v, want seq 3,4", page)
+	}
+	page, err = l.Since(ctx, "v1", 4, 2)
+	if err != nil {
+		t.Fatalf("Since page3: %v", err)
+	}
+	if len(page) != 1 || page[0].Seq != 5 {
+		t.Fatalf("page3 = %+v, want only seq 5", page)
+	}
+	all, err := l.Since(ctx, "v1", 0, 0)
+	if err != nil {
+		t.Fatalf("Since unbounded: %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("Since(0, 0) len = %d, want 5 (unbounded)", len(all))
+	}
+}
+
 func TestFileVaultLogSinceUnknownVault(t *testing.T) {
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
-	ops, err := l.Since(t.Context(), "nope", 0)
+	ops, err := l.Since(t.Context(), "nope", 0, 0)
 	if err != nil {
 		t.Fatalf("Since unknown vault err = %v, want nil", err)
 	}
@@ -142,7 +187,7 @@ func TestFileVaultLogDurabilityAcrossRestart(t *testing.T) {
 		t.Fatalf("NewFileVaultLog #2 (restart): %v", err)
 	}
 
-	ops, err := l2.Since(ctx, "v", 0)
+	ops, err := l2.Since(ctx, "v", 0, 0)
 	if err != nil {
 		t.Fatalf("Since after restart: %v", err)
 	}
@@ -219,7 +264,7 @@ func TestFileVaultLogPathTraversalSafety(t *testing.T) {
 
 	// (b) Each hostile id's data is retrievable under the SAME id string.
 	for i, id := range hostile {
-		ops, err := l.Since(ctx, id, 0)
+		ops, err := l.Since(ctx, id, 0, 0)
 		if err != nil {
 			t.Fatalf("Since(%q): %v", id, err)
 		}
@@ -252,7 +297,7 @@ func TestFileVaultLogOpaqueBinaryIntegrity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileVaultLog #2: %v", err)
 	}
-	ops, err := l2.Since(ctx, "bin", 0)
+	ops, err := l2.Since(ctx, "bin", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -279,12 +324,12 @@ func TestFileVaultLogContextCancelled(t *testing.T) {
 	if _, err := l.Append(ctx, "v1", []byte("op")); err != context.Canceled {
 		t.Fatalf("Append with cancelled ctx err = %v, want context.Canceled", err)
 	}
-	if _, err := l.Since(ctx, "v1", 0); err != context.Canceled {
+	if _, err := l.Since(ctx, "v1", 0, 0); err != context.Canceled {
 		t.Fatalf("Since with cancelled ctx err = %v, want context.Canceled", err)
 	}
 	// The cancelled Append must not have created/written a file: a fresh live
 	// read is empty.
-	ops, err := l.Since(context.Background(), "v1", 0)
+	ops, err := l.Since(context.Background(), "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since after cancelled Append: %v", err)
 	}
@@ -320,7 +365,7 @@ func TestFileVaultLogConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	ops, err := l.Since(ctx, "v1", 0)
+	ops, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -356,7 +401,7 @@ func TestFileVaultLogDefensiveCopy(t *testing.T) {
 	}
 	in[0] = 'X' // mutate caller's slice after Append
 
-	ops, err := l.Since(ctx, "v1", 0)
+	ops, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -366,7 +411,7 @@ func TestFileVaultLogDefensiveCopy(t *testing.T) {
 
 	ops[0].Blob[0] = 'Y' // mutate returned slice
 
-	again, err := l.Since(ctx, "v1", 0)
+	again, err := l.Since(ctx, "v1", 0, 0)
 	if err != nil {
 		t.Fatalf("Since again: %v", err)
 	}
@@ -417,7 +462,7 @@ func TestFileVaultLogTruncatedTrailingRecordIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileVaultLog #2: %v", err)
 	}
-	ops, err := l2.Since(ctx, "v", 0)
+	ops, err := l2.Since(ctx, "v", 0, 0)
 	if err != nil {
 		t.Fatalf("Since over torn file: %v", err)
 	}

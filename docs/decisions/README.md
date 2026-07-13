@@ -6,6 +6,9 @@
 the file-backed and opt-in durable-Postgres dev op-log backends,
 > its request-context / readiness / structured-audit-log hardening,
 > its per-op tamper-evident hash chain,
+> its stdlib op-log scale & observability layer (bounded/paginated reads,
+> per-vault rate limiting, a Prometheus-text `/metrics` endpoint, and fail-fast
+> config validation),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -54,3 +57,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0014](0014-postgres-durable-oplog-backend.md) | Postgres durable op-log backend (`SIGILD_OPLOG_POSTGRES`) | Accepted (2026-07) |
 | [0015](0015-oplog-auditability-and-request-context.md) | Op-log auditability and request-context propagation | Accepted (2026-07) |
 | [0016](0016-tamper-evident-oplog-hash-chain.md) | Tamper-evident op-log via a per-op hash chain | Accepted (2026-07) |
+| [0017](0017-oplog-scale-and-observability.md) | Op-log scale & observability — pagination, per-vault rate limiting, `/metrics`, fail-fast config | Accepted (2026-07) |

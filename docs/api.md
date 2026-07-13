@@ -66,6 +66,39 @@ The `version` value is injected at build time from the git short SHA via
 
 ---
 
+## Metrics
+
+### `GET /metrics` — Prometheus-text counters
+
+**Always available** (independent of `SIGILD_ENABLE_DEV_OPS`), unauthenticated,
+and **stdlib-only** — a hand-rendered
+[Prometheus text exposition](https://prometheus.io/docs/instrumenting/exposition_formats/)
+(`Content-Type: text/plain; version=0.0.4`) of process counters, so an operator
+can scrape `sigild` without adding a metrics client library. It exposes **only
+monotonic counters and the build version — never any blob, key, signature,
+nonce, vault content, or other secret** (a metrics endpoint that leaked payload
+would break the zero-knowledge property; this one cannot, because it holds
+nothing but counts).
+
+The exported series (names follow Prometheus conventions; the endpoint itself is
+the source of truth for the exact strings):
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `sigild_http_requests_total` | counter | total HTTP requests served |
+| `sigild_oplog_appends_total` | counter | op-log appends accepted (`POST …/ops`) |
+| `sigild_oplog_verify_total` | counter | chain verifies run (`GET …/ops/verify`) |
+| `sigild_oplog_auth_denied_total{reason="…"}` | counter | op-log auth denials, **labelled by reason** (missing / invalid / stale / replayed) |
+| `sigild_oplog_ratelimit_rejected_total` | counter | appends rejected with `429` by the per-vault rate limiter |
+| `sigild_build_info{version="…"}` | gauge (`1`) | build identity; the version label carries the injected build SHA |
+
+Counters are **process-lifetime and unlabelled by vault** (no per-vault
+cardinality blow-up, and no vault ID — itself client-chosen and potentially
+sensitive — is exported). The endpoint performs **no cryptography** and reads no
+stored bytes; it only reports aggregate counts.
+
+---
+
 ## Vault operation log (DEV-ONLY)
 
 > **READ THIS FIRST. This endpoint is a development scaffold, not a product.**
@@ -140,15 +173,32 @@ Append one opaque, client-encrypted blob to the named vault's log.
   | Status | `error` code | When |
   |--------|--------------|------|
   | `413 Request Entity Too Large` | `payload_too_large` | body exceeds the 64 KiB per-operation cap |
+  | `429 Too Many Requests` | `rate_limited` | the per-vault append rate limit is exceeded (only when `SIGILD_OPLOG_RATE_LIMIT` is set); the response carries a `Retry-After` header (seconds) |
   | `501 Not Implemented` | `not_implemented` | `SIGILD_ENABLE_DEV_OPS` is unset (the default) |
 
-### `GET /v1/vaults/{vaultID}/ops?since=N` — read operations
+  **Optional per-vault rate limit.** By default appends are unthrottled. When
+  `sigild` is started with **`SIGILD_OPLOG_RATE_LIMIT`** set (a positive
+  sustained rate in appends/second per vault, optionally with
+  **`SIGILD_OPLOG_RATE_BURST`** for the bucket depth), each vault gets an independent
+  **token-bucket** limiter: appends beyond the vault's refill rate get `429
+  rate_limited` with a `Retry-After` header telling the client when a token will
+  be available. The limit is **per vault ID** (a busy vault cannot starve
+  others), stdlib-only, and **off unless configured** — with the variable unset,
+  behaviour is exactly as before. It shapes append *rate* only; it never inspects
+  or interprets the opaque blob.
+
+### `GET /v1/vaults/{vaultID}/ops?since=N&limit=M` — read operations
 
 Return the vault's operations with sequence number **greater than `N`** (default
-`since=0` returns from the beginning), in ascending `seq` order.
+`since=0` returns from the beginning), in ascending `seq` order, **bounded** to at
+most `limit` ops per response so a large vault is read in pages rather than one
+unbounded slice.
 
-- **Query:** `since` (optional, integer, default `0`) — return ops with
-  `seq > since`.
+- **Query:**
+  - `since` (optional, integer, default `0`) — return ops with `seq > since`.
+  - `limit` (optional, integer, default **`500`**, max **`1000`**) — cap the
+    number of ops returned by this call. An out-of-range or non-integer value
+    (`≤ 0`, `> 1000`, or non-numeric) is rejected with `400 bad_limit`.
 - **Success — `200 OK`:**
 
   ```json
@@ -157,7 +207,8 @@ Return the vault's operations with sequence number **greater than `N`** (default
     "ops": [
       { "seq": 1, "blob": "<base64 of the opaque stored bytes>", "hash": "<hex SHA-256 chain hash>" }
     ],
-    "next": <highest seq returned, to pass as the next `since`>
+    "next": <highest seq returned, to pass as the next `since`>,
+    "has_more": <true if more ops exist beyond this page, else false>
   }
   ```
 
@@ -172,8 +223,19 @@ Return the vault's operations with sequence number **greater than `N`** (default
   **ciphertext only** (the server does no crypto on the plaintext), and it lets a
   client re-derive and verify the chain **itself**, without trusting the server.
 
-- **Errors:** `501 Not Implemented` (`not_implemented`) when
-  `SIGILD_ENABLE_DEV_OPS` is unset.
+  **Pagination.** `has_more` is `true` when the vault holds ops with `seq` beyond
+  the page just returned. A client drains the log by looping: request, process the
+  page, then re-request with `since = next` until `has_more` is `false`. `next` is
+  the highest `seq` in the page (unchanged from `since` when the page is empty), so
+  the loop always makes progress and terminates. This bounds both server memory
+  and response size regardless of vault length.
+
+- **Errors** (typed `{error, detail}` envelope):
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `bad_limit` | `limit` is non-integer, `≤ 0`, or `> 1000` |
+  | `501 Not Implemented` | `not_implemented` | `SIGILD_ENABLE_DEV_OPS` is unset |
 
 ### Op-log hash chain (tamper-evidence)
 

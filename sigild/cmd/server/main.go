@@ -11,10 +11,14 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,16 +31,46 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
+	// Fail-fast config validation: reject malformed env BEFORE binding the
+	// listener, so a misconfiguration is a clear startup error rather than a
+	// surprise at request time. Each parser is extracted (below) so it is
+	// unit-testable without invoking os.Exit.
 	addr := getenv("SIGILD_ADDR", ":8080")
+	if err := validateListenAddr(addr); err != nil {
+		logger.Error("invalid SIGILD_ADDR", "value", addr, "err", err)
+		os.Exit(1)
+	}
+	rate, err := parseRateLimit(os.Getenv("SIGILD_OPLOG_RATE_LIMIT"))
+	if err != nil {
+		logger.Error("invalid SIGILD_OPLOG_RATE_LIMIT", "err", err)
+		os.Exit(1)
+	}
+	burst, err := parseRateBurst(os.Getenv("SIGILD_OPLOG_RATE_BURST"))
+	if err != nil {
+		logger.Error("invalid SIGILD_OPLOG_RATE_BURST", "err", err)
+		os.Exit(1)
+	}
+	// When rate limiting is on, resolve the effective burst (defaulting to
+	// ceil(rate) when unset). When rate is 0 (disabled) burst is irrelevant.
+	if rate > 0 {
+		burst = effectiveBurst(rate, burst)
+	}
+
 	devOps := truthy(os.Getenv("SIGILD_ENABLE_DEV_OPS"))
 	cfg := api.Config{
 		Version: buildinfo.Version,
 		// host:port reachability targets; empty => reported "unconfigured".
 		// The production build will replace plain dials with real pgx/redis pings.
-		PostgresAddr:  os.Getenv("SIGILD_POSTGRES_ADDR"),
-		RedisAddr:     os.Getenv("SIGILD_REDIS_ADDR"),
-		Logger:        logger,
-		DevOpsEnabled: devOps,
+		PostgresAddr:   os.Getenv("SIGILD_POSTGRES_ADDR"),
+		RedisAddr:      os.Getenv("SIGILD_REDIS_ADDR"),
+		Logger:         logger,
+		DevOpsEnabled:  devOps,
+		OpLogRateLimit: rate,
+		OpLogRateBurst: burst,
+	}
+	if devOps && rate > 0 {
+		logger.Warn("DEV op-log per-vault RATE LIMIT enabled — dev-only",
+			"rate_per_sec", rate, "burst", burst)
 	}
 	if devOps {
 		// Backend selection for the DEV op-log, in PRECEDENCE order:
@@ -90,17 +124,12 @@ func main() {
 		// Redis); full device enrollment is FUTURE. Only meaningful while dev-ops
 		// is on.
 		if raw := os.Getenv("SIGILD_OPLOG_PUBKEY"); raw != "" {
-			pub, err := base64.StdEncoding.DecodeString(raw)
+			pub, err := parseOpLogPubKey(raw)
 			if err != nil {
-				logger.Error("SIGILD_OPLOG_PUBKEY is not valid standard base64", "err", err)
+				logger.Error("invalid SIGILD_OPLOG_PUBKEY", "err", err)
 				os.Exit(1)
 			}
-			if len(pub) != ed25519.PublicKeySize {
-				logger.Error("SIGILD_OPLOG_PUBKEY must decode to a 32-byte Ed25519 public key",
-					"got_bytes", len(pub), "want_bytes", ed25519.PublicKeySize)
-				os.Exit(1)
-			}
-			cfg.OpLogPubKey = ed25519.PublicKey(pub)
+			cfg.OpLogPubKey = pub
 			logger.Warn("DEV op-log request AUTH ENABLED: Ed25519, SINGLE configured DEV device key, per-request nonce + per-process in-memory replay cache (not replay-proof across instances) — dev-only, do NOT expose publicly")
 		}
 	}
@@ -158,4 +187,85 @@ func truthy(v string) bool {
 	default:
 		return false
 	}
+}
+
+// validateListenAddr checks SIGILD_ADDR is a bind address net/http can listen on.
+// It must be non-empty and resolvable as a TCP address (host:port, where host
+// may be empty for all-interfaces, e.g. ":8080"). A bare port with no colon, or
+// garbage, is rejected.
+func validateListenAddr(s string) error {
+	if s == "" {
+		return errors.New("must not be empty")
+	}
+	if _, err := net.ResolveTCPAddr("tcp", s); err != nil {
+		return fmt.Errorf("not a valid TCP listen address (want host:port, e.g. \":8080\"): %w", err)
+	}
+	return nil
+}
+
+// parseRateLimit parses SIGILD_OPLOG_RATE_LIMIT (per-vault requests/second). An
+// empty value means 0 (rate limiting disabled). A set value must parse as a
+// finite, non-negative float; anything else is an error.
+func parseRateLimit(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("must be a number: %w", err)
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("must be finite, got %v", s)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("must be non-negative, got %v", v)
+	}
+	return v, nil
+}
+
+// parseRateBurst parses SIGILD_OPLOG_RATE_BURST (token-bucket capacity). An empty
+// value means 0 (caller derives a default from the rate). A set value must parse
+// as a non-negative int.
+func parseRateBurst(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("must be an integer: %w", err)
+	}
+	if v < 0 {
+		return 0, fmt.Errorf("must be non-negative, got %d", v)
+	}
+	return v, nil
+}
+
+// effectiveBurst resolves the burst to use for a positive rate: an explicit
+// positive burst wins; otherwise default to ceil(rate), floored at 1 so at least
+// a single request always passes.
+func effectiveBurst(rate float64, burst int) int {
+	if burst > 0 {
+		return burst
+	}
+	b := int(math.Ceil(rate))
+	if b < 1 {
+		b = 1
+	}
+	return b
+}
+
+// parseOpLogPubKey parses SIGILD_OPLOG_PUBKEY: the standard-base64 encoding of a
+// 32-byte Ed25519 public key. Invalid base64 or a wrong length is an error.
+func parseOpLogPubKey(s string) (ed25519.PublicKey, error) {
+	pub, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("not valid standard base64: %w", err)
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("must decode to a %d-byte Ed25519 public key, got %d bytes",
+			ed25519.PublicKeySize, len(pub))
+	}
+	return ed25519.PublicKey(pub), nil
 }

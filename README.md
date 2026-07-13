@@ -130,7 +130,27 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   fingerprints ciphertext only (no key, no plaintext), so zero-knowledge is preserved.
   This is **tamper-evident, not tamper-proof**: a hostile server can still lie about
   `/ops/verify`, so the real guarantee is **client-side** — a client re-derives the chain
-  from the returned per-op hashes. Ships a distroless `Dockerfile`.
+  from the returned per-op hashes. The dev op-log is also **bounded, rate-limited, and
+  observable** (all Go-stdlib, no new dependency): `GET …/ops` is **paginated** — an
+  optional **`?limit`** (default 500, max 1000; a non-integer value → `400 bad_limit`)
+  returns a **`has_more`** flag beside `next`, and the limit is applied in every backend
+  (the Postgres backend as a SQL `LIMIT`), so a client drains a vault by looping
+  `since = next` until `has_more` is false; when **`SIGILD_OPLOG_RATE_LIMIT`** (with an
+  optional **`SIGILD_OPLOG_RATE_BURST`**) is set, each **vault** gets an independent
+  **token-bucket rate limit** and an append over its rate gets **`429 rate_limited`** +
+  `Retry-After` (**off by default**, GET is never limited, and the limiter never inspects
+  the blob); an **always-available**, unauthenticated **`GET /metrics`** renders a
+  **Prometheus-text** exposition of process counters (HTTP requests, appends, verifies,
+  auth denials by reason, rate-limit rejections, and the build version) — **counters and
+  the build version only, never a blob, key, signature, nonce, vault content, or vault
+  ID**, so it cannot leak plaintext or weaken zero-knowledge; and on startup `sigild`
+  **validates its configuration and refuses to boot** on a malformed value (bad
+  `SIGILD_ADDR`, a non-numeric rate/burst, or an invalid `SIGILD_OPLOG_PUBKEY`) rather
+  than starting misconfigured. These are **dev-scale operability primitives** (an
+  in-process limiter, process-local counters, boot-time validation) — **not** production
+  SLOs, a distributed quota, or a durable metrics pipeline; the security posture is
+  unchanged (still dev-gated and `501` by default, still opaque blobs only). Ships a
+  distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

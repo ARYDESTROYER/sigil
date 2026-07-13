@@ -71,7 +71,17 @@ public, make no security claims, until the audit completes and trademark clears.
   deterministic, reuses sig/mldsa (no new deps). This COMPLETES the hybrid crypto
   suite alongside the hybrid KEM. Still STANDALONE + UNAUDITED — NOT wired into any
   flow (the sigild op-log auth still uses the classical Ed25519 signature only); the
-  SYSTEM is not "post-quantum secure".**
+  SYSTEM is not "post-quantum secure".** **The hybrid KEM is now WIRED into an
+  encryption flow — hybrid public-key authenticated encryption
+  (`hybrid_seal`/`hybrid_open`, `hybrid_seal.rs`): `hybrid_seal` encapsulates to a
+  recipient's hybrid public key (`hybrid_encapsulate` → 32-byte combined key) then
+  `seal`s the record under it (KEM-then-AEAD), returning `(eph_pub, mlkem_ct,
+  envelope)`; `hybrid_open` decapsulates with the recipient's hybrid secret and
+  `open`s. Caller-supplied ephemeral X25519 secret + ML-KEM coin + AEAD nonce
+  (ADR 0007), composes hybrid.rs + aead.rs + envelope.rs (no new deps). A CUSTOM
+  composition — NOT RFC 9180 HPKE — and the FIRST wiring of a hybrid primitive into
+  an encryption flow; still real but UNAUDITED and STANDALONE (not the product's
+  account / key-management / vault-storage model, not used by sigild/CLI). ADR 0013.**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).

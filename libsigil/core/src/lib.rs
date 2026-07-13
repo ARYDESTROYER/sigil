@@ -44,6 +44,16 @@
 //! ephemeral X25519 secret and the ML-KEM coin, and it is not yet wired into the
 //! record/account/vault flow.
 //!
+//! [`hybrid_seal`] / [`hybrid_open`] ([`mod@hybrid_seal`]) then put that hybrid
+//! KEM to its intended use: **public-key seal/open** — encrypt a record TO a
+//! recipient's hybrid public key. They compose the hybrid KEM with the AEAD and
+//! the envelope codec into a **CUSTOM** hybrid public-key authenticated
+//! encryption (KEM-then-AEAD) flow — **NOT** RFC 9180 HPKE, and real but
+//! **UNAUDITED**. Like the rest of the crate it is standalone (a crypto-level
+//! flow, not the product's account/key-management/vault-storage model, and not
+//! wired into `sigild`/CLI) and generates no randomness — the caller supplies the
+//! ephemeral X25519 secret, the ML-KEM coin, and the AEAD nonce.
+//!
 //! Argon2id is the **first hop** in the key chain: a low-entropy human password
 //! is stretched into a 32-byte master key, which is then expanded per record and
 //! used for authenticated encryption:
@@ -63,6 +73,7 @@ extern crate alloc;
 mod aead;
 mod envelope;
 mod hybrid;
+mod hybrid_seal;
 mod hybrid_sig;
 mod kdf;
 mod kx;
@@ -76,6 +87,7 @@ pub use hybrid::{
     hybrid_decapsulate, hybrid_encapsulate, HybridEncapsulation, HybridError,
     HYBRID_SHARED_SECRET_LEN,
 };
+pub use hybrid_seal::{hybrid_open, hybrid_seal, HybridSealError, HybridSealed};
 pub use hybrid_sig::{hybrid_sign, hybrid_verify, HybridSigError, HYBRID_SIGNATURE_LEN};
 pub use kdf::{derive_master_key, Argon2Params, KdfError, MASTER_KEY_LEN};
 pub use kx::{

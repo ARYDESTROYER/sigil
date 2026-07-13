@@ -104,6 +104,24 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     any record/vault/account/session flow (the `sigild` op-log request auth still
     uses classical Ed25519 only), and the system is still not "post-quantum secure".
     See [`decisions/0012-hybrid-signature-combiner.md`](decisions/0012-hybrid-signature-combiner.md).
+  - the **hybrid public-key authenticated encryption** flow
+    ([`../libsigil/core/src/hybrid_seal.rs`](../libsigil/core/src/hybrid_seal.rs):
+    `hybrid_seal` / `hybrid_open`) — a **KEM-then-AEAD** composition that encrypts a
+    record **to a recipient's hybrid public key** (an X25519 public key + an
+    ML-KEM-768 encapsulation key). `hybrid_seal` runs the hybrid KEM (`hybrid.rs`)
+    to encapsulate a fresh 32-byte shared secret to the recipient, uses that secret
+    as the master key for the XChaCha20-Poly1305 AEAD (`aead.rs`), and returns
+    `(ephemeral X25519 public key, ML-KEM-768 ciphertext, envelope)`; `hybrid_open`
+    decapsulates with the recipient's hybrid secret keys to recover the same secret,
+    then authenticates and decrypts the envelope. Caller-supplied ephemeral X25519
+    secret + ML-KEM coin + AEAD nonce (the core generates no randomness). This is a
+    **bespoke composition — NOT RFC 9180 HPKE** — and the **first wiring of a hybrid
+    primitive into an encryption flow**. Real but UNAUDITED and **standalone**: a
+    crypto-level flow, **not** the product's account / key-management /
+    vault-storage model, and not used by `sigild` or the CLI (the envelope's
+    `kem_ct` field stays reserved — the ML-KEM ciphertext travels alongside the
+    envelope). See
+    [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
   the AEAD nonce, the Ed25519 signing seed, the ML-DSA-65 keygen seed (`xi`), the
@@ -172,6 +190,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   ML-KEM-768 KEM  (keygen d||z / m coin; caller-supplied)       │    │
    │   │   hybrid KEM: X25519 & ML-KEM-768 → HKDF combiner               │    │
    │   │   hybrid signature: Ed25519 || ML-DSA-65 (verify needs both)    │    │
+   │   │   hybrid public-key seal / open  (KEM-then-AEAD to a pubkey)    │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
@@ -258,6 +277,24 @@ static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, contract v2: a per-request
 nonce checked against a time-bounded in-memory replay cache; real multi-device
 auth is still future) — which is why it is dev-gated-off and must never be
 exposed or hold real secrets.
+
+**A second, public-key data path exists at the crypto level (not yet wired into
+the product).** The flow above is the *symmetric*, password-derived path
+(`seal_record` / `open_record`), and it is the only one the CLI packages.
+`sigil-core` now also provides an *encrypt-to-a-recipient's-hybrid-public-key*
+path — `hybrid_seal` / `hybrid_open`
+([`../libsigil/core/src/hybrid_seal.rs`](../libsigil/core/src/hybrid_seal.rs)) — a
+**KEM-then-AEAD** composition: `hybrid_seal` hybrid-encapsulates a fresh 32-byte
+shared secret to the recipient's `(X25519 public key, ML-KEM-768 encapsulation
+key)`, seals the plaintext under that secret with the same XChaCha20-Poly1305 AEAD,
+and emits `(ephemeral X25519 public key, ML-KEM-768 ciphertext, envelope)`; the
+recipient's `hybrid_open` decapsulates with its hybrid secret keys and opens the
+envelope. This is the **first wiring of a hybrid primitive into an encryption
+flow**, but it is a **crypto-level building block only** — bespoke (**NOT** RFC
+9180 HPKE), UNAUDITED, and **not** the product's account / key-management /
+vault-storage model; neither `sigild` nor the CLI uses it. See
+[`crypto-spec.md`](crypto-spec.md) and
+[`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
 
 ---
 
@@ -361,7 +398,8 @@ authoritative list, with rationale, is the **defer ledger** in
   [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
 - **No durable storage.** No Postgres / Redis / object store is wired — the op-log
   is an in-memory map, lost on restart. No schema, migration, backup, or restore.
-- **Both hybrid constructions are assembled, but wired into no flow.** For key
+- **Both hybrid constructions are assembled; the hybrid KEM now drives a
+  crypto-level seal/open flow, but neither is in the product flow.** For key
   agreement, the **combined hybrid KEM exists as a standalone primitive**
   (`hybrid.rs`: `hybrid_encapsulate` / `hybrid_decapsulate`;
   [ADR 0011](decisions/0011-hybrid-kem-combiner.md)): the combiner assembles the
@@ -381,13 +419,19 @@ authoritative list, with rationale, is the **defer ledger** in
   signing; UNAUDITED) into the fixed **3373-byte** `Ed25519.Sign(m) ||
   ML-DSA-65.Sign(m)` (64 + 3309 bytes), where `hybrid_verify` requires **BOTH**
   halves to validate — a forgery requires breaking **both** Ed25519 and ML-DSA-65.
-  Both combiners are real but **UNAUDITED and standalone**: neither is wired into a
-  record / vault / account / session flow (the envelope's `kem_ct` field stays
-  *reserved* but unused, and the `sigild` op-log request auth still uses classical
-  Ed25519 only), and the **system is still not "post-quantum secure"**. The
-  remaining crypto gap is therefore **wiring the hybrid primitives into an actual
-  account/session/record flow**; today only the symmetric path (Argon2id → AEAD →
-  envelope) runs end-to-end.
+  Both combiners are real but **UNAUDITED**. The hybrid **KEM** is now further
+  composed with the AEAD into a standalone **hybrid public-key seal/open flow**
+  (`hybrid_seal.rs`: `hybrid_seal` / `hybrid_open` — a KEM-then-AEAD encryption to a
+  recipient's hybrid public key, the **first wiring of a hybrid primitive into an
+  encryption flow**; bespoke, **NOT** RFC 9180 HPKE;
+  [ADR 0013](decisions/0013-hybrid-public-key-seal.md)). But that remains a
+  **crypto-level** flow only: neither hybrid construction is wired into the
+  **product's account / session / vault-storage flow** (the envelope's `kem_ct`
+  field stays *reserved* but unused, and the `sigild` op-log request auth still uses
+  classical Ed25519 only), and the **system is still not "post-quantum secure"**.
+  The remaining crypto gap is therefore **wiring the hybrid primitives into the
+  product account/session/record model** — `sigild` and the CLI are unchanged, and
+  the hybrid signature is not yet composed into any flow.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number — no signed ops, no Lamport/Merkle
   ordering, no conflict-free merge.

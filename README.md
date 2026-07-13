@@ -63,7 +63,17 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   the hybrid KEM (X25519&ML-KEM-768) and the hybrid signature (Ed25519&ML-DSA-65)
   — now exist as primitives, but both are UNAUDITED and standalone, NOT wired into
   any key-exchange / session / account / vault / auth flow; the system is NOT
-  "post-quantum secure"**, plus a
+  "post-quantum secure"**, and — **now composed into an encryption flow** — a real
+  (unaudited) **hybrid public-key authenticated encryption** layer
+  (`hybrid_seal`/`hybrid_open`) that encapsulates to a recipient's **hybrid public
+  key** with the hybrid KEM and then AEAD-`seal`s the record under the derived key
+  (**KEM-then-AEAD**), returning `(eph_pub, mlkem_ct, envelope)` — caller-supplied
+  ephemeral X25519 secret + ML-KEM coin + AEAD nonce (no in-core randomness),
+  composing the hybrid KEM + AEAD + envelope codec with no new deps. **This is a
+  CUSTOM composition — NOT RFC 9180 HPKE — and the FIRST wiring of a hybrid primitive
+  into an encryption flow, but it is UNAUDITED and STANDALONE: a crypto-level flow
+  only, NOT the product's account / key-management / vault-storage model, and not
+  used by sigild or the CLI**, plus a
   `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`, and the classical Ed25519 sig
   exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify` with a
   `SIGIL_ERR_VERIFY` code) for the clients.

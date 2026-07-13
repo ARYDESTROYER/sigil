@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 20, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 21, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -20,13 +20,17 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   `hybrid_sign`/`hybrid_verify` (`hybrid_sig.rs`, verify needs both).
 - KEM/KEX: X25519 (`kx.rs`) + ML-KEM-768 (`mlkem.rs`) + hybrid
   `hybrid_encapsulate`/`hybrid_decapsulate` (`hybrid.rs`, HKDF combiner).
+- public-key encryption: `hybrid_seal`/`hybrid_open` (`hybrid_seal.rs`) — the
+  hybrid KEM wired into a KEM-then-AEAD flow, encrypt a record TO a recipient's
+  hybrid pubkey (custom composition, NOT RFC 9180 HPKE). FIRST hybrid primitive
+  wired into an encryption flow; still standalone + unaudited (Phase 21).
 - FFI (`libsigil/ffi`): seal/open/buffer_free + Ed25519 sign/verify/pubkey.
 - `sigild` (Go, stdlib-only): probes + dev-gated (`SIGILD_ENABLE_DEV_OPS`) opaque
   op-log; in-memory OR file-backed (`SIGILD_OPLOG_DIR`); optional Ed25519 **v2**
   request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce + replay cache). Default 501.
 - `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing.
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0012.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0013.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
@@ -44,14 +48,16 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
   SAME change; commit + push to `main` per phase.
 
-**➡️ NEXT:** the crypto PRIMITIVES are done; the work now is WIRING them into a
-flow (nothing uses the hybrid primitives yet). In progress: Phase 21 = hybrid
-public-key seal/open (`hybrid_seal`/`hybrid_open` = hybrid KEM → AEAD, encrypt a
-record TO a recipient's hybrid public key). After that: FFI-export the hybrid
-primitives; then integrate into sigild/CLI or the record/account flow. The full
-product is still early (~6% — see the completeness note); the mountain (7 native
-clients, real backend/auth/durable store, payments, Cure53 audit, SOC2) is
-untouched.
+**➡️ NEXT:** the crypto PRIMITIVES are done and the FIRST one is now wired into a
+flow — Phase 21 shipped `hybrid_seal`/`hybrid_open` (hybrid KEM → AEAD, encrypt a
+record TO a recipient's hybrid public key; a custom KEM-then-AEAD composition, NOT
+RFC 9180 HPKE, UNAUDITED + standalone). Next: **FFI-export the hybrid primitives**
+(a `sigil-ffi` C-ABI over hybrid_seal/open + the hybrid KEM/signature) so clients
+can call them; then wire them into sigild / the CLI or the record/account flow —
+the sigild op-log auth still uses the classical Ed25519 signature only, and
+nothing in a product path uses hybrid_seal yet. The full product is still early
+(~6% — see the completeness note); the mountain (7 native clients, real
+backend/auth/durable store, payments, Cure53 audit, SOC2) is untouched.
 
 ---
 
@@ -2023,3 +2029,112 @@ Recording the decision so the doc set stays coherent as the repo grows:
 - No over-claims: "post-quantum" describes the ML-DSA-65 (and ML-KEM-768) component
   algorithms and the hybrids' *design intent* on unaudited building blocks — the
   **system is NOT "post-quantum secure".**
+
+## 2026-07-13 — Phase 21 (hybrid public-key seal/open: encrypt a record to a recipient hybrid pubkey)
+
+### Context & mandate
+- Goal: **wire the hybrid KEM into an actual encryption flow** — the primitives
+  were all assembled by Phase 20 but nothing *used* them. This phase composes the
+  hybrid KEM (`hybrid.rs`, Phase 18) with the existing AEAD seal/open (`aead.rs`)
+  and envelope codec (`envelope.rs`) into **hybrid public-key authenticated
+  encryption**: `hybrid_seal` encrypts a record TO a recipient's **hybrid public
+  key**, and `hybrid_open` recovers it with the recipient's **hybrid secret**. This
+  is the FIRST time a hybrid primitive is put into a genuine flow.
+- ⚠️ Composition only — **no new low-level cryptography and no new deps.**
+  `hybrid_seal.rs` calls the crate's existing `hybrid_encapsulate`/`hybrid_decapsulate`,
+  `seal`/`open`, and `Envelope::encode`/`decode`; it mints no keys and draws no
+  entropy. A **CUSTOM** KEM-then-AEAD construction — **NOT RFC 9180 HPKE** — real
+  but **UNAUDITED** and **standalone** (a crypto-level flow, still NOT the product's
+  account / key-management / vault-storage model, and not used by sigild/CLI).
+
+### core — `core/src/hybrid_seal.rs` ✅
+- New module, re-exported from `lib.rs` (`mod hybrid_seal;` + `pub use
+  hybrid_seal::{hybrid_open, hybrid_seal, HybridSealError, HybridSealed}`).
+- **KEM-then-AEAD composition.** `hybrid_seal(recipient_hybrid_pub, ephemeral_x25519_secret,
+  mlkem_coin, aead_nonce, aad, plaintext)` (hybrid_seal.rs lines 139–148): calls
+  `hybrid_encapsulate(recipient pubkey, eph_secret, coin) -> (eph_pub, mlkem_ct,
+  combined)` to derive a fresh 32-byte combined KEM secret to the recipient, then
+  `seal(&combined, nonce, aad, plaintext).encode()` to AEAD-encrypt the record under
+  it. It returns `(eph_pub, mlkem_ct, envelope)` — the ephemeral X25519 public key,
+  the ML-KEM-768 ciphertext, and the encoded AEAD envelope — everything the recipient
+  needs and nothing secret. `hybrid_open(recipient_hybrid_secret, eph_pub, mlkem_ct,
+  aad, envelope)` (lines 176–184) is the inverse: `hybrid_decapsulate(recipient secret,
+  eph_pub, mlkem_ct) -> combined` re-derives the same 32-byte secret, then
+  `Envelope::decode` + `open(&combined, &env)` authenticates and decrypts. **No crypto
+  is invented here** — it is a wiring of two audited-shape primitives.
+- **Entropy stays caller-supplied — core generates NO randomness (ADR 0007).** The
+  ephemeral X25519 secret, the ML-KEM encapsulation coin, and the AEAD nonce are all
+  **parameters** to `hybrid_seal`; the module draws none itself. `getrandom` count
+  stays 0 and the wasm32 build holds.
+- **`HybridSealError`** (`#[non_exhaustive]`) distinguishes the two failure domains:
+  `Hybrid(HybridError)` — the KEM step rejected an input (e.g. a non-contributory
+  recipient X25519 public key) — and `Aead(AeadError)` — the envelope failed to
+  decode or authenticate. `From` impls thread `?` through. `HybridSealed` names the
+  `(eph_pub, mlkem_ct, envelope)` output shape.
+- **Design intent (honest, of an UNAUDITED primitive):** confidentiality/integrity
+  of the record to the recipient rests on the AEAD under a key that the hybrid KEM
+  binds to BOTH the X25519 and ML-KEM-768 shares (transcript-bound HKDF combiner),
+  so the combined key is designed to stay secret if EITHER KEM half holds. Stated as
+  design intent, not a proven or audited guarantee; nothing here makes the module —
+  let alone the **system** — "post-quantum secure" or "secure".
+
+### Dependency & the WASM/GETRANDOM gate — no new deps ✅
+- **No new dependencies.** `git diff libsigil/core/Cargo.toml` empty; `git diff
+  libsigil/Cargo.lock` empty. `hybrid_seal.rs` composes `hybrid` + `aead` + `envelope`,
+  all already in the crate. Changed tree is only `lib.rs` (mod + re-exports), the new
+  `hybrid_seal.rs`, and the docs (crypto-spec / architecture / ADR 0013).
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (rechecked after the wasm build); `cargo build -p sigil-core --target
+  wasm32-unknown-unknown` **succeeds**. `#![forbid(unsafe_code)]` (lib.rs) and
+  `no_std` (`core` + `alloc`) intact. MSRV unchanged (still 1.85; machine rustc 1.96).
+
+### Tests ✅ — the encrypt-to-pubkey round-trip plus wrong-recipient / tamper proofs
+- **9 hybrid_seal tests, all PASS**, covering the load-bearing properties:
+  - **Round-trip (capstone)** — `encrypt_to_pubkey_round_trip`: a sender seals TO the
+    recipient's hybrid pubkey `(r_x_pub, ek)`; the recipient opens with the hybrid
+    secret `(r_x_secret, dk)`; recovered == plaintext. It also scans the encoded
+    envelope and asserts it does **not** contain the plaintext bytes.
+  - **Wrong recipient** — `wrong_recipient_fails_with_aead_error`: opening with an
+    unrelated recipient's `(x25519_secret, ml-kem decaps key)` derives a different
+    combined key → `Err(HybridSealError::Aead(_))`; no plaintext leaks.
+  - **Tamper (three)** — `tampered_envelope_is_rejected` (flip a tag byte) →
+    `Err(Aead(Authentication))`; `tampered_mlkem_ct_is_rejected` (flip `ct[0]`) →
+    `Err(Aead(Authentication))`; `tampered_ephemeral_pubkey_is_rejected` (flip
+    `eph_pub[0]`) → `is_err`. Plus `aad_is_authenticated`: forging the AAD at open →
+    `Err(Aead(Authentication))`.
+  - **Non-contributory guard** — `non_contributory_recipient_pub_is_rejected`: an
+    all-zero recipient X25519 public key →
+    `Err(HybridSealError::Hybrid(HybridError::Kx(KxError::NonContributory)))`, so a
+    degenerate recipient key is refused before any AEAD work.
+  - Plus determinism (same inputs → byte-identical envelope) and an empty-plaintext
+    round-trip.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo test` — **sigil-core 97 PASS** (incl. the 9 hybrid_seal tests), sigil-ffi
+  **13 PASS** · wasm32 build OK · getrandom count **0** · `#![forbid(unsafe_code)]`
+  present. Regression: cli `cargo test` (2 integration tests) ✓ (`cli/Cargo.lock`
+  getrandom = 1 as ever — separate native crate outside the wasm gate;
+  `libsigil/Cargo.lock` is the one that must stay 0, and does); sigild
+  gofmt/vet/test/build ✓; all 7 workflow YAMLs parse ✓. Web untouched.
+
+### docs — crypto-spec.md / architecture.md / ADR 0013 ✅
+- `docs/crypto-spec.md`, `docs/architecture.md`, and **ADR 0013**
+  (`0013-hybrid-public-key-seal.md`) were already updated by the docs track — ADR
+  0013 records the KEM-then-AEAD composition decision (hybrid_encapsulate → seal, a
+  custom construction explicitly NOT RFC 9180 HPKE; caller-supplied ephemeral secret /
+  coin / nonce; the `(eph_pub, mlkem_ct, envelope)` wire shape). This entry finalizes
+  the remaining living docs (this file, `CLAUDE.md`, `README.md`).
+
+### ➡️ What this opens, and what's still open (honest)
+- This is the **first wiring of a hybrid primitive into an encryption flow**: the
+  hybrid KEM now drives an actual encrypt-to-a-recipient-pubkey operation instead of
+  standing alone. It is a **crypto-level flow / primitive**, not a product feature —
+  a CUSTOM KEM-then-AEAD composition (NOT RFC 9180 HPKE), real but **UNAUDITED** and
+  **standalone**.
+- Still open — `hybrid_seal`/`hybrid_open` are **not exported over FFI** and **not
+  used by sigild or the CLI**; there is still no account / key-management /
+  vault-storage model behind them, and the sigild op-log auth still uses the
+  classical Ed25519 signature only. Next: **FFI-export the hybrid primitives**, then
+  integrate into a product path; then the eventual **audit**.
+- No over-claims: "post-quantum" names the ML-KEM-768 component algorithm and the
+  construction's *design intent* on unaudited building blocks — the **system is NOT
+  "post-quantum secure".**

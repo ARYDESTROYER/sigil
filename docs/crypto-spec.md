@@ -15,9 +15,13 @@
 > **assembled as a standalone primitive** too, in `sigil-core` (`hybrid_sig.rs`),
 > composing the Ed25519 half (`sig.rs`) and the ML-DSA-65 half (`mldsa.rs`). So
 > **both hybrid constructions (KEM and signature) now exist as standalone
-> primitives**; neither is wired into a product flow. Condensed from
-> the product brief §11/§20/§21. Subject to change. A Cure53 audit of the hybrid
-> construction is to be commissioned before public beta.
+> primitives**; neither is wired into a product flow. The hybrid **KEM** is now
+> further composed with the AEAD into **hybrid public-key authenticated
+> encryption** — `hybrid_seal` / `hybrid_open` (`hybrid_seal.rs`) — the **first
+> wiring of a hybrid primitive into an encryption flow**, though still a
+> crypto-level building block, **not** the product account/vault flow. Condensed
+> from the product brief §11/§20/§21. Subject to change. A Cure53 audit of the
+> hybrid construction is to be commissioned before public beta.
 
 ## Design principle
 
@@ -184,6 +188,65 @@ exist as standalone primitives**; the only remaining large crypto work is **wiri
 the hybrid primitives into an actual account/session/record flow** (nothing uses
 them yet), and the **SYSTEM is still not "post-quantum secure"**. See
 [ADR 0012](decisions/0012-hybrid-signature-combiner.md).
+
+## Hybrid public-key authenticated encryption (`hybrid_seal` / `hybrid_open`)
+
+**Status (pre-audit, UNAUDITED).** `sigil-core` now composes the hybrid **KEM**
+with the symmetric AEAD into **hybrid public-key authenticated encryption** —
+`hybrid_seal` / `hybrid_open` in
+[`libsigil/core/src/hybrid_seal.rs`](../libsigil/core/src/hybrid_seal.rs). This is
+the **first time a hybrid primitive is wired into an encryption flow**: until now
+the hybrid KEM (`hybrid.rs`) and the AEAD (`aead.rs`) were separate building
+blocks, and the only end-to-end path was the *symmetric*, password-derived one
+(Argon2id → AEAD → envelope; `seal_record` / `open_record`). `hybrid_seal` instead
+encrypts a record **to a recipient's hybrid public key** (an X25519 public key +
+an ML-KEM-768 encapsulation key).
+
+It is a **KEM-then-AEAD** construction:
+
+```text
+hybrid_seal(recipient_x25519_pub, recipient_mlkem_encaps_key,
+            ephemeral_x25519_secret, mlkem_coin, nonce, aad, plaintext):
+  (eph_x25519_pub, mlkem_ct, ss_combined) = hybrid_encapsulate(   # hybrid.rs
+      recipient_x25519_pub, recipient_mlkem_encaps_key,
+      ephemeral_x25519_secret, mlkem_coin)
+  envelope = seal(master_key = ss_combined, nonce, aad, plaintext)  # aead.rs
+  return (eph_x25519_pub, mlkem_ct, envelope)
+
+hybrid_open(recipient_x25519_secret, recipient_mlkem_decaps_key,
+            eph_x25519_pub, mlkem_ct, envelope):
+  ss_combined = hybrid_decapsulate(                               # hybrid.rs
+      recipient_x25519_secret, recipient_mlkem_decaps_key,
+      eph_x25519_pub, mlkem_ct)
+  return open(master_key = ss_combined, envelope)                  # aead.rs
+```
+
+The 32-byte hybrid shared secret `ss_combined` is used as the AEAD **master key**
+(the AEAD then binds the suite byte into its per-record HKDF `info` as usual — see
+the AEAD design above); it is never used as an AEAD key directly. The recipient
+decapsulates with its hybrid secret keys to reproduce the identical `ss_combined`
+and then authenticates/decrypts the envelope; a tampered ML-KEM ciphertext,
+ephemeral public key, or envelope yields a different key or an authentication
+failure, never plaintext.
+
+Honest framing:
+
+- This is a **CUSTOM KEM-then-AEAD composition — NOT RFC 9180 HPKE.** It reuses the
+  crate's existing hybrid combiner and HKDF-bound AEAD rather than the HPKE key
+  schedule, so it carries no HPKE interoperability or standardized analysis.
+- The **caller supplies** the ephemeral X25519 secret, the ML-KEM coin, and the
+  AEAD nonce ([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)); the
+  core generates no randomness and stays `wasm32-unknown-unknown`-pure.
+- It inherits the hybrid property of the KEM
+  ([ADR 0011](decisions/0011-hybrid-kem-combiner.md)): `ss_combined` stays secret if
+  **either** X25519 or ML-KEM-768 remains secure, and the transcript binding stops
+  mix-and-match — asserted as design intent of an **UNAUDITED** primitive, **not** a
+  claim that the SYSTEM is "post-quantum secure".
+- It is **real but UNAUDITED and standalone**: a **crypto-level flow**, **not** the
+  product's account / key-management / vault-storage model, and **not used by
+  `sigild` or the CLI**. The envelope's `kem_ct` field still stays *reserved* but
+  unused — the ML-KEM ciphertext travels alongside the envelope here, not inside it.
+  See [ADR 0013](decisions/0013-hybrid-public-key-seal.md).
 
 ## Migration plan (intended)
 

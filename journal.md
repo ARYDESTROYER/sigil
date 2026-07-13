@@ -9,6 +9,52 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ---
 
+## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
+
+**Where we are (through Phase 20, `main` @ origin, clean tree).** libsigil-core
+now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
+wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
+- symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
+  `seal_record`/`open_record`.
+- signatures: Ed25519 (`sig.rs`) + ML-DSA-65 (`mldsa.rs`) + hybrid
+  `hybrid_sign`/`hybrid_verify` (`hybrid_sig.rs`, verify needs both).
+- KEM/KEX: X25519 (`kx.rs`) + ML-KEM-768 (`mlkem.rs`) + hybrid
+  `hybrid_encapsulate`/`hybrid_decapsulate` (`hybrid.rs`, HKDF combiner).
+- FFI (`libsigil/ffi`): seal/open/buffer_free + Ed25519 sign/verify/pubkey.
+- `sigild` (Go, stdlib-only): probes + dev-gated (`SIGILD_ENABLE_DEV_OPS`) opaque
+  op-log; in-memory OR file-backed (`SIGILD_OPLOG_DIR`); optional Ed25519 **v2**
+  request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce + replay cache). Default 501.
+- `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing.
+- web marketing splash; deploy = validated skeletons + manual GHCR publish +
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0012.
+
+**HARD INVARIANTS (never break; the commit gate checks them every phase):**
+- `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
+  wasm-pure; the wasm32 build must pass). CLI is a SEPARATE crate (own lock) so
+  it may use getrandom.
+- `#![forbid(unsafe_code)]` in core; `#![deny(unsafe_op_in_unsafe_fn)]` in ffi.
+- sigild stays **stdlib-only** (no go.sum). No over-claims anywhere (never
+  "audited"/"secure"/"post-quantum secure"/"SOC 2"/unqualified "E2E"); the SYSTEM
+  is NOT post-quantum secure — honest UNAUDITED building blocks only.
+- Core MSRV is **1.85** (ml-dsa forced it; machine rustc is 1.96; CI pins stable).
+- Rust invocation: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH"`.
+- Deploy/publish/domain = **human-gated** (outward-facing/irreversible). Do NOT
+  publish/apply/expose without explicit human approval.
+- Working method: opus-4.8 sub-agent workflows (build ‖ verify ‖ document); I
+  re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
+  SAME change; commit + push to `main` per phase.
+
+**➡️ NEXT:** the crypto PRIMITIVES are done; the work now is WIRING them into a
+flow (nothing uses the hybrid primitives yet). In progress: Phase 21 = hybrid
+public-key seal/open (`hybrid_seal`/`hybrid_open` = hybrid KEM → AEAD, encrypt a
+record TO a recipient's hybrid public key). After that: FFI-export the hybrid
+primitives; then integrate into sigild/CLI or the record/account flow. The full
+product is still early (~6% — see the completeness note); the mountain (7 native
+clients, real backend/auth/durable store, payments, Cure53 audit, SOC2) is
+untouched.
+
+---
+
 ## 2026-06-02 — Day 0/1: greenfield foundation scaffold
 
 ### Context & mandate

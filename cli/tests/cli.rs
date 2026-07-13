@@ -123,3 +123,61 @@ fn wrong_password_open_exits_nonzero() {
         "no plaintext should be written on failure"
     );
 }
+
+#[test]
+fn hybrid_keygen_seal_open_round_trips_via_binary() {
+    let dir = TempDir::new("hyb");
+    let key = dir.join("b.key");
+    let pubkey = dir.join("b.key.pub"); // hybrid-keygen derives this from --out
+    let plain = dir.join("secret.txt");
+    let sealed = dir.join("msg.hyb");
+    let recovered = dir.join("recovered.txt");
+
+    let original = b"public-key hybrid encryption through the real binary";
+    std::fs::write(&plain, original).expect("write plaintext");
+
+    // Device B: generate a hybrid identity; b.key.pub is shareable.
+    let status = bin()
+        .args(["hybrid-keygen", "--out"])
+        .arg(&key)
+        .status()
+        .expect("run hybrid-keygen");
+    assert!(status.success(), "hybrid-keygen should exit 0");
+    assert!(
+        pubkey.exists(),
+        "hybrid-keygen must write the shareable .pub identity"
+    );
+
+    // Device A: encrypt TO B's public identity (no password).
+    let status = bin()
+        .args(["hybrid-seal", "--recipient-pub"])
+        .arg(&pubkey)
+        .arg("--in")
+        .arg(&plain)
+        .arg("--out")
+        .arg(&sealed)
+        .status()
+        .expect("run hybrid-seal");
+    assert!(status.success(), "hybrid-seal should exit 0");
+
+    // The container must not carry the plaintext in the clear.
+    let container = std::fs::read(&sealed).expect("read container");
+    assert!(!container
+        .windows(original.len())
+        .any(|w| w == original.as_slice()));
+
+    // Device B: decrypt with its secret identity.
+    let status = bin()
+        .args(["hybrid-open", "--key"])
+        .arg(&key)
+        .arg("--in")
+        .arg(&sealed)
+        .arg("--out")
+        .arg(&recovered)
+        .status()
+        .expect("run hybrid-open");
+    assert!(status.success(), "hybrid-open should exit 0");
+
+    let round_tripped = std::fs::read(&recovered).expect("read recovered");
+    assert_eq!(round_tripped, original);
+}

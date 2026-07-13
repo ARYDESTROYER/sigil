@@ -22,9 +22,11 @@ exercise and demonstrate the libsigil core, nothing more.
   `getrandom` for native randomness without touching the libsigil workspace
   lockfile (which must stay `getrandom`-free because `sigil-core` compiles to
   `wasm32`). This binary is native-only and is never compiled to wasm.
-- A `--help`/`--version`-aware binary named `sigil` with two subcommands,
-  `seal` and `open` (plus `push`/`pull`, see below), plus a testable library
-  (`src/lib.rs`) with the container and sync logic.
+- A `--help`/`--version`-aware binary named `sigil` with the password-based
+  `seal` and `open` subcommands, the public-key `hybrid-keygen` /
+  `hybrid-seal` / `hybrid-open` subcommands (see below), and `push`/`pull` (see
+  below), plus a testable library (`src/lib.rs`) with the container, hybrid, and
+  sync logic.
 
 ## Usage
 
@@ -48,6 +50,60 @@ sigil --version
 On success the command exits `0` and writes the output file. On any error it
 prints a clear message to stderr and exits non-zero. It never prints secrets,
 and a failed `open` (wrong password or tampered file) writes no plaintext.
+
+## Hybrid public-key encryption (`hybrid-keygen` / `hybrid-seal` / `hybrid-open`) — ⚠️ no password, UNAUDITED
+
+This is the **public-key path**, distinct from the password-based `seal`/`open`
+above. Instead of a shared password, you encrypt a file **to another device's
+hybrid identity** — an X25519 public key **plus** an ML-KEM-768 encapsulation
+key — and only the holder of the matching **secret** identity can open it.
+
+> **⚠️ PRE-AUDIT / UNAUDITED / DEV-ONLY.** The construction is a **custom
+> KEM-then-AEAD** composition (X25519 + ML-KEM-768 → shared secret →
+> XChaCha20-Poly1305). It is **NOT** RFC 9180 HPKE and **NOT** a standardised
+> scheme; the **system is not post-quantum secure**. It wires the **real but
+> UNAUDITED** `sigil-core` hybrid primitives and has **not** been audited. It
+> makes **no** security guarantees. **Do not use it for real secrets.**
+
+A device generates a hybrid **identity**: a **secret** identity file (its X25519
+secret + ML-KEM-768 keygen seed, written mode `0600`) and a **shareable public**
+identity file (its X25519 public key + ML-KEM-768 encapsulation key). The public
+file is safe to hand out; senders encrypt to it.
+
+```bash
+# Device B: generate a hybrid identity. Writes the SECRET id to b.key (mode 0600)
+# and the shareable PUBLIC id to b.key.pub. Share ONLY b.key.pub with senders.
+sigil hybrid-keygen --out b.key
+# -> wrote hybrid SECRET identity to b.key (mode 0600) ...
+# -> wrote shareable PUBLIC identity to b.key.pub
+# -> SHARE b.key.pub with senders ...
+
+# Device A: encrypt a file TO B's public identity (no password).
+sigil hybrid-seal --recipient-pub b.key.pub --in secret.txt --out msg.hyb
+
+# Device B: decrypt with its secret identity.
+sigil hybrid-open --key b.key --in msg.hyb --out secret.txt
+```
+
+There is **no password** on this path. `hybrid-open` never writes plaintext on
+failure (a wrong identity or a tampered container fails to authenticate and
+exits non-zero). See the [hybrid container format](#hybrid-container-format)
+below.
+
+**Identity file formats** (JSON). The **secret** identity is written mode `0600`
+and holds private key material — keep it local and do **not** commit it; the
+**public** identity is shareable:
+
+```json
+// secret identity (mode 0600) — keep local:
+{ "version": 1, "x25519_secret": "<std-base64 of 32 bytes>", "mlkem_seed": "<std-base64 of 64 bytes>" }
+
+// public identity (.pub) — shareable:
+{ "version": 1, "x25519_public_key": "<std-base64 of 32 bytes>", "mlkem_encaps_key": "<std-base64 of 1184 bytes>" }
+```
+
+(The ML-KEM-768 decapsulation key is **derived** from the stored keygen seed, not
+stored, so the secret identity stays small.)
 
 ## Two-"device" sync (`push` / `pull`) — ⚠️ dev / localhost / plain HTTP only
 
@@ -218,6 +274,29 @@ The salt/params header is **unprotected metadata** (the AEAD authenticates the
 ciphertext, tag, nonce, and a fixed `aad = "sigil-cli/1"`, not this header).
 Tampering with the salt or params simply derives the wrong key, so the record
 fails to authenticate and `open` returns an error.
+
+## Hybrid container format
+
+The `hybrid-seal` / `hybrid-open` public-key path uses its own container. It
+prepends the sender's ephemeral X25519 public key and the ML-KEM-768 ciphertext
+(both needed to re-derive the shared secret) to the seal envelope:
+
+```text
+  offset  size    field
+  ------  ------  -----------------------------------------------
+  0       8       magic          = "SIGILhyb"
+  8       1       format_version = 1
+  9       32      eph_x25519_pub (sender's ephemeral X25519 public key)
+  41      1088    mlkem_ct       (ML-KEM-768 ciphertext)
+  1129    ..      envelope       = the sigil-core hybrid_seal output
+```
+
+The recipient re-derives the hybrid shared secret from `eph_x25519_pub` +
+`mlkem_ct` + its **secret** identity, then opens the envelope. The AEAD
+authenticates the ciphertext, tag, nonce, and a fixed `aad = "sigil-hybrid-cli/1"`;
+tampering with any part of the container makes `hybrid-open` fail. `hybrid-open`
+bounds-checks the fixed prefix before slicing, so short or garbage input is a
+clear error, never a panic.
 
 ## Build & test
 

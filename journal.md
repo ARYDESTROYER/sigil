@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 22, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 23, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -32,7 +32,10 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - `sigild` (Go, stdlib-only): probes + dev-gated (`SIGILD_ENABLE_DEV_OPS`) opaque
   op-log; in-memory OR file-backed (`SIGILD_OPLOG_DIR`); optional Ed25519 **v2**
   request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce + replay cache). Default 501.
-- `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing.
+- `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing;
+  plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
+  device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
+  `hybrid_open` (Phase 23; FIRST user-facing use of the hybrid encryption path).
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
   loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0013.
 
@@ -53,20 +56,24 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   SAME change; commit + push to `main` per phase.
 
 **➡️ NEXT:** the crypto PRIMITIVES are done, the hybrid KEM is wired into an
-encryption flow (Phase 21 `hybrid_seal`/`hybrid_open`), and Phase 22 **exported that
-whole hybrid encryption path over the `sigil-ffi` C-ABI** — `sigil_x25519_public_key`,
-`sigil_ml_kem768_keygen`, `sigil_hybrid_encapsulate`/`decapsulate`/`seal`/`open` +
-`SIGIL_ERR_HYBRID` + `sigil.h` + length `#define`s, with both C-ABI round-trips
-proven — so a native client can now generate a hybrid identity + encrypt-to-a-pubkey
-through the FFI (custom KEM-then-AEAD, NOT RFC 9180 HPKE, UNAUDITED). Next: **wire
-the hybrid path into an actual account / session / record flow** — a key-management /
-enrollment model behind the primitives, then a real product path. ⚠️ Wiring the
-hybrid **signature** into sigild's op-log auth is **blocked**: Go's stdlib has no
-ML-DSA, so sigild stays stdlib-only classical Ed25519 until we either take a PQ-sig
-dependency (breaks the no-go.sum invariant) or move the check off the Go server.
-Nothing in a product path uses `hybrid_seal` yet. The full product is still early
-(~6% — see the completeness note); the mountain (7 native clients, real
-backend/auth/durable store, payments, Cure53 audit, SOC2) is untouched.
+encryption flow (Phase 21 `hybrid_seal`/`hybrid_open`), Phase 22 **exported that
+whole path over the `sigil-ffi` C-ABI**, and Phase 23 gave it the **FIRST
+user-facing exercise end-to-end**: the `sigil` CLI's `hybrid-keygen` /
+`hybrid-seal` / `hybrid-open` generate a device hybrid identity and public-key
+encrypt a file TO another device's hybrid public identity, with a LIVE two-device
+round-trip proven (B keygen → A seal to B.pub → B open == original; a different
+identity fails `Aead(Authentication)` with no plaintext leaked). Still a demo of
+the hybrid encryption path (custom KEM-then-AEAD, NOT RFC 9180 HPKE, UNAUDITED) —
+NOT the product's account / key-management model. Next: **a bigger wiring step —
+a real device-enrollment / session / key-management flow** behind the primitives
+(how identities are minted, published, trusted, and rotated), then a real product
+path; or the non-crypto product surface. ⚠️ Wiring the hybrid **signature** into
+sigild's op-log auth is **blocked**: Go's stdlib has no ML-DSA, so sigild stays
+stdlib-only classical Ed25519 until we either take a PQ-sig dependency (breaks the
+no-go.sum invariant) or move the check off the Go server. No account/session model
+uses `hybrid_seal` yet. The full product is still early (~6% — see the completeness
+note); the mountain (7 native clients, real backend/auth/durable store, payments,
+Cure53 audit, SOC2) is untouched.
 
 ---
 
@@ -2269,6 +2276,119 @@ Recording the decision so the doc set stays coherent as the repo grows:
   **signature** into sigild's op-log auth is **blocked** — Go's stdlib has no ML-DSA,
   so sigild stays stdlib-only Ed25519 until we take a PQ-sig dependency (breaks the
   no-go.sum invariant) or move the check off the Go server.
+- No over-claims: "post-quantum" names the ML-KEM-768 component algorithm and the
+  path's *design intent* on unaudited building blocks — the **system is NOT
+  "post-quantum secure".**
+
+## 2026-07-13 — Phase 23 (CLI hybrid public-key encryption: encrypt a file to a device hybrid identity)
+
+### Context & mandate
+- Goal: give the hybrid encryption path (Phase 21 core `hybrid_seal`/`hybrid_open`,
+  Phase 22 FFI) its **FIRST user-facing exercise, end-to-end**. Everything hybrid so
+  far lived in the Rust core or behind the C-ABI — no human-drivable command touched
+  it. This phase adds three `sigil` subcommands that let one device encrypt a file
+  **TO** another device's hybrid public identity and let that device decrypt it,
+  with **no shared password** (public-key, not password, encryption).
+- ⚠️ Wiring only — **no new low-level cryptography and no new deps.** The CLI
+  composes the core's already-existing `hybrid_seal`/`hybrid_open` (+ `x25519_public_key`,
+  `ml_kem768_keygen`) into on-disk identity + container formats. A **CUSTOM**
+  KEM-then-AEAD construction — **NOT RFC 9180 HPKE** — real but **UNAUDITED**, and a
+  **demo of the hybrid encryption path, NOT the product's account / key-management
+  model**. Keeps the loud PRE-AUDIT / not-for-real-secrets posture.
+
+### cli — `cli/src/lib.rs` + `cli/src/main.rs` ✅
+- **Two on-disk identity files (JSON, std-base64 fields).**
+  - **Secret** `<file>` (`HybridSecretIdentity`): `{"version":1,"x25519_secret":"<b64
+    32>","mlkem_seed":"<b64 64>"}` — the private half a device keeps to itself. The
+    ML-KEM-768 decaps key is re-derived from `mlkem_seed` on load (`ml_kem768_keygen`),
+    so the seed alone reconstitutes the PQ secret. Written **mode 0600**.
+  - **Public** `<file>.pub` (`HybridPublicIdentity`): `{"version":1,"x25519_public_key":
+    "<b64 32>","mlkem_encaps_key":"<b64 1184>"}` — the shareable half a device hands to
+    senders. Carries only public material (no `x25519_secret` / `mlkem_seed`). Written
+    0644.
+- **The `SIGILhyb` container** (`hybrid_seal_to_container` / `hybrid_open_container`):
+  `magic b"SIGILhyb"(8)` + `version(1)` + `eph_x25519_pub(32)` + `mlkem_ct(1088)` +
+  `envelope(..)` — a self-describing prefix (`HYBRID_FIXED_PREFIX_LEN` = 1129) followed
+  by the `hybrid_seal` AEAD envelope tail (the nonce lives inside the envelope). A fixed
+  `HYBRID_AAD = b"sigil-hybrid-cli/1"` namespaces this tool's records and is bound into
+  the AEAD. No password anywhere — the KEM secret comes from encapsulating to the
+  recipient's hybrid pubkey.
+- **Three subcommands** (`main.rs`):
+  - `sigil hybrid-keygen --out <file>` — draw a fresh 32-byte X25519 secret + 64-byte
+    ML-KEM seed from the CSPRNG, write the 0600 secret `<file>` and shareable
+    `<file>.pub`, and print the pubkey path for senders.
+  - `sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>` — encrypt
+    `--in` TO the recipient public identity, writing the `SIGILhyb` container.
+  - `sigil hybrid-open --key <file> --in <file> --out <file>` — decrypt the container
+    with the recipient's secret identity, writing the recovered plaintext.
+- Decode is **defensive**: identity fields are length-checked per field
+  (`decode_identity_field::<N>` rejects wrong-length base64), and the container decode
+  rejects short/garbage/bad-magic/bad-version/truncated input **without panicking**
+  (every split is length-gated first). Open failures collapse to
+  `CliError::HybridSeal(HybridSealError)` — a wrong identity or a tampered container
+  surfaces as `Aead(Authentication)` and writes **no** output file.
+
+### Dependency & isolation gate — no new deps, libsigil lock untouched ✅
+- **No new dependencies.** `cli/Cargo.toml` unchanged (`git diff --quiet` exit 0) —
+  deps stay `sigil-core` + `getrandom` + `ureq` + `serde`/`serde_json` + `base64`;
+  `cli/Cargo.lock` also unchanged. The hybrid commands reuse `sigil_core::hybrid_seal`/
+  `hybrid_open` + `getrandom` (for the fresh secrets/seed) that were already present.
+- ✅ **The wasm gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  and `git diff --quiet libsigil/Cargo.lock` exit 0 — the CLI is a SEPARATE crate (own
+  lock; its own getrandom = 1, outside the wasm gate) and did not leak into the
+  wasm-pure core. `#![forbid(unsafe_code)]` retained in both `cli/src/main.rs` and
+  `cli/src/lib.rs`.
+
+### Tests ✅ — the encrypt-to-identity round-trip plus wrong-identity / tamper / hygiene
+- **`cargo test --manifest-path cli/Cargo.toml`: 36 PASS, 0 failed** — `lib.rs` **33**
+  (incl. **7 NEW** hybrid tests: identity derivation + save/load 0600 round-trip,
+  decode rejects wrong-length field, seal/open round-trip, empty-plaintext round-trip,
+  wrong-identity fails without leaking plaintext, tampered container rejected, and
+  short/garbage/bad-magic/bad-version/truncated rejected without panic) and
+  `tests/cli.rs` **3** (incl. **NEW** `hybrid_keygen_seal_open_round_trips_via_binary`
+  driving the real `sigil` binary).
+- ✅ `cargo fmt --all --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  `cargo build` → `cli/target/debug/sigil` (4.8 MB).
+
+### LIVE two-device proof (real binary, temp dirs)
+- **Positive round-trip.** (B) `sigil hybrid-keygen --out B/id.key` → exit 0; wrote
+  `B/id.key` (**mode 0600**) + shareable `B/id.key.pub` (0644). (A) wrote a known
+  plaintext, then `sigil hybrid-seal --recipient-pub B/id.key.pub --in pt.txt --out
+  msg.hyb` → exit 0, a **1242-byte `SIGILhyb` container** with the plaintext **absent
+  in the clear**. (B) `sigil hybrid-open --key B/id.key --in msg.hyb --out got.txt` →
+  exit 0; `cmp pt.txt got.txt` == **MATCH** (recovered == original).
+- **Negative (wrong identity).** A DIFFERENT identity `B2` (`hybrid-keygen --out
+  B2/id.key`) running `hybrid-open` on A's `msg.hyb` →
+  > `sigil: error: could not hybrid-open record: Aead(Authentication)`
+  exit 1, and **no output file was written** — no plaintext leaked.
+- **Secret-file hygiene.** The secret `id.key` is mode **0600**; its `x25519_secret` /
+  `mlkem_seed` base64 values do **NOT** appear anywhere in `id.key.pub` (the public
+  file carries only `version` + `x25519_public_key` + `mlkem_encaps_key`).
+
+### Regression — everything else still green ✅
+- libsigil fmt/clippy clean; `cargo test` **97 + 19** PASS; wasm32 `sigil-core` build
+  OK; getrandom count **0**. sigild gofmt/vet/test/build ✓. All 7 workflow YAMLs
+  parse ✓. Web untouched.
+
+### docs — architecture.md (docs track) + this finalizer ✅
+- `docs/architecture.md` was already updated by the docs track to describe the CLI
+  hybrid public-key commands. This entry finalizes the remaining living docs (this
+  file, `CLAUDE.md`, `README.md`). **No new ADR** — Phase 23 is a CLI wiring of
+  primitives whose design decisions are already captured (the hybrid KEM combiner in
+  ADR 0011, the KEM-then-AEAD composition in ADR 0013); ADRs remain 0001–0013.
+
+### ➡️ What this opens, and what's still open (honest)
+- This is the **FIRST user-facing exercise of the hybrid stack end-to-end**: a person
+  can run three commands to generate a device hybrid identity and public-key encrypt a
+  file to another device — the Phase 21/22 flow is now reachable from a human-drivable
+  CLI, and the two-device round-trip is proven live.
+- Still open — it is a **demo / dev tool, NOT a product feature**: a CUSTOM
+  KEM-then-AEAD construction (NOT RFC 9180 HPKE), real but **UNAUDITED**. There is
+  still no account / device-enrollment / key-publication / trust / rotation model —
+  identities are loose files a human copies by hand — and nothing in a real product
+  path or in sigild uses it. Next: **a bigger wiring step — a real enrollment /
+  session / key-management flow** behind the primitives, or the non-crypto product
+  surface.
 - No over-claims: "post-quantum" names the ML-KEM-768 component algorithm and the
   path's *design intent* on unaudited building blocks — the **system is NOT
   "post-quantum secure".**

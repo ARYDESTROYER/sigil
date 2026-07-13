@@ -113,7 +113,14 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `--key` (or `SIGIL_DEVICE_KEY`) so a pubkey-configured server accepts them
   (no key → unsigned, as before) — **dev-only**. `pull` is **incremental** — a
   per-vault cursor is kept in the out-dir, so repeat pulls fetch only new ops.
-  Standalone crate; unaudited; not for real secrets.
+  Also `sigil hybrid-keygen`/`hybrid-seal`/`hybrid-open` — **public-key** (no
+  shared password) encryption: `hybrid-keygen` writes a 0600 secret hybrid identity
+  + a shareable `.pub`, then `hybrid-seal --recipient-pub <pub>` encrypts a file
+  **to** another device's hybrid identity (X25519 + ML-KEM-768) and `hybrid-open`
+  decrypts it, via the core's `hybrid_seal`/`hybrid_open` — the **first user-facing
+  use of the hybrid encryption path** (a demo; a **custom KEM-then-AEAD**
+  construction, **NOT RFC 9180 HPKE**; not the product's key-management model).
+  Standalone crate; **UNAUDITED**; not for real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,

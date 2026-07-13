@@ -118,9 +118,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     **bespoke composition — NOT RFC 9180 HPKE** — and the **first wiring of a hybrid
     primitive into an encryption flow**. Real but UNAUDITED and **standalone**: a
     crypto-level flow, **not** the product's account / key-management /
-    vault-storage model, and not used by `sigild` or the CLI (the envelope's
-    `kem_ct` field stays reserved — the ML-KEM ciphertext travels alongside the
-    envelope). See
+    vault-storage model; `sigild` never uses it and the CLI exercises it only as a
+    demo (its `hybrid-keygen` / `hybrid-seal` / `hybrid-open` commands, above). The
+    envelope's `kem_ct` field stays reserved — the ML-KEM ciphertext travels
+    alongside the envelope. See
     [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
@@ -151,9 +152,16 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
 - **`cli`** ([`../cli/`](../cli/)) — `sigil`, a **pre-audit demonstration** binary.
   `seal`/`open` wrap one file in a self-describing container via the real
   `sigil-core` record API; `push`/`pull` move that **opaque** container to/from a
-  **dev/localhost** `sigild` op-log over **plain HTTP** (no TLS). A **standalone
-  crate** with its own lockfile (see [§5](#5-build--dependency-isolation)). Keeps a
-  loud UNAUDITED / not-for-real-secrets banner.
+  **dev/localhost** `sigild` op-log over **plain HTTP** (no TLS). It now **also**
+  has hybrid public-key encryption commands — `hybrid-keygen` / `hybrid-seal` /
+  `hybrid-open` — that exercise the core's `hybrid_seal` / `hybrid_open` to encrypt
+  a file **to a device's hybrid public identity** (an X25519 public key + an
+  ML-KEM-768 encapsulation key). This is the **first user-facing use of the hybrid
+  encryption path**, but it is still a **demo over UNAUDITED primitives**: a
+  **custom KEM-then-AEAD** composition (**NOT** RFC 9180 HPKE), and **not** the
+  product's account / key-management model. A **standalone crate** with its own
+  lockfile (see [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
+  not-for-real-secrets banner.
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
@@ -299,7 +307,8 @@ recipient's `hybrid_open` decapsulates with its hybrid secret keys and opens the
 envelope. This is the **first wiring of a hybrid primitive into an encryption
 flow**, but it is a **crypto-level building block only** — bespoke (**NOT** RFC
 9180 HPKE), UNAUDITED, and **not** the product's account / key-management /
-vault-storage model; neither `sigild` nor the CLI uses it. See
+vault-storage model; `sigild` never uses it, and the CLI exercises it only as a
+demo (its `hybrid-keygen` / `hybrid-seal` / `hybrid-open` commands). See
 [`crypto-spec.md`](crypto-spec.md) and
 [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
 
@@ -437,8 +446,10 @@ authoritative list, with rationale, is the **defer ledger** in
   field stays *reserved* but unused, and the `sigild` op-log request auth still uses
   classical Ed25519 only), and the **system is still not "post-quantum secure"**.
   The remaining crypto gap is therefore **wiring the hybrid primitives into the
-  product account/session/record model** — `sigild` and the CLI are unchanged, and
-  the hybrid signature is not yet composed into any flow.
+  product account/session/record model** — `sigild` is unchanged and the CLI only
+  **demos** the hybrid seal/open flow (its `hybrid-keygen` / `hybrid-seal` /
+  `hybrid-open` commands), not the product model, and the hybrid signature is not
+  yet composed into any flow.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number — no signed ops, no Lamport/Merkle
   ordering, no conflict-free merge.

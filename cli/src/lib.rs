@@ -47,8 +47,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sigil_core::{
-    open_record, public_key_from_seed, seal_record, sign, Argon2Params, RecordError, NONCE_LEN,
-    SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
+    hybrid_open, hybrid_seal, ml_kem768_keygen, open_record, public_key_from_seed, seal_record,
+    sign, x25519_public_key, Argon2Params, HybridSealError, RecordError, ML_KEM768_CIPHERTEXT_LEN,
+    ML_KEM768_DECAPS_KEY_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
+    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN,
+    X25519_SECRET_KEY_LEN,
 };
 
 /// The 8-byte magic that prefixes every container.
@@ -114,11 +117,28 @@ pub enum CliError {
     /// LOCAL device material — DEV-ONLY (see the signing module note). Carries a
     /// short message and never the raw seed bytes.
     Key(String),
+    /// A failure generating, reading, parsing, writing, or DECODING a hybrid
+    /// public-key identity file (secret or public): an IO error, malformed JSON,
+    /// an unsupported version, a non-base64 field, or a decoded key of the wrong
+    /// length. The SECRET identity holds private key material — DEV-ONLY,
+    /// UNAUDITED. Carries a short message and never the raw secret bytes.
+    Identity(String),
+    /// The `sigil-core` hybrid public-key seal/open failed: a KEM-input rejection,
+    /// a malformed/truncated envelope, or — most importantly — an authentication
+    /// failure (wrong recipient identity or tampered container). The plaintext is
+    /// never returned in this case.
+    HybridSeal(HybridSealError),
 }
 
 impl From<RecordError> for CliError {
     fn from(e: RecordError) -> Self {
         CliError::Record(e)
+    }
+}
+
+impl From<HybridSealError> for CliError {
+    fn from(e: HybridSealError) -> Self {
+        CliError::HybridSeal(e)
     }
 }
 
@@ -153,6 +173,11 @@ impl core::fmt::Display for CliError {
             ),
             CliError::State(e) => write!(f, "local pull-state error: {e}"),
             CliError::Key(e) => write!(f, "device key error: {e}"),
+            CliError::Identity(e) => write!(f, "hybrid identity error: {e}"),
+            // `HybridSealError` derives Debug only; surface it via Debug so the
+            // user sees Hybrid / Aead / Envelope without claiming more than we
+            // know. Never includes plaintext.
+            CliError::HybridSeal(e) => write!(f, "could not hybrid-open record: {e:?}"),
         }
     }
 }
@@ -250,6 +275,394 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
     };
 
     let plaintext = open_record(password, salt, params, envelope)?;
+    Ok(plaintext)
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid PUBLIC-KEY encryption: encrypt a file TO another device's hybrid
+// public identity (X25519 + ML-KEM-768), with NO password. This is the
+// public-key path, distinct from the password-based seal/open above.
+//
+// STATUS: pre-audit, UNAUDITED, DEV-ONLY. This composes sigil-core's REAL but
+// UNAUDITED hybrid primitives ([`sigil_core::hybrid_seal`] /
+// [`sigil_core::hybrid_open`]) into a self-describing on-disk container. The
+// construction is a CUSTOM KEM-then-AEAD (X25519 + ML-KEM-768 -> shared secret
+// -> XChaCha20-Poly1305); it is NOT RFC 9180 HPKE and NOT a standardised scheme.
+// The SYSTEM is NOT "post-quantum secure" and makes NO security claims. Do NOT
+// use it to protect real secrets.
+//
+// A device generates a HYBRID IDENTITY: a SECRET identity file (its X25519
+// secret + ML-KEM-768 keygen seed, mode 0600) and a shareable PUBLIC identity
+// file (its X25519 public key + ML-KEM-768 encapsulation key). Senders encrypt
+// TO the public identity; only the holder of the secret identity can open.
+// ---------------------------------------------------------------------------
+
+/// The 8-byte magic that prefixes every hybrid public-key container.
+pub const HYBRID_MAGIC: &[u8; 8] = b"SIGILhyb";
+
+/// The hybrid container format version this build writes and is the only one it
+/// reads.
+pub const HYBRID_FORMAT_VERSION: u8 = 1;
+
+/// The version byte written into every hybrid identity file (secret and public).
+/// The only version this build writes or reads.
+pub const HYBRID_IDENTITY_VERSION: u8 = 1;
+
+/// The fixed additional-authenticated-data tag bound into every hybrid-sealed
+/// container. It namespaces this tool's hybrid records and is authenticated by
+/// the AEAD (carried inside the envelope).
+pub const HYBRID_AAD: &[u8] = b"sigil-hybrid-cli/1";
+
+/// Byte length of the fixed prefix of a hybrid container: `magic(8)` +
+/// `version(1)` + `eph_x25519_pub(32)` + `mlkem_ct(1088)` = 1129. The seal
+/// envelope bytes follow this prefix.
+const HYBRID_FIXED_PREFIX_LEN: usize = 8 + 1 + X25519_PUBLIC_KEY_LEN + ML_KEM768_CIPHERTEXT_LEN;
+
+/// A SECRET hybrid identity file: the private half a device keeps to itself.
+///
+/// On disk this is JSON
+/// `{"version":1,"x25519_secret":"<b64 32>","mlkem_seed":"<b64 64>"}`, where
+/// `x25519_secret` is standard-base64 of the 32-byte X25519 secret and
+/// `mlkem_seed` is standard-base64 of the 64-byte ML-KEM-768 keygen seed (the
+/// decapsulation key is DERIVED from the seed via [`ml_kem768_keygen`], not
+/// stored). This file holds SECRET key material and is written with mode `0600`;
+/// it is per-device, DEV-ONLY, and NOT synced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSecretIdentity {
+    /// Identity file format version. Always [`HYBRID_IDENTITY_VERSION`].
+    pub version: u8,
+    /// Standard-base64 of the 32-byte X25519 secret key. SECRET material.
+    pub x25519_secret: String,
+    /// Standard-base64 of the 64-byte ML-KEM-768 keygen seed. SECRET material.
+    pub mlkem_seed: String,
+}
+
+/// A shareable PUBLIC hybrid identity: the public half a device hands to
+/// senders so they can encrypt TO it. Safe to share; carries no secret material.
+///
+/// On disk this is JSON
+/// `{"version":1,"x25519_public_key":"<b64 32>","mlkem_encaps_key":"<b64 1184>"}`,
+/// where `x25519_public_key` is standard-base64 of the 32-byte X25519 public key
+/// and `mlkem_encaps_key` is standard-base64 of the 1184-byte ML-KEM-768
+/// encapsulation key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridPublicIdentity {
+    /// Identity file format version. Always [`HYBRID_IDENTITY_VERSION`].
+    pub version: u8,
+    /// Standard-base64 of the 32-byte X25519 public key.
+    pub x25519_public_key: String,
+    /// Standard-base64 of the 1184-byte ML-KEM-768 encapsulation key.
+    pub mlkem_encaps_key: String,
+}
+
+/// A decoded recipient public identity: the raw key bytes ready to pass to
+/// [`hybrid_seal_to_container`]. Produced by [`HybridPublicIdentity::decode`].
+pub struct HybridPublicKeys {
+    /// The recipient's 32-byte X25519 public key.
+    pub x25519_public_key: [u8; X25519_PUBLIC_KEY_LEN],
+    /// The recipient's 1184-byte ML-KEM-768 encapsulation key.
+    pub mlkem_encaps_key: [u8; ML_KEM768_ENCAPS_KEY_LEN],
+}
+
+/// A decoded SECRET identity: the raw X25519 secret plus the ML-KEM-768
+/// decapsulation key (derived from the stored seed), ready to pass to
+/// [`hybrid_open_container`]. Produced by [`HybridSecretIdentity::decode`].
+pub struct HybridSecretKeys {
+    /// This device's 32-byte X25519 secret key. SECRET material.
+    pub x25519_secret: [u8; X25519_SECRET_KEY_LEN],
+    /// This device's 2400-byte ML-KEM-768 decapsulation key, derived from the
+    /// stored keygen seed. SECRET material.
+    pub mlkem_decaps_key: [u8; ML_KEM768_DECAPS_KEY_LEN],
+}
+
+/// Standard-base64-decode `field` into a fixed `[u8; N]`, mapping a bad alphabet
+/// or a wrong decoded length to a clear [`CliError::Identity`] naming the field.
+fn decode_identity_field<const N: usize>(field: &str, name: &str) -> Result<[u8; N], CliError> {
+    let bytes = BASE64
+        .decode(field.as_bytes())
+        .map_err(|e| CliError::Identity(format!("{name} is not valid base64: {e}")))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        CliError::Identity(format!("{name} must decode to {N} bytes, got {}", v.len()))
+    })
+}
+
+impl HybridSecretIdentity {
+    /// Decode this secret identity into raw key bytes: validate the version,
+    /// base64-decode the X25519 secret and the ML-KEM keygen seed, and DERIVE the
+    /// ML-KEM-768 decapsulation key from the seed with [`ml_kem768_keygen`].
+    ///
+    /// # Errors
+    /// - [`CliError::Identity`] on an unsupported version, a non-base64 field, or
+    ///   a decoded secret/seed of the wrong length.
+    pub fn decode(&self) -> Result<HybridSecretKeys, CliError> {
+        if self.version != HYBRID_IDENTITY_VERSION {
+            return Err(CliError::Identity(format!(
+                "unsupported hybrid identity version {}: expected {HYBRID_IDENTITY_VERSION}",
+                self.version
+            )));
+        }
+        let x25519_secret =
+            decode_identity_field::<X25519_SECRET_KEY_LEN>(&self.x25519_secret, "x25519_secret")?;
+        let mlkem_seed =
+            decode_identity_field::<ML_KEM768_KEYGEN_SEED_LEN>(&self.mlkem_seed, "mlkem_seed")?;
+        let (_ek, mlkem_decaps_key) = ml_kem768_keygen(&mlkem_seed);
+        Ok(HybridSecretKeys {
+            x25519_secret,
+            mlkem_decaps_key,
+        })
+    }
+}
+
+impl HybridPublicIdentity {
+    /// Decode this public identity into raw key bytes ready for
+    /// [`hybrid_seal_to_container`]: validate the version and base64-decode the
+    /// X25519 public key and the ML-KEM-768 encapsulation key.
+    ///
+    /// # Errors
+    /// - [`CliError::Identity`] on an unsupported version, a non-base64 field, or
+    ///   a decoded key of the wrong length.
+    pub fn decode(&self) -> Result<HybridPublicKeys, CliError> {
+        if self.version != HYBRID_IDENTITY_VERSION {
+            return Err(CliError::Identity(format!(
+                "unsupported hybrid identity version {}: expected {HYBRID_IDENTITY_VERSION}",
+                self.version
+            )));
+        }
+        let x25519_public_key = decode_identity_field::<X25519_PUBLIC_KEY_LEN>(
+            &self.x25519_public_key,
+            "x25519_public_key",
+        )?;
+        let mlkem_encaps_key = decode_identity_field::<ML_KEM768_ENCAPS_KEY_LEN>(
+            &self.mlkem_encaps_key,
+            "mlkem_encaps_key",
+        )?;
+        Ok(HybridPublicKeys {
+            x25519_public_key,
+            mlkem_encaps_key,
+        })
+    }
+}
+
+/// Generate a fresh DEV-ONLY hybrid identity: draw a 32-byte X25519 secret and a
+/// 64-byte ML-KEM-768 keygen seed from the OS CSPRNG, derive the X25519 public
+/// key and the ML-KEM-768 encapsulation key, and return the
+/// `(secret_identity, public_identity)` pair.
+///
+/// The secret identity stores the X25519 secret and the ML-KEM keygen seed; the
+/// public identity stores the X25519 public key and the ML-KEM encapsulation
+/// key. Share the public identity with senders; keep the secret identity local.
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails while drawing the secret or seed.
+pub fn generate_hybrid_identity() -> Result<(HybridSecretIdentity, HybridPublicIdentity), CliError>
+{
+    let mut x25519_secret = [0u8; X25519_SECRET_KEY_LEN];
+    fill_random(&mut x25519_secret)?;
+    let mut mlkem_seed = [0u8; ML_KEM768_KEYGEN_SEED_LEN];
+    fill_random(&mut mlkem_seed)?;
+
+    let x25519_pub = x25519_public_key(&x25519_secret);
+    let (mlkem_encaps_key, _dk) = ml_kem768_keygen(&mlkem_seed);
+
+    let secret = HybridSecretIdentity {
+        version: HYBRID_IDENTITY_VERSION,
+        x25519_secret: BASE64.encode(x25519_secret),
+        mlkem_seed: BASE64.encode(mlkem_seed),
+    };
+    let public = HybridPublicIdentity {
+        version: HYBRID_IDENTITY_VERSION,
+        x25519_public_key: BASE64.encode(x25519_pub),
+        mlkem_encaps_key: BASE64.encode(mlkem_encaps_key),
+    };
+    Ok((secret, public))
+}
+
+/// Write a SECRET hybrid identity to `path` as JSON, with file mode `0600`
+/// (owner read/write only), since it holds private key material.
+///
+/// Mirrors [`save_key`]: created with `0600` up front so the secret is never
+/// briefly world-readable, then re-asserts `0600` in case the file pre-existed
+/// with looser permissions.
+///
+/// # Errors
+/// - [`CliError::Identity`] on a serialize, write, or permission-set failure.
+pub fn save_hybrid_secret(
+    path: &std::path::Path,
+    identity: &HybridSecretIdentity,
+) -> Result<(), CliError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let json = serde_json::to_string_pretty(identity)
+        .map_err(|e| CliError::Identity(format!("could not serialize secret identity: {e}")))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| CliError::Identity(format!("could not create secret identity file: {e}")))?;
+    use std::io::Write as _;
+    f.write_all(json.as_bytes())
+        .map_err(|e| CliError::Identity(format!("could not write secret identity file: {e}")))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| CliError::Identity(format!("could not set secret identity permissions: {e}")))
+}
+
+/// Write a shareable PUBLIC hybrid identity to `path` as JSON.
+///
+/// The public identity carries no secret material, so it is written with the
+/// default permissions (unlike [`save_hybrid_secret`]).
+///
+/// # Errors
+/// - [`CliError::Identity`] on a serialize or write failure.
+pub fn save_hybrid_public(
+    path: &std::path::Path,
+    identity: &HybridPublicIdentity,
+) -> Result<(), CliError> {
+    let json = serde_json::to_string_pretty(identity)
+        .map_err(|e| CliError::Identity(format!("could not serialize public identity: {e}")))?;
+    std::fs::write(path, json)
+        .map_err(|e| CliError::Identity(format!("could not write public identity file: {e}")))
+}
+
+/// Read a SECRET hybrid identity file from `path`.
+///
+/// Validates only the JSON shape here; the version and field lengths are checked
+/// when the identity is [`decode`d](HybridSecretIdentity::decode).
+///
+/// # Errors
+/// - [`CliError::Identity`] on an IO error or malformed JSON.
+pub fn load_hybrid_secret(path: &std::path::Path) -> Result<HybridSecretIdentity, CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Identity(format!("could not read secret identity file: {e}")))?;
+    serde_json::from_str(&text)
+        .map_err(|e| CliError::Identity(format!("secret identity file is not valid JSON: {e}")))
+}
+
+/// Read a shareable PUBLIC hybrid identity file from `path`.
+///
+/// Validates only the JSON shape here; the version and field lengths are checked
+/// when the identity is [`decode`d](HybridPublicIdentity::decode).
+///
+/// # Errors
+/// - [`CliError::Identity`] on an IO error or malformed JSON.
+pub fn load_hybrid_public(path: &std::path::Path) -> Result<HybridPublicIdentity, CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Identity(format!("could not read public identity file: {e}")))?;
+    serde_json::from_str(&text)
+        .map_err(|e| CliError::Identity(format!("public identity file is not valid JSON: {e}")))
+}
+
+/// Encrypt `plaintext` TO a recipient's decoded hybrid public identity, packing
+/// the result into the [hybrid container format](#hybrid-container-format).
+///
+/// Draws a FRESH ephemeral X25519 secret (32 bytes), ML-KEM-768 coin (32 bytes),
+/// and AEAD nonce ([`NONCE_LEN`] bytes) from the OS CSPRNG, calls
+/// [`sigil_core::hybrid_seal`] with the fixed [`HYBRID_AAD`], and prepends the
+/// magic, version, ephemeral X25519 public key, and ML-KEM-768 ciphertext to the
+/// returned envelope bytes. No password is involved (this is the public-key
+/// path). This CLI never sees the recipient's secret.
+///
+/// # Hybrid container format
+///
+/// ```text
+///   offset  size    field
+///   ------  ------  -----------------------------------------------
+///   0       8       magic          = b"SIGILhyb"
+///   8       1       version        = 1
+///   9       32      eph_x25519_pub (sender's ephemeral X25519 public key)
+///   41      1088    mlkem_ct       (ML-KEM-768 ciphertext)
+///   1129    ..      envelope       = the hybrid_seal envelope (tail)
+/// ```
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails while drawing the ephemeral secret,
+///   coin, or nonce.
+/// - [`CliError::HybridSeal`] if `sigil-core` rejects a KEM input (e.g. a
+///   non-contributory recipient X25519 public key).
+pub fn hybrid_seal_to_container(
+    recipient: &HybridPublicKeys,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CliError> {
+    let mut eph_secret = [0u8; X25519_SECRET_KEY_LEN];
+    fill_random(&mut eph_secret)?;
+    let mut coin = [0u8; ML_KEM768_ENCAPS_COIN_LEN];
+    fill_random(&mut coin)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    fill_random(&mut nonce)?;
+
+    let (eph_pub, mlkem_ct, envelope) = hybrid_seal(
+        &recipient.x25519_public_key,
+        &recipient.mlkem_encaps_key,
+        &eph_secret,
+        &coin,
+        &nonce,
+        HYBRID_AAD,
+        plaintext,
+    )?;
+
+    let mut out = Vec::with_capacity(HYBRID_FIXED_PREFIX_LEN + envelope.len());
+    out.extend_from_slice(HYBRID_MAGIC);
+    out.push(HYBRID_FORMAT_VERSION);
+    out.extend_from_slice(&eph_pub);
+    out.extend_from_slice(&mlkem_ct);
+    out.extend_from_slice(&envelope);
+    Ok(out)
+}
+
+/// Parse a hybrid container produced by [`hybrid_seal_to_container`] and open it
+/// with the recipient's decoded secret identity.
+///
+/// Bounds-checks the container (magic / version / fixed-prefix length) BEFORE
+/// slicing — short or garbage input yields a clear [`CliError`], never a panic —
+/// then calls [`sigil_core::hybrid_open`]. On any KEM/authentication/decode
+/// failure it returns a [`CliError`] and **never leaks plaintext**.
+///
+/// # Errors
+/// - [`CliError::ShortContainer`] if the buffer can't hold the fixed prefix.
+/// - [`CliError::BadMagic`] / [`CliError::UnsupportedVersion`] on header
+///   mismatch.
+/// - [`CliError::HybridSeal`] if the wrapped record fails to decode or
+///   authenticate (wrong identity or tampered container).
+pub fn hybrid_open_container(
+    identity: &HybridSecretKeys,
+    container: &[u8],
+) -> Result<Vec<u8>, CliError> {
+    if container.len() < HYBRID_FIXED_PREFIX_LEN {
+        return Err(CliError::ShortContainer);
+    }
+
+    let (magic, rest) = container.split_at(8);
+    if magic != HYBRID_MAGIC.as_slice() {
+        return Err(CliError::BadMagic);
+    }
+
+    let version = rest[0];
+    if version != HYBRID_FORMAT_VERSION {
+        return Err(CliError::UnsupportedVersion(version));
+    }
+
+    // After magic(8) + version(1): eph_x25519_pub[32] | mlkem_ct[1088] |
+    // envelope[..]. The length gate above guarantees every split below is in
+    // bounds, so the fixed-length `try_into`s cannot fail.
+    let after_version = &rest[1..];
+    let (eph_pub_bytes, rest2) = after_version.split_at(X25519_PUBLIC_KEY_LEN);
+    let (mlkem_ct_bytes, envelope) = rest2.split_at(ML_KEM768_CIPHERTEXT_LEN);
+
+    let eph_pub: [u8; X25519_PUBLIC_KEY_LEN] = eph_pub_bytes
+        .try_into()
+        .expect("eph_pub slice is exactly X25519_PUBLIC_KEY_LEN by construction");
+    let mlkem_ct: [u8; ML_KEM768_CIPHERTEXT_LEN] = mlkem_ct_bytes
+        .try_into()
+        .expect("mlkem_ct slice is exactly ML_KEM768_CIPHERTEXT_LEN by construction");
+
+    let plaintext = hybrid_open(
+        &identity.x25519_secret,
+        &identity.mlkem_decaps_key,
+        &eph_pub,
+        &mlkem_ct,
+        envelope,
+    )?;
     Ok(plaintext)
 }
 
@@ -1408,5 +1821,204 @@ mod tests {
     #[test]
     fn cursor_key_combines_server_and_vault() {
         assert_eq!(cursor_key("http://h:8080", "demo"), "http://h:8080|demo");
+    }
+
+    // --- Hybrid public-key identity + container tests ------------------------
+    //
+    // These exercise the public-key path: generate a hybrid identity, encrypt a
+    // file TO a recipient's PUBLIC identity, and open it with the matching SECRET
+    // identity. No password is involved. They use the REAL but UNAUDITED
+    // sigil-core hybrid primitives.
+
+    /// Generate a fresh hybrid identity pair for a test.
+    fn sample_hybrid() -> (HybridSecretIdentity, HybridPublicIdentity) {
+        generate_hybrid_identity().expect("generate hybrid identity")
+    }
+
+    #[test]
+    fn hybrid_identity_derivation_and_save_load_round_trip() {
+        let (secret, public) = sample_hybrid();
+        assert_eq!(secret.version, HYBRID_IDENTITY_VERSION);
+        assert_eq!(public.version, HYBRID_IDENTITY_VERSION);
+
+        // The public X25519 key must equal x25519_public_key(secret).
+        let x_secret: [u8; X25519_SECRET_KEY_LEN] = BASE64
+            .decode(secret.x25519_secret.as_bytes())
+            .expect("x25519 secret b64")
+            .try_into()
+            .expect("x25519 secret 32");
+        let derived_pub = x25519_public_key(&x_secret);
+        assert_eq!(BASE64.encode(derived_pub), public.x25519_public_key);
+
+        // The public ML-KEM encaps key must equal ek from ml_kem768_keygen(seed),
+        // and the decoded secret's decaps key must be the matching dk.
+        let seed: [u8; ML_KEM768_KEYGEN_SEED_LEN] = BASE64
+            .decode(secret.mlkem_seed.as_bytes())
+            .expect("mlkem seed b64")
+            .try_into()
+            .expect("mlkem seed 64");
+        let (ek, dk) = ml_kem768_keygen(&seed);
+        assert_eq!(BASE64.encode(ek), public.mlkem_encaps_key);
+
+        // Decoding both identities yields the raw key bytes.
+        let sk = secret.decode().expect("decode secret");
+        assert_eq!(sk.x25519_secret, x_secret);
+        assert_eq!(sk.mlkem_decaps_key, dk);
+        let pk = public.decode().expect("decode public");
+        assert_eq!(pk.x25519_public_key, derived_pub);
+        assert_eq!(pk.mlkem_encaps_key, ek);
+
+        // Save (secret 0600, public shareable), load back, and confirm they match.
+        let dir = TempDir::new("hybrid-id");
+        let sec_path = dir.path.join("id.key");
+        let pub_path = dir.path.join("id.key.pub");
+        save_hybrid_secret(&sec_path, &secret).expect("save secret");
+        save_hybrid_public(&pub_path, &public).expect("save public");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&sec_path)
+            .expect("stat secret")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "secret identity must be 0600");
+
+        let loaded_secret = load_hybrid_secret(&sec_path).expect("load secret");
+        let loaded_public = load_hybrid_public(&pub_path).expect("load public");
+        assert_eq!(
+            loaded_secret
+                .decode()
+                .expect("re-decode secret")
+                .x25519_secret,
+            x_secret
+        );
+        assert_eq!(
+            loaded_public
+                .decode()
+                .expect("re-decode public")
+                .mlkem_encaps_key,
+            ek
+        );
+    }
+
+    #[test]
+    fn hybrid_identity_decode_rejects_wrong_length_field() {
+        // A 16-byte X25519 secret (not 32) must be rejected as an Identity error.
+        let bad = HybridSecretIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_secret: BASE64.encode([0u8; 16]),
+            mlkem_seed: BASE64.encode([0u8; ML_KEM768_KEYGEN_SEED_LEN]),
+        };
+        assert!(matches!(bad.decode(), Err(CliError::Identity(_))));
+    }
+
+    #[test]
+    fn hybrid_container_seal_open_round_trip() {
+        let (secret, public) = sample_hybrid();
+        let pk = public.decode().expect("decode public");
+        let sk = secret.decode().expect("decode secret");
+
+        let plaintext = b"hybrid-encrypted to a device public identity";
+        let container = hybrid_seal_to_container(&pk, plaintext).expect("hybrid seal");
+
+        // Container shape: magic, version, and more than the fixed prefix.
+        assert_eq!(&container[..8], HYBRID_MAGIC.as_slice());
+        assert_eq!(container[8], HYBRID_FORMAT_VERSION);
+        assert!(container.len() > HYBRID_FIXED_PREFIX_LEN);
+        // The plaintext must not appear in the clear.
+        assert!(!container
+            .windows(plaintext.len())
+            .any(|w| w == plaintext.as_slice()));
+
+        let opened = hybrid_open_container(&sk, &container).expect("hybrid open");
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn hybrid_empty_plaintext_round_trips() {
+        let (secret, public) = sample_hybrid();
+        let container =
+            hybrid_seal_to_container(&public.decode().expect("decode public"), b"").expect("seal");
+        let opened = hybrid_open_container(&secret.decode().expect("decode secret"), &container)
+            .expect("open");
+        assert!(opened.is_empty());
+    }
+
+    #[test]
+    fn hybrid_wrong_identity_fails_without_leaking_plaintext() {
+        let (_secret_a, public_a) = sample_hybrid();
+        let (secret_b, _public_b) = sample_hybrid();
+
+        let plaintext = b"addressed to identity A only";
+        let container =
+            hybrid_seal_to_container(&public_a.decode().expect("decode A pub"), plaintext)
+                .expect("seal");
+
+        // Opening with B's UNRELATED secret identity must fail (the X25519 half
+        // disagrees, so the AEAD authentication fails).
+        let result = hybrid_open_container(&secret_b.decode().expect("decode B sec"), &container);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(!msg
+            .as_bytes()
+            .windows(plaintext.len())
+            .any(|w| w == plaintext));
+    }
+
+    #[test]
+    fn hybrid_tampered_container_is_rejected() {
+        let (secret, public) = sample_hybrid();
+        let plaintext = b"tamper-evident hybrid payload contents";
+        let mut container =
+            hybrid_seal_to_container(&public.decode().expect("decode public"), plaintext)
+                .expect("seal");
+        // Flip a late byte (deep in the envelope's ciphertext/tag region).
+        let last = container.len() - 1;
+        container[last] ^= 0x01;
+        let result = hybrid_open_container(&secret.decode().expect("decode secret"), &container);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(!msg
+            .as_bytes()
+            .windows(plaintext.len())
+            .any(|w| w == plaintext));
+    }
+
+    #[test]
+    fn hybrid_short_and_garbage_containers_are_rejected_without_panic() {
+        let (secret, public) = sample_hybrid();
+        let sk = secret.decode().expect("decode secret");
+
+        // Empty and too-short buffers hit the length gate, not a panic.
+        assert_eq!(
+            hybrid_open_container(&sk, &[]),
+            Err(CliError::ShortContainer)
+        );
+        assert_eq!(
+            hybrid_open_container(&sk, &[0xFFu8; 16]),
+            Err(CliError::ShortContainer)
+        );
+
+        // Long enough to pass the length gate but with wrong magic.
+        let buf = vec![0x00u8; HYBRID_FIXED_PREFIX_LEN + 8];
+        assert_eq!(hybrid_open_container(&sk, &buf), Err(CliError::BadMagic));
+
+        // A valid container with a bumped version byte.
+        let mut c =
+            hybrid_seal_to_container(&public.decode().expect("decode public"), b"x").expect("seal");
+        c[8] = 99;
+        assert_eq!(
+            hybrid_open_container(&sk, &c),
+            Err(CliError::UnsupportedVersion(99))
+        );
+
+        // Truncated envelope: header intact, envelope tail dropped. Surfaces as a
+        // HybridSeal error (Envelope/Aead), never a panic.
+        let c2 = hybrid_seal_to_container(&public.decode().expect("decode public"), b"payload")
+            .expect("seal");
+        let truncated = &c2[..c2.len() - 4];
+        assert!(matches!(
+            hybrid_open_container(&sk, truncated),
+            Err(CliError::HybridSeal(_))
+        ));
     }
 }

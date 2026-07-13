@@ -152,6 +152,14 @@ public, make no security claims, until the audit completes and trademark clears.
   as before). `pull` is **incremental**: a per-`(server,vault)` monotonic cursor is
   persisted in `<out-dir>/.sigil-pull-state.json`, so repeat pulls fetch only new
   ops (multi-vault independent); `--since` overrides the cursor for a one-off.
+  Also **`hybrid-keygen`/`hybrid-seal`/`hybrid-open`** — **public-key** (no-password)
+  encryption: `hybrid-keygen --out <file>` writes a 0600 secret hybrid identity
+  (`{x25519_secret, mlkem_seed}`) + shareable `<file>.pub` (`{x25519_public_key,
+  mlkem_encaps_key}`); `hybrid-seal --recipient-pub <pub>` encrypts a file TO that
+  device's hybrid identity (X25519 + ML-KEM-768) into a `SIGILhyb` container, and
+  `hybrid-open --key <secret>` decrypts it — via the core's `hybrid_seal`/`hybrid_open`
+  (dev/UNAUDITED; custom KEM-then-AEAD, NOT RFC 9180 HPKE; the FIRST user-facing use
+  of the hybrid encryption path — a demo, NOT the product key-management model).
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.

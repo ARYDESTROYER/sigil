@@ -11,7 +11,9 @@
 use std::process::ExitCode;
 
 use sigil_cli::{
-    cursor_key, generate_key, load_key, open_container, pull_ops, push_op, read_cursor, save_key,
+    cursor_key, generate_hybrid_identity, generate_key, hybrid_open_container,
+    hybrid_seal_to_container, load_hybrid_public, load_hybrid_secret, load_key, open_container,
+    pull_ops, push_op, read_cursor, save_hybrid_public, save_hybrid_secret, save_key,
     seal_to_container, write_cursor, PULL_STATE_FILE,
 };
 use sigil_core::Argon2Params;
@@ -41,9 +43,14 @@ sigil — pre-audit demonstration CLI over the libsigil core
   Do NOT use it to protect real secrets.
 
 USAGE:
-  sigil seal --in <file> --out <file>    Seal <in> into an encrypted container at <out>
-  sigil open --in <file> --out <file>    Open an encrypted container <in> into <out>
+  sigil seal --in <file> --out <file>    Seal <in> into a password-encrypted container at <out>
+  sigil open --in <file> --out <file>    Open a password-encrypted container <in> into <out>
   sigil keygen --out <file>              Generate a DEV device key (0600) and print its public key
+  sigil hybrid-keygen --out <file>       Generate a hybrid identity: secret <file> (0600) + shareable <file>.pub
+  sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>
+                                         Encrypt <in> TO a recipient's hybrid public identity (no password)
+  sigil hybrid-open --key <file> --in <file> --out <file>
+                                         Decrypt a hybrid container <in> with your secret identity <file>
   sigil push --vault <id> --in <file> [--server <url>] [--key <file>]
                                          Upload an opaque container to the dev op-log
   sigil pull --vault <id> --out-dir <dir> [--since <N>] [--server <url>] [--key <file>]
@@ -59,6 +66,30 @@ PASSWORD (seal/open only):
 
     SIGIL_PASSWORD='correct horse battery staple' sigil seal --in secret.txt --out secret.sigil
     SIGIL_PASSWORD='correct horse battery staple' sigil open --in secret.sigil --out secret.txt
+
+HYBRID PUBLIC-KEY ENCRYPTION (hybrid-keygen / hybrid-seal / hybrid-open) — NO password:
+  This is the PUBLIC-KEY path, distinct from the password-based seal/open above.
+  You encrypt a file TO another device's HYBRID IDENTITY (an X25519 public key +
+  an ML-KEM-768 encapsulation key); only the holder of the matching SECRET
+  identity can decrypt it. There is NO shared password.
+
+  !! PRE-AUDIT / UNAUDITED / DEV-ONLY !! The construction is a CUSTOM
+  KEM-then-AEAD composition (X25519 + ML-KEM-768 -> shared secret ->
+  XChaCha20-Poly1305). It is NOT RFC 9180 HPKE and NOT a standardised scheme; the
+  SYSTEM is NOT post-quantum secure. It has NOT been audited and makes NO security
+  guarantees. Do NOT use it to protect real secrets.
+
+  Flow (device B receives; device A sends):
+
+    # Device B: generate a hybrid identity. Writes the SECRET id to b.key (0600)
+    # and the shareable PUBLIC id to b.key.pub. Share ONLY b.key.pub with senders.
+    sigil hybrid-keygen --out b.key
+
+    # Device A: encrypt a file TO B's public identity (no password).
+    sigil hybrid-seal --recipient-pub b.key.pub --in secret.txt --out msg.hyb
+
+    # Device B: decrypt with its secret identity.
+    sigil hybrid-open --key b.key --in msg.hyb --out secret.txt
 
 SYNC (push/pull) — !! DEV / LOCALHOST / PLAIN HTTP ONLY !!
   push/pull talk PLAIN, UNENCRYPTED HTTP to a sigild DEV op-log that is itself
@@ -121,11 +152,19 @@ INCREMENTAL PULL (pull only):
   Delete it to reset the cursor and re-pull from scratch.
 
 ON-DISK CONTAINER FORMAT (all integers little-endian):
-  magic[8]=\"SIGILcli\" | version:u8=1 | m_cost:u32 | t_cost:u32 | p_cost:u32 |
-  salt_len:u8 | salt[salt_len] | envelope[..]
-  The Argon2id salt and params are stored in the header (the AEAD nonce travels
-  inside the envelope). The salt/params header is unprotected metadata; tampering
-  with it makes the record fail to open.
+  Password container (seal/open):
+    magic[8]=\"SIGILcli\" | version:u8=1 | m_cost:u32 | t_cost:u32 | p_cost:u32 |
+    salt_len:u8 | salt[salt_len] | envelope[..]
+    The Argon2id salt and params are stored in the header (the AEAD nonce travels
+    inside the envelope). The salt/params header is unprotected metadata; tampering
+    with it makes the record fail to open.
+
+  Hybrid container (hybrid-seal/hybrid-open):
+    magic[8]=\"SIGILhyb\" | version:u8=1 | eph_x25519_pub[32] | mlkem_ct[1088] |
+    envelope[..]
+    The sender's ephemeral X25519 public key and the ML-KEM-768 ciphertext precede
+    the seal envelope; the recipient re-derives the shared secret from them plus its
+    secret identity. Tampering with any of it makes the record fail to open.
 ";
 
 fn main() -> ExitCode {
@@ -171,6 +210,18 @@ fn run() -> Result<(), String> {
         "keygen" => {
             let out = parse_keygen(args)?;
             cmd_keygen(&out)
+        }
+        "hybrid-keygen" => {
+            let out = parse_keygen(args)?;
+            cmd_hybrid_keygen(&out)
+        }
+        "hybrid-seal" => {
+            let a = parse_hybrid_seal(args)?;
+            cmd_hybrid_seal(&a)
+        }
+        "hybrid-open" => {
+            let a = parse_hybrid_open(args)?;
+            cmd_hybrid_open(&a)
         }
         "push" => {
             let p = parse_push(args)?;
@@ -285,7 +336,8 @@ fn parse_pull(mut args: impl Iterator<Item = String>) -> Result<PullArgs, String
     })
 }
 
-/// Parse `sigil keygen --out <file>` from the remaining args.
+/// Parse `sigil keygen --out <file>` from the remaining args. Also used by
+/// `hybrid-keygen`, which takes the same single `--out <file>` argument.
 fn parse_keygen(mut args: impl Iterator<Item = String>) -> Result<String, String> {
     let mut out: Option<String> = None;
     while let Some(flag) = args.next() {
@@ -295,6 +347,65 @@ fn parse_keygen(mut args: impl Iterator<Item = String>) -> Result<String, String
         }
     }
     out.ok_or_else(|| "missing required --out <file>".to_string())
+}
+
+/// Parsed args for `sigil hybrid-seal`: encrypt `--in` TO the recipient public
+/// identity at `--recipient-pub`, writing the hybrid container to `--out`.
+struct HybridSealArgs {
+    recipient_pub: String,
+    input: String,
+    output: String,
+}
+
+/// Parsed args for `sigil hybrid-open`: decrypt the hybrid container at `--in`
+/// with the secret identity at `--key`, writing the plaintext to `--out`.
+struct HybridOpenArgs {
+    key: String,
+    input: String,
+    output: String,
+}
+
+fn parse_hybrid_seal(mut args: impl Iterator<Item = String>) -> Result<HybridSealArgs, String> {
+    let mut recipient_pub: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--recipient-pub" => set_once(&mut recipient_pub, &mut args, "--recipient-pub")?,
+            "--in" => set_once(&mut input, &mut args, "--in")?,
+            "--out" => set_once(&mut output, &mut args, "--out")?,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+
+    Ok(HybridSealArgs {
+        recipient_pub: recipient_pub
+            .ok_or_else(|| "missing required --recipient-pub <file>".to_string())?,
+        input: input.ok_or_else(|| "missing required --in <file>".to_string())?,
+        output: output.ok_or_else(|| "missing required --out <file>".to_string())?,
+    })
+}
+
+fn parse_hybrid_open(mut args: impl Iterator<Item = String>) -> Result<HybridOpenArgs, String> {
+    let mut key: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--key" => set_once(&mut key, &mut args, "--key")?,
+            "--in" => set_once(&mut input, &mut args, "--in")?,
+            "--out" => set_once(&mut output, &mut args, "--out")?,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+
+    Ok(HybridOpenArgs {
+        key: key.ok_or_else(|| "missing required --key <file>".to_string())?,
+        input: input.ok_or_else(|| "missing required --in <file>".to_string())?,
+        output: output.ok_or_else(|| "missing required --out <file>".to_string())?,
+    })
 }
 
 /// Store a value into `slot` exactly once, erroring on a missing value or a
@@ -397,6 +508,58 @@ fn cmd_keygen(out: &str) -> Result<(), String> {
          device public key (set sigild SIGILD_OPLOG_PUBKEY to this): {}",
         kf.public_key
     );
+    Ok(())
+}
+
+/// Generate a fresh hybrid identity, writing the SECRET identity to `out` (mode
+/// `0600`) and the shareable PUBLIC identity to `<out>.pub`. Prints the `.pub`
+/// path and a note to SHARE it with senders.
+fn cmd_hybrid_keygen(out: &str) -> Result<(), String> {
+    let (secret, public) = generate_hybrid_identity().map_err(|e| e.to_string())?;
+    let pub_out = format!("{out}.pub");
+
+    save_hybrid_secret(std::path::Path::new(out), &secret).map_err(|e| e.to_string())?;
+    save_hybrid_public(std::path::Path::new(&pub_out), &public).map_err(|e| e.to_string())?;
+
+    println!(
+        "wrote hybrid SECRET identity to {out} (mode 0600) — keep it local, it decrypts your messages\n\
+         wrote shareable PUBLIC identity to {pub_out}\n\
+         SHARE {pub_out} with senders so they can `hybrid-seal --recipient-pub {pub_out}` TO this device"
+    );
+    Ok(())
+}
+
+/// Encrypt `--in` TO the recipient's PUBLIC hybrid identity and write the hybrid
+/// container to `--out`. No password (this is the public-key path).
+fn cmd_hybrid_seal(a: &HybridSealArgs) -> Result<(), String> {
+    let public =
+        load_hybrid_public(std::path::Path::new(&a.recipient_pub)).map_err(|e| e.to_string())?;
+    let recipient = public.decode().map_err(|e| e.to_string())?;
+
+    let plaintext =
+        std::fs::read(&a.input).map_err(|e| format!("could not read input {:?}: {e}", a.input))?;
+
+    let container = hybrid_seal_to_container(&recipient, &plaintext).map_err(|e| e.to_string())?;
+
+    std::fs::write(&a.output, &container)
+        .map_err(|e| format!("could not write output {:?}: {e}", a.output))?;
+    Ok(())
+}
+
+/// Decrypt the hybrid container at `--in` with the SECRET identity at `--key` and
+/// write the plaintext to `--out`. No password (this is the public-key path).
+fn cmd_hybrid_open(a: &HybridOpenArgs) -> Result<(), String> {
+    let secret = load_hybrid_secret(std::path::Path::new(&a.key)).map_err(|e| e.to_string())?;
+    let identity = secret.decode().map_err(|e| e.to_string())?;
+
+    let container =
+        std::fs::read(&a.input).map_err(|e| format!("could not read input {:?}: {e}", a.input))?;
+
+    // hybrid_open_container never returns plaintext on error, so this is safe.
+    let plaintext = hybrid_open_container(&identity, &container).map_err(|e| e.to_string())?;
+
+    std::fs::write(&a.output, &plaintext)
+        .map_err(|e| format!("could not write output {:?}: {e}", a.output))?;
     Ok(())
 }
 

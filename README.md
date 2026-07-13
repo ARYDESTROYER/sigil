@@ -74,9 +74,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   into an encryption flow, but it is UNAUDITED and STANDALONE: a crypto-level flow
   only, NOT the product's account / key-management / vault-storage model, and not
   used by sigild or the CLI**, plus a
-  `sigil-ffi` C-ABI (`seal`/`open`/`buffer_free`, and the classical Ed25519 sig
-  exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify` with a
-  `SIGIL_ERR_VERIFY` code) for the clients.
+  `sigil-ffi` C-ABI for the clients — `seal`/`open`/`buffer_free`, the classical
+  Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`
+  (with a `SIGIL_ERR_VERIFY` code), and — **now assembled** — the **hybrid
+  encryption path**: `sigil_x25519_public_key` + `sigil_ml_kem768_keygen` derive a
+  hybrid identity's public halves, `sigil_hybrid_encapsulate`/`sigil_hybrid_decapsulate`
+  are the two sides of the hybrid KEM, and `sigil_hybrid_seal`/`sigil_hybrid_open`
+  encrypt a record **to** a recipient's hybrid public key and decrypt it — the
+  custom KEM-then-AEAD `hybrid_seal`/`hybrid_open` flow above exposed over the C-ABI
+  (a `SIGIL_ERR_HYBRID` status code plus fixed-size length `#define`s, both C-ABI
+  round-trips proven). **These FFI exports are real but UNAUDITED building blocks —
+  a CUSTOM KEM-then-AEAD construction, NOT RFC 9180 HPKE, and NOT wired into any
+  product flow; the system is NOT "post-quantum secure".**
 - `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a

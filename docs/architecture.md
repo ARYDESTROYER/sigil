@@ -136,10 +136,17 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   **C-ABI** over the core: the AEAD layer `sigil_seal` / `sigil_open` /
   `sigil_buffer_free`, and — alongside it — the classical **Ed25519** primitive
   `sigil_public_key_from_seed` / `sigil_sign` / `sigil_verify`, so the same
-  standalone, UNAUDITED sign/verify the CLI uses is reachable over the C-ABI too
-  (plus `sigil_current_suite` as a link/smoke check), with a hand-maintained
-  [`sigil.h`](../libsigil/ffi/include/sigil.h). This is the seam the native
-  clients (in separate repos) will link against. It is the only crate with
+  standalone, UNAUDITED sign/verify the CLI uses is reachable over the C-ABI too.
+  The C-ABI now **also exposes the hybrid encryption path** —
+  `sigil_x25519_public_key`, `sigil_ml_kem768_keygen`, and
+  `sigil_hybrid_encapsulate` / `sigil_hybrid_decapsulate` / `sigil_hybrid_seal` /
+  `sigil_hybrid_open` — so a native client can generate a hybrid identity and
+  encrypt a record **to a recipient's hybrid public key** through the FFI. That is
+  the same **custom KEM-then-AEAD** composition as the core's `hybrid_seal`
+  (**NOT** RFC 9180 HPKE), still **real but UNAUDITED** and not wired into a product
+  flow. (Plus `sigil_current_suite` as a link/smoke check.) All with a
+  hand-maintained [`sigil.h`](../libsigil/ffi/include/sigil.h). This is the seam the
+  native clients (in separate repos) will link against. It is the only crate with
   `unsafe` (the FFI boundary); `core` forbids it.
 - **`cli`** ([`../cli/`](../cli/)) — `sigil`, a **pre-audit demonstration** binary.
   `seal`/`open` wrap one file in a self-describing container via the real

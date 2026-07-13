@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 21, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 22, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -24,7 +24,11 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   hybrid KEM wired into a KEM-then-AEAD flow, encrypt a record TO a recipient's
   hybrid pubkey (custom composition, NOT RFC 9180 HPKE). FIRST hybrid primitive
   wired into an encryption flow; still standalone + unaudited (Phase 21).
-- FFI (`libsigil/ffi`): seal/open/buffer_free + Ed25519 sign/verify/pubkey.
+- FFI (`libsigil/ffi`): seal/open/buffer_free + Ed25519 sign/verify/pubkey + the
+  **hybrid encryption path** (`sigil_x25519_public_key`, `sigil_ml_kem768_keygen`,
+  `sigil_hybrid_encapsulate`/`decapsulate`/`seal`/`open`; `SIGIL_ERR_HYBRID`) — a
+  native client can generate a hybrid identity + encrypt-to-a-pubkey through the
+  C-ABI (custom KEM-then-AEAD, NOT HPKE; UNAUDITED, not wired into a flow) (Phase 22).
 - `sigild` (Go, stdlib-only): probes + dev-gated (`SIGILD_ENABLE_DEV_OPS`) opaque
   op-log; in-memory OR file-backed (`SIGILD_OPLOG_DIR`); optional Ed25519 **v2**
   request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce + replay cache). Default 501.
@@ -48,14 +52,19 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
   SAME change; commit + push to `main` per phase.
 
-**➡️ NEXT:** the crypto PRIMITIVES are done and the FIRST one is now wired into a
-flow — Phase 21 shipped `hybrid_seal`/`hybrid_open` (hybrid KEM → AEAD, encrypt a
-record TO a recipient's hybrid public key; a custom KEM-then-AEAD composition, NOT
-RFC 9180 HPKE, UNAUDITED + standalone). Next: **FFI-export the hybrid primitives**
-(a `sigil-ffi` C-ABI over hybrid_seal/open + the hybrid KEM/signature) so clients
-can call them; then wire them into sigild / the CLI or the record/account flow —
-the sigild op-log auth still uses the classical Ed25519 signature only, and
-nothing in a product path uses hybrid_seal yet. The full product is still early
+**➡️ NEXT:** the crypto PRIMITIVES are done, the hybrid KEM is wired into an
+encryption flow (Phase 21 `hybrid_seal`/`hybrid_open`), and Phase 22 **exported that
+whole hybrid encryption path over the `sigil-ffi` C-ABI** — `sigil_x25519_public_key`,
+`sigil_ml_kem768_keygen`, `sigil_hybrid_encapsulate`/`decapsulate`/`seal`/`open` +
+`SIGIL_ERR_HYBRID` + `sigil.h` + length `#define`s, with both C-ABI round-trips
+proven — so a native client can now generate a hybrid identity + encrypt-to-a-pubkey
+through the FFI (custom KEM-then-AEAD, NOT RFC 9180 HPKE, UNAUDITED). Next: **wire
+the hybrid path into an actual account / session / record flow** — a key-management /
+enrollment model behind the primitives, then a real product path. ⚠️ Wiring the
+hybrid **signature** into sigild's op-log auth is **blocked**: Go's stdlib has no
+ML-DSA, so sigild stays stdlib-only classical Ed25519 until we either take a PQ-sig
+dependency (breaks the no-go.sum invariant) or move the check off the Go server.
+Nothing in a product path uses `hybrid_seal` yet. The full product is still early
 (~6% — see the completeness note); the mountain (7 native clients, real
 backend/auth/durable store, payments, Cure53 audit, SOC2) is untouched.
 
@@ -2137,4 +2146,129 @@ Recording the decision so the doc set stays coherent as the repo grows:
   integrate into a product path; then the eventual **audit**.
 - No over-claims: "post-quantum" names the ML-KEM-768 component algorithm and the
   construction's *design intent* on unaudited building blocks — the **system is NOT
+  "post-quantum secure".**
+
+## 2026-07-13 — Phase 22 (FFI: hybrid encryption path over the C-ABI)
+
+### Context & mandate
+- Goal: **expose the hybrid encryption path (Phase 21) across the `sigil-ffi`
+  C-ABI** so native clients can call it. Phase 21 wired the hybrid KEM into
+  `hybrid_seal`/`hybrid_open` but that flow lived only in Rust — no client could
+  reach it. This phase adds the thin extern-`"C"` surface (and its `sigil.h`
+  declarations) over the core's already-existing hybrid primitives.
+- ⚠️ FFI-only — **no new low-level cryptography, no new deps, and `libsigil/core`
+  is untouched** (`git diff --stat libsigil/core` is EMPTY — not even a doc
+  change). The core already re-exports `x25519_public_key`, `ml_kem768_keygen`,
+  and `hybrid_encapsulate`/`decapsulate`/`seal`/`open` plus every length constant
+  the FFI needs; this phase only wraps them. These are **UNAUDITED** primitives
+  and the encryption path is a **CUSTOM KEM-then-AEAD** composition — **NOT RFC
+  9180 HPKE**; the system is **NOT "post-quantum secure"**.
+
+### ffi — `libsigil/ffi/src/lib.rs` + `include/sigil.h` ✅
+- **Six new extern `"C"` exports** wrapping the hybrid encryption path:
+  - `sigil_x25519_public_key` — derive the 32-byte X25519 public key from a
+    32-byte secret scalar (a hybrid identity's classical public half).
+  - `sigil_ml_kem768_keygen` — generate an ML-KEM-768 `(encaps, decaps)` key pair
+    from a 64-byte `d‖z` seed (the PQ public half + secret half).
+  - `sigil_hybrid_encapsulate` / `sigil_hybrid_decapsulate` — the two sides of the
+    hybrid KEM (X25519 + ML-KEM-768 combined via HKDF into one 32-byte secret).
+  - `sigil_hybrid_seal` — encrypt a record **to** a recipient's hybrid public key,
+    outputting `(eph_pub, mlkem_ct, envelope)` in a heap `SigilBuffer`.
+  - `sigil_hybrid_open` — decrypt with the recipient's hybrid secret key,
+    outputting the recovered plaintext.
+- **New status code `SIGIL_ERR_HYBRID` (-5)** for a hybrid-KEM rejection (notably
+  a non-contributory / low-order X25519 public key) on
+  encapsulate/decapsulate/seal, writing no output. `sigil_hybrid_open` instead
+  mirrors `sigil_open`: **every** failure — hybrid-KEM rejection, envelope decode,
+  or authentication — collapses to `SIGIL_ERR_OPEN`, and no plaintext is written,
+  so the boundary never leaks structure or plaintext on a bad recipient / tamper.
+- **`sigil.h`** gains the six prototypes, `#define SIGIL_ERR_HYBRID (-5)`, and the
+  fixed-size length `#define`s the caller allocates against:
+  `SIGIL_X25519_PUBLIC_KEY_LEN`/`SECRET_KEY_LEN` = 32, `SIGIL_MLKEM768_ENCAPS_KEY_LEN`
+  = 1184, `DECAPS_KEY_LEN` = 2400, `CIPHERTEXT_LEN` = 1088, `KEYGEN_SEED_LEN` = 64,
+  `ENCAPS_COIN_LEN` = 32, `SIGIL_HYBRID_SHARED_SECRET_LEN` = 32, `SIGIL_AEAD_NONCE_LEN`
+  = 24. Fixed-size outputs (pubkeys, key pairs, KEM secret) go into caller-provided
+  buffers with nothing to free; the seal envelope + the open plaintext come back in
+  heap `SigilBuffer`s the caller MUST release with `sigil_buffer_free`. Hand-written,
+  kept in sync with `lib.rs` by hand; `ffi/README.md` updated to match.
+- **Caller-supplied entropy stays the caller's job (ADR 0007).** This layer draws
+  NO randomness — the ephemeral X25519 secret, the ML-KEM coin, the keygen seed,
+  and the AEAD nonce are all parameters and MUST come fresh per call from a CSPRNG.
+
+### Unsafe discipline — ffi contract intact ✅
+- `#![deny(unsafe_op_in_unsafe_fn)]` present (ffi `lib.rs:65`); `core` keeps
+  `#![forbid(unsafe_code)]` (`core/lib.rs:68`). Every exported extern fn carries a
+  `/// # Safety` section (12 exported fns total), and every `unsafe { … }` block
+  carries a `// SAFETY` comment (46 production blocks; the few that looked bare
+  sit under a shared multi-line SAFETY comment over consecutive `copy_fixed` /
+  `optional_slice` statements). `nm` on the built `libsigil_ffi.dylib` shows all
+  six new symbols (`_sigil_hybrid_*`, `_sigil_x25519_public_key`,
+  `_sigil_ml_kem768_keygen`) as public `T` symbols.
+
+### Dependency & the WASM/GETRANDOM gate — no new deps, core untouched ✅
+- **No new dependencies, no `Cargo.toml`/`Cargo.lock` change.** The diff touches
+  only `ffi/src/lib.rs`, `ffi/include/sigil.h`, `ffi/README.md`, and the two docs
+  (`docs/architecture.md`, `docs/crypto-spec.md`) already updated by the docs
+  track. `git diff --stat libsigil/core` is EMPTY.
+- ✅ **The gate held.** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (rechecked twice, incl. after the wasm build); `cargo build -p sigil-core
+  --target wasm32-unknown-unknown` **succeeds** — FFI work does not touch the
+  wasm-pure core, and the invariant is intact. (FFI is a separate crate that MAY
+  use unsafe; only `core` forbids it.)
+
+### Tests ✅ — both hybrid C-ABI round-trips proven, plus a standalone C smoke
+- **`cargo test --manifest-path libsigil/Cargo.toml`: sigil-core 97 PASS,
+  sigil-ffi 19 PASS, 0 failed** (the ffi suite grew from 13 → 19 with six hybrid
+  C-ABI tests). The load-bearing ones exercise the actual extern `"C"` fns:
+  - **KEM round-trip** — `hybrid_kem_round_trip_through_ffi`:
+    `sigil_hybrid_encapsulate` then `sigil_hybrid_decapsulate` recover the **same
+    32-byte combined secret**.
+  - **Seal/open round-trip (capstone)** — `hybrid_seal_then_open_round_trip`:
+    `sigil_hybrid_seal` then `sigil_hybrid_open` recover the **exact plaintext**.
+  - Plus `hybrid_empty_plaintext_round_trips`, `hybrid_wrong_recipient_open_fails`
+    (collapses to `SIGIL_ERR_OPEN`, no leak), `hybrid_non_contributory_recipient_pub_errors`
+    (→ `SIGIL_ERR_HYBRID`), and `hybrid_null_args_return_null_arg`.
+- **Standalone C smoke (link + round-trip through the real header).** Compiled a
+  C file (`#include "sigil.h"`) with `cc -std=c11 -Wall -Wextra` against the built
+  `libsigil_ffi.dylib` + include dir — **linked cleanly, rc=0, no warnings**. It
+  builds a recipient hybrid identity (`sigil_ml_kem768_keygen` from a fixed 64-byte
+  seed + `sigil_x25519_public_key` from a fixed secret), runs `sigil_hybrid_seal`
+  on a 35-byte message with AAD, then `sigil_hybrid_open`. Output:
+  > `seal ok: envelope 88 bytes / open ok: recovered 35 bytes, EXACT MATCH /
+  > wrong-recipient open rc=-2 (expect SIGIL_ERR_OPEN=-2) / ALL C-ABI SMOKE CHECKS
+  > PASSED`
+  process exit 0, buffers freed via `sigil_buffer_free`. Confirms the link, the
+  hybrid seal→open round-trip, and that a wrong recipient secret returns
+  `SIGIL_ERR_OPEN` **without leaking plaintext**.
+- ✅ `cargo fmt --check` clean · `cargo clippy --all-targets -D warnings` clean ·
+  wasm32 build OK · getrandom count **0**. Regression: cli fmt/clippy/**26 + 2**
+  tests ✓ (`cli/Cargo.lock` getrandom = 1 as ever — separate native crate outside
+  the wasm gate); sigild gofmt/vet/test/build ✓; all 7 workflow YAMLs parse ✓.
+  Web untouched.
+
+### docs — architecture.md / crypto-spec.md ✅
+- `docs/architecture.md` and `docs/crypto-spec.md` were already updated by the docs
+  track to describe the hybrid encryption path across the C-ABI. This entry
+  finalizes the remaining living docs (this file, `CLAUDE.md`, `README.md`, and the
+  `ffi/README.md` export table). **No new ADR** — Phase 22 is a mechanical FFI
+  wrapping of primitives whose design decisions are already captured (the hybrid KEM
+  combiner in ADR 0011 and the KEM-then-AEAD composition in ADR 0013); ADRs
+  remain 0001–0013.
+
+### ➡️ What this opens, and what's still open (honest)
+- A **native client can now, over the C-ABI, generate a hybrid identity
+  (X25519 + ML-KEM-768) and encrypt a record TO another party's hybrid public key**,
+  then decrypt it — the Phase 21 flow is reachable from C. Both C-ABI round-trips
+  (KEM and seal/open) are proven in-tree and via a standalone C smoke.
+- Still open — it is a **crypto-level flow over the FFI, not a product feature**: a
+  CUSTOM KEM-then-AEAD composition (NOT RFC 9180 HPKE), real but **UNAUDITED** and
+  **standalone**. There is still no account / key-management / enrollment /
+  vault-storage model behind it, and neither sigild nor the CLI calls it; the sigild
+  op-log auth still uses the classical Ed25519 signature only. Next: **wire the
+  hybrid path into an actual account / session / record flow.** ⚠️ Wiring the hybrid
+  **signature** into sigild's op-log auth is **blocked** — Go's stdlib has no ML-DSA,
+  so sigild stays stdlib-only Ed25519 until we take a PQ-sig dependency (breaks the
+  no-go.sum invariant) or move the check off the Go server.
+- No over-claims: "post-quantum" names the ML-KEM-768 component algorithm and the
+  path's *design intent* on unaudited building blocks — the **system is NOT
   "post-quantum secure".**

@@ -247,6 +247,12 @@ Honest framing:
   `sigild` or the CLI**. The envelope's `kem_ct` field still stays *reserved* but
   unused — the ML-KEM ciphertext travels alongside the envelope here, not inside it.
   See [ADR 0013](decisions/0013-hybrid-public-key-seal.md).
+- These hybrid primitives are also reachable over the **C-ABI** —
+  `sigil_x25519_public_key`, `sigil_ml_kem768_keygen`, and `sigil_hybrid_*`
+  (`encapsulate` / `decapsulate` / `seal` / `open`) in
+  [`libsigil/ffi/`](../libsigil/ffi/) (`sigil.h`) — so native clients can generate a
+  hybrid identity and encrypt to a recipient's hybrid public key. Still the same
+  custom KEM-then-AEAD, **UNAUDITED**, and not wired into a product flow.
 
 ## Migration plan (intended)
 

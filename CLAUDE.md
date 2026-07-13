@@ -90,9 +90,16 @@ public, make no security claims, until the audit completes and trademark clears.
   composition — NOT RFC 9180 HPKE — and the FIRST wiring of a hybrid primitive into
   an encryption flow; still real but UNAUDITED and STANDALONE (not the product's
   account / key-management / vault-storage model, not used by sigild/CLI). ADR 0013.**
-  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export **plus the classical
+  `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
-  (`SIGIL_ERR_VERIFY` = -4), hand-written `sigil.h`).
+  (`SIGIL_ERR_VERIFY` = -4), **plus the hybrid encryption path
+  (`sigil_x25519_public_key`, `sigil_ml_kem768_keygen`,
+  `sigil_hybrid_encapsulate`/`sigil_hybrid_decapsulate`/`sigil_hybrid_seal`/`sigil_hybrid_open`)**
+  — derive a hybrid identity + encapsulate/decapsulate + encrypt a record TO a
+  recipient's hybrid pubkey (the custom KEM-then-AEAD `hybrid_seal`/`hybrid_open`
+  flow over the C-ABI, NOT RFC 9180 HPKE), with `SIGIL_ERR_HYBRID` = -5 and
+  fixed-size length `#define`s; C-ABI round-trips proven, UNAUDITED, not wired into
+  any product flow — hand-written `sigil.h`).
 - `sigild/` — Go sync server skeleton (`/healthz`, `/readyz`, `/version`,
   request-ID/access-log/recover middleware, in-memory `store`; distroless
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an

@@ -86,6 +86,9 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("POST /v1/vaults/{vaultID}/ops",
 			limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsAppend)))
 		mux.Handle("GET /v1/vaults/{vaultID}/ops", http.HandlerFunc(h.opsList))
+		// Tamper-evidence: walk the op-log hash chain. Same dev-gate + auth-guard
+		// as the other ops routes.
+		mux.Handle("GET /v1/vaults/{vaultID}/ops/verify", http.HandlerFunc(h.opsVerify))
 	} else {
 		// Default: vault operation log is intentionally unimplemented in the
 		// skeleton. We return 501 rather than fake any crypto/vault/CRDT/auth
@@ -94,6 +97,9 @@ func NewRouter(cfg Config) http.Handler {
 		ops := limitBody(maxOpsBodyBytes, http.HandlerFunc(h.opsNotImplemented))
 		mux.Handle("GET /v1/vaults/{vaultID}/ops", ops)
 		mux.Handle("POST /v1/vaults/{vaultID}/ops", ops)
+		// The verify route is a distinct path, so register its own 501 stub
+		// (it would otherwise 404 instead of the deliberate not-implemented 501).
+		mux.Handle("GET /v1/vaults/{vaultID}/ops/verify", http.HandlerFunc(h.opsNotImplemented))
 	}
 
 	// Outermost first: recover panics, assign a request ID, then access-log.

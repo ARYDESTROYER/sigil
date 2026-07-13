@@ -22,6 +22,7 @@ import (
 const (
 	auditEventAppend     = "oplog.append"
 	auditEventList       = "oplog.list"
+	auditEventVerify     = "oplog.verify"
 	auditEventAuthDenied = "oplog.auth_denied"
 )
 
@@ -58,6 +59,18 @@ func (h *handlers) auditList(r *http.Request, vaultID string, since uint64, retu
 		"vault_id", vaultID,
 		"since", since,
 		"returned_count", returnedCount,
+	)
+}
+
+// auditVerify logs an op-log chain-verification, recording the outcome (ok) and
+// how many ops were walked — never any blob content or hash bytes.
+func (h *handlers) auditVerify(r *http.Request, vaultID string, ok bool, count uint64) {
+	h.cfg.Logger.Info(auditEventVerify,
+		"event", auditEventVerify,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"ok", ok,
+		"count", count,
 	)
 }
 

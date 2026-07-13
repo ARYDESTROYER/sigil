@@ -328,6 +328,111 @@ func TestPostgresVaultLogDurabilityAcrossReconnect(t *testing.T) {
 	}
 }
 
+// TestPostgresVaultLogVerifyChainOK appends three ops and confirms VerifyChain
+// reports an intact chain (OK, Count 3, tip == last stored hash), and that the
+// stored hashes chain correctly under chainHash.
+func TestPostgresVaultLogVerifyChainOK(t *testing.T) {
+	ctx := context.Background()
+	l, prefix := newTestLog(t)
+	vault := prefix + "v"
+
+	blobs := [][]byte{[]byte("first"), {0x00, 0xff, 0x01}, []byte("third-op")}
+	var prev [32]byte
+	var last [32]byte
+	for i, b := range blobs {
+		op, err := l.Append(ctx, vault, b)
+		if err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+		if want := chainHash(vault, uint64(i+1), prev, b); op.Hash != want {
+			t.Fatalf("op%d.Hash = %x, want %x", i+1, op.Hash, want)
+		}
+		prev = op.Hash
+		last = op.Hash
+	}
+
+	res, err := l.VerifyChain(ctx, vault)
+	if err != nil {
+		t.Fatalf("VerifyChain: %v", err)
+	}
+	if !res.OK || res.Count != 3 || res.BrokenAtSeq != 0 || res.TipHash != last {
+		t.Fatalf("VerifyChain = %+v, want OK count 3 tip %x", res, last)
+	}
+}
+
+// TestPostgresVaultLogVerifyChainDetectsTamper directly corrupts a stored row's
+// hash column and confirms VerifyChain reports OK=false broken at that seq.
+func TestPostgresVaultLogVerifyChainDetectsTamper(t *testing.T) {
+	ctx := context.Background()
+	l, prefix := newTestLog(t)
+	vault := prefix + "v"
+
+	for i := 0; i < 3; i++ {
+		if _, err := l.Append(ctx, vault, []byte{byte('a' + i)}); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+
+	// Overwrite op2's stored hash with 32 zero bytes, directly in the DB.
+	if _, err := l.pool.Exec(ctx,
+		`UPDATE sigil_vault_ops SET hash = $1 WHERE vault_id = $2 AND seq = 2`,
+		make([]byte, 32), vault); err != nil {
+		t.Fatalf("tamper UPDATE: %v", err)
+	}
+
+	res, err := l.VerifyChain(ctx, vault)
+	if err != nil {
+		t.Fatalf("VerifyChain: %v", err)
+	}
+	if res.OK {
+		t.Fatal("VerifyChain OK = true after DB tamper, want false")
+	}
+	if res.BrokenAtSeq != 2 {
+		t.Fatalf("VerifyChain BrokenAtSeq = %d, want 2", res.BrokenAtSeq)
+	}
+	if res.Count != 3 {
+		t.Fatalf("VerifyChain Count = %d, want 3", res.Count)
+	}
+}
+
+// TestPostgresVaultLogChainMatchesMem is the cross-backend consistency proof
+// including Postgres: for the SAME (vaultID, blobs) input, Postgres and
+// MemVaultLog produce the IDENTICAL per-op hash sequence and the identical
+// VerifyChain tip — demonstrating chainHash is backend-independent.
+func TestPostgresVaultLogChainMatchesMem(t *testing.T) {
+	ctx := context.Background()
+	l, prefix := newTestLog(t)
+	vault := prefix + "v"
+
+	blobs := [][]byte{[]byte("alpha"), {0x00, 0xff}, []byte("gamma-op"), {}}
+	mem := NewMemVaultLog()
+	for i, b := range blobs {
+		po, err := l.Append(ctx, vault, b)
+		if err != nil {
+			t.Fatalf("pg Append %d: %v", i, err)
+		}
+		mo, err := mem.Append(ctx, vault, b)
+		if err != nil {
+			t.Fatalf("mem Append %d: %v", i, err)
+		}
+		if po.Hash != mo.Hash {
+			t.Fatalf("op%d hash mismatch: postgres %x vs mem %x", i+1, po.Hash, mo.Hash)
+		}
+	}
+
+	pgRes, err := l.VerifyChain(ctx, vault)
+	if err != nil {
+		t.Fatalf("pg VerifyChain: %v", err)
+	}
+	memRes, err := mem.VerifyChain(ctx, vault)
+	if err != nil {
+		t.Fatalf("mem VerifyChain: %v", err)
+	}
+	if pgRes.TipHash != memRes.TipHash {
+		t.Fatalf("tip hash differs: postgres %x vs mem %x", pgRes.TipHash, memRes.TipHash)
+	}
+}
+
 // TestPostgresVaultLogContextCancelled verifies request-context propagation into
 // the driver: a cancelled context passed to Append/Since cancels the DB work and
 // returns promptly with a non-nil error (rather than running the query).

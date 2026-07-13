@@ -49,6 +49,27 @@ against a `SIGILD_OPLOG_PUBKEY`-guarded op-log are visible. This is still the
 **dev** op-log (gated off by default); a production audit log would additionally
 be signed and tamper-evident.
 
+**Hash chain gives tamper-EVIDENCE for the op-log.** Every stored op now carries
+a per-op **SHA-256 hash-chain link** — `hash(seq) = SHA-256("sigil-oplog-chain-v1"
+|| len-prefixed vaultID || seq || prev_hash || blob)`, genesis `prev_hash` =
+zeros — so each op commits to the previous one across **all three backends**
+(see [`api.md`](api.md) and [ADR 0016](decisions/0016-tamper-evident-oplog-hash-chain.md)).
+An adversary who **modifies, reorders, inserts, or drops** stored ops changes the
+hash of every op from that point on, so the tampering is **detectable by a
+verifier** — a dev-scale down-payment on adversary #4's *signed append-only audit
+log* and part of adversary #5's *replay/drop detection* (the production goal is
+the full signed / Merkle-root audit log; this is not that yet). Because the hash
+fingerprints the **already client-encrypted** blob, tamper-evidence is added with
+**no plaintext and no key**, so the zero-knowledge property is preserved.
+**Honest limits:** this is **tamper-EVIDENT, not tamper-PROOF**. There is a
+**single, non-notarized server** and no Byzantine-fault tolerance; the server
+exposes a convenience `GET …/ops/verify` but **can lie about it** (it could
+recompute a consistent chain over data it has itself doctored). The guarantee
+that actually resists a hostile server is **client-side**: a client re-derives
+the chain from the per-op hashes it receives and compares against its own
+remembered tip. Server-side verification only catches accidental corruption and a
+non-adversarial operator's storage faults.
+
 **Status note for this repo:** none of the defenses in the table above is
 implemented yet. The current `sigild` skeleton performs no crypto, runs no auth,
 and stores only the opaque blobs described above; `libsigil` has real-but-

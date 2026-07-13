@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -219,14 +220,77 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 	h.auditList(r, vaultID, since, len(ops))
 
 	next := since
-	for _, op := range ops {
+	wire := make([]opJSON, len(ops))
+	for i, op := range ops {
 		if op.Seq > next {
 			next = op.Seq
 		}
+		wire[i] = opJSON{
+			Seq:  op.Seq,
+			Blob: op.Blob,
+			Hash: base64.StdEncoding.EncodeToString(op.Hash[:]),
+		}
 	}
 	writeJSON(w, http.StatusOK, struct {
-		VaultID string     `json:"vaultID"`
-		Ops     []store.Op `json:"ops"`
-		Next    uint64     `json:"next"`
-	}{VaultID: vaultID, Ops: ops, Next: next})
+		VaultID string   `json:"vaultID"`
+		Ops     []opJSON `json:"ops"`
+		Next    uint64   `json:"next"`
+	}{VaultID: vaultID, Ops: wire, Next: next})
+}
+
+// opJSON is the wire shape of one op. Blob ([]byte) marshals to std-base64
+// automatically; Hash is emitted explicitly as std-base64 (encoding/json would
+// otherwise render the [32]byte as a numeric array).
+type opJSON struct {
+	Seq  uint64 `json:"seq"`
+	Blob []byte `json:"blob"`
+	Hash string `json:"hash"`
+}
+
+// opsVerify walks a vault's op-log hash chain and reports whether it is intact.
+//
+// DEV-ONLY: wired ONLY when cfg.DevOpsEnabled is set, and (like the other ops
+// routes) guarded by authorizeOps when a device key is configured. This is
+// tamper-EVIDENT verification: it DETECTS an insertion/deletion/modification of a
+// stored op, but does not prevent one. It is NOT append-only-enforced, notarized,
+// or Byzantine-proof, and a dishonest server can lie about this result — the
+// trustworthy check is CLIENT-SIDE, recomputing the chain from the per-op hashes
+// returned by GET /ops. The chain fingerprints the OPAQUE ciphertext only.
+func (h *handlers) opsVerify(w http.ResponseWriter, r *http.Request) {
+	vaultID := r.PathValue("vaultID")
+	if vaultID == "" {
+		writeError(w, http.StatusBadRequest, "missing_vault_id", "vault ID is required")
+		return
+	}
+
+	// Verify the op-log request signature over (method, path, query, ts, nonce,
+	// ""). GET carries no body. Returns an empty reason (authorized) unless
+	// cfg.OpLogPubKey is set.
+	if reason := h.authorizeOps(r, nil); reason != "" {
+		h.auditAuthDenied(r, vaultID, reason)
+		writeOpsAuthError(w, reason)
+		return
+	}
+
+	res, err := h.log.VerifyChain(r.Context(), vaultID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "")
+		return
+	}
+	h.auditVerify(r, vaultID, res.OK, res.Count)
+
+	writeJSON(w, http.StatusOK, struct {
+		VaultID string `json:"vaultID"`
+		OK      bool   `json:"ok"`
+		Count   uint64 `json:"count"`
+		TipHash string `json:"tip_hash"`
+		// BrokenAtSeq is the seq of the first broken link; omitted when ok.
+		BrokenAtSeq uint64 `json:"broken_at_seq,omitempty"`
+	}{
+		VaultID:     vaultID,
+		OK:          res.OK,
+		Count:       res.Count,
+		TipHash:     base64.StdEncoding.EncodeToString(res.TipHash[:]),
+		BrokenAtSeq: res.BrokenAtSeq,
+	})
 }

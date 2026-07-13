@@ -107,9 +107,14 @@ The `version` value is injected at build time from the git short SHA via
 >   client is expected to encrypt before sending. `sigild` is dumb storage of
 >   ciphertext, by design.
 > - **NOT a real op log.** "Operation log" here means an append-and-read byte
->   journal with a monotonic per-vault sequence number. There is **no** CRDT
->   merge, no Lamport/Merkle verification, no signature checking, no conflict
->   resolution — those are deferred to the production build.
+>   journal with a monotonic per-vault sequence number and a per-op SHA-256
+>   **hash chain** for **tamper-evidence** (see
+>   [Op-log hash chain](#op-log-hash-chain-tamper-evidence) and `GET …/ops/verify`
+>   below). That chain is tamper-*evident*, **not** tamper-*proof*: a hostile
+>   server can still lie about it (real verification is client-side). There is
+>   still **no** CRDT merge, no Lamport clock, no Merkle root, no signature
+>   checking on ops, and no conflict resolution — those are deferred to the
+>   production build.
 > - **DO NOT EXPOSE PUBLICLY** and **DO NOT STORE REAL SECRETS.**
 
 When `SIGILD_ENABLE_DEV_OPS` is set, the following two operations are served. A
@@ -150,7 +155,7 @@ Return the vault's operations with sequence number **greater than `N`** (default
   {
     "vaultID": "<vaultID>",
     "ops": [
-      { "seq": 1, "blob": "<base64 of the opaque stored bytes>" }
+      { "seq": 1, "blob": "<base64 of the opaque stored bytes>", "hash": "<hex SHA-256 chain hash>" }
     ],
     "next": <highest seq returned, to pass as the next `since`>
   }
@@ -160,8 +165,95 @@ Return the vault's operations with sequence number **greater than `N`** (default
   POSTed — the server re-emits ciphertext it never decoded. An unknown vault ID
   returns an empty `ops` array, not an error.
 
+  `hash` is the op's **hex-encoded SHA-256 hash-chain link** (64 hex chars) — the
+  tamper-evidence tip for that op, computed over the previous op's hash and this
+  op's `(vaultID, seq, blob)` per the construction in
+  [Op-log hash chain](#op-log-hash-chain-tamper-evidence) below. It fingerprints
+  **ciphertext only** (the server does no crypto on the plaintext), and it lets a
+  client re-derive and verify the chain **itself**, without trusting the server.
+
 - **Errors:** `501 Not Implemented` (`not_implemented`) when
   `SIGILD_ENABLE_DEV_OPS` is unset.
+
+### Op-log hash chain (tamper-evidence)
+
+> **Tamper-EVIDENT, not tamper-PROOF, and not a security claim.** This detects
+> after-the-fact tampering with the stored ops; it does **not** prevent it and
+> does **not** make `sigild` a notarized, append-only-enforced, or
+> Byzantine-fault-tolerant log. The **real** guarantee is **client-side**: verify
+> the chain yourself from the per-op `hash` values. See the honesty note below.
+
+Every stored op carries a **hash-chain link** so a verifier can detect whether
+any op was **inserted, deleted, reordered, or modified**. Each op's hash commits
+to the previous op's hash, so altering op *k* changes the hash of *k* and of
+**every** op after it. The construction, shared by **all three backends**
+(in-memory, file-backed, Postgres), is:
+
+```
+hash(seq) = SHA-256(
+      "sigil-oplog-chain-v1"     // ASCII domain-separation label
+   || len(vaultID) || vaultID    // length-prefixed vault ID (4-byte big-endian length, then bytes)
+   || seq                        // 8-byte big-endian sequence number
+   || prev_hash                  // previous op's 32-byte hash; genesis = 32 zero bytes
+   || blob                       // the opaque client-encrypted bytes, verbatim
+)
+```
+
+- **Genesis:** for the first op in a vault (`seq = 1`), `prev_hash` is 32 zero
+  bytes.
+- **Domain separation:** the `"sigil-oplog-chain-v1"` label and the length-prefix
+  on `vaultID` make the field boundaries unambiguous, so a chain for one vault
+  can never be confused with another and the version can be rotated later.
+- **Opaque, zero-knowledge preserved:** the hash is taken over the **already
+  client-encrypted** `blob`. Hashing ciphertext fingerprints it for
+  tamper-evidence but reveals **no plaintext** and needs **no key** — the server
+  still does no cryptography on vault contents. See
+  [`threat-model.md`](threat-model.md).
+
+The per-op `hash` is returned inline by `GET …/ops` (above), so a client can
+recompute the chain locally and compare.
+
+### `GET /v1/vaults/{vaultID}/ops/verify` — server-side chain check
+
+Recompute a vault's entire hash chain server-side and report whether it is
+intact. Same **dev-gate** and (optional) **auth** as the other op-log routes:
+`501` when `SIGILD_ENABLE_DEV_OPS` is unset; `401` when `SIGILD_OPLOG_PUBKEY` is
+set and the request is missing/invalid/stale/replayed (the signed message uses
+the request's own method/path/query, exactly as for `GET …/ops`).
+
+- **Success — `200 OK`:**
+
+  ```json
+  {
+    "vaultID": "<vaultID>",
+    "ok": true,
+    "count": <number of ops in the vault>,
+    "tip_hash": "<hex SHA-256 of the last op's chain link>",
+    "broken_at_seq": null
+  }
+  ```
+
+  - `ok` — `true` if the recomputed chain matches every stored per-op hash. An
+    empty vault is trivially intact (`ok = true`, `count = 0`).
+  - `count` — how many ops were checked.
+  - `tip_hash` — the last op's hex chain hash (the vault's current tip); an empty
+    vault has no ops, so there is no meaningful tip.
+  - `broken_at_seq` — `null` when `ok` is `true`; otherwise the **first** `seq`
+    whose recomputed hash does not match, i.e. where tamper-evidence tripped.
+
+- **Errors:** `501 Not Implemented` when dev-ops is off; `401 Unauthorized` when
+  auth is configured and the request fails it.
+
+**Honesty note — what `/ops/verify` is and is NOT.** A server-side check is a
+**convenience**, not a root of trust: a **malicious server can lie** — it can
+recompute a perfectly consistent chain over data it has itself doctored, or
+simply return `{"ok": true}`. So `/ops/verify` only catches **accidental**
+corruption and a **non-adversarial** operator's storage faults. The guarantee
+that actually resists a hostile server is **client-side**: the client keeps its
+own tip hash and re-derives the chain from the per-op `hash` values in
+`GET …/ops`. This is a **dev-scale, tamper-EVIDENT** down-payment on the
+product's future **signed / Merkle-root** audit log — not a notarized,
+append-only-enforced, or Byzantine-proof log.
 
 ### Authentication (optional, dev) — `SIGILD_OPLOG_PUBKEY`
 
@@ -315,7 +407,12 @@ minimum:
   backend provides.
 - **Real operation / CRDT semantics** — signed, ordered operations with
   Lamport-clock / Merkle-root replay-and-drop detection and conflict-free merge,
-  versus today's plain append-and-read byte journal.
+  versus today's plain append-and-read byte journal. The dev op-log's per-op
+  SHA-256 **hash chain** (above) is a **tamper-EVIDENT** down-payment on this —
+  it detects modification/insertion/deletion of stored ops by a *client-side*
+  verifier — but it is **not** the signed, Merkle-rooted, Byzantine-resistant
+  audit log the production build owes: a hostile server can still lie about the
+  chain, and there is no signature or CRDT merge on the ops themselves.
 
 Even then, the server's stored bytes stay **opaque client ciphertext**: the
 server never holds plaintext or keys. See

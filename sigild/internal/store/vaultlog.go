@@ -8,15 +8,19 @@ import (
 // Op is a single entry in a vault's operation log. Seq is a 1-based, strictly
 // increasing sequence number assigned per vault. Blob is the client-encrypted
 // operation payload: it is OPAQUE to the server, which never decrypts, parses,
-// or otherwise interprets it.
+// or otherwise interprets it. Hash is the tamper-evidence chain hash binding this
+// op to its vault, seq, all prior ops, and blob (see chainHash in oplogchain.go).
 //
 // encoding/json marshals Blob ([]byte) as a base64 string automatically; API
-// responses rely on that.
+// responses rely on that. Hash is json:"-" because encoding/json would render a
+// [32]byte as a numeric array; the API layer emits it explicitly as std-base64
+// (see the ops handlers).
 //
 // STATUS: pre-audit skeleton.
 type Op struct {
-	Seq  uint64 `json:"seq"`
-	Blob []byte `json:"blob"`
+	Seq  uint64   `json:"seq"`
+	Blob []byte   `json:"blob"`
+	Hash [32]byte `json:"-"`
 }
 
 // VaultLog is an append-only log of opaque, client-encrypted operations, keyed
@@ -40,7 +44,15 @@ type VaultLog interface {
 	Append(ctx context.Context, vaultID string, blob []byte) (Op, error)
 	// Since returns the vault's ops with Seq strictly greater than `since`, in
 	// ascending Seq order. An unknown vault yields an empty slice and nil error.
+	// Each returned Op carries its stored chain Hash.
 	Since(ctx context.Context, vaultID string, since uint64) ([]Op, error)
+	// VerifyChain walks the vault's op hash chain (see oplogchain.go) and reports
+	// whether it is intact. It is tamper-EVIDENT verification: it DETECTS an
+	// insertion/deletion/modification of a stored op, but does not prevent one,
+	// and a dishonest server can lie about the result — the trustworthy check is
+	// client-side. An unknown/empty vault verifies OK with Count 0 and a genesis
+	// (zero) tip. It honours ctx.
+	VerifyChain(ctx context.Context, vaultID string) (VerifyResult, error)
 }
 
 // Pinger is an OPTIONAL capability a VaultLog backend may implement to expose a
@@ -94,8 +106,14 @@ func (l *MemVaultLog) Append(ctx context.Context, vaultID string, blob []byte) (
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	seq := uint64(len(l.logs[vaultID])) + 1
-	op := Op{Seq: seq, Blob: cp}
+	ops := l.logs[vaultID]
+	seq := uint64(len(ops)) + 1
+	// Continue the chain from the previous op's hash (genesis zeros for the first).
+	var prev [32]byte
+	if n := len(ops); n > 0 {
+		prev = ops[n-1].Hash
+	}
+	op := Op{Seq: seq, Blob: cp, Hash: chainHash(vaultID, seq, prev, cp)}
 	l.logs[vaultID] = append(l.logs[vaultID], op)
 	return op, nil
 }
@@ -120,7 +138,14 @@ func (l *MemVaultLog) Since(ctx context.Context, vaultID string, since uint64) (
 		}
 		cp := make([]byte, len(op.Blob))
 		copy(cp, op.Blob)
-		out = append(out, Op{Seq: op.Seq, Blob: cp})
+		out = append(out, Op{Seq: op.Seq, Blob: cp, Hash: op.Hash})
 	}
 	return out, nil
+}
+
+// VerifyChain walks the vault's hash chain and reports whether it is intact. It
+// reads the ops through Since (which takes l.mu), so it must NOT be called while
+// holding l.mu. See verifyChainVia / verifyChain for the tamper-evidence details.
+func (l *MemVaultLog) VerifyChain(ctx context.Context, vaultID string) (VerifyResult, error) {
+	return verifyChainVia(ctx, l, vaultID)
 }

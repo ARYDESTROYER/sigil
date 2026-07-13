@@ -203,6 +203,19 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   signature, nonce, or key** — so it proves *who appended what, when* while the
   **trust boundary is preserved**: the server still never sees plaintext (see
   [`decisions/0015-oplog-auditability-and-request-context.md`](decisions/0015-oplog-auditability-and-request-context.md)).
+  **Tamper-evidence (hash chain):** across **all three backends**, every op now
+  carries a per-op **SHA-256 hash-chain link** — `hash(seq) =
+  SHA-256("sigil-oplog-chain-v1" || len-prefixed vaultID || seq || prev_hash ||
+  blob)`, genesis `prev_hash` = zeros — so each op commits to the previous one and
+  any insertion / deletion / reorder / modification of stored ops is **detectable**.
+  The hash is returned per-op by `GET …/ops`, and a `GET …/ops/verify` route
+  recomputes the whole chain server-side (`{ok, count, tip_hash, broken_at_seq}`).
+  Because the hash fingerprints the **already client-encrypted** blob, it adds
+  tamper-evidence with **no plaintext and no key** — zero-knowledge intact. This is
+  **tamper-EVIDENT, not tamper-PROOF**: a hostile server can still lie about
+  `/ops/verify`, so the real check is **client-side** re-derivation from the
+  returned per-op hashes; it is not a signed / Merkle / Byzantine-proof log (see
+  [`decisions/0016-tamper-evident-oplog-hash-chain.md`](decisions/0016-tamper-evident-oplog-hash-chain.md)).
   `sigild` performs **no cryptography** and never sees plaintext or keys. Full
   contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
@@ -244,7 +257,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   /healthz · /readyz · /version   (probes; no secrets)                 │
    │   /v1/vaults/{id}/ops  →  501 by default                               │
    │     └─ SIGILD_ENABLE_DEV_OPS: op-log (mem/file/pg) of opaque ciphertext│
-   │        (append seq / read since) — dev wiring only; unauthenticated    │
+   │        (append seq / read since; SHA-256 hash chain, tamper-evident)    │
    │        unless SIGILD_OPLOG_PUBKEY sets a single Ed25519 dev device key  │
    └───────────────────────────────────────────────────────────────────────┘
 
@@ -489,8 +502,12 @@ authoritative list, with rationale, is the **defer ledger** in
   `hybrid-open` commands), not the product model, and the hybrid signature is not
   yet composed into any flow.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
-  byte journal with a monotonic sequence number — no signed ops, no Lamport/Merkle
-  ordering, no conflict-free merge.
+  byte journal with a monotonic sequence number and a per-op SHA-256 **hash
+  chain** for **tamper-evidence** (detects modify/insert/delete/reorder of stored
+  ops via a client-side verifier; [ADR 0016](decisions/0016-tamper-evident-oplog-hash-chain.md)) —
+  but still **no signed ops**, no Lamport/Merkle ordering, no conflict-free
+  merge, and the chain is **tamper-evident, not tamper-proof** (a hostile server
+  can lie about `/ops/verify`; the real check is client-side).
 - **No payments / accounts / sync protocol / key rotation / recovery.** None of
   the product workflows exist.
 - **No live PQ-TLS proof.** `sigild` serves plain HTTP in the skeleton; the hybrid

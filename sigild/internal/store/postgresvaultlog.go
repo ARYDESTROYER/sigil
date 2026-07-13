@@ -24,6 +24,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,16 +38,25 @@ const opTimeout = 10 * time.Second
 
 // createSchemaSQL creates the op-log table if it does not already exist. The
 // (vault_id, seq) primary key enforces per-vault uniqueness of the sequence
-// number at the database level; blob is opaque bytea; created_at is server-side
-// bookkeeping only and never returned to clients.
+// number at the database level; blob is the opaque bytea; hash is the op's
+// tamper-evidence chain hash (32-byte SHA-256, see chainHash); created_at is
+// server-side bookkeeping only and never returned to clients.
 const createSchemaSQL = `
 CREATE TABLE IF NOT EXISTS sigil_vault_ops (
 	vault_id   text        NOT NULL,
 	seq        bigint      NOT NULL,
 	blob       bytea       NOT NULL,
+	hash       bytea       NOT NULL,
 	created_at timestamptz NOT NULL DEFAULT now(),
 	PRIMARY KEY (vault_id, seq)
 )`
+
+// addHashColumnSQL upgrades a pre-existing table (created before the hash chain)
+// by adding the hash column. It is a no-op on a fresh DB where createSchemaSQL
+// already includes the column. The column is added NULLABLE here (an existing
+// table may already hold rows that predate the chain); a fresh table gets it NOT
+// NULL via createSchemaSQL. Acceptable for a DEV backend with no real data.
+const addHashColumnSQL = `ALTER TABLE sigil_vault_ops ADD COLUMN IF NOT EXISTS hash bytea`
 
 // Pool sizing/lifecycle for the dev Postgres backend. Op bodies are tiny (the
 // server caps a single op at 64 KiB) and each Append/Since is a short-lived
@@ -102,6 +112,11 @@ func NewPostgresVaultLog(ctx context.Context, dsn string) (*PostgresVaultLog, er
 		pool.Close()
 		return nil, fmt.Errorf("ensure op-log schema: %w", err)
 	}
+	// Idempotently add the hash column to a table created before the chain existed.
+	if _, err := pool.Exec(ctx, addHashColumnSQL); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure op-log hash column: %w", err)
+	}
 
 	return &PostgresVaultLog{pool: pool}, nil
 }
@@ -112,12 +127,14 @@ func NewPostgresVaultLog(ctx context.Context, dsn string) (*PostgresVaultLog, er
 // CONCURRENCY: appends to the SAME vault are serialized by a transaction-scoped
 // per-vault advisory lock (pg_advisory_xact_lock over hashtext(vaultID)); the
 // lock is released automatically when the transaction commits or rolls back.
-// While the lock is held we read MAX(seq) and INSERT MAX+1 in the same
-// transaction, so concurrent appenders to one vault produce a strictly
-// increasing, unique, contiguous sequence with no gaps. Different vaults hash to
-// (almost always) different advisory-lock keys and so proceed concurrently; the
-// (vault_id, seq) primary key is the final backstop that rejects any duplicate
-// seq even on an advisory-lock hash collision between two distinct vault IDs.
+// While the lock is held we read the previous op's (seq, hash), compute this op's
+// chain hash, and INSERT (vault, seq+1, blob, hash) in the same transaction, so
+// concurrent appenders to one vault produce a strictly increasing, unique,
+// contiguous sequence with no gaps AND an unbroken hash chain. Different vaults
+// hash to (almost always) different advisory-lock keys and so proceed
+// concurrently; the (vault_id, seq) primary key is the final backstop that
+// rejects any duplicate seq even on an advisory-lock hash collision between two
+// distinct vault IDs.
 func (l *PostgresVaultLog) Append(ctx context.Context, vaultID string, blob []byte) (Op, error) {
 	// Defensive copy so the caller cannot mutate stored bytes through the input
 	// slice after this call, matching the Mem/File backends' contract.
@@ -130,23 +147,38 @@ func (l *PostgresVaultLog) Append(ctx context.Context, vaultID string, blob []by
 	defer cancel()
 
 	var seq int64
+	var hash [32]byte
 	err := pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
 		// Serialize concurrent appends to THIS vault. The lock is held for the
 		// duration of the transaction and released on commit/rollback.
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, vaultID); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx,
-			`INSERT INTO sigil_vault_ops (vault_id, seq, blob)
-			 VALUES ($1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM sigil_vault_ops WHERE vault_id = $1), $2)
-			 RETURNING seq`,
-			vaultID, cp,
-		).Scan(&seq)
+		// Read the previous op (highest seq) to continue the chain. No row means
+		// this is the genesis op: seq 0, prevHash = the 32 zero bytes.
+		var prevSeq int64
+		var prevHash []byte
+		err := tx.QueryRow(ctx,
+			`SELECT seq, hash FROM sigil_vault_ops WHERE vault_id = $1 ORDER BY seq DESC LIMIT 1`,
+			vaultID,
+		).Scan(&prevSeq, &prevHash)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		var prev [32]byte
+		copy(prev[:], prevHash) // nil (no prior row) => stays genesis zeros
+		seq = prevSeq + 1
+		hash = chainHash(vaultID, uint64(seq), prev, cp)
+		_, err = tx.Exec(ctx,
+			`INSERT INTO sigil_vault_ops (vault_id, seq, blob, hash) VALUES ($1, $2, $3, $4)`,
+			vaultID, seq, cp, hash[:],
+		)
+		return err
 	})
 	if err != nil {
 		return Op{}, fmt.Errorf("append op: %w", err)
 	}
-	return Op{Seq: uint64(seq), Blob: cp}, nil
+	return Op{Seq: uint64(seq), Blob: cp, Hash: hash}, nil
 }
 
 // Since returns the vault's ops with Seq strictly greater than `since`, in
@@ -160,7 +192,7 @@ func (l *PostgresVaultLog) Since(ctx context.Context, vaultID string, since uint
 	defer cancel()
 
 	rows, err := l.pool.Query(ctx,
-		`SELECT seq, blob FROM sigil_vault_ops
+		`SELECT seq, blob, hash FROM sigil_vault_ops
 		 WHERE vault_id = $1 AND seq > $2
 		 ORDER BY seq ASC`,
 		vaultID, int64(since),
@@ -173,8 +205,8 @@ func (l *PostgresVaultLog) Since(ctx context.Context, vaultID string, since uint
 	out := make([]Op, 0)
 	for rows.Next() {
 		var seq int64
-		var blob []byte
-		if err := rows.Scan(&seq, &blob); err != nil {
+		var blob, hashBytes []byte
+		if err := rows.Scan(&seq, &blob, &hashBytes); err != nil {
 			return nil, fmt.Errorf("scan op: %w", err)
 		}
 		// pgx already returns a fresh []byte per row for bytea, but copy
@@ -182,12 +214,21 @@ func (l *PostgresVaultLog) Since(ctx context.Context, vaultID string, since uint
 		// internals.
 		cp := make([]byte, len(blob))
 		copy(cp, blob)
-		out = append(out, Op{Seq: uint64(seq), Blob: cp})
+		var hash [32]byte
+		copy(hash[:], hashBytes)
+		out = append(out, Op{Seq: uint64(seq), Blob: cp, Hash: hash})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate ops: %w", err)
 	}
 	return out, nil
+}
+
+// VerifyChain walks the vault's hash chain and reports whether it is intact,
+// reading the ops through Since. See verifyChainVia / verifyChain for the
+// tamper-evidence details.
+func (l *PostgresVaultLog) VerifyChain(ctx context.Context, vaultID string) (VerifyResult, error) {
+	return verifyChainVia(ctx, l, vaultID)
 }
 
 // Ping verifies the database is reachable, for the readiness probe. It bounds

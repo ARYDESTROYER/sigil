@@ -14,8 +14,17 @@
 //     first real production-store *adapter*, selected via SIGILD_OPLOG_POSTGRES).
 //
 // Every VaultLog stores OPAQUE client-encrypted blobs and performs NO
-// cryptography. Even the Postgres backend is a durable DEV backend, not the
-// finished production store: there is still no auth/enrollment model, no
-// per-vault authorization, no CRDT/merge, no S3 offload for large blobs, no
-// managed migrations, and no backup/replication.
+// cryptography on the plaintext. Each op additionally carries a SHA-256 chain
+// hash (see oplogchain.go) that makes the log tamper-EVIDENT: any later
+// insertion/deletion/modification of a stored op is DETECTABLE via VerifyChain.
+// The hash is computed over the ciphertext blob only (it fingerprints
+// ciphertext), so it does not weaken the server's zero-knowledge property. This
+// is tamper-EVIDENT, not tamper-PROOF: it does not prevent a malicious server
+// from rewriting the chain or lying about VerifyChain — the trustworthy check is
+// client-side.
+//
+// Even the Postgres backend is a durable DEV backend, not the finished
+// production store: there is still no auth/enrollment model, no per-vault
+// authorization, no CRDT/merge, no S3 offload for large blobs, no managed
+// migrations, and no backup/replication.
 package store

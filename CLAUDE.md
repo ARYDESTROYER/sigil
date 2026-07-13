@@ -147,7 +147,23 @@ public, make no security claims, until the audit completes and trademark clears.
   (…`/since/returned_count`), and `oplog.auth_denied` (…`/reason`, a fixed enum) — where
   `blob_sha256` is a hex **SHA-256 fingerprint** of the opaque stored bytes; the server
   **NEVER logs the blob content or any signature/nonce/timestamp/key** (zero-knowledge
-  boundary intact, proven by a no-blob-in-logs test). Endpoint reference in
+  boundary intact, proven by a no-blob-in-logs test). **Tamper-evident via a per-op
+  SHA-256 hash chain (Phase 26, ADR 0016):** one canonical `chainHash`
+  (`store/oplogchain.go`) shared by all three backends commits each op to the previous —
+  `hash(seq) = SHA-256("sigil-oplog-chain-v1" ‖ uint32_be(len(vaultID)) ‖ vaultID ‖
+  uint64_be(seq) ‖ prev_hash[32] ‖ blob)`, genesis `prev_hash` = 32 zero bytes — so
+  altering / inserting / deleting / reordering any op changes that op's hash and every
+  hash after it. `Op` carries `Hash`; **File's on-disk format is bumped v1→v2** to persist
+  the hash, **Postgres gains a hash column** (assigned inside the same advisory-lock tx as
+  `seq`), Mem holds it in-process. `GET …/ops` returns each op's hex `hash`; a new
+  **`GET /v1/vaults/{vaultID}/ops/verify`** recomputes the chain server-side and returns
+  `{vaultID, ok, count, tip_hash, broken_at_seq}` (`VerifyChain`) — both **dev-gated**
+  (`501` when dev-ops off) and **auth-guarded** exactly like the other ops routes. The
+  chain fingerprints the OPAQUE ciphertext (no key, no plaintext → **zero-knowledge
+  intact**) and is tamper-**EVIDENT, NOT tamper-proof**: a hostile server can still lie
+  about `/ops/verify`, so the real guarantee is **client-side** (re-derive the chain from
+  the returned per-op hashes); this stays a **dev op-log**, not a Byzantine /
+  append-only-enforced / notarized log. Endpoint reference in
   [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,

@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 25, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 26, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -38,13 +38,19 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   storage work), `/readyz` pings the **live** backend (Postgres pool → `503` if down),
   `http.Server` read/write/idle timeouts + `pgxpool` limits, and a **structured audit
   log** (`oplog.append`/`list`/`auth_denied` metadata + a blob **SHA-256 fingerprint** —
-  NEVER the blob content or any secret; zero-knowledge boundary intact).
+  NEVER the blob content or any secret; zero-knowledge boundary intact). **Tamper-evident
+  (Phase 26):** a per-op **SHA-256 hash chain** across all three backends via one
+  canonical `chainHash` (each op commits to the previous), a per-op `hash` in the GET
+  response, and `GET …/ops/verify` (`VerifyChain{ok,count,tip_hash,broken_at_seq}`); File
+  format bumped v1→v2 + Postgres gains a hash column. The chain fingerprints the OPAQUE
+  ciphertext (zero-knowledge intact) and is tamper-**EVIDENT not tamper-proof** — a
+  hostile server can lie, so real verification is **client-side**.
 - `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing;
   plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
   device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
   `hybrid_open` (Phase 23; FIRST user-facing use of the hybrid encryption path).
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0014.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0016.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
@@ -65,41 +71,37 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
   SAME change; commit + push to `main` per phase.
 
-**➡️ NEXT:** Phase 25 **hardened the dev op-log for reliability + auditability**
-without touching its security posture (**ADR 0015**). (i) **Request-context
-propagation:** `VaultLog.Append`/`Since` now take a `context.Context` threaded from
-the HTTP request (bodies read under it), so a client disconnect / timeout cancels
-in-flight storage work instead of pinning a pooled Postgres connection — Mem/File
-honor cancellation cheaply, Postgres passes ctx straight to `pgx`; proven by
-`TestPostgresVaultLogContextCancelled` (cancelled ctx → non-nil error, nothing
-persisted). (ii) **`/readyz` really pings the live backend:** when Postgres is
-configured it pings the `pgxpool` via a `store.Pinger` seam, bounded by a 2 s
-`readyzPingTimeout` — `GET /readyz` ⇒ **200 `oplog:ok`** while PG up, **503
-`oplog:unreachable`** after `docker stop` — so a load balancer drains a node whose
-store is down; Mem/File have no remote dep and report healthy. (iii) **Timeouts:**
-`http.Server` read/write/idle (15/15/60 s) + `pgxpool` limits (MaxConns 10) bound the
-work. (iv) **Structured audit log** (`internal/api/audit.go`, `slog`):
-`oplog.append` (`event/request_id/vault_id/seq/size_bytes/`**`blob_sha256`**`/auth`),
-`oplog.list` (…`/since/returned_count`), `oplog.auth_denied` (…`/reason` ∈
-`missing_headers|bad_timestamp|stale_timestamp|bad_signature|replayed`). The KEY
-guarantee: the trail records only metadata + a hex **SHA-256 fingerprint of the
-already-encrypted blob** — **NEVER the blob content, key, signature, nonce, or
-timestamp** — so the zero-knowledge boundary holds; proven by a no-blob-in-logs test
-that posts a recognizable blob and asserts it never appears in the full JSON log
-across the success path + all four denial paths. Still **NOT a production sync
-server**: dev-gated (default 501), opaque, unauthenticated unless
-`SIGILD_OPLOG_PUBKEY`; it still owes the real data layer — auth / enrollment,
-per-vault authorization, CRDT / merge, managed migrations, backups-with-restore,
-replication. Next: **build that layer around the adapter** (start with a real
-device-enrollment / per-vault authorization model), OR resume the crypto wiring — a
-real device-enrollment / session / key-management flow behind the hybrid primitives
-(Phase 21–23: how identities are minted, published, trusted, rotated). ⚠️ Wiring the
-hybrid **signature** into op-log auth is **still blocked**: Go's stdlib has no ML-DSA,
-so op-log auth stays classical Ed25519 (v2) until we take a PQ-sig dependency or move
-the check off the Go server. No account/session model uses `hybrid_seal` yet. The
+**➡️ NEXT:** Phase 26 made the dev op-log **tamper-evident** without touching its
+security posture (**ADR 0016**). Every `VaultLog` backend now maintains a per-op
+**SHA-256 hash chain** via one canonical `chainHash` (`store/oplogchain.go`):
+`hash(seq) = SHA-256("sigil-oplog-chain-v1" ‖ uint32_be(len(vaultID)) ‖ vaultID ‖
+uint64_be(seq) ‖ prev_hash[32] ‖ blob)`, genesis `prev_hash` = 32 zero bytes — so
+altering / inserting / deleting / reordering any op changes that op's hash **and every
+hash after it**. `Op` gained `Hash`; `GET …/ops` returns each op's hex `hash`; a new
+**`GET …/ops/verify`** recomputes the chain server-side → `{ok, count, tip_hash,
+broken_at_seq}` (`VerifyChain`). FileVaultLog's on-disk format bumped **v1→v2** to persist
+the hash; the Postgres `sigil_vault_ops` table gained a hash column (assigned inside the
+same `pg_advisory_xact_lock` tx as `seq`); Mem carries it in-process. Proven live: against
+a real Postgres, corrupting a blob (`broken_at_seq=2`) or the hash column
+(`broken_at_seq=3`) flips `/ops/verify` to `ok=false` while an untampered control vault
+stays `ok=true`; Mem/File/Postgres produce identical per-op hashes for identical input.
+**Honest scope:** hashing the OPAQUE ciphertext preserves zero-knowledge (no key, no
+plaintext); this is tamper-**EVIDENT not tamper-proof** — a hostile server can still lie
+about `/ops/verify`, so the REAL guarantee is **client-side** (re-derive the chain from
+the returned per-op hashes). Still a **dev op-log** (dev-gated, default 501,
+unauthenticated unless `SIGILD_OPLOG_PUBKEY`), NOT a Byzantine / append-only-enforced /
+notarized log. It still owes the real data layer — auth / enrollment, per-vault
+authorization, CRDT / merge, managed migrations, backups-with-restore, replication, and a
+signed / Merkle-root production audit log. Next: **build that layer around the adapter**
+(start with a real device-enrollment / per-vault authorization model), OR resume the
+crypto wiring — a real device-enrollment / session / key-management flow behind the hybrid
+primitives (Phase 21–23: how identities are minted, published, trusted, rotated). ⚠️
+Wiring the hybrid **signature** into op-log auth is **still blocked**: Go's stdlib has no
+ML-DSA, so op-log auth stays classical Ed25519 (v2) until we take a PQ-sig dependency or
+move the check off the Go server. No account/session model uses `hybrid_seal` yet. The
 full product is still early (~6% — see the completeness note); the mountain (7 native
 clients, real backend/auth, payments, Cure53 audit, SOC2) is mostly untouched —
-Phase 25 made one durable adapter reliable + auditable, not the store.
+Phase 26 made one adapter's history verifiable, not the store.
 
 ---
 
@@ -2642,3 +2644,123 @@ Recording the decision so the doc set stays coherent as the repo grows:
   replication. No over-claims: reliability + auditability are the **only** new
   properties; the security posture is unchanged and the **system is NOT
   "post-quantum secure".**
+
+---
+
+## 2026-07-13 — Phase 26 (tamper-evident hash-chained op-log)
+
+### Context & mandate
+- Phase 25 (ADR 0015) added a structured audit log that fingerprints each op with
+  SHA-256, and named the gap outright: a production audit log would be *signed and
+  tamper-evident*. But the per-op `blob_sha256` fingerprints each op in **isolation** —
+  nothing bound op *k* to op *k−1*, so a backend / operator / corrupted file or row could
+  modify, reorder, insert, or drop a stored op and **neither the server nor a client would
+  notice**. Threat-model adversaries #4 (signed append-only audit log) and #5 (replay/drop
+  detection) want the log's **history** verifiable, not just its confidentiality.
+- Mandate: make the op-log **tamper-evident** WITHOUT touching the security posture or the
+  zero-knowledge boundary. HARD RULES held absolutely: the server stores **opaque blobs**
+  and does **no crypto on the plaintext**; the op-log stays **dev-gated** (default **501**)
+  and **unauthenticated unless `SIGILD_OPLOG_PUBKEY`**; `sigild` keeps its ONE dep (`pgx`),
+  Mem/File stay stdlib; `libsigil`/`cli` untouched. Recorded as **ADR 0016**.
+
+### The chain — one canonical `chainHash` (`store/oplogchain.go`) ✅
+- Each op gets a 32-byte hash that commits to the previous op's hash:
+  > `hash(seq) = SHA-256( "sigil-oplog-chain-v1"  ‖  uint32_be(len(vaultID)) ‖ vaultID
+  >   ‖  uint64_be(seq)  ‖  prev_hash[32]  ‖  blob )`
+
+  with `prev_hash = 32 zero bytes` for the **genesis** op (`seq = 1`). The ASCII domain
+  label separates this hash from any other SHA-256 use; the **uint32 length-prefix** on
+  `vaultID` makes the field boundary unambiguous (so `("ab","c") ≠ ("a","bc")`) and binds
+  the chain to its vault; `blob` is the opaque client-encrypted bytes verbatim.
+- Because each op chains from the one before, altering / inserting / deleting / reordering
+  ANY op changes that op's hash **and every hash after it**.
+- **Hashing the OPAQUE ciphertext preserves zero-knowledge**: the chain is computed over
+  already-client-encrypted bytes — it needs **no key** and reveals **no plaintext** (the
+  same property the Phase 25 audit fingerprint relies on). The server still performs no
+  cryptography on vault contents.
+
+### All three backends store + continue the identical chain ✅
+- `Op` gained a `Hash []byte` field. Every backend's `Append` computes the next op's hash
+  from the stored tip via the shared `chainHash`, and `verifyChain` recomputes the whole
+  chain the same way — ONE function, so the three backends are provably hash-compatible.
+- **MemVaultLog** — carries each op's hash in-process (non-durable by design).
+- **FileVaultLog** — on-disk format **bumped v1 → v2**: a version header + per-record
+  `[4-byte BE len][blob][32-byte hash]`; a fresh instance re-reads the persisted hashes,
+  so verification survives restart.
+- **PostgresVaultLog** — the `sigil_vault_ops` table gains a **hash column**; the next hash
+  is computed and inserted inside the **same `pg_advisory_xact_lock` tx** that assigns
+  `seq`, so concurrent same-vault appends stay chain-consistent.
+
+### `/ops/verify` + `VerifyChain`, exposed two ways ✅
+- `GET …/ops` now returns each op's hex `hash` inline, so a client can **re-derive and
+  verify the chain itself** from the returned hashes.
+- New **`GET /v1/vaults/{vaultID}/ops/verify`** recomputes the chain server-side and
+  returns `{vaultID, ok, count, tip_hash, broken_at_seq}` (`VerifyChain{OK, Count, TipHash,
+  BrokenAtSeq}`) — `broken_at_seq` is the first mismatching `seq` (or `null` when intact);
+  an empty vault verifies `ok=true, count=0` with the genesis tip.
+- **Same gate, same auth, same opacity**: `/ops/verify` and the per-op `hash` are
+  **dev-gated** (the router registers `opsNotImplemented` → **501** when dev-ops is off)
+  and **auth-guarded** by `authorizeOps` exactly like the existing ops routes. The 64 KiB
+  cap and the opaque contract are unchanged.
+
+### Verified — live Postgres tamper detection + cross-backend hash equality ✅
+- **Live Postgres, end-to-end** (real `postgres:16-alpine`, server on :8099,
+  `SIGILD_ENABLE_DEV_OPS=1` + `SIGILD_OPLOG_POSTGRES`):
+  > appended 3 ops → `GET /ops/verify` ⇒ `{ok:true, count:3, tip_hash:…}`. Then
+  > `psql … UPDATE sigil_vault_ops SET blob = blob || '\x00' WHERE …seq=2` ⇒
+  > `GET /ops/verify` ⇒ `{ok:false, count:3, broken_at_seq:2, tip_hash: all-zero}`.
+  > Separately forcing 32 zero bytes into the **hash column at seq=3** ⇒
+  > `{ok:false, broken_at_seq:3}` while an untampered control vault stayed `ok=true` —
+  > proving `broken_at_seq` tracks the tampered position (not hardcoded).
+- **Gated store tests under `-race`**: `TestPostgresVaultLogVerifyChainOK`,
+  `TestPostgresVaultLogVerifyChainDetectsTamper` (corrupts the hash column →
+  `broken_at_seq=2`), `TestPostgresVaultLogChainMatchesMem` all PASS; the full PG suite
+  (13 tests, incl. concurrent appends + durability-across-reconnect) PASS under `-race`.
+- **File + Mem tamper tests** PASS: `TestFileVaultLogVerifyChainDetectsTamper` (flips an
+  on-disk blob byte, a fresh instance re-reads → `broken_at_seq=2`),
+  `TestMemVaultLogVerifyChainDetectsTamper` (white-box blob byte flip → `broken_at_seq=2`).
+- **Cross-backend hash equality — both pairs PASS**:
+  > `TestVaultLogChainCrossBackendConsistency` appends identical `(vaultID, blobs incl. an
+  > empty blob)` to **Mem vs File** and asserts identical per-op `Seq`, identical per-op
+  > `Hash`, and identical `VerifyChain` `TipHash`; `TestPostgresVaultLogChainMatchesMem`
+  > (ran live) asserts an identical per-op hash sequence and tip for **Postgres vs Mem**.
+
+  `TestChainHashDeterministicAndSensitive` proves `chainHash` is a pure function that
+  changes when ANY of vaultID / seq / prev_hash / blob changes.
+
+### Regression — everything else still green ✅
+- `gofmt -l sigild` empty · `go vet ./...` clean · `go build ./...` OK · `go mod verify`
+  OK (sigild's only dep is still `pgx`; Mem/File stdlib) · `go test ./...` offline all
+  packages ok (PG tests SKIP without `SIGILD_TEST_POSTGRES`) · `go test -race -count=1
+  ./internal/api/ ./internal/store/` clean (api ok ~1.6s, store ok ~5.0s, no data races).
+- **Default op-log UNCHANGED** — proven live on a plain server (no dev-ops): `GET`/`POST`
+  `…/ops` **and** `GET …/ops/verify` all ⇒ **501** `{"error":"not_implemented",…}` (a
+  deliberate 501, not a 404); `TestVaultOpsVerifyDefaultStill501` confirms it. Op-log stays
+  unauthenticated unless `SIGILD_OPLOG_PUBKEY`.
+- **libsigil / CLI untouched**: `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**;
+  `git status --porcelain cli/ libsigil/` empty — this phase is sigild + docs only.
+
+### docs — api.md / architecture.md / threat-model.md / ADR 0016 + this finalizer ✅
+- The docs track already updated `docs/api.md` (the per-op `hash` field + the `/ops/verify`
+  endpoint + the chain formula), `docs/architecture.md`, and `docs/threat-model.md`, and
+  wrote **ADR 0016**. This entry finalizes the remaining living docs (this file,
+  `CLAUDE.md`, `README.md`) and updates the RESUME ANCHOR.
+
+### ➡️ What this opens, and what's still open (honest)
+- The op-log is now **tamper-evident**: modification / insertion / deletion / reordering of
+  any stored op is detectable from the per-op hashes, and an operator can spot-check a vault
+  with one `/ops/verify` request — all with the zero-knowledge boundary intact (the chain
+  fingerprints ciphertext only).
+- **Tamper-EVIDENT, NOT tamper-proof — no over-claim.** A single, non-notarized server can
+  still **lie** about `/ops/verify` (recompute a perfectly consistent chain over data it
+  has itself doctored, or just return `{"ok":true}`). Server-side verify catches only
+  **accidental** corruption / a non-adversarial operator's storage faults; the guarantee
+  that resists a **hostile** server is **client-side** — the client keeps its own tip and
+  re-derives the chain from the returned per-op hashes. Still a **dev op-log**, NOT a
+  Byzantine-fault-tolerant / append-only-enforced / notarized log, and NOT the production
+  build's signed / Merkle-root store.
+- Still owed by the real data layer (unchanged from Phase 25): auth / enrollment, per-vault
+  authorization, CRDT / merge, managed migrations, backups-with-proven-restore, replication
+  — and a signed / Merkle-root, replay-and-drop-detecting production audit log. Tamper-
+  evidence is the **only** new property; the security posture is unchanged and the **system
+  is NOT "post-quantum secure".**

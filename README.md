@@ -120,7 +120,17 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   log** records each append / list / auth-denial as metadata plus a **SHA-256
   fingerprint** of the opaque blob — **never the blob content, and never any key,
   signature, nonce, or timestamp** (the zero-knowledge boundary is preserved, proven by
-  a no-blob-in-logs test). Ships a distroless `Dockerfile`.
+  a no-blob-in-logs test). The op-log is also **tamper-evident**: every backend maintains
+  a **per-op SHA-256 hash chain** (each op's hash commits to the previous op's hash, over
+  the opaque ciphertext), so modifying, inserting, deleting, or reordering any stored op
+  changes that op's hash and every hash after it. `GET …/ops` returns each op's hash and a
+  new `GET …/ops/verify` recomputes the chain and reports
+  `{ok, count, tip_hash, broken_at_seq}` for **integrity auditing** — both dev-gated and
+  auth-guarded exactly like the other ops routes. Hashing the **already-encrypted** blob
+  fingerprints ciphertext only (no key, no plaintext), so zero-knowledge is preserved.
+  This is **tamper-evident, not tamper-proof**: a hostile server can still lie about
+  `/ops/verify`, so the real guarantee is **client-side** — a client re-derives the chain
+  from the returned per-op hashes. Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

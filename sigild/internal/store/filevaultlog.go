@@ -23,30 +23,51 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 )
 
+// On-disk format v2 (this file). Each vault file begins with a fixed HEADER, then
+// a sequence of records:
+//
+//	HEADER : "SIGILflog" (9 bytes) || version byte (0x02)          = 10 bytes
+//	RECORD : [4-byte big-endian uint32 blob-len][blob][32-byte hash]
+//
+// The 32-byte hash is the op's tamper-evidence chain hash (see chainHash). The
+// header lets us reject a legacy v1 file (records with no hash), which predates
+// the chain. This is a DEV backend with no real data, so a hard format bump —
+// v1 files are unsupported and yield a clear error — is acceptable.
+const (
+	fileMagic         = "SIGILflog"
+	fileFormatVersion = 2
+	fileHeaderLen     = len(fileMagic) + 1 // magic + 1 version byte
+)
+
+// fileHeader is the exact 10-byte header written when a vault file is created.
+var fileHeader = append([]byte(fileMagic), fileFormatVersion)
+
 // FileVaultLog persists each vault's ops to its own append-only file under dir.
-//
-// On-disk record framing (one op per record):
-//
-//	[4-byte big-endian uint32 length][that many raw opaque blob bytes]
 //
 // Seq is implicit: it is the 1-based position of the record within the file.
 // The first record is Seq 1, the second Seq 2, and so on. The in-memory `seqs`
-// map caches the current max seq per vault so Append need not rescan; it is
-// rebuilt lazily by counting on-disk records the first time a vault is touched,
-// which is what re-derives correct seqs after a restart.
+// map caches the current max seq per vault so Append need not rescan; `tips`
+// caches the last stored hash per vault so Append can continue the chain without
+// re-reading. Both are rebuilt lazily by scanning the on-disk file the first time
+// a vault is touched, which re-derives correct seqs (and the chain tip) after a
+// restart.
 type FileVaultLog struct {
 	dir string
 
 	mu sync.Mutex
 	// seqs caches the current max seq per vault. A vault absent from the map has
 	// not been loaded yet; its counter is rebuilt from disk on first touch.
-	seqs   map[string]uint64
+	seqs map[string]uint64
+	// tips caches the last stored chain hash per vault (genesis zeros when the
+	// vault has no ops), so Append can chain onto it. Rebuilt from disk with seqs.
+	tips   map[string][32]byte
 	loaded map[string]bool
 }
 
@@ -63,6 +84,7 @@ func NewFileVaultLog(dir string) (*FileVaultLog, error) {
 	return &FileVaultLog{
 		dir:    dir,
 		seqs:   make(map[string]uint64),
+		tips:   make(map[string][32]byte),
 		loaded: make(map[string]bool),
 	}, nil
 }
@@ -81,76 +103,121 @@ func (l *FileVaultLog) pathFor(vaultID string) string {
 	return filepath.Join(l.dir, name)
 }
 
-// ensureLoaded rebuilds the cached seq counter for vaultID from disk if it has
-// not been loaded yet. Caller must hold l.mu.
+// ensureLoaded rebuilds the cached seq counter AND chain tip for vaultID from
+// disk if it has not been loaded yet. Caller must hold l.mu.
 func (l *FileVaultLog) ensureLoaded(vaultID string) error {
 	if l.loaded[vaultID] {
 		return nil
 	}
-	n, err := l.countRecords(l.pathFor(vaultID))
+	n, tip, err := scanFile(l.pathFor(vaultID))
 	if err != nil {
 		return err
 	}
 	l.seqs[vaultID] = n
+	l.tips[vaultID] = tip
 	l.loaded[vaultID] = true
 	return nil
 }
 
-// countRecords returns the number of complete framed records in the file at
-// path. A missing file counts as 0. A truncated trailing record (e.g. a crash
-// mid-write) is ignored rather than treated as an error.
-func (l *FileVaultLog) countRecords(path string) (uint64, error) {
+// scanFile validates the header (for an existing file) and walks every complete
+// record, returning the record count and the LAST record's stored hash (the chain
+// tip; genesis zeros when there are no records). A missing file yields (0, zero,
+// nil). A file with a missing/incorrect header — e.g. a legacy v1 file — yields a
+// clear error. A truncated trailing record (crash mid-write) is ignored.
+func scanFile(path string) (uint64, [32]byte, error) {
+	var tip [32]byte
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
+			return 0, tip, nil
 		}
-		return 0, err
+		return 0, tip, err
 	}
 	defer f.Close()
 
 	r := bufio.NewReader(f)
+	empty, err := readHeader(r)
+	if err != nil {
+		return 0, tip, err
+	}
+	if empty {
+		return 0, tip, nil
+	}
 	var n uint64
 	for {
-		_, ok, err := readRecord(r)
+		_, hash, ok, err := readRecord(r)
 		if err != nil {
-			return 0, err
+			return 0, tip, err
 		}
 		if !ok {
-			// Clean EOF or a truncated trailing record: stop counting.
-			return n, nil
+			// Clean EOF or a truncated trailing record: stop.
+			return n, tip, nil
 		}
 		n++
+		tip = hash
 	}
 }
 
-// readRecord reads one framed record from r. It returns (blob, true, nil) for a
-// complete record, (nil, false, nil) at a clean EOF or when the trailing record
-// is truncated (a partial length prefix or a short blob), and a non-nil error
-// only for genuine I/O failures. Treating truncation as a clean stop makes a
-// crash mid-Append recoverable: the partial last record is simply ignored.
-func readRecord(r *bufio.Reader) ([]byte, bool, error) {
+// readHeader reads and validates the fixed v2 file header from r.
+//
+// It reports empty=true for a ZERO-length stream — a valid empty log (a file that
+// was created but not yet written, e.g. a crash between create and the header
+// write). Callers treat that like a missing file, not an error. A NON-empty
+// stream must carry a valid header: a wrong magic (e.g. a legacy v1 file, which
+// had no header) or an unsupported version yields a clear error.
+func readHeader(r *bufio.Reader) (empty bool, err error) {
+	if _, perr := r.Peek(1); errors.Is(perr, io.EOF) {
+		return true, nil
+	}
+	var hdr [fileHeaderLen]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return false, fmt.Errorf("op-log file: read header: %w", err)
+	}
+	if string(hdr[:len(fileMagic)]) != fileMagic {
+		return false, fmt.Errorf("op-log file: bad magic %q (a legacy v1 file predates the hash chain and is unsupported; expected a v%d file)",
+			hdr[:len(fileMagic)], fileFormatVersion)
+	}
+	if v := hdr[len(fileMagic)]; v != fileFormatVersion {
+		return false, fmt.Errorf("op-log file: unsupported format version %d (want %d)", v, fileFormatVersion)
+	}
+	return false, nil
+}
+
+// readRecord reads one framed record ([4-byte len][blob][32-byte hash]) from r.
+// It returns (blob, hash, true, nil) for a complete record, (nil, zero, false,
+// nil) at a clean EOF or when the trailing record is truncated (a partial length
+// prefix, a short blob, or a short hash), and a non-nil error only for genuine
+// I/O failures. Treating truncation as a clean stop makes a crash mid-Append
+// recoverable: the partial last record is simply ignored.
+func readRecord(r *bufio.Reader) ([]byte, [32]byte, bool, error) {
+	var hash [32]byte
+
 	var lenBuf [4]byte
-	_, err := io.ReadFull(r, lenBuf[:])
-	if err != nil {
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			// Clean EOF (no more records) or a partial length prefix: ignore.
-			return nil, false, nil
+			return nil, hash, false, nil
 		}
-		return nil, false, err
+		return nil, hash, false, err
 	}
 	n := binary.BigEndian.Uint32(lenBuf[:])
 	blob := make([]byte, n)
-	_, err = io.ReadFull(r, blob)
-	if err != nil {
+	if _, err := io.ReadFull(r, blob); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			// Length prefix promised more bytes than exist: truncated trailing
 			// record from a crash mid-write — ignore it.
-			return nil, false, nil
+			return nil, hash, false, nil
 		}
-		return nil, false, err
+		return nil, hash, false, err
 	}
-	return blob, true, nil
+	if _, err := io.ReadFull(r, hash[:]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			// Blob written but the trailing hash was torn off mid-write: ignore.
+			return nil, hash, false, nil
+		}
+		return nil, hash, false, err
+	}
+	return blob, hash, true, nil
 }
 
 // Append durably records a defensive COPY of blob as the next op for vaultID and
@@ -183,6 +250,20 @@ func (l *FileVaultLog) Append(ctx context.Context, vaultID string, blob []byte) 
 	// fsync below, which we check.
 	defer f.Close()
 
+	// A brand-new (zero-length) file needs its header before the first record.
+	// ensureLoaded has already rejected any pre-existing file with a bad header,
+	// so a non-empty file here is guaranteed to be a valid v2 file.
+	if info, err := f.Stat(); err != nil {
+		return Op{}, err
+	} else if info.Size() == 0 {
+		if _, err := f.Write(fileHeader); err != nil {
+			return Op{}, err
+		}
+	}
+
+	seq := l.seqs[vaultID] + 1
+	hash := chainHash(vaultID, seq, l.tips[vaultID], cp)
+
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(cp)))
 	if _, err := f.Write(lenBuf[:]); err != nil {
@@ -191,13 +272,17 @@ func (l *FileVaultLog) Append(ctx context.Context, vaultID string, blob []byte) 
 	if _, err := f.Write(cp); err != nil {
 		return Op{}, err
 	}
+	if _, err := f.Write(hash[:]); err != nil {
+		return Op{}, err
+	}
 	if err := f.Sync(); err != nil {
 		return Op{}, err
 	}
 
-	seq := l.seqs[vaultID] + 1
+	// Commit the in-memory counters only after the record is durably on disk.
 	l.seqs[vaultID] = seq
-	return Op{Seq: seq, Blob: cp}, nil
+	l.tips[vaultID] = hash
+	return Op{Seq: seq, Blob: cp, Hash: hash}, nil
 }
 
 // Since returns the vault's ops with Seq strictly greater than `since`, in
@@ -223,10 +308,17 @@ func (l *FileVaultLog) Since(ctx context.Context, vaultID string, since uint64) 
 	defer f.Close()
 
 	r := bufio.NewReader(f)
+	empty, err := readHeader(r)
+	if err != nil {
+		return nil, err
+	}
+	if empty {
+		return []Op{}, nil
+	}
 	out := make([]Op, 0)
 	var seq uint64
 	for {
-		blob, ok, err := readRecord(r)
+		blob, hash, ok, err := readRecord(r)
 		if err != nil {
 			return nil, err
 		}
@@ -239,7 +331,14 @@ func (l *FileVaultLog) Since(ctx context.Context, vaultID string, since uint64) 
 		}
 		// readRecord already allocated a fresh slice per record, so it is an
 		// independent defensive copy; hand it straight to the caller.
-		out = append(out, Op{Seq: seq, Blob: blob})
+		out = append(out, Op{Seq: seq, Blob: blob, Hash: hash})
 	}
 	return out, nil
+}
+
+// VerifyChain walks the vault's hash chain and reports whether it is intact. It
+// reads through Since (which takes l.mu), so it must NOT be called while holding
+// l.mu. See verifyChainVia / verifyChain for the tamper-evidence details.
+func (l *FileVaultLog) VerifyChain(ctx context.Context, vaultID string) (VerifyResult, error) {
+	return verifyChainVia(ctx, l, vaultID)
 }

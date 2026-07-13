@@ -3,7 +3,6 @@ package api
 import (
 	"crypto/ed25519"
 	"encoding/base64"
-	"errors"
 	"net/http"
 	"strconv"
 	"sync"
@@ -26,15 +25,21 @@ const opsAuthSkew = 300 // seconds
 // no longer verifies, and a request without X-Sigil-Nonce is rejected.
 const opsAuthDomain = "sigil-oplog-auth-v2\n"
 
-// errUnauthorized is the sentinel authorizeOps returns when a request fails the
-// op-log auth contract (missing headers / bad timestamp / bad signature). The
-// caller maps it to a 401 typed-error envelope.
-var errUnauthorized = errors.New("oplog auth: unauthorized")
+// authReason is the machine-readable cause of an op-log auth outcome. The empty
+// value means AUTHORIZED (including when auth is disabled); every other value
+// names the single check that failed. It is surfaced verbatim in the structured
+// audit log, so it MUST stay a fixed enum that carries NO secret material — no
+// signature, nonce, or timestamp value, only which check tripped.
+type authReason string
 
-// errReplay is the sentinel authorizeOps returns when the signature is valid but
-// the request's nonce was already seen inside the timestamp window (a replay).
-// The caller maps it to a 401 with a distinct "replayed request" detail.
-var errReplay = errors.New("oplog auth: replayed request")
+const (
+	reasonOK             authReason = ""
+	reasonMissingHeaders authReason = "missing_headers"
+	reasonBadTimestamp   authReason = "bad_timestamp"
+	reasonStaleTimestamp authReason = "stale_timestamp"
+	reasonBadSignature   authReason = "bad_signature"
+	reasonReplayed       authReason = "replayed"
+)
 
 // nonceCacheMaxEntries is a hard safety backstop on the seen-nonce cache size.
 // At steady state the cache holds at most one window's worth of nonces (entries
@@ -100,11 +105,12 @@ func (c *nonceCache) checkAndRecord(nonce string, ts, now int64) bool {
 // authorizeOps enforces the op-log request-authentication contract (v2) for a
 // single vault-ops request.
 //
-// When h.cfg.OpLogPubKey is nil, auth is DISABLED and this returns nil
+// When h.cfg.OpLogPubKey is nil, auth is DISABLED and this returns reasonOK
 // immediately — the op-log keeps its existing UNAUTHENTICATED behaviour. When
 // the key is set, the request must carry a valid Ed25519 signature over the
 // canonical v2 message (below) AND a fresh, not-yet-seen nonce, else this returns
-// errUnauthorized / errReplay (both -> 401).
+// the authReason naming the failed check (all -> 401). reasonOK ("") means the
+// request is authorized.
 //
 // HONEST SCOPE (DEV-ONLY): this verifies against a SINGLE configured device
 // public key, and the replay cache is PER-PROCESS/in-memory (see nonceCache) —
@@ -123,14 +129,16 @@ func (c *nonceCache) checkAndRecord(nonce string, ts, now int64) bool {
 // BODY is the raw request body bytes (empty for GET). The Go server and the Rust
 // CLI MUST agree on this exactly.
 //
-// Verification order: (1) all three headers present; (2) timestamp parses and is
-// inside the skew window; (3) signature verifies; (4) — ONLY after a valid
-// signature, so unauthenticated probes never touch the cache — the nonce is not
-// a replay. It is recorded on first valid sighting.
-func (h *handlers) authorizeOps(r *http.Request, body []byte) error {
+// Verification order maps 1:1 to the returned authReason: (1) all three headers
+// present (missing_headers); (2) timestamp parses (bad_timestamp) and is inside
+// the skew window (stale_timestamp); (3) signature decodes and verifies
+// (bad_signature); (4) — ONLY after a valid signature, so unauthenticated probes
+// never touch the cache — the nonce is not a replay (replayed). It is recorded on
+// first valid sighting.
+func (h *handlers) authorizeOps(r *http.Request, body []byte) authReason {
 	// Auth disabled: nil key => unchanged, UNAUTHENTICATED behaviour.
 	if h.cfg.OpLogPubKey == nil {
-		return nil
+		return reasonOK
 	}
 
 	// 1) All three headers must be present and non-blank.
@@ -138,17 +146,17 @@ func (h *handlers) authorizeOps(r *http.Request, body []byte) error {
 	nonceHeader := r.Header.Get("X-Sigil-Nonce")
 	sigHeader := r.Header.Get("X-Sigil-Signature")
 	if tsHeader == "" || nonceHeader == "" || sigHeader == "" {
-		return errUnauthorized
+		return reasonMissingHeaders
 	}
 
 	// 2) Timestamp must parse as int64 and fall inside the skew window.
 	ts, err := strconv.ParseInt(tsHeader, 10, 64)
 	if err != nil {
-		return errUnauthorized
+		return reasonBadTimestamp
 	}
 	now := time.Now().Unix()
 	if skew := now - ts; skew < -opsAuthSkew || skew > opsAuthSkew {
-		return errUnauthorized
+		return reasonStaleTimestamp
 	}
 
 	// 3) Reconstruct the canonical v2 signed MESSAGE from the request. The
@@ -173,10 +181,10 @@ func (h *handlers) authorizeOps(r *http.Request, body []byte) error {
 	// Decode the signature and verify against the configured device key.
 	sig, err := base64.StdEncoding.DecodeString(sigHeader)
 	if err != nil {
-		return errUnauthorized
+		return reasonBadSignature
 	}
 	if !ed25519.Verify(h.cfg.OpLogPubKey, msg, sig) {
-		return errUnauthorized
+		return reasonBadSignature
 	}
 
 	// 4) Replay check — ONLY after a valid signature, so unauthenticated probes
@@ -184,17 +192,19 @@ func (h *handlers) authorizeOps(r *http.Request, body []byte) error {
 	//    replay; a fresh nonce is recorded here. h.nonces is non-nil whenever
 	//    OpLogPubKey is set (see NewRouter); guard defensively regardless.
 	if h.nonces != nil && h.nonces.checkAndRecord(nonceHeader, ts, now) {
-		return errReplay
+		return reasonReplayed
 	}
-	return nil
+	return reasonOK
 }
 
-// writeOpsAuthError maps an authorizeOps failure to the 401 typed-error
-// envelope, distinguishing a replayed request from a generic signature failure.
-// The error CODE stays "unauthorized" in both cases; only the detail differs.
-func writeOpsAuthError(w http.ResponseWriter, err error) {
+// writeOpsAuthError maps a non-OK authReason to the 401 typed-error envelope,
+// distinguishing a replayed request from a generic signature failure. The error
+// CODE stays "unauthorized" in every case; only the detail differs (and it never
+// echoes the specific reason, to avoid handing a prober a check-by-check oracle
+// — the precise reason goes only to the server-side audit log).
+func writeOpsAuthError(w http.ResponseWriter, reason authReason) {
 	detail := "missing or invalid op-log request signature"
-	if errors.Is(err, errReplay) {
+	if reason == reasonReplayed {
 		detail = "replayed request"
 	}
 	writeError(w, http.StatusUnauthorized, "unauthorized", detail)

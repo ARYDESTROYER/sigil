@@ -133,7 +133,21 @@ public, make no security claims, until the audit completes and trademark clears.
   the replay cache is **per-process/in-memory** (multi-instance needs a shared store,
   e.g. Redis), dev-only — enrollment / multi-device / JWT remain future. **No crypto
   on the blob**: the server never decodes it; it
-  stores/returns the exact client bytes. Endpoint reference in
+  stores/returns the exact client bytes. **Hardened for reliability + auditability
+  (Phase 25, ADR 0015):** the `VaultLog` seam is **request-context-aware** — `Append`/
+  `Since` take a `context.Context` threaded from `r.Context()` (bodies read under it),
+  so a client disconnect / timeout cancels in-flight storage work instead of pinning a
+  pooled Postgres connection (Mem/File honor cancellation cheaply; Postgres passes ctx to
+  `pgx`). `/readyz` now performs a **real health check of the live backend** — when
+  Postgres is configured it pings the `pgxpool` (`store.Pinger`, bounded by a 2 s
+  `readyzPingTimeout`) and returns **503** if the DB is down (Mem/File report healthy).
+  `http.Server` read/write/idle timeouts + `pgxpool` limits bound the work. A
+  **structured audit log** (`internal/api/audit.go`, `slog`) emits `oplog.append`
+  (`event/request_id/vault_id/seq/size_bytes/blob_sha256/auth`), `oplog.list`
+  (…`/since/returned_count`), and `oplog.auth_denied` (…`/reason`, a fixed enum) — where
+  `blob_sha256` is a hex **SHA-256 fingerprint** of the opaque stored bytes; the server
+  **NEVER logs the blob content or any signature/nonce/timestamp/key** (zero-knowledge
+  boundary intact, proven by a no-blob-in-logs test). Endpoint reference in
   [`docs/api.md`](docs/api.md).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,

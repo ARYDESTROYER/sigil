@@ -4,6 +4,7 @@
 > (the 72-hour foundation sprint, through the dev-gated op-log, the Ed25519
 > sign/verify primitive and device-key request auth (v2, nonce/replay-hardened),
 the file-backed and opt-in durable-Postgres dev op-log backends,
+> its request-context / readiness / structured-audit-log hardening,
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -50,3 +51,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0012](0012-hybrid-signature-combiner.md) | Hybrid signature combiner (Ed25519 then ML-DSA-65) | Accepted (2026-07) |
 | [0013](0013-hybrid-public-key-seal.md) | Hybrid public-key seal (KEM-then-AEAD over the hybrid KEM) | Accepted (2026-07) |
 | [0014](0014-postgres-durable-oplog-backend.md) | Postgres durable op-log backend (`SIGILD_OPLOG_POSTGRES`) | Accepted (2026-07) |
+| [0015](0015-oplog-auditability-and-request-context.md) | Op-log auditability and request-context propagation | Accepted (2026-07) |

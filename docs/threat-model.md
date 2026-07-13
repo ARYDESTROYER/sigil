@@ -35,6 +35,20 @@ scaffold only and **must never be exposed publicly or hold real secrets**; a
 production op-log will add device-key auth, per-vault authorization, and durable
 storage, while still storing only opaque ciphertext.
 
+**Audit log preserves zero-knowledge.** The dev op-log emits a **structured
+audit log** of every append, list, and **auth denial**, but it records only
+**metadata plus a SHA-256 integrity fingerprint of the opaque ciphertext** — the
+server **never logs plaintext, keys, blob content, or the request signature /
+nonce**. Fingerprinting bytes that are *already* client-encrypted gives an
+operator a *who-appended-what-when* trail (a dev-scale down-payment on adversary
+#4's "signed append-only audit log") **without weakening the zero-knowledge
+property**: the log reveals nothing the server did not already store, and the
+server still cannot decrypt a vault. Auth denials are audited with their reason
+(missing / invalid / stale / replayed signature), so failed access attempts
+against a `SIGILD_OPLOG_PUBKEY`-guarded op-log are visible. This is still the
+**dev** op-log (gated off by default); a production audit log would additionally
+be signed and tamper-evident.
+
 **Status note for this repo:** none of the defenses in the table above is
 implemented yet. The current `sigild` skeleton performs no crypto, runs no auth,
 and stores only the opaque blobs described above; `libsigil` has real-but-

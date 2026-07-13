@@ -38,13 +38,18 @@ Always `200` while the process is serving. Performs no dependency checks.
 
 ### `GET /readyz` — readiness
 
-`200` when every *configured* dependency dials OK (or is unconfigured); `503`
+`200` when every *configured* dependency is healthy (or is unconfigured); `503`
 when a configured dependency is unreachable, so a load balancer drains the
-instance. The skeleton does a plain TCP dial only — no auth handshake, no real
-pg/redis ping (that is the production build's job).
+instance. The future `SIGILD_POSTGRES_ADDR` / `SIGILD_REDIS_ADDR` probes are
+still a plain TCP dial only (no auth handshake — that is the production build's
+job). The **active op-log backend**, however, now gets a **real** health check:
+when the durable Postgres op-log backend (`SIGILD_OPLOG_POSTGRES`) is in use,
+`/readyz` **pings its `pgxpool` connection pool** and returns `503` if that ping
+fails; the in-memory and file-backed backends have no remote dependency and
+report healthy.
 
 ```json
-{ "version": "<build version>", "checks": { "postgres": "ok|unreachable|unconfigured", "redis": "ok|unreachable|unconfigured" } }
+{ "version": "<build version>", "checks": { "postgres": "ok|unreachable|unconfigured", "redis": "ok|unreachable|unconfigured", "oplog": "ok|unreachable|unconfigured" } }
 ```
 
 ### `GET /version` — build identity
@@ -259,6 +264,35 @@ The matching CLI key file is JSON, written with mode `0600`:
 cache is **in-memory / per-process** (a multi-instance production deploy needs a
 shared store); multi-device enrollment / registry / JWT auth is future; and with
 `SIGILD_OPLOG_PUBKEY` unset there is no auth at all.
+
+### Audit log (structured server-side events)
+
+Every op-log **append**, **list**, and **auth denial** emits a **structured
+audit event** to the server log (alongside the request-scoped access log). Each
+event carries only **metadata plus an integrity fingerprint** — never the
+payload:
+
+| Field | Meaning |
+|-------|---------|
+| `event` | the audited action — e.g. `oplog.append`, `oplog.list`, `oplog.auth_denied` |
+| `request_id` | the request's `X-Request-ID`, to correlate with the access log |
+| `vault_id` | the target vault ID (opaque, client-chosen) |
+| `seq` | the sequence number assigned (append) or the highest returned (list) |
+| `size` | the opaque blob's length in bytes |
+| `blob_sha256` | hex **SHA-256 fingerprint** of the opaque stored bytes — for integrity / traceability only |
+| `auth` / `reason` | on a denial, why it failed (missing / invalid / stale / replayed signature) |
+
+The server logs a **fingerprint** of the ciphertext, **not** the ciphertext: it
+**NEVER** writes the opaque blob content, any signature, nonce, timestamp, or key
+material to the log. Because the fingerprint is taken over bytes that are
+**already client-encrypted**, an operator can prove *who appended what, when*
+without the server ever seeing plaintext — the audit trail does not weaken the
+zero-knowledge property (see [`threat-model.md`](threat-model.md)).
+
+Request bodies are read under the **request context**: a client that
+disconnects, or a read that exceeds the server's `http.Server` timeouts, cancels
+the in-flight append/read (and, for the Postgres backend, releases the pooled
+connection) rather than blocking a goroutine.
 
 ---
 

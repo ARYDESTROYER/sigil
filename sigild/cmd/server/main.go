@@ -105,10 +105,20 @@ func main() {
 		}
 	}
 
+	// Server-wide timeouts bound how long a single connection may tie up
+	// resources, so a slow or stuck client cannot hold a goroutine/socket open
+	// indefinitely. Op bodies are tiny (a single op is capped at 64 KiB, see
+	// api.maxOpsBodyBytes) and every handler is fast, so a 15 s read/write budget
+	// is generous; IdleTimeout reaps idle keep-alive connections after 60 s.
+	// ReadHeaderTimeout stays as a tight guard against slow-header (Slowloris)
+	// attacks.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           api.NewRouter(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

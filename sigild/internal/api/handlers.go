@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -49,14 +50,32 @@ func (h *handlers) version(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// readyz reports whether sigild's dependencies are reachable. The skeleton does
-// a plain TCP dial (no auth handshake); the production build replaces this with
-// real pgx/redis pings. If a *configured* dependency is unreachable we return
-// 503 so a load balancer drains the instance.
-func (h *handlers) readyz(w http.ResponseWriter, _ *http.Request) {
+// readyzPingTimeout bounds the live op-log backend health check so a wedged
+// database can never hang the readiness probe. It is deliberately short: a slow
+// backend should drain the instance, not stall the load balancer's probe.
+const readyzPingTimeout = 2 * time.Second
+
+// readyz reports whether sigild's dependencies are reachable. Configured
+// host:port targets get a plain TCP dial. Additionally, when the DEV op-log is
+// on and its backend can report live health (implements store.Pinger — i.e. the
+// Postgres backend), we ping the REAL dependency rather than merely dialing, so a
+// load balancer drains an instance whose database is down. Mem/File have no
+// external dependency and do not implement Pinger, so the live check is skipped
+// for them (and h.log is nil when dev-ops is off). Any "unreachable" check makes
+// the whole probe 503.
+func (h *handlers) readyz(w http.ResponseWriter, r *http.Request) {
 	checks := map[string]string{
 		"postgres": dialState(h.cfg.PostgresAddr),
 		"redis":    dialState(h.cfg.RedisAddr),
+	}
+	if p, ok := h.log.(store.Pinger); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), readyzPingTimeout)
+		defer cancel()
+		if err := p.Ping(ctx); err != nil {
+			checks["oplog"] = "unreachable"
+		} else {
+			checks["oplog"] = "ok"
+		}
 	}
 	status := http.StatusOK
 	for _, state := range checks {
@@ -131,11 +150,12 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Verify the op-log request signature over (method, path, query, ts, nonce,
-	// body) and reject replays. No-op (returns nil) unless cfg.OpLogPubKey is
-	// set. Must run AFTER the body is read (it is part of the signed message) and
-	// BEFORE we append.
-	if err := h.authorizeOps(r, blob); err != nil {
-		writeOpsAuthError(w, err)
+	// body) and reject replays. Returns an empty reason (authorized) unless
+	// cfg.OpLogPubKey is set. Must run AFTER the body is read (it is part of the
+	// signed message) and BEFORE we append.
+	if reason := h.authorizeOps(r, blob); reason != "" {
+		h.auditAuthDenied(r, vaultID, reason)
+		writeOpsAuthError(w, reason)
 		return
 	}
 	if len(blob) == 0 {
@@ -143,11 +163,12 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	op, err := h.log.Append(vaultID, blob)
+	op, err := h.log.Append(r.Context(), vaultID, blob)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "")
 		return
 	}
+	h.auditAppend(r, vaultID, op.Seq, blob)
 	writeJSON(w, http.StatusCreated, struct {
 		VaultID string `json:"vaultID"`
 		Seq     uint64 `json:"seq"`
@@ -171,9 +192,11 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 
 	// Verify the op-log request signature over (method, path, query, ts, nonce,
 	// "") and reject replays. GET carries no body, so the signed body is empty.
-	// No-op (returns nil) unless cfg.OpLogPubKey is set. Must run BEFORE we list.
-	if err := h.authorizeOps(r, nil); err != nil {
-		writeOpsAuthError(w, err)
+	// Returns an empty reason (authorized) unless cfg.OpLogPubKey is set. Must run
+	// BEFORE we list.
+	if reason := h.authorizeOps(r, nil); reason != "" {
+		h.auditAuthDenied(r, vaultID, reason)
+		writeOpsAuthError(w, reason)
 		return
 	}
 
@@ -188,11 +211,12 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 		since = parsed
 	}
 
-	ops, err := h.log.Since(vaultID, since)
+	ops, err := h.log.Since(r.Context(), vaultID, since)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "")
 		return
 	}
+	h.auditList(r, vaultID, since, len(ops))
 
 	next := since
 	for _, op := range ops {

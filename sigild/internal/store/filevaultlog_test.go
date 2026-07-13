@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"os"
@@ -17,12 +18,13 @@ func base64RawURL(vaultID string) string {
 }
 
 func TestFileVaultLogSeqIncrements(t *testing.T) {
+	ctx := t.Context()
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
 	for i := uint64(1); i <= 3; i++ {
-		op, err := l.Append("v1", []byte{byte(i)})
+		op, err := l.Append(ctx, "v1", []byte{byte(i)})
 		if err != nil {
 			t.Fatalf("Append %d: %v", i, err)
 		}
@@ -33,13 +35,14 @@ func TestFileVaultLogSeqIncrements(t *testing.T) {
 }
 
 func TestFileVaultLogSeqIsPerVault(t *testing.T) {
+	ctx := t.Context()
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
-	a1, _ := l.Append("a", []byte("x"))
-	b1, _ := l.Append("b", []byte("y"))
-	a2, _ := l.Append("a", []byte("z"))
+	a1, _ := l.Append(ctx, "a", []byte("x"))
+	b1, _ := l.Append(ctx, "b", []byte("y"))
+	a2, _ := l.Append(ctx, "a", []byte("z"))
 	if a1.Seq != 1 || a2.Seq != 2 {
 		t.Fatalf("vault a seqs = %d,%d, want 1,2", a1.Seq, a2.Seq)
 	}
@@ -49,16 +52,17 @@ func TestFileVaultLogSeqIsPerVault(t *testing.T) {
 }
 
 func TestFileVaultLogSinceZeroReturnsAll(t *testing.T) {
+	ctx := t.Context()
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := l.Append("v1", []byte{byte(i)}); err != nil {
+		if _, err := l.Append(ctx, "v1", []byte{byte(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since("v1", 0)
+	ops, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -73,16 +77,17 @@ func TestFileVaultLogSinceZeroReturnsAll(t *testing.T) {
 }
 
 func TestFileVaultLogSinceFilters(t *testing.T) {
+	ctx := t.Context()
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
 	for i := 0; i < 5; i++ {
-		if _, err := l.Append("v1", []byte{byte(i)}); err != nil {
+		if _, err := l.Append(ctx, "v1", []byte{byte(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since("v1", 3)
+	ops, err := l.Since(ctx, "v1", 3)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -99,7 +104,7 @@ func TestFileVaultLogSinceUnknownVault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
-	ops, err := l.Since("nope", 0)
+	ops, err := l.Since(t.Context(), "nope", 0)
 	if err != nil {
 		t.Fatalf("Since unknown vault err = %v, want nil", err)
 	}
@@ -112,6 +117,7 @@ func TestFileVaultLogSinceUnknownVault(t *testing.T) {
 // FileVaultLog over the same dir (simulated restart) must re-derive seqs from
 // disk, return prior ops byte-identically, and continue numbering at seq 4.
 func TestFileVaultLogDurabilityAcrossRestart(t *testing.T) {
+	ctx := t.Context()
 	dir := t.TempDir()
 
 	blobs := [][]byte{[]byte("first"), []byte("second"), []byte("third")}
@@ -121,7 +127,7 @@ func TestFileVaultLogDurabilityAcrossRestart(t *testing.T) {
 		t.Fatalf("NewFileVaultLog #1: %v", err)
 	}
 	for i, b := range blobs {
-		op, err := l1.Append("v", b)
+		op, err := l1.Append(ctx, "v", b)
 		if err != nil {
 			t.Fatalf("Append %d: %v", i, err)
 		}
@@ -136,7 +142,7 @@ func TestFileVaultLogDurabilityAcrossRestart(t *testing.T) {
 		t.Fatalf("NewFileVaultLog #2 (restart): %v", err)
 	}
 
-	ops, err := l2.Since("v", 0)
+	ops, err := l2.Since(ctx, "v", 0)
 	if err != nil {
 		t.Fatalf("Since after restart: %v", err)
 	}
@@ -153,7 +159,7 @@ func TestFileVaultLogDurabilityAcrossRestart(t *testing.T) {
 	}
 
 	// A 4th append must continue at seq 4 (counter re-derived from disk).
-	op4, err := l2.Append("v", []byte("fourth"))
+	op4, err := l2.Append(ctx, "v", []byte("fourth"))
 	if err != nil {
 		t.Fatalf("Append #4 after restart: %v", err)
 	}
@@ -165,6 +171,7 @@ func TestFileVaultLogDurabilityAcrossRestart(t *testing.T) {
 // TestFileVaultLogPathTraversalSafety asserts that hostile vaultIDs cannot write
 // outside the base dir, yet remain retrievable under their exact id string.
 func TestFileVaultLogPathTraversalSafety(t *testing.T) {
+	ctx := t.Context()
 	base := t.TempDir()
 	// Put the log in a subdir so we can scan the PARENT for any escapees.
 	dir := filepath.Join(base, "oplog")
@@ -177,7 +184,7 @@ func TestFileVaultLogPathTraversalSafety(t *testing.T) {
 	hostile := []string{"../escape", "a/b/c", "..", "../../etc/passwd"}
 	for i, id := range hostile {
 		blob := []byte{byte(i), 0xAA}
-		if _, err := l.Append(id, blob); err != nil {
+		if _, err := l.Append(ctx, id, blob); err != nil {
 			t.Fatalf("Append(%q): %v", id, err)
 		}
 	}
@@ -212,7 +219,7 @@ func TestFileVaultLogPathTraversalSafety(t *testing.T) {
 
 	// (b) Each hostile id's data is retrievable under the SAME id string.
 	for i, id := range hostile {
-		ops, err := l.Since(id, 0)
+		ops, err := l.Since(ctx, id, 0)
 		if err != nil {
 			t.Fatalf("Since(%q): %v", id, err)
 		}
@@ -229,6 +236,7 @@ func TestFileVaultLogPathTraversalSafety(t *testing.T) {
 // TestFileVaultLogOpaqueBinaryIntegrity round-trips a blob with NUL, 0xff and
 // other binary bytes through a simulated restart, byte-for-byte.
 func TestFileVaultLogOpaqueBinaryIntegrity(t *testing.T) {
+	ctx := t.Context()
 	dir := t.TempDir()
 	blob := []byte{0x00, 0xff, 0x10, 0x00, 0x7f, 0x80, 0x01, 0xfe}
 
@@ -236,7 +244,7 @@ func TestFileVaultLogOpaqueBinaryIntegrity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileVaultLog #1: %v", err)
 	}
-	if _, err := l1.Append("bin", blob); err != nil {
+	if _, err := l1.Append(ctx, "bin", blob); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
@@ -244,7 +252,7 @@ func TestFileVaultLogOpaqueBinaryIntegrity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileVaultLog #2: %v", err)
 	}
-	ops, err := l2.Since("bin", 0)
+	ops, err := l2.Since(ctx, "bin", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -256,9 +264,39 @@ func TestFileVaultLogOpaqueBinaryIntegrity(t *testing.T) {
 	}
 }
 
+// TestFileVaultLogContextCancelled verifies the cheap entry check: an
+// already-cancelled context makes Append and Since return ctx.Err() promptly and
+// Append writes nothing to disk.
+func TestFileVaultLogContextCancelled(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewFileVaultLog(dir)
+	if err != nil {
+		t.Fatalf("NewFileVaultLog: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := l.Append(ctx, "v1", []byte("op")); err != context.Canceled {
+		t.Fatalf("Append with cancelled ctx err = %v, want context.Canceled", err)
+	}
+	if _, err := l.Since(ctx, "v1", 0); err != context.Canceled {
+		t.Fatalf("Since with cancelled ctx err = %v, want context.Canceled", err)
+	}
+	// The cancelled Append must not have created/written a file: a fresh live
+	// read is empty.
+	ops, err := l.Since(context.Background(), "v1", 0)
+	if err != nil {
+		t.Fatalf("Since after cancelled Append: %v", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("cancelled Append still stored an op: len = %d, want 0", len(ops))
+	}
+}
+
 // TestFileVaultLogConcurrentAppends appends from many goroutines and asserts a
 // unique, contiguous 1..N seq set. Run under -race.
 func TestFileVaultLogConcurrentAppends(t *testing.T) {
+	ctx := t.Context()
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
@@ -273,7 +311,7 @@ func TestFileVaultLogConcurrentAppends(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				if _, err := l.Append("v1", []byte("op")); err != nil {
+				if _, err := l.Append(ctx, "v1", []byte("op")); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}
@@ -282,7 +320,7 @@ func TestFileVaultLogConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	ops, err := l.Since("v1", 0)
+	ops, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -307,17 +345,18 @@ func TestFileVaultLogConcurrentAppends(t *testing.T) {
 // TestFileVaultLogDefensiveCopy verifies mutating an input blob after Append AND
 // mutating a returned blob both leave the stored value untouched.
 func TestFileVaultLogDefensiveCopy(t *testing.T) {
+	ctx := t.Context()
 	l, err := NewFileVaultLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
 	in := []byte("opaque")
-	if _, err := l.Append("v1", in); err != nil {
+	if _, err := l.Append(ctx, "v1", in); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	in[0] = 'X' // mutate caller's slice after Append
 
-	ops, err := l.Since("v1", 0)
+	ops, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -327,7 +366,7 @@ func TestFileVaultLogDefensiveCopy(t *testing.T) {
 
 	ops[0].Blob[0] = 'Y' // mutate returned slice
 
-	again, err := l.Since("v1", 0)
+	again, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since again: %v", err)
 	}
@@ -341,15 +380,16 @@ func TestFileVaultLogDefensiveCopy(t *testing.T) {
 // follow), as a crash mid-write would leave. Since must return the two complete
 // records without error or panic, and Append must continue at seq 3.
 func TestFileVaultLogTruncatedTrailingRecordIgnored(t *testing.T) {
+	ctx := t.Context()
 	dir := t.TempDir()
 	l, err := NewFileVaultLog(dir)
 	if err != nil {
 		t.Fatalf("NewFileVaultLog: %v", err)
 	}
-	if _, err := l.Append("v", []byte("aa")); err != nil {
+	if _, err := l.Append(ctx, "v", []byte("aa")); err != nil {
 		t.Fatalf("Append 1: %v", err)
 	}
-	if _, err := l.Append("v", []byte("bb")); err != nil {
+	if _, err := l.Append(ctx, "v", []byte("bb")); err != nil {
 		t.Fatalf("Append 2: %v", err)
 	}
 
@@ -377,7 +417,7 @@ func TestFileVaultLogTruncatedTrailingRecordIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileVaultLog #2: %v", err)
 	}
-	ops, err := l2.Since("v", 0)
+	ops, err := l2.Since(ctx, "v", 0)
 	if err != nil {
 		t.Fatalf("Since over torn file: %v", err)
 	}
@@ -389,7 +429,7 @@ func TestFileVaultLogTruncatedTrailingRecordIgnored(t *testing.T) {
 	}
 
 	// Next append must continue at seq 3, overwriting nothing (append-only).
-	op3, err := l2.Append("v", []byte("cc"))
+	op3, err := l2.Append(ctx, "v", []byte("cc"))
 	if err != nil {
 		t.Fatalf("Append after torn: %v", err)
 	}

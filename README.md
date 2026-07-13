@@ -111,7 +111,16 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   key**; the replay cache is **per-process/in-memory** (multi-instance needs a shared
   store); **dev-only** (enrollment / multi-device / JWT are future). Performs no
   crypto on the blob —
-  never decodes it. Ships a distroless `Dockerfile`.
+  never decodes it. The dev op-log is **hardened for reliability and auditability**:
+  the `VaultLog` seam is **request-context-aware**, so a client disconnect or timeout
+  cancels in-flight storage work (instead of pinning a pooled Postgres connection);
+  `/readyz` performs a **real health check of the live backend** (it pings the Postgres
+  pool and returns `503` if the database is down, so a load balancer drains the node);
+  `http.Server` timeouts and `pgxpool` limits bound the work; and a **structured audit
+  log** records each append / list / auth-denial as metadata plus a **SHA-256
+  fingerprint** of the opaque blob — **never the blob content, and never any key,
+  signature, nonce, or timestamp** (the zero-knowledge boundary is preserved, proven by
+  a no-blob-in-logs test). Ships a distroless `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

@@ -190,6 +190,19 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   (no auth model, enrollment, CRDT/merge, or backups) — see
   [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md)
   and [`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md).
+  **Reliability & auditability hardening** (dev backend): the `VaultLog` seam now
+  takes a **request `context.Context`**, so a cancelled or slow request (client
+  disconnect, `http.Server` read/write/idle timeouts, or — for Postgres —
+  `pgxpool` acquire limits) cancels the in-flight append/read instead of leaking a
+  goroutine; `/readyz` performs a **real** health check of the active backend
+  (pinging the `pgxpool` when Postgres is configured, `503` if the DB is down);
+  and every append, list, and auth denial emits a **structured audit event**
+  (`event`, `request_id`, `vault_id`, `seq`, `size`, a **SHA-256 fingerprint** of
+  the opaque blob, and the denial reason). The audit log records **metadata and a
+  fingerprint of the already-encrypted blob — never its content, and never a
+  signature, nonce, or key** — so it proves *who appended what, when* while the
+  **trust boundary is preserved**: the server still never sees plaintext (see
+  [`decisions/0015-oplog-auditability-and-request-context.md`](decisions/0015-oplog-auditability-and-request-context.md)).
   `sigild` performs **no cryptography** and never sees plaintext or keys. Full
   contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
@@ -293,7 +306,10 @@ stores it, and re-emits it unchanged; it never decodes the envelope, never holds
 plaintext, and never holds a key. Vault confidentiality therefore does **not**
 depend on the server (this is the property the threat model leans on for the
 rogue-employee and compromised-server adversaries — see
-[`threat-model.md`](threat-model.md)). Note the current dev op-log is *also*
+[`threat-model.md`](threat-model.md)). The dev op-log's structured **audit log**
+does not change this: it records metadata and a **SHA-256 fingerprint of the
+already-encrypted blob**, never the blob content or any key, so an audit trail of
+*who appended what, when* coexists with the server never seeing plaintext. Note the current dev op-log is *also*
 non-durable and unauthenticated by default — optionally guarded by a single
 static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, contract v2: a per-request
 nonce checked against a time-bounded in-memory replay cache; real multi-device

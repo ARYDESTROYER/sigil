@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 24, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 25, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -33,7 +33,12 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   op-log; **three `VaultLog` backends** — in-memory, file-backed (`SIGILD_OPLOG_DIR`),
   or **durable/concurrent Postgres** (`SIGILD_OPLOG_POSTGRES`; precedence PG > file >
   mem); optional Ed25519 **v2** request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce +
-  replay cache). Default 501.
+  replay cache). Default 501. **Hardened for reliability + auditability (Phase 25):**
+  `VaultLog` is request-context-aware (client-disconnect/timeout cancels in-flight
+  storage work), `/readyz` pings the **live** backend (Postgres pool → `503` if down),
+  `http.Server` read/write/idle timeouts + `pgxpool` limits, and a **structured audit
+  log** (`oplog.append`/`list`/`auth_denied` metadata + a blob **SHA-256 fingerprint** —
+  NEVER the blob content or any secret; zero-knowledge boundary intact).
 - `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing;
   plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
   device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
@@ -60,28 +65,41 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
   SAME change; commit + push to `main` per phase.
 
-**➡️ NEXT:** Phase 24 gave the dev op-log its **FIRST durable, concurrent
-production-store adapter** — `PostgresVaultLog` (pgx/v5 `pgxpool`), a third
-`VaultLog` backend selected by `SIGILD_OPLOG_POSTGRES` (precedence PG > file > mem).
-Opaque `bytea` blobs, per-vault `seq` assigned inside a tx under a
-`pg_advisory_xact_lock` (concurrency-safe, gap-free), defensive copies; proven LIVE
-against Docker Postgres 16 under `-race` (400 concurrent appends → unique/contiguous
-1..400 seq; durability across a fresh pool). This **relaxes the stdlib-only
-invariant** — sigild now carries `pgx` + a `go.sum` (ADR 0014 partially supersedes
-ADR 0005); the core server + Mem/File backends stay stdlib. It is still **NOT a
-finished production store**: dev-gated (default 501), opaque, unauthenticated unless
-`SIGILD_OPLOG_PUBKEY`, and it owes the real data layer — auth / enrollment,
+**➡️ NEXT:** Phase 25 **hardened the dev op-log for reliability + auditability**
+without touching its security posture (**ADR 0015**). (i) **Request-context
+propagation:** `VaultLog.Append`/`Since` now take a `context.Context` threaded from
+the HTTP request (bodies read under it), so a client disconnect / timeout cancels
+in-flight storage work instead of pinning a pooled Postgres connection — Mem/File
+honor cancellation cheaply, Postgres passes ctx straight to `pgx`; proven by
+`TestPostgresVaultLogContextCancelled` (cancelled ctx → non-nil error, nothing
+persisted). (ii) **`/readyz` really pings the live backend:** when Postgres is
+configured it pings the `pgxpool` via a `store.Pinger` seam, bounded by a 2 s
+`readyzPingTimeout` — `GET /readyz` ⇒ **200 `oplog:ok`** while PG up, **503
+`oplog:unreachable`** after `docker stop` — so a load balancer drains a node whose
+store is down; Mem/File have no remote dep and report healthy. (iii) **Timeouts:**
+`http.Server` read/write/idle (15/15/60 s) + `pgxpool` limits (MaxConns 10) bound the
+work. (iv) **Structured audit log** (`internal/api/audit.go`, `slog`):
+`oplog.append` (`event/request_id/vault_id/seq/size_bytes/`**`blob_sha256`**`/auth`),
+`oplog.list` (…`/since/returned_count`), `oplog.auth_denied` (…`/reason` ∈
+`missing_headers|bad_timestamp|stale_timestamp|bad_signature|replayed`). The KEY
+guarantee: the trail records only metadata + a hex **SHA-256 fingerprint of the
+already-encrypted blob** — **NEVER the blob content, key, signature, nonce, or
+timestamp** — so the zero-knowledge boundary holds; proven by a no-blob-in-logs test
+that posts a recognizable blob and asserts it never appears in the full JSON log
+across the success path + all four denial paths. Still **NOT a production sync
+server**: dev-gated (default 501), opaque, unauthenticated unless
+`SIGILD_OPLOG_PUBKEY`; it still owes the real data layer — auth / enrollment,
 per-vault authorization, CRDT / merge, managed migrations, backups-with-restore,
 replication. Next: **build that layer around the adapter** (start with a real
-enrollment / per-vault authorization model), OR resume the crypto wiring — **a real
-device-enrollment / session / key-management flow** behind the hybrid primitives
+device-enrollment / per-vault authorization model), OR resume the crypto wiring — a
+real device-enrollment / session / key-management flow behind the hybrid primitives
 (Phase 21–23: how identities are minted, published, trusted, rotated). ⚠️ Wiring the
-hybrid **signature** into sigild's op-log auth is **still blocked**: Go's stdlib has
-no ML-DSA, so op-log auth stays classical Ed25519 (v2) until we take a PQ-sig
-dependency or move the check off the Go server. No account/session model uses
-`hybrid_seal` yet. The full product is still early (~6% — see the completeness note);
-the mountain (7 native clients, real backend/auth, payments, Cure53 audit, SOC2) is
-mostly untouched — Postgres is one durable adapter, not the store.
+hybrid **signature** into op-log auth is **still blocked**: Go's stdlib has no ML-DSA,
+so op-log auth stays classical Ed25519 (v2) until we take a PQ-sig dependency or move
+the check off the Go server. No account/session model uses `hybrid_seal` yet. The
+full product is still early (~6% — see the completeness note); the mountain (7 native
+clients, real backend/auth, payments, Cure53 audit, SOC2) is mostly untouched —
+Phase 25 made one durable adapter reliable + auditable, not the store.
 
 ---
 
@@ -2513,3 +2531,114 @@ Recording the decision so the doc set stays coherent as the repo grows:
   store for large blobs). It **must not be exposed publicly or hold real secrets.**
 - No over-claims: durability + concurrency are the **only** new properties; the security
   posture is unchanged and the **system is NOT "post-quantum secure".**
+
+## 2026-07-13 — Phase 25 (sigild reliability + auditability hardening)
+
+### Context & mandate
+- Goal: make the dev op-log **reliable to operate and auditable** — without touching
+  its security posture. Two gaps stood out after Phase 24 gave it a networked Postgres
+  backend: (i) the `VaultLog` seam (`Append`/`Since`) took **no `context.Context`**, so
+  a client disconnect or slow request could not cancel in-flight storage work — against
+  Postgres a dropped client could pin a pooled connection until the query returned on
+  its own, and body reads were unbounded by the request lifetime; and (ii) there was
+  **no visibility** (no record of *who appended what, when*; auth denials left no trail)
+  and `/readyz` only TCP-dialled the future `postgres`/`redis` addresses, so it reported
+  ready even when the **backend actually serving traffic** was unreachable.
+- HARD RULES held absolutely: the server still stores **opaque client-encrypted blobs**
+  and does **no crypto**; the op-log stays **dev-gated** (`SIGILD_ENABLE_DEV_OPS`,
+  default **501**) and **unauthenticated unless `SIGILD_OPLOG_PUBKEY`** (unchanged).
+  Observability must put **no** plaintext, key, blob content, or auth secret into a log
+  — that would puncture the zero-knowledge boundary the whole design rests on. Recorded
+  as **ADR 0015**.
+
+### (a) Request-context propagation through `VaultLog` ✅
+- `Append`/`Since` now take a `context.Context` threaded from the HTTP request
+  (`r.Context()`), and request bodies are read under it. A cancelled/slow request
+  (client disconnect, `http.Server` timeouts, or `pgxpool` acquire limits) cancels the
+  in-flight append/read instead of leaking a goroutine or pinning a connection. Mem/File
+  honor cancellation cheaply; Postgres passes the ctx straight to `pgx`.
+- Proven live by **`TestPostgresVaultLogContextCancelled`**: a cancelled ctx cancels the
+  DB work and returns a non-nil error with **nothing persisted**.
+
+### (b) `/readyz` pings the live op-log backend ✅
+- Readiness now performs a **real** health check of the **active** backend: when
+  Postgres is configured it **pings the `pgxpool`** (via a `store.Pinger` seam bounded by
+  a 2 s `readyzPingTimeout`) and returns **503** if the DB is down; the in-memory / file
+  backends have no remote dependency and report healthy. The future
+  `SIGILD_POSTGRES_ADDR`/`SIGILD_REDIS_ADDR` probes stay plain TCP dials.
+- Verified live against Docker Postgres 16:
+  > `GET /readyz` ⇒ **HTTP 200** `{"checks":{"oplog":"ok",…}}` while PG up; after
+  > `docker stop`, `GET /readyz` ⇒ **HTTP 503** `{"checks":{"oplog":"unreachable",…}}`
+  > (backend-down detected via `store.Pinger.Ping`, bounded by the 2 s timeout).
+
+### (c) Timeouts + pool limits ✅
+- `http.Server` gained read/write/idle timeouts (15 / 15 / 60 s) and the `pgxpool`
+  gained connection limits (`MaxConns` 10, `MaxConnLifetime` 1 h), so no single request
+  or connection runs unbounded.
+
+### (d) Structured audit log — metadata + a fingerprint, NEVER the content ✅
+- New `internal/api/audit.go` emits three structured `slog` events on the op-log path:
+  - `oplog.append` — `event, request_id, vault_id, seq, size_bytes, blob_sha256, auth`
+    (`auth` ∈ `ed25519`|`none`); `blob_sha256` is a hex **SHA-256 fingerprint** of the
+    opaque stored bytes, computed once, for integrity/traceability only.
+  - `oplog.list` — `event, request_id, vault_id, since, returned_count`.
+  - `oplog.auth_denied` — `event, request_id, vault_id, reason`, where `reason` is a
+    fixed enum (`missing_headers|bad_timestamp|stale_timestamp|bad_signature|replayed`)
+    — **never** any secret.
+- Wired in `handlers.go`: `auditAppend` after a successful `Append`, `auditList` after
+  `Since`, `auditAuthDenied` before every `401` denial.
+- **KEY guarantee — the zero-knowledge boundary is preserved.** The audit trail proves
+  *who appended what, when* while the server NEVER logs the blob content, any signature,
+  nonce, timestamp, or key. Because the fingerprint is taken over bytes that are
+  **already client-encrypted**, the log reveals nothing the server did not already hold,
+  and the server still performs no crypto and cannot decrypt a vault.
+- **Proven by a no-blob-in-logs test** (ran + PASSED under `-race`):
+  > `TestAuditAppendAndListNoBlobInLogs` posts a recognizable blob
+  > (`TOPSECRET-opaque-blob-DO-NOT-LOG-9f3a2b7c`), verifies the append/list metadata
+  > (incl. `blob_sha256 == sha256(blob)`), then asserts the raw blob **never** appears in
+  > the ENTIRE captured JSON log. `TestAuditAuthDeniedReasonsNoBlobInLogs` drives all four
+  > denial paths (`missing_headers`/`bad_signature`/`stale_timestamp`/`replayed`), asserts
+  > the precise reason each time, asserts the accepted request records `auth="ed25519"`,
+  > and re-asserts the blob never appears on any path.
+
+### Regression — everything else still green ✅
+- `gofmt -l sigild` empty · `go vet ./...` clean · `go test ./...` offline all packages
+  **ok** (the 10 Postgres tests SKIP cleanly with a `set SIGILD_TEST_POSTGRES` message) ·
+  `go test -race ./internal/api/ ./internal/store/` clean (api ok 1.327s, store ok
+  4.159s, no data races) · `go build ./...` OK · `go mod verify` OK. **Live Postgres:
+  all 10 `PostgresVaultLog` integration tests RAN and PASSED under `-race`** (seq /
+  isolation / since / defensive-copy / opaque integrity + `ConcurrentAppends` 400
+  contiguous + `DurabilityAcrossReconnect` + the new `ContextCancelled`); ok 1.935s.
+- **Default op-log unchanged:** dev-ops OFF ⇒ **501** both verbs
+  (`TestVaultOpsReturns501`, `TestVaultOpsDefaultStill501`,
+  `TestOplogIntegrationGatingDisabled`); op-log stays UNAUTHENTICATED unless
+  `SIGILD_OPLOG_PUBKEY` (`authorizeOps` returns OK when the key is nil;
+  `TestOpsAuthDisabledUnchangedNoHeaders`).
+- **libsigil wasm/getrandom invariant UNAFFECTED and re-confirmed:**
+  `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**; `cli` = 1 (untouched).
+  This phase is sigild + docs only — core/CLI untouched.
+
+### docs — api.md / architecture.md / deployment.md / threat-model.md / ADR 0015 + this finalizer ✅
+- `docs/api.md`, `docs/architecture.md`, `docs/deployment.md`, `docs/threat-model.md`,
+  and **ADR 0015** were already written by the docs track (request-context propagation,
+  the real `/readyz` backend ping, `http.Server`/`pgxpool` timeouts, and the audit-event
+  schema + the never-log-a-secret guarantee). This entry finalizes the remaining living
+  docs (this file, `CLAUDE.md`, `README.md`) and updates the RESUME ANCHOR. ⚠️ Minor
+  known drift: `docs/api.md`'s audit table names the field `size` while the code emits
+  `size_bytes` — flagged for the docs track to reconcile (outside this finalizer's edit
+  scope).
+
+### ➡️ What this opens, and what's still open (honest)
+- The dev op-log is now **more reliable** (cancellation/timeout-bounded work, no
+  goroutine/connection leaks on client disconnect), **auditable** (a structured,
+  correlatable trail of appends / lists / auth-denials), and `/readyz` **tells the
+  truth** about the store actually serving traffic — all with the zero-knowledge
+  boundary intact (audit records only metadata + a fingerprint of already-encrypted
+  bytes).
+- Still open — this is **dev-op-log hardening, NOT a production sync server**: still
+  dev-gated (default 501), still opaque, still unauthenticated unless
+  `SIGILD_OPLOG_PUBKEY`, and it still owes the real data layer — auth / enrollment,
+  per-vault authorization, CRDT / merge, managed migrations, backups-with-proven-restore,
+  replication. No over-claims: reliability + auditability are the **only** new
+  properties; the security posture is unchanged and the **system is NOT
+  "post-quantum secure".**

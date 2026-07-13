@@ -1,6 +1,9 @@
 package store
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // Op is a single entry in a vault's operation log. Seq is a 1-based, strictly
 // increasing sequence number assigned per vault. Blob is the client-encrypted
@@ -24,15 +27,32 @@ type Op struct {
 // the log applies NO encryption, encoding, decryption, or interpretation. The
 // server stores exactly the bytes it was given and hands them back unchanged.
 //
+// Both methods take a context so a cancelled or timed-out request cancels the
+// underlying work (e.g. a slow database op). Fast local backends check it at
+// entry and are otherwise synchronous; a remote backend threads it into the
+// driver. A cancelled ctx yields ctx.Err() promptly.
+//
 // STATUS: pre-audit skeleton. The production op log must add authentication, a
 // durable store, and real op/CRDT merge semantics; this provides none of those.
 type VaultLog interface {
 	// Append records blob as the next operation for vaultID and returns the
 	// stored Op (with its assigned Seq).
-	Append(vaultID string, blob []byte) (Op, error)
+	Append(ctx context.Context, vaultID string, blob []byte) (Op, error)
 	// Since returns the vault's ops with Seq strictly greater than `since`, in
 	// ascending Seq order. An unknown vault yields an empty slice and nil error.
-	Since(vaultID string, since uint64) ([]Op, error)
+	Since(ctx context.Context, vaultID string, since uint64) ([]Op, error)
+}
+
+// Pinger is an OPTIONAL capability a VaultLog backend may implement to expose a
+// live health check to the readiness probe. A backend that depends on a remote
+// resource (PostgresVaultLog -> its database) implements Ping so /readyz can
+// verify that dependency is actually reachable, not merely that the process is
+// up. Backends with no external dependency (MemVaultLog, FileVaultLog) do NOT
+// implement it; readyz simply skips the live check for them.
+type Pinger interface {
+	// Ping verifies the backend's underlying dependency is reachable, honouring
+	// ctx for cancellation/timeout. A nil return means healthy.
+	Ping(ctx context.Context) error
 }
 
 // MemVaultLog is a concurrency-safe, in-memory VaultLog. Each vault gets an
@@ -60,7 +80,14 @@ var _ VaultLog = (*MemVaultLog)(nil)
 // Append stores a defensive COPY of blob as the next op for vaultID and returns
 // the stored Op. Copying on the way in ensures the caller cannot mutate stored
 // bytes through the original slice after the call. Seq is 1-based per vault.
-func (l *MemVaultLog) Append(vaultID string, blob []byte) (Op, error) {
+//
+// The op is fast and purely in-memory; ctx is honoured only as a cheap entry
+// check so an already-cancelled request returns ctx.Err() without doing work.
+func (l *MemVaultLog) Append(ctx context.Context, vaultID string, blob []byte) (Op, error) {
+	if err := ctx.Err(); err != nil {
+		return Op{}, err
+	}
+
 	cp := make([]byte, len(blob))
 	copy(cp, blob)
 
@@ -75,8 +102,13 @@ func (l *MemVaultLog) Append(vaultID string, blob []byte) (Op, error) {
 
 // Since returns ops for vaultID with Seq > since, ascending, each carrying a
 // defensive COPY of its blob so callers cannot mutate stored bytes through the
-// returned slices. An unknown vault yields an empty slice and nil error.
-func (l *MemVaultLog) Since(vaultID string, since uint64) ([]Op, error) {
+// returned slices. An unknown vault yields an empty slice and nil error. ctx is
+// honoured as a cheap entry check (see Append).
+func (l *MemVaultLog) Since(ctx context.Context, vaultID string, since uint64) ([]Op, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

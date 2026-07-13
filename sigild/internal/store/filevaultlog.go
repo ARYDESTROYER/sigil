@@ -19,6 +19,7 @@ package store
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -156,7 +157,14 @@ func readRecord(r *bufio.Reader) ([]byte, bool, error) {
 // returns the stored Op. It writes one framed record and fsyncs before
 // returning. Seq is 1-based per vault and is derived from the cached counter
 // (which is rebuilt from disk on first touch, so it is correct after a restart).
-func (l *FileVaultLog) Append(vaultID string, blob []byte) (Op, error) {
+//
+// The write is local and synchronous; ctx is honoured as a cheap entry check so
+// an already-cancelled request returns ctx.Err() before touching the disk.
+func (l *FileVaultLog) Append(ctx context.Context, vaultID string, blob []byte) (Op, error) {
+	if err := ctx.Err(); err != nil {
+		return Op{}, err
+	}
+
 	cp := make([]byte, len(blob))
 	copy(cp, blob)
 
@@ -195,8 +203,13 @@ func (l *FileVaultLog) Append(vaultID string, blob []byte) (Op, error) {
 // Since returns the vault's ops with Seq strictly greater than `since`, in
 // ascending Seq order, each carrying a defensive COPY of its blob. A missing
 // file (unknown vault) yields an empty slice and nil error. A truncated trailing
-// record is skipped gracefully (no error, no panic).
-func (l *FileVaultLog) Since(vaultID string, since uint64) ([]Op, error) {
+// record is skipped gracefully (no error, no panic). ctx is honoured as a cheap
+// entry check (see Append).
+func (l *FileVaultLog) Since(ctx context.Context, vaultID string, since uint64) ([]Op, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

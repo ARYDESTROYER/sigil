@@ -48,22 +48,47 @@ CREATE TABLE IF NOT EXISTS sigil_vault_ops (
 	PRIMARY KEY (vault_id, seq)
 )`
 
+// Pool sizing/lifecycle for the dev Postgres backend. Op bodies are tiny (the
+// server caps a single op at 64 KiB) and each Append/Since is a short-lived
+// query, so a small pool is ample; bounded connection lifetimes recycle backend
+// connections and a periodic health check evicts dead ones so a restarted
+// database is picked up without bouncing the process.
+const (
+	poolMaxConns          = 10
+	poolMaxConnLifetime   = time.Hour
+	poolMaxConnIdleTime   = 30 * time.Minute
+	poolHealthCheckPeriod = time.Minute
+)
+
 // PostgresVaultLog implements VaultLog against a pgxpool connection pool.
 type PostgresVaultLog struct {
 	pool *pgxpool.Pool
 }
 
-// compile-time check that PostgresVaultLog satisfies VaultLog.
-var _ VaultLog = (*PostgresVaultLog)(nil)
+// compile-time checks that PostgresVaultLog satisfies VaultLog and Pinger.
+var (
+	_ VaultLog = (*PostgresVaultLog)(nil)
+	_ Pinger   = (*PostgresVaultLog)(nil)
+)
 
 // NewPostgresVaultLog opens a pooled connection to dsn, verifies it with a Ping,
 // and idempotently ensures the op-log schema exists. The supplied ctx bounds
-// only construction (pool open + ping + schema); it is NOT retained, so the
-// caller may pass a short-lived context. Per-op contexts are created internally.
+// only construction (pool open + ping + schema); it is NOT retained. Per-op
+// contexts derive from the CALLER's request context (see Append/Since), so a
+// cancelled/slow request cancels the underlying database work.
 //
 // A returned pool must be released with Close.
 func NewPostgresVaultLog(ctx context.Context, dsn string) (*PostgresVaultLog, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	cfg.MaxConns = poolMaxConns
+	cfg.MaxConnLifetime = poolMaxConnLifetime
+	cfg.MaxConnIdleTime = poolMaxConnIdleTime
+	cfg.HealthCheckPeriod = poolHealthCheckPeriod
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres pool: %w", err)
 	}
@@ -93,13 +118,15 @@ func NewPostgresVaultLog(ctx context.Context, dsn string) (*PostgresVaultLog, er
 // (almost always) different advisory-lock keys and so proceed concurrently; the
 // (vault_id, seq) primary key is the final backstop that rejects any duplicate
 // seq even on an advisory-lock hash collision between two distinct vault IDs.
-func (l *PostgresVaultLog) Append(vaultID string, blob []byte) (Op, error) {
+func (l *PostgresVaultLog) Append(ctx context.Context, vaultID string, blob []byte) (Op, error) {
 	// Defensive copy so the caller cannot mutate stored bytes through the input
 	// slice after this call, matching the Mem/File backends' contract.
 	cp := make([]byte, len(blob))
 	copy(cp, blob)
 
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	// Derive from the CALLER's context so a cancelled/slow request cancels the DB
+	// work, while still capping any single op at opTimeout.
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
 	var seq int64
@@ -126,8 +153,10 @@ func (l *PostgresVaultLog) Append(vaultID string, blob []byte) (Op, error) {
 // ascending Seq order, each carrying a fresh COPY of its blob so callers cannot
 // mutate stored bytes. An unknown vault (no matching rows) yields an empty
 // slice and nil error.
-func (l *PostgresVaultLog) Since(vaultID string, since uint64) ([]Op, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+func (l *PostgresVaultLog) Since(ctx context.Context, vaultID string, since uint64) ([]Op, error) {
+	// Derive from the CALLER's context (see Append) so a cancelled request
+	// cancels the query; opTimeout caps a wedged read.
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
 	rows, err := l.pool.Query(ctx,
@@ -159,6 +188,15 @@ func (l *PostgresVaultLog) Since(vaultID string, since uint64) ([]Op, error) {
 		return nil, fmt.Errorf("iterate ops: %w", err)
 	}
 	return out, nil
+}
+
+// Ping verifies the database is reachable, for the readiness probe. It bounds
+// the check with opTimeout on top of the caller's ctx (which readyz already
+// gives a short deadline), so a wedged database can never hang /readyz.
+func (l *PostgresVaultLog) Ping(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	return l.pool.Ping(ctx)
 }
 
 // Close releases the underlying connection pool. It is safe to call once when

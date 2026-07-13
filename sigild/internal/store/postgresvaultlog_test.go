@@ -72,10 +72,11 @@ func cleanup(t *testing.T, l *PostgresVaultLog, prefix string) {
 }
 
 func TestPostgresVaultLogSeqIncrements(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	vault := prefix + "v"
 	for i := uint64(1); i <= 3; i++ {
-		op, err := l.Append(vault, []byte{byte(i)})
+		op, err := l.Append(ctx, vault, []byte{byte(i)})
 		if err != nil {
 			t.Fatalf("Append %d: %v", i, err)
 		}
@@ -86,11 +87,12 @@ func TestPostgresVaultLogSeqIncrements(t *testing.T) {
 }
 
 func TestPostgresVaultLogSeqIsPerVault(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	a, b := prefix+"a", prefix+"b"
-	a1, _ := l.Append(a, []byte("x"))
-	b1, _ := l.Append(b, []byte("y"))
-	a2, _ := l.Append(a, []byte("z"))
+	a1, _ := l.Append(ctx, a, []byte("x"))
+	b1, _ := l.Append(ctx, b, []byte("y"))
+	a2, _ := l.Append(ctx, a, []byte("z"))
 	if a1.Seq != 1 || a2.Seq != 2 {
 		t.Fatalf("vault a seqs = %d,%d, want 1,2", a1.Seq, a2.Seq)
 	}
@@ -100,14 +102,15 @@ func TestPostgresVaultLogSeqIsPerVault(t *testing.T) {
 }
 
 func TestPostgresVaultLogSinceZeroReturnsAll(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	vault := prefix + "v"
 	for i := 0; i < 3; i++ {
-		if _, err := l.Append(vault, []byte{byte(i)}); err != nil {
+		if _, err := l.Append(ctx, vault, []byte{byte(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(vault, 0)
+	ops, err := l.Since(ctx, vault, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -122,14 +125,15 @@ func TestPostgresVaultLogSinceZeroReturnsAll(t *testing.T) {
 }
 
 func TestPostgresVaultLogSinceFilters(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	vault := prefix + "v"
 	for i := 0; i < 5; i++ {
-		if _, err := l.Append(vault, []byte{byte(i)}); err != nil {
+		if _, err := l.Append(ctx, vault, []byte{byte(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since(vault, 3)
+	ops, err := l.Since(ctx, vault, 3)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -143,7 +147,7 @@ func TestPostgresVaultLogSinceFilters(t *testing.T) {
 
 func TestPostgresVaultLogSinceUnknownVault(t *testing.T) {
 	l, prefix := newTestLog(t)
-	ops, err := l.Since(prefix+"nope", 0)
+	ops, err := l.Since(context.Background(), prefix+"nope", 0)
 	if err != nil {
 		t.Fatalf("Since unknown vault err = %v, want nil", err)
 	}
@@ -155,16 +159,17 @@ func TestPostgresVaultLogSinceUnknownVault(t *testing.T) {
 // TestPostgresVaultLogDefensiveCopy verifies mutating an input blob after Append
 // AND mutating a returned blob both leave the stored value untouched.
 func TestPostgresVaultLogDefensiveCopy(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	vault := prefix + "v"
 
 	in := []byte("opaque")
-	if _, err := l.Append(vault, in); err != nil {
+	if _, err := l.Append(ctx, vault, in); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	in[0] = 'X' // mutate caller's slice after Append
 
-	ops, err := l.Since(vault, 0)
+	ops, err := l.Since(ctx, vault, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -174,7 +179,7 @@ func TestPostgresVaultLogDefensiveCopy(t *testing.T) {
 
 	ops[0].Blob[0] = 'Y' // mutate returned slice
 
-	again, err := l.Since(vault, 0)
+	again, err := l.Since(ctx, vault, 0)
 	if err != nil {
 		t.Fatalf("Since again: %v", err)
 	}
@@ -186,14 +191,15 @@ func TestPostgresVaultLogDefensiveCopy(t *testing.T) {
 // TestPostgresVaultLogOpaqueBinaryIntegrity round-trips a blob containing NUL,
 // 0xff and other binary bytes, byte-for-byte, through the bytea column.
 func TestPostgresVaultLogOpaqueBinaryIntegrity(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	vault := prefix + "bin"
 	blob := []byte{0x00, 0xff, 0x10, 0x00, 0x7f, 0x80, 0x01, 0xfe}
 
-	if _, err := l.Append(vault, blob); err != nil {
+	if _, err := l.Append(ctx, vault, blob); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	ops, err := l.Since(vault, 0)
+	ops, err := l.Since(ctx, vault, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -209,6 +215,7 @@ func TestPostgresVaultLogOpaqueBinaryIntegrity(t *testing.T) {
 // vault and asserts a unique, contiguous 1..N seq set. This exercises the
 // advisory-lock + MAX(seq)+1 mechanism under contention. Run under -race.
 func TestPostgresVaultLogConcurrentAppends(t *testing.T) {
+	ctx := context.Background()
 	l, prefix := newTestLog(t)
 	vault := prefix + "v"
 
@@ -222,7 +229,7 @@ func TestPostgresVaultLogConcurrentAppends(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				if _, err := l.Append(vault, []byte("op")); err != nil {
+				if _, err := l.Append(ctx, vault, []byte("op")); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}
@@ -231,7 +238,7 @@ func TestPostgresVaultLogConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	ops, err := l.Since(vault, 0)
+	ops, err := l.Since(ctx, vault, 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -258,6 +265,7 @@ func TestPostgresVaultLogConcurrentAppends(t *testing.T) {
 // read the prior ops byte-identically and continue numbering at seq 4.
 func TestPostgresVaultLogDurabilityAcrossReconnect(t *testing.T) {
 	dsn := requireDSN(t)
+	opCtx := context.Background()
 	prefix := uniquePrefix()
 	vault := prefix + "v"
 
@@ -270,7 +278,7 @@ func TestPostgresVaultLogDurabilityAcrossReconnect(t *testing.T) {
 		t.Fatalf("NewPostgresVaultLog #1: %v", err)
 	}
 	for i, b := range blobs {
-		op, err := l1.Append(vault, b)
+		op, err := l1.Append(opCtx, vault, b)
 		if err != nil {
 			l1.Close()
 			t.Fatalf("Append %d: %v", i, err)
@@ -294,7 +302,7 @@ func TestPostgresVaultLogDurabilityAcrossReconnect(t *testing.T) {
 		l2.Close()
 	})
 
-	ops, err := l2.Since(vault, 0)
+	ops, err := l2.Since(opCtx, vault, 0)
 	if err != nil {
 		t.Fatalf("Since after reconnect: %v", err)
 	}
@@ -311,11 +319,39 @@ func TestPostgresVaultLogDurabilityAcrossReconnect(t *testing.T) {
 	}
 
 	// A 4th append must continue at seq 4 (derived from the durable MAX(seq)).
-	op4, err := l2.Append(vault, []byte("fourth"))
+	op4, err := l2.Append(opCtx, vault, []byte("fourth"))
 	if err != nil {
 		t.Fatalf("Append #4 after reconnect: %v", err)
 	}
 	if op4.Seq != 4 {
 		t.Fatalf("4th append seq = %d, want 4 (seq derived from durable state)", op4.Seq)
+	}
+}
+
+// TestPostgresVaultLogContextCancelled verifies request-context propagation into
+// the driver: a cancelled context passed to Append/Since cancels the DB work and
+// returns promptly with a non-nil error (rather than running the query).
+func TestPostgresVaultLogContextCancelled(t *testing.T) {
+	l, prefix := newTestLog(t)
+	vault := prefix + "v"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := l.Append(ctx, vault, []byte("op")); err == nil {
+		t.Fatal("Append with cancelled ctx returned nil error, want cancellation error")
+	}
+	if _, err := l.Since(ctx, vault, 0); err == nil {
+		t.Fatal("Since with cancelled ctx returned nil error, want cancellation error")
+	}
+
+	// Sanity: with a live context the same log still works (nothing was persisted
+	// by the cancelled calls).
+	ops, err := l.Since(context.Background(), vault, 0)
+	if err != nil {
+		t.Fatalf("Since after cancelled calls: %v", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("cancelled Append persisted an op: len = %d, want 0", len(ops))
 	}
 }

@@ -2,14 +2,16 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"sync"
 	"testing"
 )
 
 func TestMemVaultLogSeqIncrements(t *testing.T) {
+	ctx := t.Context()
 	l := NewMemVaultLog()
 	for i := uint64(1); i <= 3; i++ {
-		op, err := l.Append("v1", []byte{byte(i)})
+		op, err := l.Append(ctx, "v1", []byte{byte(i)})
 		if err != nil {
 			t.Fatalf("Append %d: %v", i, err)
 		}
@@ -20,10 +22,11 @@ func TestMemVaultLogSeqIncrements(t *testing.T) {
 }
 
 func TestMemVaultLogSeqIsPerVault(t *testing.T) {
+	ctx := t.Context()
 	l := NewMemVaultLog()
-	a1, _ := l.Append("a", []byte("x"))
-	b1, _ := l.Append("b", []byte("y"))
-	a2, _ := l.Append("a", []byte("z"))
+	a1, _ := l.Append(ctx, "a", []byte("x"))
+	b1, _ := l.Append(ctx, "b", []byte("y"))
+	a2, _ := l.Append(ctx, "a", []byte("z"))
 	if a1.Seq != 1 || a2.Seq != 2 {
 		t.Fatalf("vault a seqs = %d,%d, want 1,2", a1.Seq, a2.Seq)
 	}
@@ -33,13 +36,14 @@ func TestMemVaultLogSeqIsPerVault(t *testing.T) {
 }
 
 func TestMemVaultLogSinceZeroReturnsAll(t *testing.T) {
+	ctx := t.Context()
 	l := NewMemVaultLog()
 	for i := 0; i < 3; i++ {
-		if _, err := l.Append("v1", []byte{byte(i)}); err != nil {
+		if _, err := l.Append(ctx, "v1", []byte{byte(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since("v1", 0)
+	ops, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -54,13 +58,14 @@ func TestMemVaultLogSinceZeroReturnsAll(t *testing.T) {
 }
 
 func TestMemVaultLogSinceFilters(t *testing.T) {
+	ctx := t.Context()
 	l := NewMemVaultLog()
 	for i := 0; i < 5; i++ {
-		if _, err := l.Append("v1", []byte{byte(i)}); err != nil {
+		if _, err := l.Append(ctx, "v1", []byte{byte(i)}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}
-	ops, err := l.Since("v1", 3)
+	ops, err := l.Since(ctx, "v1", 3)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -74,7 +79,7 @@ func TestMemVaultLogSinceFilters(t *testing.T) {
 
 func TestMemVaultLogSinceUnknownVault(t *testing.T) {
 	l := NewMemVaultLog()
-	ops, err := l.Since("nope", 0)
+	ops, err := l.Since(t.Context(), "nope", 0)
 	if err != nil {
 		t.Fatalf("Since unknown vault err = %v, want nil", err)
 	}
@@ -86,14 +91,15 @@ func TestMemVaultLogSinceUnknownVault(t *testing.T) {
 // TestMemVaultLogDefensiveCopy verifies that mutating an input blob after Append
 // AND mutating a returned blob both leave the stored value untouched.
 func TestMemVaultLogDefensiveCopy(t *testing.T) {
+	ctx := t.Context()
 	l := NewMemVaultLog()
 	in := []byte("opaque")
-	if _, err := l.Append("v1", in); err != nil {
+	if _, err := l.Append(ctx, "v1", in); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	in[0] = 'X' // mutate caller's slice after Append
 
-	ops, err := l.Since("v1", 0)
+	ops, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}
@@ -103,7 +109,7 @@ func TestMemVaultLogDefensiveCopy(t *testing.T) {
 
 	ops[0].Blob[0] = 'Y' // mutate returned slice
 
-	again, err := l.Since("v1", 0)
+	again, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since again: %v", err)
 	}
@@ -112,10 +118,36 @@ func TestMemVaultLogDefensiveCopy(t *testing.T) {
 	}
 }
 
+// TestMemVaultLogContextCancelled verifies the cheap entry check: an
+// already-cancelled context makes both Append and Since return ctx.Err()
+// promptly without recording or reading anything.
+func TestMemVaultLogContextCancelled(t *testing.T) {
+	l := NewMemVaultLog()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := l.Append(ctx, "v1", []byte("op")); err != context.Canceled {
+		t.Fatalf("Append with cancelled ctx err = %v, want context.Canceled", err)
+	}
+	if _, err := l.Since(ctx, "v1", 0); err != context.Canceled {
+		t.Fatalf("Since with cancelled ctx err = %v, want context.Canceled", err)
+	}
+	// The cancelled Append must not have stored anything: a fresh live read is
+	// empty.
+	ops, err := l.Since(context.Background(), "v1", 0)
+	if err != nil {
+		t.Fatalf("Since after cancelled Append: %v", err)
+	}
+	if len(ops) != 0 {
+		t.Fatalf("cancelled Append still stored an op: len = %d, want 0", len(ops))
+	}
+}
+
 // TestMemVaultLogConcurrentAppends runs many goroutines appending to the same
 // vault under the race detector. It asserts the total count and that every seq
 // is unique and contiguous (1..N).
 func TestMemVaultLogConcurrentAppends(t *testing.T) {
+	ctx := t.Context()
 	l := NewMemVaultLog()
 	const workers = 16
 	const perWorker = 100
@@ -127,7 +159,7 @@ func TestMemVaultLogConcurrentAppends(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				if _, err := l.Append("v1", []byte("op")); err != nil {
+				if _, err := l.Append(ctx, "v1", []byte("op")); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}
@@ -136,7 +168,7 @@ func TestMemVaultLogConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	ops, err := l.Since("v1", 0)
+	ops, err := l.Since(ctx, "v1", 0)
 	if err != nil {
 		t.Fatalf("Since: %v", err)
 	}

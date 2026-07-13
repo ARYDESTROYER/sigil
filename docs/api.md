@@ -3,8 +3,9 @@
 > **STATUS: pre-audit skeleton.** `sigild` is the Sigil sync-server skeleton. It
 > performs **no cryptography**, holds **no keys**, and stores **no plaintext**.
 > The only stateful surface — the vault operation log — is a **dev-only,
-> opt-in, in-memory, unauthenticated** stub that stores **opaque
-> client-encrypted blobs** the server never decrypts or interprets. Nothing
+> opt-in, unauthenticated** store of **opaque client-encrypted blobs** the
+> server never decrypts or interprets (in-memory by default, with optional
+> file-backed or durable Postgres backends). Nothing
 > here is audited or production-ready. See [`deployment.md`](deployment.md) for
 > the (not-yet-applied) deploy story and [`sprint-72h.md`](sprint-72h.md) for
 > scope. This reference describes the surface as wired in
@@ -72,15 +73,28 @@ The `version` value is injected at build time from the git short SHA via
 >   would poison the future audit.
 > - **UNAUTHENTICATED.** There is no auth, no identity, no per-vault access
 >   control. Anyone who can reach the port can read and append to any vault ID.
-> - **IN-MEMORY BY DEFAULT / OPTIONAL FILE-BACKED.** With the dev flag on, the
->   op-log is backed by a process-memory map by default — **lost on restart**,
->   never written to disk, not replicated. If **`SIGILD_OPLOG_DIR`** is also set,
->   a **file-backed** backend persists each vault's journal under that directory
->   for **local-dev durability** instead (the `vaultID` is base64url-encoded to a
->   safe flat filename, so it cannot escape the directory). Either way it is the
->   **same opaque, dev-only, unauthenticated `VaultLog`** — **not** the production
->   store. Production durability is still Postgres/S3 with backups, and is
->   unbuilt. See [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md).
+> - **THREE BACKENDS behind the `VaultLog` seam.** With the dev flag on, the
+>   op-log is served by one of three interchangeable backends, selected at
+>   startup by **precedence `SIGILD_OPLOG_POSTGRES` > `SIGILD_OPLOG_DIR` >
+>   in-memory**:
+>   - **in-memory (default)** — a process-memory map; **lost on restart**, never
+>     written to disk, not replicated.
+>   - **file-backed** (**`SIGILD_OPLOG_DIR`**) — persists each vault's journal
+>     under that directory for **local-dev durability** (the `vaultID` is
+>     base64url-encoded to a safe flat filename, so it cannot escape the
+>     directory). A local-dev convenience, still **not** the production store.
+>   - **durable Postgres** (**`SIGILD_OPLOG_POSTGRES`** = a libpq DSN) — a real,
+>     **durable and concurrent** backend on the `pgx` driver (`sigild`'s first
+>     third-party dependency), with per-vault sequencing made concurrency-safe by
+>     a transaction / advisory lock. This adds durability and concurrency but is
+>     **NOT a finished production store**: it still has no auth model, no
+>     enrollment, no CRDT/merge, and no backup/restore or managed migrations.
+>
+>   All three are the **same opaque, dev-only, unauthenticated `VaultLog`** — the
+>   server does **no cryptography**, never decodes the bytes, and re-emits them
+>   unchanged; the 64 KiB per-op cap and `413` apply to all. See
+>   [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md)
+>   and [`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md).
 > - **OPAQUE BLOBS ONLY.** The server treats each operation body as an opaque
 >   byte string. It does **no cryptography**, never sees plaintext or keys, and
 >   does **not** parse, validate, decrypt, order, merge, or otherwise interpret
@@ -259,8 +273,12 @@ minimum:
   device key; its per-request nonce is checked against an in-memory,
   **per-process** replay cache (a multi-instance deploy would need a shared one),
   and with it unset the dev route is wide open.
-- **Durable, replicated storage** — a real Postgres/object-store (S3/R2) backend
-  with migrations, backups, and a proven restore, replacing the in-memory map.
+- **Durable, replicated storage** — the opt-in **Postgres** dev backend
+  (`SIGILD_OPLOG_POSTGRES`, [`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md))
+  now gives the dev op-log a durable, concurrent home, but a production store
+  still needs managed migrations, backups, a proven restore, and replication
+  (and, for large blobs, an object store such as S3/R2) — none of which the dev
+  backend provides.
 - **Real operation / CRDT semantics** — signed, ordered operations with
   Lamport-clock / Merkle-root replay-and-drop detection and conflict-free merge,
   versus today's plain append-and-read byte journal.

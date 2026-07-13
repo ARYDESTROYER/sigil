@@ -90,10 +90,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a
   dev flag (`SIGILD_ENABLE_DEV_OPS`, default off) the ops route becomes an op-log
-  that stores **opaque client-encrypted blobs** and hands them back unchanged — by
-  default **in-memory** (non-durable), or, when `SIGILD_OPLOG_DIR` is set, a
-  **file-backed durable** backend (path-traversal-safe filenames; **dev-only, NOT
-  the production store**). Op-log requests are **unauthenticated by default**, but
+  that stores **opaque client-encrypted blobs** and hands them back unchanged, via
+  one of **three `VaultLog` backends** (precedence `SIGILD_OPLOG_POSTGRES` >
+  `SIGILD_OPLOG_DIR` > in-memory): by default **in-memory** (non-durable); when
+  `SIGILD_OPLOG_DIR` is set, a **file-backed durable** backend
+  (path-traversal-safe filenames); or, when `SIGILD_OPLOG_POSTGRES` (a `pgx` DSN)
+  is set, a **durable, concurrent PostgreSQL** backend (opaque `bytea` blobs,
+  concurrency-safe per-vault sequencing) — the first real store adapter, and the
+  reason `sigild` now has **its first third-party dependency (`pgx`)** and a
+  `go.sum`; the core server + the in-memory / file backends stay stdlib-only. All
+  three are **dev-only, NOT a finished production store** (no auth / enrollment,
+  per-vault authorization, CRDT / merge, migrations, or backups). Op-log requests
+  are **unauthenticated by default**, but
   when `SIGILD_OPLOG_PUBKEY` (std-base64 of a 32-byte Ed25519 public key) is set
   the server **verifies an Ed25519 signature (contract v2)** (Go stdlib
   `crypto/ed25519`) over a canonical `(method,path,query,timestamp,nonce,body)`
@@ -156,7 +164,8 @@ Native platform clients (iOS/Android/macOS/Windows/Linux/watchOS/wearOS) live in
 
 - Rust stable (rustfmt, clippy, `wasm32-unknown-unknown` target) — pinned in
   [`rust-toolchain.toml`](rust-toolchain.toml).
-- Go 1.24+ (the brief targets 1.24.x for the native `X25519MLKEM768` TLS group).
+- Go 1.25+ (`sigild`'s `go.mod` is `go 1.25.0`, required by the Postgres backend's
+  `pgx`; the brief targets 1.24.x for the native `X25519MLKEM768` TLS group).
 - Node 22 (`.nvmrc`) + pnpm 9 (via Corepack).
 
 ## Build & test

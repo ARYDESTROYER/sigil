@@ -5,9 +5,9 @@
 > applied, or exposed to the public internet. The artifacts under
 > [`../deploy/`](../deploy/) are reference shapes, and `sigild` itself is a
 > skeleton that performs **no cryptography and runs no auth** (vault ops default
-> to `501`; an opt-in `SIGILD_ENABLE_DEV_OPS` dev-only, in-memory, unauthenticated
-> store of opaque client-encrypted blobs exists for local wiring only — never
-> expose it). Treat every "production" word below as
+> to `501`; an opt-in `SIGILD_ENABLE_DEV_OPS` dev-only, unauthenticated store of
+> opaque client-encrypted blobs — in-memory, file-backed, or durable Postgres —
+> exists for local wiring only, never expose it). Treat every "production" word below as
 > *future, unbuilt, unaudited*. See [`sprint-72h.md`](sprint-72h.md) for the
 > wall-clock gates and the defer ledger this descends from.
 
@@ -249,10 +249,19 @@ To avoid any over-claim, the honest gaps:
   may be stored in it. This honours the "stub with `501` rather than poison the
   audit" guardrail (brief §14): the production default stays `501`. See
   [`api.md`](api.md) for the full contract.
-- **No data stores are wired.** Postgres / Redis / S3(R2) are referenced by env
-  var names and by the readiness probe only; there is no schema, no migration, no
-  client, no backup/restore. The first Postgres migration (with RLS as
-  posture-only) is in the stretch tier and **not done**.
+- **No production data store is wired.** The dev op-log can now be pointed at a
+  real Postgres via **`SIGILD_OPLOG_POSTGRES`** (a libpq DSN, on the `pgx`
+  driver — `sigild`'s first third-party dependency, so the module now carries a
+  `go.sum`) for a **durable, concurrent** dev backend
+  ([`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md)),
+  but production still needs an **auth / enrollment model, CRDT / merge
+  semantics, managed migrations, and backup / restore / replication** around it —
+  none of which exist. Redis / S3(R2) are still only env-var names and
+  readiness-probe targets; the first RLS-posture migration is still in the
+  stretch tier and **not done**. As with all dev-ops, **do not enable
+  `SIGILD_ENABLE_DEV_OPS` (or wire a Postgres DSN) on any exposed instance** — the
+  dev op-log must never be reachable from the public internet, and no real
+  secrets may be stored in it.
 - **No live PQ-TLS proof.** `sigild`'s skeleton listener serves plain HTTP; a
   TLS-enabled Go-native listener and a PQ-capable client are prerequisites that
   do not exist on the build machine (LibreSSL can't negotiate the group). See

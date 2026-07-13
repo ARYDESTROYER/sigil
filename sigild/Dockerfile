@@ -21,7 +21,9 @@
 # (run from the sigild/ directory — the build context is sigild/.)
 
 # ---- builder stage ---------------------------------------------------------
-FROM golang:1.24-alpine AS builder
+# go 1.25: sigild's go directive is 1.25 because pgx (the optional durable
+# Postgres op-log backend) requires it. The image is otherwise unchanged.
+FROM golang:1.25-alpine AS builder
 
 # VERSION is stamped into the binary via -ldflags. Defaults to "dev" so the
 # image still builds without an explicit build-arg.
@@ -29,9 +31,11 @@ ARG VERSION=dev
 
 WORKDIR /src
 
-# sigild is stdlib-only, so there is no go.sum to copy and no module download
-# step. Copy go.mod first to keep the layer cache warm, then the source.
-COPY go.mod ./
+# sigild now carries one third-party dependency (pgx) for the optional durable
+# Postgres op-log backend, so it has a go.sum. Copy the module files first and
+# download deps in their own cached layer, then copy the source.
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . ./
 
 # Static, reproducible-ish build: CGO off, stripped (-s -w), -trimpath, with the

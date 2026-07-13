@@ -19,18 +19,43 @@ jobs:
     defaults:
       run:
         working-directory: sigild
+    # Postgres service so the op-log integration tests run in CI instead of
+    # skipping. The op-log stores opaque client-encrypted blobs (bytea); the
+    # server does no crypto. This is the dev-gated durable backend, not a
+    # finished production sync server.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sigild_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24.x"
-          # No external modules yet, so there is no go.sum to cache against.
-          cache: false
+          # pgx (the Postgres op-log backend) requires go >= 1.25, which bumps
+          # the module's go directive; pin the toolchain to match.
+          go-version: "1.25.x"
+          # sigild now has a go.sum (pgx for the Postgres op-log backend), so
+          # cache the module downloads.
+          cache: true
+      - name: mod download
+        run: go mod download
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: vet
         run: go vet ./...
       - name: test
+        # SIGILD_TEST_POSTGRES points the integration tests at the service
+        # container above; without it they skip.
+        env:
+          SIGILD_TEST_POSTGRES: postgres://postgres:postgres@localhost:5432/sigild_test?sslmode=disable
         run: go test ./...
       - name: build
         run: go build ./...

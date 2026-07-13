@@ -105,13 +105,20 @@ public, make no security claims, until the audit completes and trademark clears.
   `Dockerfile`). `POST|GET /v1/vaults/{id}/ops` defaults to **`501`**; an
   opaque, **dev-gated** op-log (the `VaultLog` interface) is wired in only when
   `SIGILD_ENABLE_DEV_OPS` is truthy (**dev only, unauthenticated**; default OFF →
-  ops stay `501`). Two dev backends, same `VaultLog` interface: the default
-  **in-memory** `MemVaultLog` (non-durable, lost on restart), or — when
-  **`SIGILD_OPLOG_DIR`** is set — a **file-backed** `FileVaultLog`
+  ops stay `501`). **Three backends**, same `VaultLog` interface, selected by
+  precedence **`SIGILD_OPLOG_POSTGRES` > `SIGILD_OPLOG_DIR` > in-memory**: the
+  default **in-memory** `MemVaultLog` (non-durable, lost on restart); when
+  **`SIGILD_OPLOG_DIR`** is set, a **file-backed** `FileVaultLog`
   (length-prefixed + `fsync`'d per-vault append-only files, durable across
   restart; the untrusted `vaultID` is `base64.RawURLEncoding`-encoded to a flat,
-  path-traversal-safe filename). The file backend is a **local-dev convenience,
-  NOT the production store** (production = Postgres/S3). When
+  path-traversal-safe filename); or, when **`SIGILD_OPLOG_POSTGRES`** (a pgx DSN)
+  is set, a **durable, concurrent Postgres** `PostgresVaultLog` (pgx/v5 `pgxpool`,
+  schema `sigil_vault_ops`, opaque `bytea` blobs, per-vault `seq` assigned inside a
+  tx under `pg_advisory_xact_lock` so concurrent same-vault appends stay gap-free;
+  integration tests gated on `SIGILD_TEST_POSTGRES`, else skipped). The file backend
+  is a **local-dev convenience** and the Postgres backend is the **first durable
+  store adapter but still NOT a finished production store** (no auth / enrollment,
+  per-vault authorization, CRDT / merge, managed migrations, or backups). When
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 of a 32-byte Ed25519 public key) is set,
   op-log requests are **Ed25519-authenticated — contract v2** (`authorizeOps`, Go
   stdlib `crypto/ed25519`): both GET and POST verify an `X-Sigil-Signature` over a
@@ -167,7 +174,8 @@ public, make no security claims, until the audit completes and trademark clears.
 
 ## Toolchains (this machine — macOS arm64)
 
-- **Go** 1.26.3 at `/opt/homebrew/bin/go` (go.mod directive: 1.24).
+- **Go** 1.26.3 at `/opt/homebrew/bin/go` (go.mod directive: **1.25.0** — raised for
+  the opt-in Postgres backend's `pgx`, which requires Go ≥ 1.25).
 - **Rust** stable (rustc 1.96) via Homebrew `rustup`. ⚠️ The `~/.cargo/bin`
   proxies were **not** created, and `rustup run stable cargo` did not resolve
   subcommands. The reliable invocation is to put the toolchain bin on PATH:
@@ -219,6 +227,10 @@ publishes automatically while in stealth.
 ## Conventions & guardrails
 
 - **License split:** clients/core/web/CLI = Apache-2.0; `sigild/` = BSL-1.1.
+- **`sigild` dependencies:** stdlib-only **except** the opt-in Postgres op-log
+  backend, which links `pgx` (the module has a `go.sum`; ADR 0014 relaxes ADR 0005).
+  The core server + the in-memory / file-backed backends stay stdlib; `pgx` is
+  dormant unless `SIGILD_OPLOG_POSTGRES` is set. Keep new deps out of everything else.
 - **No over-claims:** public copy must obey
   [`web/apps/marketing/MARKETING-CLAIMS.md`](web/apps/marketing/MARKETING-CLAIMS.md)
   — never "audited", "SOC 2", "post-quantum secure", or unqualified "E2E

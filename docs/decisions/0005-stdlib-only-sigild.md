@@ -1,6 +1,12 @@
 # 0005 — `sigild` is Go stdlib-only
 
-- **Status:** Accepted — 2026-06.
+- **Status:** Accepted — 2026-06. **Partially superseded by
+  [0014](0014-postgres-durable-oplog-backend.md)** (2026-07) for the storage
+  backend: `sigild` gains its first dependency (`pgx`, and therefore a `go.sum`)
+  for the **opt-in Postgres op-log backend**, while the core server and the
+  in-memory / file-backed backends stay stdlib-only. The Context and Decision
+  below are left as originally written (this ADR anticipated exactly that
+  supersession — see its final Consequence).
 
 ## Context
 

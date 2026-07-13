@@ -177,12 +177,19 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   [`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md)
   and [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
   The op-log sits behind a `VaultLog` seam with
-  **two dev backends**: an **in-memory, non-durable** map (the default) and an
-  optional **file-backed** one selected via `SIGILD_OPLOG_DIR` for local-dev
-  durability (the `vaultID` is base64url-encoded to a safe flat filename to
-  prevent path traversal). Both are dev-only and opaque; **production storage
-  (Postgres/S3, with auth/backups/restore) is still unbuilt** — see
-  [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md).
+  **three dev backends**, chosen at startup by precedence
+  `SIGILD_OPLOG_POSTGRES` > `SIGILD_OPLOG_DIR` > in-memory: an **in-memory,
+  non-durable** map (the default); an optional **file-backed** one
+  (`SIGILD_OPLOG_DIR`) for local-dev durability (the `vaultID` is
+  base64url-encoded to a safe flat filename to prevent path traversal); and a
+  **durable Postgres** backend (`SIGILD_OPLOG_POSTGRES`) on the `pgx` driver —
+  **`sigild`'s first third-party dependency** and its first real
+  production-store *adapter*, with concurrency-safe per-vault sequencing over
+  opaque `bytea` blobs. All three are dev-only and opaque; the Postgres backend
+  adds durability + concurrency but is **still not a finished production store**
+  (no auth model, enrollment, CRDT/merge, or backups) — see
+  [`decisions/0006-file-backed-dev-op-log-backend.md`](decisions/0006-file-backed-dev-op-log-backend.md)
+  and [`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md).
   `sigild` performs **no cryptography** and never sees plaintext or keys. Full
   contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
@@ -223,7 +230,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │  SERVER SIDE — sigild (Go)        NO CRYPTO · OPAQUE BLOBS ONLY         │
    │   /healthz · /readyz · /version   (probes; no secrets)                 │
    │   /v1/vaults/{id}/ops  →  501 by default                               │
-   │     └─ SIGILD_ENABLE_DEV_OPS: in-memory op-log of opaque ciphertext    │
+   │     └─ SIGILD_ENABLE_DEV_OPS: op-log (mem/file/pg) of opaque ciphertext│
    │        (append seq / read since) — dev wiring only; unauthenticated    │
    │        unless SIGILD_OPLOG_PUBKEY sets a single Ed25519 dev device key  │
    └───────────────────────────────────────────────────────────────────────┘
@@ -371,8 +378,18 @@ between them are load-bearing:
    built with `default-features = false` to strip its TLS stack on purpose — push/pull
    speak plain HTTP to a localhost dev `sigild` only.
 
-`sigild` is **Go stdlib-only / hermetic** — no third-party modules — which keeps
-the server build reproducible and its dependency surface near-zero.
+`sigild`'s **core server and its in-memory / file-backed dev backends are Go
+stdlib-only**, which keeps that surface reproducible and near-zero-dependency.
+The optional **Postgres** op-log backend (`SIGILD_OPLOG_POSTGRES`) is the one
+exception: it links the `pgx` driver — `sigild`'s **first third-party
+dependency**, so the module now carries a `go.sum` — and is compiled in but
+dormant unless a DSN is configured. This is a deliberate, documented relaxation
+of the stdlib-only rule (partially superseding
+[`decisions/0005-stdlib-only-sigild.md`](decisions/0005-stdlib-only-sigild.md))
+recorded in
+[`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md);
+so the honest framing is "stdlib-only **except** the opt-in Postgres backend,"
+not "stdlib-only."
 
 The exact, known-green `fmt`/`clippy`/`test`/`wasm`/`vet`/`build` invocations (and
 the `getrandom`-count guard) are maintained in [`../CLAUDE.md`](../CLAUDE.md) and
@@ -412,8 +429,13 @@ authoritative list, with rationale, is the **defer ledger** in
   registry, no JWT auth, and no per-vault membership check
   ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md),
   [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
-- **No durable storage.** No Postgres / Redis / object store is wired — the op-log
-  is an in-memory map, lost on restart. No schema, migration, backup, or restore.
+- **No production storage.** The dev op-log now has an opt-in **durable Postgres
+  backend** (`SIGILD_OPLOG_POSTGRES`, on `pgx`;
+  [ADR 0014](decisions/0014-postgres-durable-oplog-backend.md)) alongside the
+  in-memory (default) and file-backed backends — so it *can* be durable and
+  concurrent in dev — but that is **not a production store**: no managed
+  migrations, no backup/restore, no replication, no Redis / object store, and no
+  auth / enrollment / CRDT around it.
 - **Both hybrid constructions are assembled; the hybrid KEM now drives a
   crypto-level seal/open flow, but neither is in the product flow.** For key
   agreement, the **combined hybrid KEM exists as a standalone primitive**

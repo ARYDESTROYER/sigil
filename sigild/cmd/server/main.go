@@ -39,11 +39,35 @@ func main() {
 		DevOpsEnabled: devOps,
 	}
 	if devOps {
-		// Optional durable LOCAL-DEV backend: if SIGILD_OPLOG_DIR is set, persist
-		// the dev op-log to per-vault append-only files there so it survives a
-		// restart. It is still UNAUTHENTICATED / dev-only and is NOT the
-		// production store (production = Postgres/S3/Redis). Unset => in-memory.
-		if dir := os.Getenv("SIGILD_OPLOG_DIR"); dir != "" {
+		// Backend selection for the DEV op-log, in PRECEDENCE order:
+		//   1. SIGILD_OPLOG_POSTGRES (a DSN) => durable, CONCURRENT Postgres backend
+		//   2. SIGILD_OPLOG_DIR            => durable, single-process file backend
+		//   3. neither                     => non-durable in-memory backend
+		// All three store OPAQUE client-encrypted blobs, do NO crypto, and are
+		// still UNAUTHENTICATED unless SIGILD_OPLOG_PUBKEY is set below. None is
+		// the production store (production = Postgres/S3/Redis with a real auth
+		// model, enrollment, CRDT and backups — none of which this has).
+		switch {
+		case os.Getenv("SIGILD_OPLOG_POSTGRES") != "":
+			dsn := os.Getenv("SIGILD_OPLOG_POSTGRES")
+			// Bound construction (pool open + ping + schema) so a bad/unreachable
+			// DSN fails fast rather than hanging startup.
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			pgLog, err := store.NewPostgresVaultLog(ctx, dsn)
+			cancel()
+			if err != nil {
+				// An explicitly-configured DSN that cannot connect / ensure schema
+				// is a fatal misconfiguration, not a fallback to another backend.
+				logger.Error("failed to open Postgres dev op-log", "err", err)
+				os.Exit(1)
+			}
+			cfg.VaultLog = pgLog
+			logger.Warn("DEV op-log enabled: DURABLE POSTGRES backend active — UNAUTHENTICATED, dev-only, NOT a finished production store (no auth model / enrollment / CRDT / backups) — do NOT expose publicly")
+		case os.Getenv("SIGILD_OPLOG_DIR") != "":
+			// Optional durable LOCAL-DEV backend: persist the dev op-log to
+			// per-vault append-only files so it survives a restart. Still
+			// UNAUTHENTICATED / dev-only and NOT the production store.
+			dir := os.Getenv("SIGILD_OPLOG_DIR")
 			fileLog, err := store.NewFileVaultLog(dir)
 			if err != nil {
 				logger.Error("failed to open file-backed dev op-log", "dir", dir, "err", err)
@@ -51,7 +75,7 @@ func main() {
 			}
 			cfg.VaultLog = fileLog
 			logger.Warn("DEV op-log enabled: FILE-BACKED durable backend active — UNAUTHENTICATED, dev-only, NOT the production store — do NOT expose publicly", "dir", dir)
-		} else {
+		default:
 			logger.Warn("DEV op-log enabled: UNAUTHENTICATED, in-memory, non-durable — do NOT expose publicly")
 		}
 

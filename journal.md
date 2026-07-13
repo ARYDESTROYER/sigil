@@ -11,7 +11,7 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 23, `main` @ origin, clean tree).** libsigil-core
+**Where we are (through Phase 24, `main` @ origin, clean tree).** libsigil-core
 now has a COMPLETE but **UNAUDITED** hybrid crypto suite, all `no_std`,
 wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
 - symmetric: Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, envelope codec,
@@ -29,22 +29,27 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   `sigil_hybrid_encapsulate`/`decapsulate`/`seal`/`open`; `SIGIL_ERR_HYBRID`) — a
   native client can generate a hybrid identity + encrypt-to-a-pubkey through the
   C-ABI (custom KEM-then-AEAD, NOT HPKE; UNAUDITED, not wired into a flow) (Phase 22).
-- `sigild` (Go, stdlib-only): probes + dev-gated (`SIGILD_ENABLE_DEV_OPS`) opaque
-  op-log; in-memory OR file-backed (`SIGILD_OPLOG_DIR`); optional Ed25519 **v2**
-  request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce + replay cache). Default 501.
+- `sigild` (Go, ONE dep — `pgx`): probes + dev-gated (`SIGILD_ENABLE_DEV_OPS`) opaque
+  op-log; **three `VaultLog` backends** — in-memory, file-backed (`SIGILD_OPLOG_DIR`),
+  or **durable/concurrent Postgres** (`SIGILD_OPLOG_POSTGRES`; precedence PG > file >
+  mem); optional Ed25519 **v2** request auth (`SIGILD_OPLOG_PUBKEY`, signed nonce +
+  replay cache). Default 501.
 - `cli` (`sigil`): seal/open/push/pull(incremental)/keygen + v2 request signing;
   plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
   device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
   `hybrid_open` (Phase 23; FIRST user-facing use of the hybrid encryption path).
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0013.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0014.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
   wasm-pure; the wasm32 build must pass). CLI is a SEPARATE crate (own lock) so
   it may use getrandom.
 - `#![forbid(unsafe_code)]` in core; `#![deny(unsafe_op_in_unsafe_fn)]` in ffi.
-- sigild stays **stdlib-only** (no go.sum). No over-claims anywhere (never
+- sigild now has **ONE dependency — `pgx`** — for the opt-in Postgres op-log backend
+  (the module gained a `go.sum`; ADR 0014 relaxes ADR 0005 for exactly this backend).
+  The **core server + the in-memory / file-backed backends stay stdlib-only**; `pgx`
+  is dormant unless `SIGILD_OPLOG_POSTGRES` is set. No over-claims anywhere (never
   "audited"/"secure"/"post-quantum secure"/"SOC 2"/unqualified "E2E"); the SYSTEM
   is NOT post-quantum secure — honest UNAUDITED building blocks only.
 - Core MSRV is **1.85** (ml-dsa forced it; machine rustc is 1.96; CI pins stable).
@@ -55,25 +60,28 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   re-run the full gate MYSELF before every commit; keep `docs/` in sync in the
   SAME change; commit + push to `main` per phase.
 
-**➡️ NEXT:** the crypto PRIMITIVES are done, the hybrid KEM is wired into an
-encryption flow (Phase 21 `hybrid_seal`/`hybrid_open`), Phase 22 **exported that
-whole path over the `sigil-ffi` C-ABI**, and Phase 23 gave it the **FIRST
-user-facing exercise end-to-end**: the `sigil` CLI's `hybrid-keygen` /
-`hybrid-seal` / `hybrid-open` generate a device hybrid identity and public-key
-encrypt a file TO another device's hybrid public identity, with a LIVE two-device
-round-trip proven (B keygen → A seal to B.pub → B open == original; a different
-identity fails `Aead(Authentication)` with no plaintext leaked). Still a demo of
-the hybrid encryption path (custom KEM-then-AEAD, NOT RFC 9180 HPKE, UNAUDITED) —
-NOT the product's account / key-management model. Next: **a bigger wiring step —
-a real device-enrollment / session / key-management flow** behind the primitives
-(how identities are minted, published, trusted, and rotated), then a real product
-path; or the non-crypto product surface. ⚠️ Wiring the hybrid **signature** into
-sigild's op-log auth is **blocked**: Go's stdlib has no ML-DSA, so sigild stays
-stdlib-only classical Ed25519 until we either take a PQ-sig dependency (breaks the
-no-go.sum invariant) or move the check off the Go server. No account/session model
-uses `hybrid_seal` yet. The full product is still early (~6% — see the completeness
-note); the mountain (7 native clients, real backend/auth/durable store, payments,
-Cure53 audit, SOC2) is untouched.
+**➡️ NEXT:** Phase 24 gave the dev op-log its **FIRST durable, concurrent
+production-store adapter** — `PostgresVaultLog` (pgx/v5 `pgxpool`), a third
+`VaultLog` backend selected by `SIGILD_OPLOG_POSTGRES` (precedence PG > file > mem).
+Opaque `bytea` blobs, per-vault `seq` assigned inside a tx under a
+`pg_advisory_xact_lock` (concurrency-safe, gap-free), defensive copies; proven LIVE
+against Docker Postgres 16 under `-race` (400 concurrent appends → unique/contiguous
+1..400 seq; durability across a fresh pool). This **relaxes the stdlib-only
+invariant** — sigild now carries `pgx` + a `go.sum` (ADR 0014 partially supersedes
+ADR 0005); the core server + Mem/File backends stay stdlib. It is still **NOT a
+finished production store**: dev-gated (default 501), opaque, unauthenticated unless
+`SIGILD_OPLOG_PUBKEY`, and it owes the real data layer — auth / enrollment,
+per-vault authorization, CRDT / merge, managed migrations, backups-with-restore,
+replication. Next: **build that layer around the adapter** (start with a real
+enrollment / per-vault authorization model), OR resume the crypto wiring — **a real
+device-enrollment / session / key-management flow** behind the hybrid primitives
+(Phase 21–23: how identities are minted, published, trusted, rotated). ⚠️ Wiring the
+hybrid **signature** into sigild's op-log auth is **still blocked**: Go's stdlib has
+no ML-DSA, so op-log auth stays classical Ed25519 (v2) until we take a PQ-sig
+dependency or move the check off the Go server. No account/session model uses
+`hybrid_seal` yet. The full product is still early (~6% — see the completeness note);
+the mountain (7 native clients, real backend/auth, payments, Cure53 audit, SOC2) is
+mostly untouched — Postgres is one durable adapter, not the store.
 
 ---
 
@@ -2392,3 +2400,116 @@ Recording the decision so the doc set stays coherent as the repo grows:
 - No over-claims: "post-quantum" names the ML-KEM-768 component algorithm and the
   path's *design intent* on unaudited building blocks — the **system is NOT
   "post-quantum secure".**
+
+## 2026-07-13 — Phase 24 (durable Postgres op-log backend)
+
+### Context & mandate
+- Goal: give the dev op-log its **first real, durable, concurrent store adapter**.
+  Everything behind the `VaultLog` seam so far was process-local — the in-memory
+  `MemVaultLog` is lost on restart, and the file-backed `FileVaultLog`
+  (`SIGILD_OPLOG_DIR`) is a single-node convenience with no concurrency story beyond
+  per-file locking. So the demo path (`sigil push` → `sigil pull`) could not survive a
+  realistic multi-writer or restart-heavy dev setup, and the interface had never been
+  exercised by a networked database.
+- ⚠️ **Deliberate architectural shift.** This adds `sigild`'s **first third-party
+  dependency (`pgx`)**, so the module gains a `go.sum` and the long-standing
+  "sigild is stdlib-only" invariant is **relaxed** — honestly, for exactly this one
+  backend. Recorded as **ADR 0014**, which *partially supersedes* **ADR 0005**
+  (stdlib-only): the core server + the Mem/File backends stay stdlib-only; only the
+  Postgres adapter links `pgx`, and it is dormant unless a DSN is configured.
+- HARD RULES held: the server still stores **opaque client-encrypted blobs** and does
+  **no crypto** (Postgres column is `bytea`; never decoded/parsed/ordered/merged); the
+  op-log stays **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default **501**) and
+  **unauthenticated unless `SIGILD_OPLOG_PUBKEY`** (unchanged). Postgres only adds a
+  durable/concurrent backend — no new security properties, no auth model.
+
+### sigild — `internal/store/postgresvaultlog.go` ✅
+- **`PostgresVaultLog` (pgx/v5 `pgxpool`)** implements the identical `VaultLog` seam as
+  the Mem/File backends. `NewPostgresVaultLog(ctx, dsn)` opens a `pgxpool` and ensures
+  the schema `sigil_vault_ops (vault_id text, seq bigint, blob bytea, …)` keyed on
+  `(vault_id, seq)`; `Close()` drains the pool.
+- **Opaque `bytea`, defensive copies.** `Append` stores the exact client bytes as
+  `bytea` and `Since` re-emits them unchanged; both sides copy the slice so a caller can
+  never mutate stored/returned buffers. The 64 KiB per-op cap + `413` still live at the
+  handler, unchanged.
+- **Concurrency-safe per-vault `seq`.** Each append runs in a **transaction** that first
+  takes a per-vault `pg_advisory_xact_lock(hashtext(vaultID))`, then inserts
+  `seq = (SELECT COALESCE(MAX(seq),0)+1 FROM sigil_vault_ops WHERE vault_id = $1)`, so
+  concurrent appenders to the **same** vault get gap-free, strictly increasing sequence
+  numbers with no races. Reads (`since > N`) come off the indexed `(vault_id, seq)`
+  ordering.
+- **Selection precedence (`cmd/server/main.go`):** with dev-ops ON, backend =
+  `SIGILD_OPLOG_POSTGRES` (a DSN) **>** `SIGILD_OPLOG_DIR` (file) **>** in-memory
+  `MemVaultLog`. With dev-ops OFF (the default, only production-safe setting) **no
+  backend is constructed** and both verbs of `/v1/vaults/{id}/ops` return **501**.
+
+### Tests — 9 integration tests, gated on a DSN ✅
+- New `internal/store/postgresvaultlog_test.go` **skips cleanly** when
+  `SIGILD_TEST_POSTGRES` is unset (`t.Skip("set SIGILD_TEST_POSTGRES …")`), so the
+  offline suite stays green with **no** database. Seven behavioral tests cover
+  seq-increments, per-vault seq isolation, `since=0` returns all, `since` filtering,
+  unknown-vault, defensive copy, and opaque-binary integrity; two showpiece tests cover
+  concurrency and durability (below).
+- **Verified LIVE against a real Docker Postgres 16** (host port 5544,
+  `SIGILD_TEST_POSTGRES` set, `go test ./internal/store/ -run Postgres -race -v`) — all
+  **9 RAN (not skipped) and PASSED under `-race`**; package result `ok, 2.189s`. Quoting
+  the two showpieces:
+  > `TestPostgresVaultLogConcurrentAppends` — 16 goroutines × 25 = **400 appends to ONE
+  > vault** via `pg_advisory_xact_lock` + `MAX(seq)+1` inside a tx; asserted 400 ops with
+  > a **unique, contiguous 1..400 seq set** — PASS 0.42s.
+  > `TestPostgresVaultLogDurabilityAcrossReconnect` — wrote 3 ops, `Close()`d the pool,
+  > opened a **SECOND fresh pool** on the same DSN, read all 3 back **byte-identically**,
+  > and a 4th append **continued at seq 4** from the durable `MAX(seq)` — PASS 0.03s.
+- Confirmed the same tests **SKIP** when `SIGILD_TEST_POSTGRES` is unset, and the
+  container was removed afterward (`docker rm -f sigil_pg_v` → GONE).
+
+### Dependency / stdlib-only shift ✅
+- `sigild/go.mod` now `go 1.25.0` (pgx requires ≥1.25) and
+  `require github.com/jackc/pgx/v5 v5.10.0`; the module gained a **`go.sum`**.
+  `go mod verify` = all modules verified (pgx + transitive
+  `pgpassfile`/`pgservicefile`/`puddle`, `golang.org/x/sync`, `golang.org/x/text`).
+- Honest framing (per ADR 0014): sigild is now "**stdlib-only *except* the opt-in
+  Postgres backend**," not "stdlib-only." Core server + Mem/File backends remain
+  stdlib; `pgx` is dormant without a DSN.
+- **libsigil wasm/getrandom invariant UNAFFECTED and re-confirmed:**
+  `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0** (unchanged); `cli/Cargo.lock`
+  = 1 as ever (separate native crate). This phase is sigild + docs + CI only — core/CLI
+  untouched.
+
+### CI — `.github/workflows/sigild.yml` gained a Postgres service ✅
+- The `sigild` workflow now stands up a **Postgres service container**, sets
+  `SIGILD_TEST_POSTGRES` for the test step, and pins Go **1.25.x** (+ module cache) so
+  the 9 integration tests **run in CI** (not just skip). All 7 workflow YAMLs still
+  parse. `Dockerfile` bumped to `golang:1.25-alpine` and now `COPY go.mod go.sum` +
+  `go mod download` before build.
+
+### Regression — everything else still green ✅
+- `gofmt -l sigild` empty · `go vet ./...` clean · `go test ./...` offline (no DSN) all
+  packages **ok** (the 9 Postgres tests SKIP with a clear message; FileVaultLog 6 /
+  MemKV 7 / MemVaultLog 7 PASS; api package ok) · `go build ./...` OK · `go mod verify`
+  OK. Default op-log **unchanged**: dev-ops OFF ⇒ **501** for both verbs
+  (`TestVaultOpsReturns501`, `TestVaultOpsDefaultStill501`,
+  `TestOplogIntegrationGatingDisabled`); dev-ops ON with no env var ⇒ non-durable
+  `MemVaultLog`. libsigil fmt/clippy/test + wasm32 build + getrandom 0; cli tests pass.
+  Web untouched.
+
+### docs — api.md / deployment.md / architecture.md / ADR 0014 (docs track) + this finalizer ✅
+- `docs/api.md`, `docs/deployment.md`, `docs/architecture.md`, and **ADR 0014** were
+  already written by the docs track (three backends + `SIGILD_OPLOG_POSTGRES`
+  selection/precedence, the storage note, and the stdlib-only relaxation);
+  `deploy/.../sigild.yml` (compose) gained a Postgres service. This entry finalizes the
+  remaining living docs (this file, `CLAUDE.md`, `README.md`) and updates the RESUME
+  ANCHOR's stdlib-only invariant.
+
+### ➡️ What this opens, and what's still open (honest)
+- The dev op-log now has a **durable, concurrent** home when a DSN is set, and the
+  `VaultLog` seam is validated against a real networked database — the **first
+  production-store adapter**, exercised live under `-race` for both concurrency and
+  durability-across-reconnect.
+- Still open — it is **one adapter, NOT the production data layer**: still dev-gated
+  (default 501), still opaque `bytea`, still unauthenticated unless
+  `SIGILD_OPLOG_PUBKEY`, and it owes auth / enrollment, per-vault authorization, CRDT /
+  merge, managed migrations, backups-with-proven-restore, and replication (+ an object
+  store for large blobs). It **must not be exposed publicly or hold real secrets.**
+- No over-claims: durability + concurrency are the **only** new properties; the security
+  posture is unchanged and the **system is NOT "post-quantum secure".**

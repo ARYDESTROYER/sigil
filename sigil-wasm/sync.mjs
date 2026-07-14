@@ -1,0 +1,141 @@
+// sync.mjs — a tiny, framework-free, dependency-free ESM transport that moves
+// OPAQUE sealed containers to/from a dev sigild op-log over plain HTTP.
+//
+// It is the JS twin of the `sigil` CLI's push/pull: it shuttles already-sealed
+// bytes and NEVER inspects or interprets a container's contents. It performs NO
+// cryptography — confidentiality comes entirely from the caller sealing the
+// bytes (via the wasm seal_to_container / hybrid_seal_to_container) BEFORE push.
+// The sigild server is zero-knowledge: it stores and returns the exact bytes.
+//
+// Works in BOTH Node (v20+, global fetch) and the browser (fetch + atob): the
+// only environment-specific bit is base64 decoding, which is feature-detected
+// (Buffer in Node, atob in the browser).
+//
+// The sigild op-log HTTP contract this speaks (dev-only, unauthenticated when
+// SIGILD_OPLOG_PUBKEY is unset):
+//   PUSH  POST {base}/v1/vaults/{vaultId}/ops   body = RAW container bytes
+//         -> 201 JSON { vaultID, seq }
+//   PULL  GET  {base}/v1/vaults/{vaultId}/ops?since={n}&limit={m}
+//         -> 200 JSON { vaultID, ops:[{seq, blob, hash}], next, has_more }
+//         where blob and hash are STANDARD-base64 strings.
+//
+// Pre-audit / UNAUDITED / DEV / LOCALHOST / PLAIN-HTTP demo. No TLS, no auth on
+// this path. Do NOT point it at a remote host or use it for real secrets.
+
+// How many ops to request per page when draining. The server clamps ?limit to
+// [1, 1000]; 500 is its default and a comfortable page size for small containers.
+const PULL_PAGE_LIMIT = 500;
+
+// Decode a standard-base64 string into a Uint8Array, working in Node (Buffer)
+// and the browser (atob). This is the only runtime-specific primitive here.
+function base64ToBytes(b64) {
+  if (typeof Buffer !== "undefined") {
+    // Node: Buffer handles standard base64 directly.
+    return new Uint8Array(Buffer.from(b64, "base64"));
+  }
+  // Browser: atob -> binary string -> bytes.
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Join a base URL and a path without doubling or dropping the slash.
+function joinUrl(baseUrl, path) {
+  return `${baseUrl.replace(/\/+$/, "")}${path}`;
+}
+
+// pushContainer — POST the raw container bytes to the op-log and return the
+// server-assigned sequence number.
+//
+//   baseUrl        e.g. "http://127.0.0.1:8080"
+//   vaultId        the vault to append to (opaque id; a single path segment)
+//   containerBytes Uint8Array | ArrayBuffer | Buffer — the RAW sealed container
+//   -> { seq }     the monotonic sequence assigned by the server
+//
+// Throws a clear Error on any non-201 response.
+export async function pushContainer(baseUrl, vaultId, containerBytes) {
+  const body =
+    containerBytes instanceof Uint8Array
+      ? containerBytes
+      : new Uint8Array(containerBytes);
+
+  const url = joinUrl(baseUrl, `/v1/vaults/${encodeURIComponent(vaultId)}/ops`);
+  const res = await globalThis.fetch(url, {
+    method: "POST",
+    // Opaque bytes — an octet-stream, never decoded by the server.
+    headers: { "Content-Type": "application/octet-stream" },
+    body,
+  });
+
+  if (res.status !== 201) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `pushContainer: expected 201 from ${url}, got ${res.status} ${res.statusText}${
+        text ? ` — ${text.trim()}` : ""
+      }`,
+    );
+  }
+
+  const json = await res.json();
+  if (typeof json.seq !== "number") {
+    throw new Error(`pushContainer: 201 response missing numeric seq: ${JSON.stringify(json)}`);
+  }
+  return { seq: json.seq };
+}
+
+// pullContainers — drain a vault from `sinceOpt` (default 0) and return every op
+// newer than it, in ascending seq order, with each container base64-DECODED back
+// to the exact bytes that were pushed.
+//
+//   baseUrl   e.g. "http://127.0.0.1:8080"
+//   vaultId   the vault to read
+//   sinceOpt  fetch ops with seq > sinceOpt (default 0 = from the start)
+//   -> [{ seq, container: Uint8Array, hash }]
+//
+// The server pages: it returns up to `limit` ops plus { next, has_more }. This
+// loops since=next until has_more is false, accumulating every op, so the caller
+// gets the whole vault in one call regardless of size.
+export async function pullContainers(baseUrl, vaultId, sinceOpt = 0) {
+  let since = Number(sinceOpt) || 0;
+  const out = [];
+
+  for (;;) {
+    const url = joinUrl(
+      baseUrl,
+      `/v1/vaults/${encodeURIComponent(vaultId)}/ops?since=${since}&limit=${PULL_PAGE_LIMIT}`,
+    );
+    const res = await globalThis.fetch(url, { method: "GET" });
+    if (res.status !== 200) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `pullContainers: expected 200 from ${url}, got ${res.status} ${res.statusText}${
+          text ? ` — ${text.trim()}` : ""
+        }`,
+      );
+    }
+
+    const json = await res.json();
+    const ops = Array.isArray(json.ops) ? json.ops : [];
+    for (const op of ops) {
+      out.push({
+        seq: op.seq,
+        // base64 -> raw container bytes (the server returned them verbatim).
+        container: base64ToBytes(op.blob),
+        // The server's hex/std-base64 chain hash, passed through untouched.
+        hash: op.hash,
+      });
+    }
+
+    // Advance to the server's cursor and stop when the vault is drained.
+    if (!json.has_more) break;
+    // Defensive: if next didn't advance, stop rather than loop forever.
+    if (typeof json.next !== "number" || json.next <= since) break;
+    since = json.next;
+  }
+
+  // Already ascending by seq (the server returns them in order), but sort to be
+  // safe across pages.
+  out.sort((a, b) => a.seq - b.seq);
+  return out;
+}

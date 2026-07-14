@@ -181,6 +181,43 @@
     <label>Plaintext recovered from hybrid container</label>
     <pre id="hybRecovered"></pre>
 
+    <hr style="margin: 2rem 0; border: none; border-top: 1px solid rgba(127,127,127,0.3);" />
+
+    <h2>Sync over the dev <code>sigild</code> op-log (<code>SIGILcli</code>)</h2>
+    <p class="banner" style="font-weight: 500;">
+      DEV / LOCALHOST / PLAIN HTTP / NO AUTH. Needs a local sigild started with
+      <code>SIGILD_ENABLE_DEV_OPS=1</code> on loopback (e.g.
+      <code>SIGILD_ADDR=127.0.0.1:8080 SIGILD_ENABLE_DEV_OPS=1 ./sigild</code>).
+      Do NOT point this at a remote host.
+    </p>
+    <p class="muted">
+      Closes the E2EE sync loop from the browser: <strong>Seal + Push</strong>
+      seals the <em>Plaintext</em> above into a <code>SIGILcli</code> container and
+      POSTs the OPAQUE bytes to the op-log; <strong>Pull + Open</strong> drains the
+      vault, opens the LATEST container with the password above, and shows the
+      recovered plaintext. The server is <strong>zero-knowledge</strong> — it
+      stores and returns the exact sealed bytes and does NO crypto; confidentiality
+      is the browser sealing BEFORE push. This interoperates with the
+      <code>sigil push</code> / <code>sigil pull</code> CLI through the same vault.
+    </p>
+
+    <label for="syncServer">Server URL</label>
+    <input id="syncServer" type="text" autocomplete="off" value="http://127.0.0.1:8080" />
+
+    <label for="syncVault">Vault ID</label>
+    <input id="syncVault" type="text" autocomplete="off" value="demo" />
+
+    <div class="row">
+      <button id="syncPush">Seal → Push</button>
+      <button id="syncPull">Pull → Open</button>
+    </div>
+
+    <label>Sync status</label>
+    <pre id="syncStatus"></pre>
+
+    <label>Plaintext recovered from the pulled container</label>
+    <pre id="syncRecovered"></pre>
+
     <script type="module" src="./main.js"></script>
   </body>
 </html>

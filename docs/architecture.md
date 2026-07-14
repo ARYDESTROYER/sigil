@@ -221,6 +221,34 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   HPKE**, it is a **DEMO — not the product key-management model**, and the **system
   is still NOT "post-quantum secure"** (see
   [ADR 0021](decisions/0021-wasm-hybrid-public-key-encryption.md)).
+  **The wasm client now also CLOSES THE CLIENT↔SERVER SYNC LOOP** — it reaches all
+  the way to the `sigild` op-log. `sigil-wasm/sync.mjs` is a tiny, framework-free,
+  dependency-free ESM transport (`pushContainer` / `pullContainers`) — the JS twin
+  of the CLI's `sigil push` / `sigil pull` — that shuttles an **opaque** sealed
+  container to/from a dev op-log over `fetch`. `pushContainer` POSTs the **raw
+  container bytes** to `POST /v1/vaults/{id}/ops` (→ `201 {vaultID, seq}`);
+  `pullContainers` drains `GET /v1/vaults/{id}/ops?since=&limit=` (→
+  `{vaultID, ops:[{seq, blob, hash}], next, has_more}`, `blob`/`hash` standard-base64),
+  looping `since=next` until `has_more` is false and base64-decoding each `blob`
+  back to the exact pushed bytes. It runs in **both Node** (global `fetch` +
+  `Buffer`) **and the browser** (`fetch` + `atob`); the demo `demo/` gains a **Sync**
+  section over it. Because the container is **opaque**, `sigil-wasm` performs **no
+  crypto in the transport** (the wasm seals *before* push) and the **server stays
+  zero-knowledge** — it stores and re-emits the exact bytes. Crucially this
+  **interoperates cross-client with the CLI** through the same server: the browser
+  and `sigil` share the `SIGILcli` container **and** the op-log contract, so `sigil
+  seal`+`push` → wasm `open_container` and wasm `seal_to_container`+push → `sigil
+  pull`+`open` both round-trip. A live-server integration test
+  ([`../sigil-wasm/test/sync-interop.mjs`](../sigil-wasm/test/sync-interop.mjs))
+  proves it end-to-end: it builds `sigild` + the **real** CLI, boots a live sigild
+  on a free localhost port (`SIGILD_ENABLE_DEV_OPS=1`, in-memory, no auth), and
+  asserts a client self-loop, both cross-client directions, and an **OPAQUE** check
+  that a raw `GET …/ops` blob base64-decodes to **exactly** the pushed bytes (the
+  server did no crypto). Honest framing: this is **dev / localhost / plain-HTTP /
+  no-auth** and **UNAUDITED** — it is **not** the product's sync model (no real
+  auth / enrollment / CRDT / merge); it only demonstrates that the client column
+  can reach the opaque op-log and interoperate with the CLI through it (see
+  [ADR 0022](decisions/0022-wasm-client-server-sync-loop.md)).
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
@@ -560,7 +588,11 @@ authoritative list, with rationale, is the **defer ledger** in
   actually link the wasm-pure core into a JS runtime — but it is a **demo of the
   UNAUDITED `seal_record` / `open_record` building block**, not a product client
   and not the account / key-management model
-  ([ADR 0019](decisions/0019-wasm-client-bindings.md)).
+  ([ADR 0019](decisions/0019-wasm-client-bindings.md)). It now **closes the
+  client↔server sync loop** by push/pulling opaque containers to a dev `sigild`
+  op-log (`sync.mjs`; [ADR 0022](decisions/0022-wasm-client-server-sync-loop.md)),
+  but only over **dev / localhost / plain-HTTP / no-auth** — this demonstrates the
+  E2EE sync architecture, it is **not** the product's sync / auth / CRDT model.
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
   device-key signature check (contract v2: a per-request nonce plus a

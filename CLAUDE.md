@@ -295,6 +295,31 @@ public, make no security claims, until the audit completes and trademark clears.
   hybrid-seal` → wasm opens). A DEMO of the UNAUDITED building blocks — a **custom
   KEM-then-AEAD, NOT RFC 9180 HPKE**, not the product key-management model, not for
   real secrets; the **system is NOT "post-quantum secure"** (ADR 0021).
+  **Now CLOSES THE CLIENT↔SERVER E2EE SYNC LOOP (Phase 32, ADR 0022):**
+  **`sigil-wasm/sync.mjs`** is a tiny, framework-free, dependency-free ESM transport
+  (`pushContainer` / `pullContainers`) that shuttles **OPAQUE** sealed containers
+  to/from a **dev `sigild` op-log** over `fetch` — the JS twin of `sigil push` /
+  `sigil pull`. It does **no cryptography** and never inspects a container: crypto
+  stays in the wasm (`seal_to_container` / `hybrid_seal_to_container` seal BEFORE
+  push), the JS only moves bytes. It speaks the existing dev op-log contract:
+  `pushContainer` POSTs the **raw container bytes** to `POST /v1/vaults/{id}/ops`
+  (→ 201 `{vaultID, seq}`); `pullContainers` drains `GET /v1/vaults/{id}/ops?since=&limit=`
+  (→ `{vaultID, ops:[{seq, blob, hash}], next, has_more}`, `blob`/`hash` std-base64),
+  looping `since=next` until `has_more` is false and base64-decoding each `blob` back
+  to the exact bytes. Works in **both Node (global `fetch` + `Buffer`) and the browser
+  (`fetch` + `atob`)** — the only env-specific bit (base64 decode) is feature-detected.
+  Proven by **`sigil-wasm/test/sync-interop.mjs`**, which builds `sigild` (`go build
+  ./cmd/server`) + the real `sigil` CLI (`cargo build --bin sigil`), boots a **LIVE
+  sigild** on a free localhost port (`SIGILD_ENABLE_DEV_OPS=1`, in-memory, no auth),
+  and asserts: PROOF 1 client self-loop (wasm seal → push → pull → wasm open); PROOF 2
+  **CLI writes / browser reads** (`sigil seal`+`sigil push` → JS pull → `wasm.open_container`);
+  PROOF 3 **browser writes / CLI reads** (wasm seal + JS push → `sigil pull` + `sigil open`);
+  and OPAQUE — a raw `GET …/ops` blob base64-decodes to **EXACTLY** the pushed bytes
+  (the server returned them verbatim, did no crypto → **zero-knowledge** intact). The
+  browser `demo/` also gains a **Sync** section (server-URL + vault-ID fields, Seal→Push /
+  Pull→Open buttons) over `sync.mjs`. **Dev / localhost / plain-HTTP / no-auth** (no
+  `SIGILD_OPLOG_PUBKEY`), UNAUDITED, **not** the product sync model (no real auth /
+  enrollment / CRDT); do not point it at a remote host or use it for real secrets.
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)

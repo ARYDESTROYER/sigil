@@ -196,9 +196,16 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `hybrid_open_container` encrypt a file **to** a device's hybrid identity (X25519
   + ML-KEM-768) into the same `SIGILhyb` container the CLI uses, interoperable with
   `sigil hybrid-seal` / `sigil hybrid-open` both ways (proven by `node
-  sigil-wasm/test/hybrid-interop.mjs`). A **standalone crate** (own lockfile),
+  sigil-wasm/test/hybrid-interop.mjs`). It can now also **sync opaque sealed
+  containers to a dev `sigild` op-log** — `sigil-wasm/sync.mjs` (`pushContainer` /
+  `pullContainers`) POSTs the raw sealed bytes and pulls them back (paginated) over
+  `fetch`, doing **no crypto itself** (the wasm seals before push), so the browser
+  interoperates with `sigil push` / `sigil pull` through the same vault and the
+  server stays **zero-knowledge**; proven end-to-end against a **live** sigild and
+  the real CLI by `node sigil-wasm/test/sync-interop.mjs` (**dev / localhost /
+  plain-HTTP / no-auth**). A **standalone crate** (own lockfile),
   **UNAUDITED**, a **demo of a building block** — a custom KEM-then-AEAD (not RFC
-  9180 HPKE), not the product's account/key-management model, and not for real
+  9180 HPKE), not the product's account/key-management/sync model, and not for real
   secrets; the system is **not** "post-quantum secure". (Public copy still obeys
   [`web/apps/marketing/MARKETING-CLAIMS.md`](web/apps/marketing/MARKETING-CLAIMS.md).)
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +

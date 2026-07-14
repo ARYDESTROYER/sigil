@@ -25,6 +25,7 @@ import init, {
   recommended_salt_len,
   version,
 } from "../pkg-web/sigil_wasm.js";
+import { pushContainer, pullContainers } from "../sync.mjs";
 
 // Fast Argon2 params so the demo is instant (m_cost >= 8 * p_cost). Production
 // uses far higher costs — see sigil_core::Argon2Params::RECOMMENDED. The CLI
@@ -335,6 +336,78 @@ async function main() {
         "Hybrid-open error (wrong identity / not a SIGILhyb container / tampered?): " + e;
     } finally {
       ev.target.value = ""; // allow re-selecting the same file
+    }
+  });
+
+  // --- Sync over the dev sigild op-log (SIGILcli) ------------------------
+  // Closes the E2EE loop from the browser using the shared, framework-free
+  // sync.mjs transport: seal here, PUSH the OPAQUE bytes to the op-log, later
+  // PULL them back and open with the same password. The server is zero-knowledge
+  // (opaque bytes, no crypto); this interoperates with `sigil push`/`sigil pull`.
+  $("syncPush").addEventListener("click", async () => {
+    try {
+      const base = $("syncServer").value.trim();
+      const vault = $("syncVault").value.trim();
+      if (!base || !vault) {
+        $("syncStatus").textContent = "Enter a server URL and a vault ID first.";
+        return;
+      }
+      const password = enc.encode($("password").value);
+      const plaintext = enc.encode($("plaintext").value);
+
+      // Caller-supplied entropy: fresh salt + nonce from the browser CSPRNG.
+      const salt = new Uint8Array(recommended_salt_len());
+      crypto.getRandomValues(salt);
+      const nonce = new Uint8Array(nonce_len());
+      crypto.getRandomValues(nonce);
+
+      const container = seal_to_container(
+        password,
+        salt,
+        nonce,
+        PARAMS.m_cost,
+        PARAMS.t_cost,
+        PARAMS.p_cost,
+        plaintext,
+      );
+
+      const { seq } = await pushContainer(base, vault, container);
+      $("syncStatus").textContent =
+        `Pushed ${container.length} opaque bytes to vault "${vault}" as seq ${seq}. ` +
+        `Pull it back below, or with: sigil pull --vault ${vault} --out-dir ./inbox --server ${base}`;
+      $("syncRecovered").textContent = "";
+    } catch (e) {
+      $("syncStatus").textContent =
+        "Push error (is a dev sigild running with SIGILD_ENABLE_DEV_OPS=1?): " + e;
+    }
+  });
+
+  $("syncPull").addEventListener("click", async () => {
+    try {
+      const base = $("syncServer").value.trim();
+      const vault = $("syncVault").value.trim();
+      if (!base || !vault) {
+        $("syncStatus").textContent = "Enter a server URL and a vault ID first.";
+        return;
+      }
+      const password = enc.encode($("password").value);
+
+      // Drain the vault; open the LATEST container (highest seq).
+      const ops = await pullContainers(base, vault, 0);
+      if (ops.length === 0) {
+        $("syncStatus").textContent = `Vault "${vault}" is empty — push something first.`;
+        $("syncRecovered").textContent = "";
+        return;
+      }
+      const latest = ops[ops.length - 1];
+      const recovered = open_container(password, latest.container);
+      $("syncStatus").textContent =
+        `Pulled ${ops.length} op(s) from vault "${vault}"; opened the latest (seq ${latest.seq}).`;
+      $("syncRecovered").textContent = dec.decode(recovered);
+    } catch (e) {
+      $("syncRecovered").textContent = "";
+      $("syncStatus").textContent =
+        "Pull/open error (wrong password / no dev sigild / empty vault?): " + e;
     }
   });
 }

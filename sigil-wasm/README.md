@@ -227,6 +227,60 @@ Node bridges the CLI identity JSON — the wasm crate never parses identity file
 It prints a `PASS` line naming both directions and exits non-zero on any
 mismatch. It builds the CLI itself but needs `pkg-node/` from `./build-wasm.sh`.
 
+## Sync over the dev `sigild` op-log (`sync.mjs`)
+
+`sync.mjs` is a small, framework-free, dependency-free ESM transport that moves
+**opaque** sealed containers to/from a dev `sigild` op-log over plain HTTP. It is
+the JS twin of the `sigil push` / `sigil pull` CLI: it performs **no cryptography**
+and never inspects a container — it just shuttles already-sealed bytes. It works
+in **both** Node (global `fetch`) and the browser (`fetch` + `atob`); base64
+decoding is feature-detected (`Buffer` in Node, `atob` in the browser).
+
+```js
+import { pushContainer, pullContainers } from "./sync.mjs";
+
+// POST the raw sealed bytes; returns the server-assigned seq.
+const { seq } = await pushContainer("http://127.0.0.1:8080", "demo", containerBytes);
+
+// Drain the vault (loops since=next until has_more=false); base64-decodes each
+// op.blob back to the exact container bytes, in ascending seq order.
+const ops = await pullContainers("http://127.0.0.1:8080", "demo", 0);
+// -> [{ seq, container: Uint8Array, hash }, ...]
+```
+
+The `sigild` op-log is **zero-knowledge**: it stores and returns the exact opaque
+bytes and does no crypto — confidentiality is the caller sealing *before* push.
+This is **dev / localhost / plain-HTTP / no-auth**: enable it with a local sigild
+started as `SIGILD_ADDR=127.0.0.1:8080 SIGILD_ENABLE_DEV_OPS=1 ./sigild` (the
+in-memory backend; no `SIGILD_OPLOG_PUBKEY` ⇒ unauthenticated). Do **not** point
+it at a remote host or use it for real secrets.
+
+## Run the sync-loop interop test
+
+```bash
+./build-wasm.sh                     # produces pkg-node/ (must run first)
+node test/sync-interop.mjs
+```
+
+This closes the E2EE sync loop against a **live** sigild AND the real `sigil`
+CLI, all through the opaque op-log. It builds `sigild` (`go build ./cmd/server`)
+and the CLI (`cargo build --bin sigil`), boots sigild on a free localhost port
+with `SIGILD_ENABLE_DEV_OPS=1` (in-memory, no auth), polls `/readyz`, and always
+kills the server in a `finally`. It proves:
+
+- **PROOF 1** — client self-loop: `wasm.seal_to_container` → `pushContainer` →
+  `pullContainers` → `wasm.open_container` equals the original;
+- **PROOF 2** — CLI writes / browser reads: `sigil seal` + `sigil push` a
+  `SIGILcli` container, then `pullContainers` (JS) + `wasm.open_container` equals
+  the original;
+- **PROOF 3** — browser writes / CLI reads: `wasm.seal_to_container` +
+  `pushContainer`, then `sigil pull` + `sigil open` equals the original;
+- **OPAQUE** — after a push, a raw `GET …/ops` is fetched and the stored blob is
+  asserted to base64-decode to **exactly** the pushed bytes (the server returned
+  them verbatim; it did no crypto).
+
+It prints a `PASS` line naming all proofs and exits non-zero on any failure.
+
 ## Serve the browser demo
 
 ```bash
@@ -246,8 +300,15 @@ browser. Finally it has a **hybrid PUBLIC-KEY** section: generate a hybrid
 identity (secret held in memory, `.pub` downloadable), **hybrid-seal → download
 .hyb** to a loaded recipient `.pub` (or, by default, your own identity for a
 self-round-trip), and **open** an uploaded `.hyb` with your secret identity —
-byte-compatible with `sigil hybrid-seal` / `sigil hybrid-open`. It carries a loud
-pre-audit banner.
+byte-compatible with `sigil hybrid-seal` / `sigil hybrid-open`. Finally it has a
+**Sync** section (via `sync.mjs`) with a server-URL field, a vault-ID field, a
+**Seal → Push** button (seals the plaintext and POSTs the opaque container to a
+dev sigild, showing the assigned seq) and a **Pull → Open** button (drains the
+vault, opens the latest container with the password, and shows the recovered
+plaintext) — interoperating with `sigil push` / `sigil pull` through the same
+vault. That section needs a local dev sigild started with
+`SIGILD_ENABLE_DEV_OPS=1` on loopback and is dev / plain-HTTP / no-auth. It
+carries a loud pre-audit banner.
 
 ## Native unit tests
 

@@ -11,7 +11,24 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 31, `main` @ origin, clean tree).** Phase 31 brought
+**Where we are (through Phase 32, `main` @ origin, clean tree).** Phase 32 **CLOSED
+THE CLIENT↔SERVER E2EE SYNC LOOP** for the client column: **`sigil-wasm/sync.mjs`**
+— a tiny, framework-free, dependency-free ESM transport (`pushContainer` /
+`pullContainers`, the JS twin of `sigil push` / `sigil pull`) — push/pulls **OPAQUE**
+sealed containers to/from the dev `sigild` op-log over `fetch`. It does **no crypto**
+(the wasm seals before push) and reuses the existing op-log contract verbatim:
+`pushContainer` POSTs raw bytes to `POST /v1/vaults/{id}/ops` (→ 201 `{vaultID, seq}`),
+`pullContainers` drains `GET …/ops?since=&limit=` (→ `{vaultID, ops:[{seq, blob,
+hash}], next, has_more}`, base64 blobs, loops `since=next` until `has_more=false`).
+Runs in **both Node** (`fetch`+`Buffer`) **and the browser** (`fetch`+`atob`,
+feature-detected); the `demo/` gained a **Sync** section. Proven GREEN by
+**`test/sync-interop.mjs`**, which builds `sigild` + the **real** CLI, boots a LIVE
+sigild on a free port (`SIGILD_ENABLE_DEV_OPS=1`, in-memory, no auth) and asserts
+PROOF 1 client self-loop, PROOF 2 **CLI writes / browser reads**, PROOF 3 **browser
+writes / CLI reads**, and OPAQUE (a raw `GET …/ops` blob base64-decodes to EXACTLY
+the pushed bytes → **server did no crypto, zero-knowledge intact**). Dev / localhost
+/ plain-HTTP / no-auth, UNAUDITED; NOT the product sync model (no real auth /
+enrollment / CRDT). ADR 0022. Phase 31 brought
 **HYBRID public-key (no-password) encryption to `sigil-wasm`**: four new
 `#[wasm_bindgen]` exports — `hybrid_x25519_public` / `hybrid_mlkem_encaps_key` /
 `hybrid_seal_to_container` / `hybrid_open_container` — encrypt a file **to** a
@@ -130,8 +147,16 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   interop test (`test/hybrid-interop.mjs`) shelling to the real CLI both directions.
   FIRST browser exercise of the PQ-hybrid path; custom KEM-then-AEAD not HPKE;
   getrandom==0 preserved. ADR 0021.
+  **Phase 32: now CLOSES THE CLIENT↔SERVER SYNC LOOP** — `sync.mjs`
+  (`pushContainer`/`pullContainers`) push/pulls the OPAQUE container to/from the dev
+  `sigild` op-log over `fetch` (raw-bytes POST → `{vaultID, seq}`; paginated base64
+  GET), no crypto in JS, reusing the existing op-log contract. `test/sync-interop.mjs`
+  builds sigild + the real CLI, boots a LIVE sigild (dev-ops/in-mem/no-auth) and proves
+  client self-loop + cross-client CLI↔wasm (both directions) + OPAQUE server (bytes
+  verbatim, zero-knowledge). Dev/localhost/plain-HTTP/no-auth; NOT the product sync
+  model. ADR 0022.
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0021.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0022.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
@@ -3330,3 +3355,79 @@ the two copies **MUST stay byte-for-byte in sync**, enforced by the tests below.
   ADRs 0020/0021 would be superseded). Posture unchanged; the **system is NOT "post-quantum
   secure".**
 
+---
+
+## 2026-07-14 — Phase 32 (wasm client↔server sync loop over the dev op-log)
+
+### What & why
+**CLOSED THE CLIENT↔SERVER E2EE SYNC LOOP** for the client column. Through Phase 31 the wasm
+client only did **on-device** crypto (`seal`/`open`, `SIGILcli`, `SIGILhyb`) — it never
+crossed the trust boundary to a server. `sigild`'s dev-gated, opaque op-log is the server half
+of the sync story and the `sigil` CLI already push/pulls to it. This phase teaches the
+browser/Node client to reach the **same** op-log and interoperate with the CLI through it —
+demonstrating the full E2EE sync architecture, not just client-side crypto.
+
+Added **`sigil-wasm/sync.mjs`** — a tiny, framework-free, dependency-free ESM transport, the
+JS twin of `sigil push` / `sigil pull`. Two exports:
+- `pushContainer(baseUrl, vaultId, containerBytes)` → POSTs the **raw** container bytes to
+  `POST /v1/vaults/{id}/ops` (Content-Type `application/octet-stream`), asserts `201`, returns
+  `{ seq }` from the `{vaultID, seq}` response.
+- `pullContainers(baseUrl, vaultId, since=0)` → drains
+  `GET /v1/vaults/{id}/ops?since=&limit=500`, reading `{vaultID, ops:[{seq, blob, hash}], next,
+  has_more}` (std-base64 `blob`/`hash`), loops `since=next` until `has_more=false`, and
+  base64-decodes each `blob` back to the exact bytes → `[{seq, container: Uint8Array, hash}]`.
+
+Key design: **the JS does NO cryptography** — it only shuttles bytes; the wasm seals BEFORE
+push and opens AFTER pull. It **reuses the existing op-log contract verbatim** (no new server
+surface). It runs in **both Node** (global `fetch` + `Buffer`) **and the browser** (`fetch` +
+`atob`) — the only env-specific bit (base64 decode) is feature-detected. The browser `demo/`
+gained a **Sync** section (server-URL + vault-ID fields, Seal→Push / Pull→Open buttons) over
+`sync.mjs`, with a loud pre-audit banner.
+
+### How verified
+- **Live-server sync-loop interop PASS:** `node sigil-wasm/test/sync-interop.mjs` (after
+  `build-wasm.sh`) **builds `sigild`** (`go build ./cmd/server`) **and the REAL `sigil` CLI**
+  (`cargo build --bin sigil`), boots a LIVE sigild on a free localhost port
+  (`SIGILD_ENABLE_DEV_OPS=1`, in-memory backend, no auth), polls `/readyz`, and always kills
+  the server in a `finally`. It proves:
+  - **PROOF 1** — client self-loop: `wasm.seal_to_container` → `pushContainer` (seq 1) →
+    `pullContainers` → `wasm.open_container` == original plaintext.
+  - **PROOF 2** — **CLI writes / browser reads**: `sigil seal` + `sigil push` a `SIGILcli`
+    container → `pullContainers` (JS) + `wasm.open_container` == original (asserts the pulled
+    bytes really carry `SIGILcli` magic).
+  - **PROOF 3** — **browser writes / CLI reads**: `wasm.seal_to_container` + `pushContainer`
+    → `sigil pull` (writes `op-1.sigil`) + `sigil open` == original.
+  - **OPAQUE** — after a push, a raw `GET …/ops` blob base64-decodes to **EXACTLY** the pushed
+    container bytes → the server returned them verbatim and did **no crypto** (zero-knowledge
+    intact). The two ends use different crypto material per proof yet interoperate because the
+    `SIGILcli` container is self-describing (salt + Argon2 params in the header) and the
+    password is shared out-of-band; the server never sees any of it.
+  Prints the `PASS: sigil-wasm E2EE sync loop over a LIVE sigild op-log …` line, exits 0.
+- The op-log contract in `sync.mjs` was checked against the actual server code
+  (`sigild/internal/api/handlers.go`: `POST` → `{vaultID, seq}` 201; `GET` →
+  `{vaultID, ops:[{seq, blob, hash}], next, has_more}`, `blob` a `[]byte` → std-base64) — no
+  name drift.
+
+### Docs (this pass — docs only, no code touched)
+- `docs/architecture.md`: §1 `sigil-wasm` bullet extended with the closed client↔server sync
+  loop (`sync.mjs`, `pushContainer`/`pullContainers`, the reused op-log contract, opaque →
+  zero-knowledge, cross-client CLI interop, the `sync-interop.mjs` live-server proof, honest
+  dev/localhost/no-auth framing); §6 "no clients" gap notes the loop is now closed but dev-only.
+- `README.md`: `sigil-wasm/` bullet notes browser sync of opaque containers to the dev op-log
+  interoperating with the CLI; dev-only; UNAUDITED; MARKETING-CLAIMS discipline.
+- `CLAUDE.md`: `sigil-wasm` repo-map bullet records `sync.mjs` (push/pull over the op-log),
+  `test/sync-interop.mjs` (live sigild + real CLI cross-client proof), the demo Sync UI, and
+  the dev/localhost/plain-HTTP/no-auth + zero-knowledge framing.
+- `docs/decisions/0022-wasm-client-server-sync-loop.md` written (Nygard) + indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07); ADR banner extended. RESUME ANCHOR moved to
+  Phase 32.
+
+### ➡️ Still open (honest)
+- **Dev / localhost / plain-HTTP / no-auth only.** The proof boots sigild with no
+  `SIGILD_OPLOG_PUBKEY` over plain HTTP on loopback. `sync.mjs` must not be pointed at a remote
+  host or used for real secrets. It is a **demonstration** of the sync loop — **not** the
+  product sync model: no real auth / device enrollment / per-vault authorization, and no CRDT /
+  conflict-free merge / operation semantics (the op-log stays a plain append-and-read byte
+  journal with a tamper-evident hash chain, not a mergeable log). A real product sync/auth
+  model is a future, separate decision. Posture unchanged; the **system is NOT "post-quantum
+  secure".**

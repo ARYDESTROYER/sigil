@@ -162,6 +162,29 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   product's account / key-management model. A **standalone crate** with its own
   lockfile (see [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
   not-for-real-secrets banner.
+- **`sigil-wasm`** ([`../sigil-wasm/`](../sigil-wasm/)) — a thin
+  [`wasm-bindgen`](https://rustwasm.github.io/wasm-bindgen/) binding over the
+  `sigil-core` **record API**, exposing `seal_record` / `open_record` (plus
+  `nonce_len` / `recommended_salt_len` / `version`) to JavaScript. It is the
+  **first thing to actually consume the wasm-pure core** — the client column,
+  reserved until now, has started. It adds **no cryptography of its own** (all
+  crypto stays in `#![forbid(unsafe_code)]` `sigil-core`; this crate only marshals
+  bytes and cannot itself `forbid(unsafe_code)` because `#[wasm_bindgen]` generates
+  `unsafe` glue). Its point is to carry the **caller-supplied-entropy invariant all
+  the way out to a JS runtime**: the Argon2id **salt** and the AEAD **nonce** are
+  generated in JavaScript with `crypto.getRandomValues` and passed **into** the
+  wasm as byte arrays, so both the core **and** this binding stay `getrandom`-free
+  (proven mechanically — `getrandom` appears in neither `libsigil/Cargo.lock` nor
+  `sigil-wasm/Cargo.lock`). Like `cli`, it is a **standalone crate** with its own
+  lockfile, path-depending on `../libsigil/core` and **not** a member of the
+  `libsigil` workspace (see [§4](#4-build--dependency-isolation)), so it can never
+  perturb the audit-bound core lockfile. It builds via
+  [`../sigil-wasm/build-wasm.sh`](../sigil-wasm/build-wasm.sh) (wasm-pack) into
+  gitignored `pkg-web/` (browser ESM) + `pkg-node/` (Node CJS) artifacts, and is
+  exercised by a Node round-trip test, native `#[cfg(test)]` unit tests, and a
+  browser `demo/`. It wraps **only** the symmetric `seal_record` / `open_record`
+  path — a **DEMONSTRATION** of the UNAUDITED building block, **NOT** the product's
+  account / key-management model, and not for real secrets.
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
@@ -416,7 +439,7 @@ KEM/signature primitives are **not yet wired into the suite frame** — the
 
 ## 4. Build & dependency isolation
 
-There are **three Rust build surfaces** plus the Go server, and the boundaries
+There are **four Rust build surfaces** plus the Go server, and the boundaries
 between them are load-bearing:
 
 1. **The `libsigil` workspace** (`core` + `ffi`) — native build/clippy/test. This
@@ -439,6 +462,17 @@ between them are load-bearing:
    `libsigil/Cargo.lock` must be unchanged by any CLI work. The CLI's `ureq` is
    built with `default-features = false` to strip its TLS stack on purpose — push/pull
    speak plain HTTP to a localhost dev `sigild` only.
+4. **The standalone `sigil-wasm` crate** — the `wasm-bindgen` binding, also
+   **outside** the `libsigil` workspace with its **own
+   [`../sigil-wasm/Cargo.lock`](../sigil-wasm/Cargo.lock)**, path-depending on
+   `../libsigil/core`. It compiles to a real `.wasm` via `wasm-pack` (which bundles
+   a `wasm-bindgen` matching the pinned `=0.2.100`). Unlike `cli`, it deliberately
+   does **not** add `getrandom`: entropy is supplied by JavaScript
+   (`crypto.getRandomValues`), so the same mechanical guard applies to a second
+   lockfile — `grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock` **must also stay
+   `0`**, and `libsigil/Cargo.lock` must be unchanged by any wasm-binding work. This
+   is what proves the caller-supplied-entropy invariant end to end into a JS runtime
+   (see [`decisions/0019-wasm-client-bindings.md`](decisions/0019-wasm-client-bindings.md)).
 
 `sigild`'s **core server and its in-memory / file-backed dev backends are Go
 stdlib-only**, which keeps that surface reproducible and near-zero-dependency.
@@ -482,10 +516,15 @@ To avoid any over-claim, the honest gaps in the current architecture (the
 authoritative list, with rationale, is the **defer ledger** in
 [`sprint-72h.md`](sprint-72h.md)):
 
-- **No clients / extension.** The native apps (iOS/Android/macOS/Windows/Linux/
-  watch) live in separate repos and consume `libsigil` as a versioned artifact;
-  none exist yet. The web app, admin console, and browser extension are reserved
-  directories.
+- **No clients / extension (but the client column has started).** The native apps
+  (iOS/Android/macOS/Windows/Linux/watch) live in separate repos and consume
+  `libsigil` as a versioned artifact; none exist yet, and the web app, admin
+  console, and browser extension are still reserved directories. The **one**
+  client-side consumer that now exists is **`sigil-wasm`** — the first thing to
+  actually link the wasm-pure core into a JS runtime — but it is a **demo of the
+  UNAUDITED `seal_record` / `open_record` building block**, not a product client
+  and not the account / key-management model
+  ([ADR 0019](decisions/0019-wasm-client-bindings.md)).
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
   device-key signature check (contract v2: a per-request nonce plus a

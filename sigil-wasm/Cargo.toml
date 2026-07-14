@@ -1,0 +1,40 @@
+# sigil-wasm — a thin wasm-bindgen binding over the libsigil `sigil-core`
+# record API, proving the wasm-pure / caller-supplied-entropy design all the way
+# out to a JavaScript (browser + Node) runtime.
+#
+# STATUS: pre-audit. This crate wraps the REAL but UNAUDITED `sigil-core` record
+# API (Argon2id -> XChaCha20-Poly1305 envelope) for the browser. It is a
+# DEMONSTRATION of the libsigil building block only and MUST NOT be used to
+# protect real secrets. See README.md for the loud warning.
+#
+# IMPORTANT: this crate is INTENTIONALLY OUTSIDE the `libsigil/` cargo workspace,
+# exactly like `cli/`. It has its own `sigil-wasm/Cargo.lock`. Unlike `cli/`,
+# however, it DELIBERATELY does NOT depend on `getrandom`: the whole point of the
+# wasm column is to prove the caller-supplied-entropy invariant end to end —
+# entropy (the Argon2id salt + the AEAD nonce) is generated in JavaScript
+# (`crypto.getRandomValues`) and passed IN as byte arrays. So both this
+# lockfile AND `libsigil/Cargo.lock` MUST stay getrandom-free
+# (`grep -c 'name = "getrandom"' <lock>` == 0). Do NOT add getrandom here.
+[package]
+name = "sigil-wasm"
+version = "0.0.0"
+edition = "2021"
+# 1.85: this path-depends on sigil-core, which pulls ml-dsa 0.1.1 (edition 2024,
+# MSRV 1.85). Matches core/cli. The machine toolchain is 1.96, so it builds.
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0"
+description = "Pre-audit wasm-bindgen binding over the real-but-unaudited libsigil sigil-core record API. Browser/Node demo of the wasm-pure, caller-supplied-entropy core. Not for real secrets."
+
+[lib]
+# `cdylib` is what wasm-bindgen/wasm-pack link into a `.wasm`; `rlib` is added so
+# the native `#[cfg(test)]` unit tests can compile and run under `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The real (UNAUDITED) crypto building block. Path dependency only; this does NOT
+# add `sigil-wasm` to the libsigil workspace.
+sigil-core = { path = "../libsigil/core" }
+# Thin JS<->wasm glue. PINNED to an exact patch so the generated bindings match
+# the `wasm-bindgen` CLI that `wasm-pack` bundles (see build-wasm.sh).
+wasm-bindgen = "=0.2.100"

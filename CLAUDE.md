@@ -240,6 +240,27 @@ public, make no security claims, until the audit completes and trademark clears.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.
+- `sigil-wasm/` — a thin **`wasm-bindgen`** binding (`sigil-wasm`, Apache-2.0)
+  over the libsigil-core **record API**, exposing `seal_record`/`open_record`
+  (plus `nonce_len`/`recommended_salt_len`/`version`) to JavaScript. The **FIRST
+  thing to actually consume the wasm-pure core** in a JS runtime (browser + Node).
+  Like `cli/` it is a **standalone crate with its own `sigil-wasm/Cargo.lock`**
+  (path-deps `../libsigil/core`, NOT a libsigil workspace member, so it can never
+  perturb `libsigil/Cargo.lock`). **Unlike `cli/` it is deliberately
+  `getrandom`-free:** the Argon2id salt + the AEAD nonce are generated in JS
+  (`crypto.getRandomValues`) and passed IN as byte arrays, proving the
+  caller-supplied-entropy invariant end to end — so **both** `libsigil/Cargo.lock`
+  **and** `sigil-wasm/Cargo.lock` must stay `getrandom`-free. It adds **no crypto
+  of its own** (all crypto stays in `#![forbid(unsafe_code)]` `sigil-core`; the
+  binding cannot `forbid(unsafe_code)` because `#[wasm_bindgen]` generates
+  `unsafe` glue, so the crate-type is `["cdylib","rlib"]` and the testable logic
+  lives in `*_inner` helpers). Build with **`sigil-wasm/build-wasm.sh`** (wasm-pack
+  0.13.1, which bundles wasm-bindgen 0.2.100 matching the `=0.2.100` pin),
+  producing `pkg-web/` (browser ESM) + `pkg-node/` (Node CJS) — both **gitignored
+  build artifacts, never committed**. Verified by a Node round-trip test
+  (`test/roundtrip.mjs`) + native unit tests + a browser `demo/`. A DEMO of the
+  UNAUDITED building block, **NOT** the product account/key-management model; not
+  for real secrets.
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)
@@ -272,6 +293,16 @@ cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path cli/Cargo.toml
 grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
+# sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
+# clippy/test exercise the *_inner helpers; build-wasm.sh emits pkg-web/pkg-node
+# (needs wasm-pack); then the Node round-trip proves seal/open in a JS runtime.
+cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
+cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
+cargo test  --manifest-path sigil-wasm/Cargo.toml
+./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
+node sigil-wasm/test/roundtrip.mjs                  # prints PASS, exits 0
+grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
+
 # Go server — fmt / vet / test / build
 go=/opt/homebrew/bin/go
 gofmt -l sigild            # must print nothing
@@ -296,7 +327,8 @@ publishes automatically while in stealth.
 
 ## Conventions & guardrails
 
-- **License split:** clients/core/web/CLI = Apache-2.0; `sigild/` = BSL-1.1.
+- **License split:** clients/core/web/CLI = Apache-2.0 (incl. `sigil-wasm`, the
+  client-side wasm binding); `sigild/` = BSL-1.1.
 - **`sigild` dependencies:** stdlib-only **except** the opt-in Postgres op-log
   backend, which links `pgx` (the module has a `go.sum`; ADR 0014 relaxes ADR 0005).
   The core server + the in-memory / file-backed backends stay stdlib; `pgx` is

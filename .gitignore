@@ -15,6 +15,12 @@ target/
 **/*.rs.bk
 Cargo.lock.orig
 
+# --- sigil-wasm build artifacts (wasm-pack output; never commit) ---
+# (node_modules/ is already ignored in the Node section below)
+sigil-wasm/pkg-web/
+sigil-wasm/pkg-node/
+sigil-wasm/target/
+
 # --- Go ---
 /sigild/bin/
 *.test

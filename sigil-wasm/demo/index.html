@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>sigil-wasm demo (pre-audit / UNAUDITED)</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      }
+      body {
+        max-width: 44rem;
+        margin: 2rem auto;
+        padding: 0 1rem 4rem;
+        line-height: 1.5;
+      }
+      .banner {
+        border: 2px solid #b91c1c;
+        background: #fef2f2;
+        color: #7f1d1d;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        font-weight: 600;
+      }
+      @media (prefers-color-scheme: dark) {
+        .banner { background: #2a0a0a; color: #fca5a5; }
+      }
+      label { display: block; margin-top: 1rem; font-weight: 600; }
+      input[type="password"], textarea {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.5rem;
+        font: inherit;
+        margin-top: 0.25rem;
+      }
+      textarea { min-height: 5rem; }
+      .row { display: flex; gap: 0.75rem; margin-top: 1rem; flex-wrap: wrap; }
+      button {
+        padding: 0.5rem 1.25rem;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: 6px;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-all;
+        background: rgba(127,127,127,0.12);
+        padding: 0.75rem;
+        border-radius: 6px;
+        min-height: 1.5rem;
+      }
+      .muted { color: #6b7280; font-size: 0.9rem; }
+      code { background: rgba(127,127,127,0.15); padding: 0 0.25rem; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <p class="banner">
+      PRE-AUDIT / UNAUDITED demo of the wasm-pure sigil-core. This is a
+      building-block demonstration only. DO NOT enter real secrets.
+    </p>
+
+    <h1>sigil-wasm</h1>
+    <p class="muted">
+      Seals and opens a record entirely in your browser via the
+      <code>sigil-core</code> record API (Argon2id → XChaCha20-Poly1305),
+      compiled to WebAssembly. The Argon2id salt and the AEAD nonce are generated
+      here in JavaScript with <code>crypto.getRandomValues</code> and passed into
+      the wasm — the module has no randomness of its own.
+    </p>
+    <p class="muted" id="version">loading wasm…</p>
+
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="off" value="correct horse battery staple" />
+
+    <label for="plaintext">Plaintext</label>
+    <textarea id="plaintext">a short note (not a real secret)</textarea>
+
+    <div class="row">
+      <button id="seal">Seal →</button>
+      <button id="open">← Open</button>
+    </div>
+
+    <label for="envelope">Envelope (base64)</label>
+    <pre id="envelope"></pre>
+
+    <label>Recovered plaintext</label>
+    <pre id="recovered"></pre>
+
+    <p class="muted">
+      Fast Argon2 params are used here (<code>m_cost=8, t_cost=1, p_cost=1</code>)
+      so the demo is instant; production uses far higher costs. The salt and
+      params from the last Seal are held in memory and reused by Open.
+    </p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

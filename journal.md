@@ -11,7 +11,18 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 28, `main` @ origin, clean tree).** Phase 28 gave
+**Where we are (through Phase 29, `main` @ origin, clean tree).** Phase 29 opened
+the **CLIENT COLUMN** (reserved until now): **`sigil-wasm`**, a standalone
+`wasm-bindgen` binding that runs the core's `seal_record`/`open_record` in the
+**browser + Node** — the FIRST thing to actually consume the wasm-pure core in a
+JS runtime. It is deliberately **`getrandom`-free**: JS supplies the Argon2id salt
++ AEAD nonce via `crypto.getRandomValues`, so the caller-supplied-entropy
+invariant is now proven end-to-end into a JS host (both `libsigil/Cargo.lock` AND
+`sigil-wasm/Cargo.lock` are getrandom==0). Own `Cargo.lock` like `cli/` (not a
+libsigil workspace member); build via `sigil-wasm/build-wasm.sh` → gitignored
+`pkg-web/`+`pkg-node/`; proven by a Node round-trip test (PASS) + native `*_inner`
+unit tests + a browser `demo/`. A DEMO of the UNAUDITED building block, NOT the
+product account/key-management model (ADR 0019). Phase 28 gave
 the durable Postgres op-log **managed, versioned embedded migrations**
 (`schema_migrations`, applied under a session `pg_advisory_lock`; auto at boot or
 via the `sigild migrate` / `sigild migrate status` operator CLI; opt out with
@@ -74,13 +85,22 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   plus **hybrid-keygen/hybrid-seal/hybrid-open** — public-key encrypt a file TO a
   device's hybrid identity (X25519 + ML-KEM-768) via the core's `hybrid_seal`/
   `hybrid_open` (Phase 23; FIRST user-facing use of the hybrid encryption path).
+- `sigil-wasm` (Phase 29): standalone `wasm-bindgen` crate (own `Cargo.lock`, NOT
+  a workspace member), thin binding over the core record API —
+  `seal_record`/`open_record`/`nonce_len`/`recommended_salt_len`/`version` to JS.
+  No crypto of its own; `getrandom`-free (JS supplies salt+nonce). `build-wasm.sh`
+  (wasm-pack 0.13.1 / wasm-bindgen 0.2.100) → gitignored `pkg-web/`+`pkg-node/`;
+  Node round-trip test + native `*_inner` tests + browser `demo/`. FIRST consumer
+  of the wasm-pure core; UNAUDITED demo, not the product key model. ADR 0019.
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0017.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0019.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
   wasm-pure; the wasm32 build must pass). CLI is a SEPARATE crate (own lock) so
-  it may use getrandom.
+  it may use getrandom. `sigil-wasm` is ALSO a separate crate but is deliberately
+  getrandom-FREE too (JS supplies entropy), so
+  `grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock` MUST **also** be **0**.
 - `#![forbid(unsafe_code)]` in core; `#![deny(unsafe_op_in_unsafe_fn)]` in ffi.
 - sigild now has **ONE dependency — `pgx`** — for the opt-in Postgres op-log backend
   (the module gained a `go.sum`; ADR 0014 relaxes ADR 0005 for exactly this backend).
@@ -3028,3 +3048,76 @@ Recording the decision so the doc set stays coherent as the repo grows:
   restore-drill automation. Production persistence (Postgres + S3/R2 + Redis) is still
   broader and unbuilt. Posture unchanged: dev-gated / **501** by default, opaque blobs only,
   no crypto on the plaintext; the **system is NOT "post-quantum secure".**
+
+---
+
+## 2026-07-14 — Phase 29 (wasm client column: `sigil-wasm` seal/open in the browser)
+
+### What & why
+Opened the **client column** — reserved and empty until now. Added **`sigil-wasm`**, a
+standalone `wasm-bindgen` binding over `sigil-core`'s record API, exposing
+`seal_record` / `open_record` (plus `nonce_len` / `recommended_salt_len` / `version`) to
+JavaScript so a **browser or Node** process can seal/open a record entirely client-side.
+It is the **FIRST thing to actually consume the wasm-pure core in a JS runtime** — until
+now the `wasm32-unknown-unknown` build only proved the core stays *linkable*; nothing
+exercised it from JS.
+
+The point of the phase is to prove **caller-supplied entropy end to end into a JS host**.
+`sigil-core` has no in-core RNG ([ADR 0007](docs/decisions/0007-caller-supplied-entropy-in-core.md));
+`sigil-wasm` carries that all the way out — the Argon2id salt + the AEAD nonce are
+generated in JS with `crypto.getRandomValues` and passed IN as byte arrays — so the crate
+is deliberately **`getrandom`-free**, unlike `cli/`.
+
+### How (design decisions → ADR 0019)
+- **Separate crate, own lockfile.** Not a `libsigil` workspace member (mirrors `cli/`,
+  [ADR 0002](docs/decisions/0002-standalone-cli-crate-for-getrandom-isolation.md)):
+  path-deps `../libsigil/core`, resolves into its own `sigil-wasm/Cargo.lock`, so
+  `wasm-bindgen` (pinned `= "0.2.100"`) never touches `libsigil/Cargo.lock`.
+- **Entropy from JS, not `getrandom`.** Deliberately no `getrandom` dep — the whole point
+  is to keep the guard mechanical across a *second* lockfile.
+- **No crypto of its own.** `#[wasm_bindgen]` entry points are a paper-thin shell over
+  `*_inner` helpers (returning `Result<Vec<u8>, String>`, natively testable) that only
+  marshal bytes into `sigil-core`. Crate cannot `#![forbid(unsafe_code)]` (the
+  `#[wasm_bindgen]` macro emits `unsafe` glue); all security-relevant code stays in the
+  `forbid(unsafe_code)` core. Lib is `crate-type = ["cdylib","rlib"]`.
+- Build via `sigil-wasm/build-wasm.sh` (wasm-pack 0.13.1, which bundles wasm-bindgen-cli
+  0.2.100 matching the pin) → **two** packages from one crate: `pkg-web/` (browser ESM,
+  `--target web`) + `pkg-node/` (Node CJS, `--target nodejs`). Both are **build artifacts,
+  gitignored** (root `.gitignore`: `sigil-wasm/pkg-web/`, `sigil-wasm/pkg-node/`,
+  `sigil-wasm/target/`) — NOT committed. Committed: crate source, `Cargo.lock`,
+  `build-wasm.sh`, `test/roundtrip.mjs`, `demo/`, `README.md`.
+
+### How verified
+- **Node round-trip PASS:** `node sigil-wasm/test/roundtrip.mjs` (after `build-wasm.sh`)
+  generates a 16-byte salt + 24-byte nonce with `webcrypto.getRandomValues`, seals a known
+  marker under fast Argon2 params, asserts the sealed bytes do NOT contain the plaintext,
+  opens back and asserts equality, and asserts wrong-password + short-nonce both throw —
+  prints the `PASS: sigil-wasm Node round-trip (…)` line and exits 0.
+- Native `*_inner` unit tests (`cargo test --manifest-path sigil-wasm/Cargo.toml`):
+  round-trip, wrong-password-fails, wrong-nonce-len-rejected, constants-are-faithful.
+- Browser `demo/` (`demo/index.html` + `demo/main.js`) serves an in-browser seal/open page
+  with a loud pre-audit banner (salt+nonce from `window.crypto.getRandomValues`).
+- **Both getrandom guards == 0:** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  (unchanged) AND `grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock` = **0**. `libsigil/`
+  and `cli/` untouched (new crate + docs only).
+
+### Docs (this pass — docs only, no code touched)
+- `docs/architecture.md`: `sigil-wasm` added to the §1 component map as the first
+  client-side consumer of the wasm-pure core; §4 now lists **four** Rust build surfaces
+  (added the `sigil-wasm` crate + its second getrandom-guarded lockfile); §6 "No clients"
+  note updated — the client column has started (still a demo, not a product client).
+- `README.md`: new `sigil-wasm/` bullet + layout line + build/test snippet (honest
+  pre-audit tone; a demo of an UNAUDITED building block, not the product key model).
+- `CLAUDE.md`: `sigil-wasm` repo-map bullet, build/test commands (+ the
+  `sigil-wasm/Cargo.lock` getrandom==0 check), license-split note (Apache-2.0, client side).
+- `docs/decisions/0019-wasm-client-bindings.md` written (Nygard) + indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07); ADR banner extended. RESUME ANCHOR moved
+  to Phase 29.
+
+### ➡️ Still open (honest)
+- `sigil-wasm` wraps **only** the symmetric password-derived `seal_record`/`open_record`
+  path — it does NOT touch the hybrid public-key flow, and it is **not** the product's
+  account / key-management / session model. A building-block demo, UNAUDITED, not for real
+  secrets. `pkg-*` require a `wasm-pack` build step (artifacts gitignored). No real web app,
+  admin console, or extension yet (still reserved dirs). Posture unchanged; the **system is
+  NOT "post-quantum secure".**

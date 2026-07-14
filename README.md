@@ -178,6 +178,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   use of the hybrid encryption path** (a demo; a **custom KEM-then-AEAD**
   construction, **NOT RFC 9180 HPKE**; not the product's key-management model).
   Standalone crate; **UNAUDITED**; not for real secrets.
+- `sigil-wasm/` — a thin **`wasm-bindgen`** binding over the libsigil core's
+  record API that runs **`seal_record` / `open_record` in the browser (and Node)**
+  — the first thing to actually consume the wasm-pure core in a JS runtime. It
+  adds **no crypto of its own** (all crypto stays in `sigil-core`) and carries the
+  core's caller-supplied-entropy design all the way into JavaScript: the Argon2id
+  salt and the AEAD nonce are generated in JS with `crypto.getRandomValues` and
+  passed in, so it stays **`getrandom`-free**, exactly like the core. Build with
+  `./sigil-wasm/build-wasm.sh` (uses `wasm-pack` to emit gitignored `pkg-web/` +
+  `pkg-node/`); prove it with `node sigil-wasm/test/roundtrip.mjs` or serve
+  `sigil-wasm/demo/` for an in-browser seal/open page. A **standalone crate**
+  (own lockfile), **UNAUDITED**, a **demo of a building block** — not the product's
+  account/key-management model, and not for real secrets.
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
@@ -201,6 +213,7 @@ sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
 web/             Next.js marketing (+ webapp/admin reserved), pnpm workspace
 extension/       Browser extension (reserved)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
+sigil-wasm/      Rust wasm-bindgen binding — in-browser seal/open demo over the core (pre-audit)
 deploy/          terraform / nomad / caddy / systemd + local/ (loopback smoke) + preflight.sh
 docs/            architecture, threat model, crypto spec, op-log API, sprint plan
 docs/decisions/  Architecture Decision Records (ADRs)
@@ -228,6 +241,10 @@ cargo build --manifest-path libsigil/Cargo.toml -p sigil-core --target wasm32-un
 
 # Rust demo CLI (separate crate; native-only)
 cargo test  --manifest-path cli/Cargo.toml
+
+# sigil-wasm (separate crate; wasm-bindgen binding — getrandom-free, JS supplies entropy)
+cargo test  --manifest-path sigil-wasm/Cargo.toml   # native *_inner unit tests
+./sigil-wasm/build-wasm.sh && node sigil-wasm/test/roundtrip.mjs   # browser/Node round-trip
 
 # Go sync server
 ( cd sigild && gofmt -l . && go vet ./... && go test ./... && go build ./... )

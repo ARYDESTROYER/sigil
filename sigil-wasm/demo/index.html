@@ -28,13 +28,24 @@
         .banner { background: #2a0a0a; color: #fca5a5; }
       }
       label { display: block; margin-top: 1rem; font-weight: 600; }
-      input[type="password"], textarea {
+      input[type="password"], input[type="text"], textarea {
         width: 100%;
         box-sizing: border-box;
         padding: 0.5rem;
         font: inherit;
         margin-top: 0.25rem;
       }
+      input[type="number"], select { padding: 0.4rem; font: inherit; }
+      .totp-entry {
+        display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap;
+        padding: 0.5rem 0.75rem; margin-top: 0.4rem;
+        background: rgba(127,127,127,0.10); border-radius: 6px;
+      }
+      .totp-code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 1.35rem; font-weight: 700; letter-spacing: 0.06em;
+      }
+      .totp-meta { color: #6b7280; font-size: 0.85rem; }
       textarea { min-height: 5rem; }
       .row { display: flex; gap: 0.75rem; margin-top: 1rem; flex-wrap: wrap; }
       button {
@@ -217,6 +228,63 @@
 
     <label>Plaintext recovered from the pulled container</label>
     <pre id="syncRecovered"></pre>
+
+    <hr style="margin: 2rem 0; border: none; border-top: 1px solid rgba(127,127,127,0.3);" />
+
+    <h2>TOTP authenticator vault (<code>SIGILcli</code>)</h2>
+    <p class="banner" style="font-weight: 500;">
+      DEV / UNAUDITED — do NOT enter a real 2FA secret. This is a demonstration
+      of the RFC 6238 TOTP primitive, not a hardened authenticator.
+    </p>
+    <p class="muted">
+      Add a base32 TOTP secret and this page keeps an in-memory vault, showing the
+      LIVE code for each entry (refreshed every second, with a countdown to the
+      next period). The time comes from your browser clock
+      (<code>Date.now()/1000</code>) — <code>sigil-core</code> reads no clock, so
+      the wasm TOTP takes the time as an argument. <strong>Seal + Push vault</strong>
+      seals the whole vault into a <code>SIGILcli</code> container (the SAME format
+      the <code>sigil totp</code> CLI uses) and pushes the OPAQUE bytes to the dev
+      op-log above; <strong>Pull + Open vault</strong> pulls it back and decrypts it
+      here. The vault is cross-compatible with
+      <code>sigil totp add/list/code</code> at the command line (same password).
+    </p>
+
+    <label for="totpLabel">Account label</label>
+    <input id="totpLabel" type="text" autocomplete="off" value="work" />
+
+    <label for="totpSecret">Base32 secret (RFC 4648)</label>
+    <input id="totpSecret" type="text" autocomplete="off" value="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" />
+
+    <div class="row">
+      <label style="font-weight: 600;">Digits
+        <input id="totpDigits" type="number" min="6" max="10" value="6" style="width: 4rem;" />
+      </label>
+      <label style="font-weight: 600;">Period (s)
+        <input id="totpPeriod" type="number" min="1" value="30" style="width: 5rem;" />
+      </label>
+      <label style="font-weight: 600;">Algorithm
+        <select id="totpAlgo">
+          <option value="sha1" selected>sha1</option>
+          <option value="sha256">sha256</option>
+          <option value="sha512">sha512</option>
+        </select>
+      </label>
+      <button id="totpAdd">Add to vault</button>
+    </div>
+
+    <label>Vault (live codes, refreshing each second)</label>
+    <div id="totpList"><span class="muted">(empty — add a secret above)</span></div>
+
+    <label for="totpVaultId" style="margin-top: 1.5rem;">Op-log vault ID (uses the Server URL above)</label>
+    <input id="totpVaultId" type="text" autocomplete="off" value="totp-demo" />
+
+    <div class="row">
+      <button id="totpPush">Seal → Push vault</button>
+      <button id="totpPull">Pull → Open vault</button>
+    </div>
+
+    <label>TOTP vault status</label>
+    <pre id="totpStatus"></pre>
 
     <script type="module" src="./main.js"></script>
   </body>

@@ -1,0 +1,108 @@
+# 0024 — Browser TOTP vault and cross-client TOTP through the op-log
+
+- **Status:** Accepted — 2026-07.
+
+## Context
+
+The authenticator function itself landed in
+[ADR 0023](0023-totp-hotp-primitive-and-cli-vault.md): a wasm-pure RFC 4226 /
+RFC 6238 OTP primitive in `sigil-core` and an encrypted `sigil totp` vault in
+the native CLI. But that feature only worked *at the command line*. The client
+column (`sigil-wasm`) could seal/open the shared `SIGILcli` container
+([ADR 0020](0020-shared-client-container-format.md)), do hybrid public-key
+encryption ([ADR 0021](0021-wasm-hybrid-public-key-encryption.md)), and
+push/pull opaque containers to the dev op-log
+([ADR 0022](0022-wasm-client-server-sync-loop.md)) — but it could **not
+generate a 2FA code**. The authenticator, the actual product feature, did not
+exist in the browser.
+
+The goal of this phase was to finish that feature in the browser and, more
+importantly, to **prove it works cross-client**: a TOTP secret added by one
+client and synced through the opaque, zero-knowledge op-log must yield the
+*same* code on the other client. That is the first end-to-end product feature
+spanning two clients and the server.
+
+Two constraints carried over:
+
+1. **The wasm crate must stay `getrandom`-free** and add no crypto of its own
+   ([ADR 0019](0019-wasm-client-bindings.md)). The OTP math already lives in
+   the core; the binding must only marshal bytes. TOTP is defined over "current
+   Unix time", but neither the core nor the binding may read a clock
+   ([ADR 0007](0007-caller-supplied-entropy-in-core.md)).
+2. **The vault format is a mirrored, not shared, contract.** The CLI's
+   `TotpVault` / `TotpEntry` JSON is a Rust `serde` type in `cli/src/lib.rs`;
+   the browser is JavaScript. There is no shared crate for the inner vault JSON,
+   exactly as the `SIGILcli` / `SIGILhyb` container constants are mirrored, not
+   shared. A drift in the JSON shape silently breaks cross-client interop.
+
+## Decision
+
+**Expose the core OTP primitive through `wasm-bindgen` with JS-supplied time,
+and mirror the CLI's vault JSON in a small framework-free ESM module that reuses
+the existing sealed container and op-log sync.**
+
+- **Primitive exports — [`sigil-wasm/src/lib.rs`](../../sigil-wasm/src/lib.rs).**
+  Add three `#[wasm_bindgen]` functions over `sigil-core`:
+  `totp(key, unix_time, period, t0, digits, algorithm)`,
+  `hotp(key, counter, digits, algorithm)`, and `format_code(code, digits)`.
+  **`unix_time` / `t0` / `counter` arrive as JS Numbers (`f64`)** — JS has no
+  native `u64` — validated to non-negative integers before the `u64` cast, so
+  the JS caller supplies the clock and the binding reads none. `algorithm` is a
+  lowercase string (`"sha1"` default, `"sha256"`, `"sha512"`) mapped by
+  `otp_algorithm_from_str`, mirroring the CLI's `totp_algorithm_from_str`, so
+  both clients accept the same `algorithm` JSON field. TOTP/HOTP draw no
+  entropy, so the crate stays `getrandom`-free. The RFC 4226 App D / RFC 6238
+  App B known-answer vectors are asserted **through the `f64`/string wrappers**
+  as native `#[cfg(test)]` tests, proving the JS-facing contract independent of
+  any clock.
+- **Vault module — [`sigil-wasm/totp-vault.mjs`](../../sigil-wasm/totp-vault.mjs).**
+  A dependency-free ESM module (runs in Node and the browser) that reads and
+  writes the **same sealed `SIGILcli` TOTP vault the CLI uses**: `openVault` →
+  `wasm.open_container`, `sealVault` → `wasm.seal_to_container`, `codeForEntry`
+  → `wasm.totp` + `wasm.format_code` (with `t0 = 0`, the caller passing
+  `Math.floor(Date.now()/1000)`), plus `addEntry` / `newVault` and a
+  `base32Decode` for adding a provisioning secret. It performs **no crypto of
+  its own** — it hands bytes to the wasm binding. The inner **`TotpVault` /
+  `TotpEntry` JSON schema is MIRRORED from `cli/src/lib.rs`** (version `1`;
+  `label` / optional `issuer` omitted when absent / `secret` as **standard
+  base64 of the raw key bytes** / lowercase `algorithm` / `digits` / `period`),
+  with a header comment tying it to that file and demanding it stay in sync.
+- **Reuse the sealed vault and the op-log, add nothing to the server.** Because
+  a TOTP vault is just another opaque `SIGILcli` container, it rides the
+  existing `sync.mjs` push/pull transport ([ADR 0022](0022-wasm-client-server-sync-loop.md))
+  unchanged — the secret syncs E2EE through the zero-knowledge op-log with **no
+  server change**. The browser `demo/` gains a **TOTP authenticator vault**
+  section (add a base32 secret, live per-entry codes, Seal→Push / Pull→Open the
+  vault).
+
+## Consequences
+
+- **The authenticator now works in the browser and cross-client.** A secret
+  added by `sigil totp add`, synced through the opaque op-log, is decrypted by
+  `openVault` and turned into the **same** RFC-correct code by `codeForEntry` in
+  the browser (and vice versa). This is the **first end-to-end product feature
+  proven working cross-client** (CLI ↔ browser) through the server.
+- **The vault JSON schema is now duplicated `cli/src/lib.rs` ↔ `totp-vault.mjs`.**
+  Like the container-format constants, it is mirrored, not shared. The guard is
+  a header sync note **plus** a live cross-client interop test
+  ([`sigil-wasm/test/totp-interop.mjs`](../../sigil-wasm/test/totp-interop.mjs)):
+  it builds `sigild` + the real CLI, boots a live sigild
+  (`SIGILD_ENABLE_DEV_OPS=1`, in-memory, no auth), asserts the wasm TOTP KAT
+  (RFC 6238 App B, T=59, sha1/256/512), then has the CLI add a secret → push →
+  the browser pull → `openVault` → `codeForEntry(T=59)` equal **both** the RFC
+  vector `94287082` **and** an independent from-scratch Node HMAC-SHA-1 TOTP,
+  and checks the server returned the pushed bytes **verbatim** (opaque). Any
+  drift in the JSON shape (renamed field, wrong casing, base32-vs-base64 secret)
+  fails here.
+- **The no-clock / no-RNG invariants hold.** `totp`/`hotp` take time/counter as
+  arguments; the binding validates the `f64` and casts, reading no clock and
+  drawing no entropy, so both `libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock`
+  stay `getrandom`==0 ([ADR 0007](0007-caller-supplied-entropy-in-core.md),
+  [ADR 0019](0019-wasm-client-bindings.md)).
+- **Still pre-audit / UNAUDITED / dev-only.** The OTP math is RFC-vector-checked
+  and the sync is the same opaque dev op-log — but the build is unaudited, the
+  transport is dev / localhost / plain-HTTP / no-auth, and the client still only
+  *generates* codes (verification, constant-time compare, and zeroization are
+  left to callers). **Do not store real 2FA secrets in this build.** This is not
+  the product's account / key-management / sync model. Public copy still obeys
+  [`../../web/apps/marketing/MARKETING-CLAIMS.md`](../../web/apps/marketing/MARKETING-CLAIMS.md).

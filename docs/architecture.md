@@ -273,6 +273,40 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   auth / enrollment / CRDT / merge); it only demonstrates that the client column
   can reach the opaque op-log and interoperate with the CLI through it (see
   [ADR 0022](decisions/0022-wasm-client-server-sync-loop.md)).
+  **The wasm client now GENERATES TOTP codes in the browser, cross-client with
+  the CLI** — the **first end-to-end product feature working across two clients
+  and the server**. Three `#[wasm_bindgen]` exports wrap the core OTP primitive
+  ([ADR 0023](decisions/0023-totp-hotp-primitive-and-cli-vault.md)):
+  `totp(key, unix_time, period, t0, digits, algorithm)`,
+  `hotp(key, counter, digits, algorithm)`, and `format_code(code, digits)`. Per
+  the no-clock invariant, **the JS caller supplies the Unix time** (`unix_time` /
+  `t0` / `counter` arrive as `f64` and are validated to non-negative integers
+  before the `u64` cast); the `algorithm` string map mirrors the CLI's, and
+  TOTP/HOTP draw no entropy, so the crate stays `getrandom`-free. A small,
+  framework-free ESM module
+  ([`../sigil-wasm/totp-vault.mjs`](../sigil-wasm/totp-vault.mjs)) reads and
+  writes the **same sealed `SIGILcli` TOTP vault the `sigil totp` CLI uses**
+  (`openVault` / `sealVault` / `addEntry` / `codeForEntry` / `newVault` over
+  `open_container` / `seal_to_container` / `totp` / `format_code`), performing no
+  crypto of its own. The inner **`TotpVault` / `TotpEntry` JSON schema is
+  MIRRORED — not shared — between `cli/src/lib.rs` and `totp-vault.mjs`**
+  (version `1`; `label` / optional `issuer` / `secret` as standard base64 of the
+  raw key bytes / lowercase `algorithm` / `digits` / `period`) and must stay in
+  sync. Because the vault is just another opaque `SIGILcli` container, it rides
+  the existing `sync.mjs` op-log transport unchanged, so **a secret added on one
+  client and synced through the opaque, zero-knowledge op-log yields the same
+  code on the other** — E2EE, with no server change. Proven end-to-end by
+  ([`../sigil-wasm/test/totp-interop.mjs`](../sigil-wasm/test/totp-interop.mjs)):
+  it asserts the wasm TOTP known-answer vectors (RFC 6238 App B, T=59,
+  sha1/256/512), then has the **CLI add a secret → push → the browser pull →
+  `openVault` → `codeForEntry(T=59)`** equal both the RFC vector `94287082` and
+  an independent from-scratch Node HMAC-SHA-1 TOTP, and checks the server
+  returned the bytes verbatim (opaque). The browser `demo/` gains a **TOTP
+  authenticator vault** section (add a base32 secret, live codes, Seal→Push /
+  Pull→Open). Honest framing: **UNAUDITED**, dev / localhost / plain-HTTP /
+  no-auth, generation only (no verification / constant-time compare /
+  zeroization); do not store real 2FA secrets
+  (see [ADR 0024](decisions/0024-wasm-totp-vault-and-cross-client-totp.md)).
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),

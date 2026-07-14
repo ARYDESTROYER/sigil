@@ -51,6 +51,10 @@ hybrid_mlkem_encaps_key(seed): Uint8Array         // 64-byte seed    -> 1184-byt
 hybrid_seal_to_container(recipient_x25519_pub, recipient_mlkem_encaps_key,
                          ephemeral_x25519_secret, mlkem_coin, aead_nonce, plaintext): Uint8Array
 hybrid_open_container(recipient_x25519_secret, recipient_mlkem_seed, container): Uint8Array
+// TOTP / HOTP one-time-password codes (RFC 4226 / RFC 6238) — see below
+totp(key, unix_time, period, t0, digits, algorithm): number  // algorithm = "sha1"|"sha256"|"sha512"
+hotp(key, counter, digits, algorithm): number
+format_code(code, digits): string   // zero-pads, e.g. format_code(1, 6) === "000001"
 nonce_len(): number            // 24 (XChaCha20-Poly1305 nonce length)
 recommended_salt_len(): number // 16
 version(): string
@@ -281,6 +285,71 @@ kills the server in a `finally`. It proves:
 
 It prints a `PASS` line naming all proofs and exits non-zero on any failure.
 
+## TOTP authenticator codes (`totp` / `hotp` / `format_code`)
+
+The wasm exposes `sigil-core`'s **RFC 4226 HOTP / RFC 6238 TOTP** primitive so the
+browser can generate the same one-time codes the `sigil totp` CLI does. As
+everywhere in this crate the core reads **no clock** — the Unix time is a
+caller-supplied argument, passed from JS as a Number (an `f64`, validated to a
+non-negative integer before the `u64` cast). No entropy is drawn, so this keeps
+the crate `getrandom`-free.
+
+```js
+// RFC 6238 Appendix B vector: T=59, 8 digits, period 30, t0 0, SHA-1 → 94287082.
+const key = new TextEncoder().encode("12345678901234567890");
+const code = totp(key, Math.floor(Date.now() / 1000), 30, 0, 6, "sha1");
+const shown = format_code(code, 6);   // zero-padded, e.g. "073921"
+```
+
+`algorithm` is a lowercase string `"sha1"` (default, also `""`), `"sha256"`, or
+`"sha512"` — matching the CLI's `TotpEntry.algorithm` JSON field; any other value
+throws. `digits` must be `6..=10` and `period` non-zero. Native `#[cfg(test)]`
+tests assert the RFC 4226 App D / RFC 6238 App B known-answer vectors *through*
+these wrappers, plus rejection of unknown algorithms and non-integer/negative
+times.
+
+### The shared TOTP vault module (`totp-vault.mjs`)
+
+`totp-vault.mjs` is a framework-free ESM module that reads and writes the **same
+sealed TOTP vault** the CLI uses, so the browser and `sigil totp` are cross-clients
+over one vault. The vault at rest is a normal CLI `SIGILcli` container; its
+decrypted plaintext is a JSON `TotpVault { version, entries: TotpEntry[] }` whose
+schema is **mirrored from `cli/src/lib.rs`** (label / optional issuer / base64 raw
+secret / lowercase algorithm / digits / period — the `issuer` key is omitted when
+absent, matching serde). It injects the wasm binding as a `wasm` argument and
+provides:
+
+```js
+openVault(wasm, password, containerBytes) -> { version, entries }
+codeForEntry(wasm, entry, unixTimeSeconds) -> "123456"   // t0 = 0
+addEntry(vault, { label, issuer?, secretBytes, algorithm, digits, period }) -> vault
+sealVault(wasm, password, vault, salt, nonce, params) -> containerBytes
+base32Decode(str) -> Uint8Array   // RFC 4648, case-insensitive (for a provisioning secret)
+```
+
+### Run the cross-client TOTP interop test
+
+```bash
+./build-wasm.sh                     # produces pkg-node/ (must run first)
+node test/totp-interop.mjs
+```
+
+The **killer** cross-client proof. It builds `sigild` + the CLI, boots sigild on a
+free localhost port (`SIGILD_ENABLE_DEV_OPS=1`, in-memory, no auth), and proves:
+
+- **KAT** — the wasm TOTP reproduces the RFC 6238 App B vectors (SHA-1/256/512,
+  T=59), so the wasm path is correct independent of any clock;
+- **CROSS** — `sigil totp add work --secret <base32> …` seals a TOTP secret into a
+  `SIGILcli` vault; `pushContainer` sends the **opaque** vault bytes to sigild;
+  `pullContainers` reads them back; `openVault` decrypts the same vault; and
+  `codeForEntry(T=59)` equals **both** the RFC vector `94287082` **and** an
+  independent Node `HMAC-SHA1` TOTP — proving *CLI writes a secret → opaque
+  zero-knowledge op-log → browser/wasm generates the correct code*;
+- **OPAQUE** — the server returned the pushed vault bytes verbatim (no crypto on
+  the blob).
+
+It prints a `PASS` line and exits non-zero on any mismatch.
+
 ## Serve the browser demo
 
 ```bash
@@ -309,6 +378,16 @@ plaintext) — interoperating with `sigil push` / `sigil pull` through the same
 vault. That section needs a local dev sigild started with
 `SIGILD_ENABLE_DEV_OPS=1` on loopback and is dev / plain-HTTP / no-auth. It
 carries a loud pre-audit banner.
+
+Last, a **TOTP authenticator vault** section: enter a base32 secret + a label and
+**Add to vault** to keep an in-page `TotpVault`, which shows each entry's **live**
+code refreshing every second with a countdown to the next period (the browser
+clock supplies the time). **Seal → Push vault** seals the whole vault into a
+`SIGILcli` container (via `totp-vault.mjs` + `sync.mjs`) and pushes the opaque
+bytes to the dev op-log; **Pull → Open vault** pulls it back and decrypts it — so
+the vault round-trips through a local sigild and is cross-compatible with
+`sigil totp add/list/code` (same password). Dev / UNAUDITED — **do not enter a
+real 2FA secret.**
 
 ## Native unit tests
 

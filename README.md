@@ -219,7 +219,15 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   interoperates with `sigil push` / `sigil pull` through the same vault and the
   server stays **zero-knowledge**; proven end-to-end against a **live** sigild and
   the real CLI by `node sigil-wasm/test/sync-interop.mjs` (**dev / localhost /
-  plain-HTTP / no-auth**). A **standalone crate** (own lockfile),
+  plain-HTTP / no-auth**). The browser can now also **hold an encrypted TOTP vault
+  and generate 2FA codes** — wasm `totp` / `hotp` / `format_code` (the JS caller
+  supplies the time; the crate stays `getrandom`-free) plus a framework-free
+  `sigil-wasm/totp-vault.mjs` that reads/writes the **same sealed `SIGILcli` TOTP
+  vault the `sigil totp` CLI uses**, so a secret added on one client and synced
+  through the opaque op-log yields the **same code on the other, cross-client**
+  (proven by `node sigil-wasm/test/totp-interop.mjs`: CLI adds → op-log → browser
+  code == the RFC vector). UNAUDITED, generation only — **do not store real 2FA
+  secrets yet**. A **standalone crate** (own lockfile),
   **UNAUDITED**, a **demo of a building block** — a custom KEM-then-AEAD (not RFC
   9180 HPKE), not the product's account/key-management/sync model, and not for real
   secrets; the system is **not** "post-quantum secure". (Public copy still obeys

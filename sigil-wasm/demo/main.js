@@ -21,11 +21,25 @@ import init, {
   hybrid_mlkem_encaps_key,
   hybrid_seal_to_container,
   hybrid_open_container,
+  totp,
+  format_code,
   nonce_len,
   recommended_salt_len,
   version,
 } from "../pkg-web/sigil_wasm.js";
 import { pushContainer, pullContainers } from "../sync.mjs";
+import {
+  newVault,
+  addEntry,
+  openVault,
+  sealVault,
+  codeForEntry,
+  base32Decode,
+} from "../totp-vault.mjs";
+
+// totp-vault.mjs takes the wasm binding as an injected `wasm` object; adapt the
+// named ESM imports into the shape it expects (the same functions the CLI uses).
+const wasmForVault = { open_container, seal_to_container, totp, format_code };
 
 // Fast Argon2 params so the demo is instant (m_cost >= 8 * p_cost). Production
 // uses far higher costs — see sigil_core::Argon2Params::RECOMMENDED. The CLI
@@ -410,6 +424,133 @@ async function main() {
         "Pull/open error (wrong password / no dev sigild / empty vault?): " + e;
     }
   });
+
+  // --- TOTP authenticator vault (SIGILcli) -------------------------------
+  // An in-page vault of TOTP entries, showing the LIVE code for each (the browser
+  // clock supplies the time; sigil-core reads none). The vault seals into the
+  // SAME SIGILcli container the `sigil totp` CLI uses, and rides the same opaque
+  // op-log via sync.mjs — so a secret added here can be read by `sigil totp`, and
+  // vice versa. Vault logic lives in the shared, framework-free totp-vault.mjs.
+  let totpVault = newVault();
+
+  const escapeHtml = (s) =>
+    String(s).replace(
+      /[&<>"']/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+    );
+
+  // Repaint the vault list with each entry's CURRENT code + a countdown to the
+  // next period. Called on every add/pull and once a second by the interval.
+  function renderTotp() {
+    const list = $("totpList");
+    if (totpVault.entries.length === 0) {
+      list.innerHTML = '<span class="muted">(empty — add a secret above)</span>';
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    list.innerHTML = "";
+    for (const entry of totpVault.entries) {
+      let code, remaining;
+      try {
+        code = codeForEntry(wasmForVault, entry, now);
+        remaining = entry.period - (now % entry.period);
+      } catch (e) {
+        code = "error";
+        remaining = 0;
+      }
+      const row = document.createElement("div");
+      row.className = "totp-entry";
+      const issuer = entry.issuer ? `${escapeHtml(entry.issuer)} · ` : "";
+      row.innerHTML =
+        `<span class="totp-code">${escapeHtml(code)}</span>` +
+        `<strong>${escapeHtml(entry.label)}</strong>` +
+        `<span class="totp-meta">${issuer}${escapeHtml(entry.algorithm)} · ` +
+        `${entry.digits} digits · ${entry.period}s · next in ${remaining}s</span>`;
+      list.appendChild(row);
+    }
+  }
+
+  $("totpAdd").addEventListener("click", () => {
+    try {
+      const label = $("totpLabel").value.trim();
+      const secretB32 = $("totpSecret").value.trim();
+      const digits = parseInt($("totpDigits").value, 10);
+      const period = parseInt($("totpPeriod").value, 10);
+      const algorithm = $("totpAlgo").value;
+      const secretBytes = base32Decode(secretB32);
+      addEntry(totpVault, { label, secretBytes, algorithm, digits, period });
+      $("totpStatus").textContent =
+        `Added "${label}" to the in-page vault (${totpVault.entries.length} entr${
+          totpVault.entries.length === 1 ? "y" : "ies"
+        }). Seal + Push it to sync with the CLI.`;
+      renderTotp();
+    } catch (e) {
+      $("totpStatus").textContent = "Add error: " + e;
+    }
+  });
+
+  $("totpPush").addEventListener("click", async () => {
+    try {
+      const base = $("syncServer").value.trim();
+      const vaultId = $("totpVaultId").value.trim();
+      if (!base || !vaultId) {
+        $("totpStatus").textContent = "Enter the Server URL (above) and a vault ID first.";
+        return;
+      }
+      if (totpVault.entries.length === 0) {
+        $("totpStatus").textContent = "Add an entry first — the vault is empty.";
+        return;
+      }
+      const password = enc.encode($("password").value);
+
+      // Caller-supplied entropy: fresh salt + nonce from the browser CSPRNG.
+      const salt = new Uint8Array(recommended_salt_len());
+      crypto.getRandomValues(salt);
+      const nonce = new Uint8Array(nonce_len());
+      crypto.getRandomValues(nonce);
+
+      const container = sealVault(wasmForVault, password, totpVault, salt, nonce, PARAMS);
+      const { seq } = await pushContainer(base, vaultId, container);
+      $("totpStatus").textContent =
+        `Sealed the vault (${container.length} opaque bytes) and pushed it to "${vaultId}" as seq ${seq}. ` +
+        `Read it on the CLI with: SIGIL_PASSWORD='…' sigil pull --vault ${vaultId} --out-dir ./inbox --server ${base}`;
+    } catch (e) {
+      $("totpStatus").textContent =
+        "Push error (is a dev sigild running with SIGILD_ENABLE_DEV_OPS=1?): " + e;
+    }
+  });
+
+  $("totpPull").addEventListener("click", async () => {
+    try {
+      const base = $("syncServer").value.trim();
+      const vaultId = $("totpVaultId").value.trim();
+      if (!base || !vaultId) {
+        $("totpStatus").textContent = "Enter the Server URL (above) and a vault ID first.";
+        return;
+      }
+      const password = enc.encode($("password").value);
+
+      const ops = await pullContainers(base, vaultId, 0);
+      if (ops.length === 0) {
+        $("totpStatus").textContent = `Vault "${vaultId}" is empty — push something first.`;
+        return;
+      }
+      // Open the LATEST vault snapshot (highest seq) and replace the in-page vault.
+      const latest = ops[ops.length - 1];
+      totpVault = openVault(wasmForVault, password, latest.container);
+      $("totpStatus").textContent =
+        `Pulled + opened vault "${vaultId}" (seq ${latest.seq}) — ${totpVault.entries.length} ` +
+        `entr${totpVault.entries.length === 1 ? "y" : "ies"}. Live codes below.`;
+      renderTotp();
+    } catch (e) {
+      $("totpStatus").textContent =
+        "Pull/open error (wrong password / no dev sigild / empty vault?): " + e;
+    }
+  });
+
+  // Repaint the live codes + countdown once a second.
+  renderTotp();
+  setInterval(renderTotp, 1000);
 }
 
 main();

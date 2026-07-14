@@ -34,9 +34,10 @@
 //! exactly why the testable logic is kept out of it.
 
 use sigil_core::{
-    hybrid_open as core_hybrid_open, hybrid_seal as core_hybrid_seal,
-    ml_kem768_keygen as core_ml_kem768_keygen, open_record as core_open_record,
-    seal_record as core_seal_record, x25519_public_key as core_x25519_public_key, Argon2Params,
+    format_code as core_format_code, hotp as core_hotp, hybrid_open as core_hybrid_open,
+    hybrid_seal as core_hybrid_seal, ml_kem768_keygen as core_ml_kem768_keygen,
+    open_record as core_open_record, seal_record as core_seal_record, totp as core_totp,
+    x25519_public_key as core_x25519_public_key, Argon2Params, OtpAlgorithm,
     ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
     ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
@@ -331,6 +332,64 @@ pub fn hybrid_open_container(
         .map_err(|e| JsError::new(&e))
 }
 
+// --- TOTP / HOTP one-time-password codes (RFC 4226 / RFC 6238) --------------
+//
+// A thin binding over `sigil-core`'s OTP primitive — the authenticator math at
+// the heart of the product. It adds NO cryptography of its own; it only marshals
+// arguments. Two contracts carry through to JS:
+//
+//   * NO CLOCK. `sigil-core` reads no time; the Unix time is a *caller-supplied*
+//     argument. JS passes it as a Number (`f64`), which this validates to a
+//     non-negative integer before the `u64` cast (JS has no native u64).
+//   * The `algorithm` arrives as a lowercase string ("sha1"/"sha256"/"sha512",
+//     "" → sha1), matching the CLI's `TotpEntry.algorithm` JSON field, so the
+//     browser and the `sigil totp` CLI agree on the same vault entries.
+//
+// TOTP/HOTP draw NO entropy, so these keep the crate `getrandom`-free.
+
+/// Compute an RFC 6238 TOTP code for `unix_time` under `key`.
+///
+/// `unix_time` and `t0` are JS Numbers (`f64`): each MUST be a non-negative
+/// integer (finite, no fractional part, within `u64` range) or a JS `Error` is
+/// thrown. `period` is the time step in seconds (usually 30), `t0` the epoch
+/// offset (usually 0), `digits` the code width (6..=10), and `algorithm` one of
+/// `"sha1"` (default, also for `""`), `"sha256"`, `"sha512"` — any other value is
+/// rejected. Returns the numeric code WITHOUT leading-zero padding; render it with
+/// [`format_code`]. A bad period / time-before-`t0` / digit count surfaces as a
+/// thrown `Error`.
+#[wasm_bindgen]
+pub fn totp(
+    key: &[u8],
+    unix_time: f64,
+    period: u32,
+    t0: f64,
+    digits: u32,
+    algorithm: &str,
+) -> Result<u32, JsError> {
+    totp_inner(key, unix_time, period, t0, digits, algorithm).map_err(|e| JsError::new(&e))
+}
+
+/// Compute an RFC 4226 HOTP code for `counter` under `key`.
+///
+/// `counter` is a JS Number (`f64`) that MUST be a non-negative integer, as for
+/// [`totp`]. `digits` is the code width (6..=10) and `algorithm` one of
+/// `"sha1"` (default, also for `""`), `"sha256"`, `"sha512"`. Returns the numeric
+/// code WITHOUT leading-zero padding; render it with [`format_code`]. Bad inputs
+/// surface as a thrown `Error`.
+#[wasm_bindgen]
+pub fn hotp(key: &[u8], counter: f64, digits: u32, algorithm: &str) -> Result<u32, JsError> {
+    hotp_inner(key, counter, digits, algorithm).map_err(|e| JsError::new(&e))
+}
+
+/// Render a numeric OTP `code` as a zero-padded decimal string of exactly
+/// `digits` characters (e.g. `1` at 6 digits → `"000001"`), preserving leading
+/// zeros. `digits` is clamped to the supported range, so this never throws. Thin
+/// wrapper over `sigil_core::format_code`.
+#[wasm_bindgen]
+pub fn format_code(code: u32, digits: u32) -> String {
+    core_format_code(code, digits)
+}
+
 // --- Testable core-marshalling logic (no `JsError`, so it runs natively) ----
 
 #[allow(clippy::too_many_arguments)]
@@ -559,6 +618,59 @@ fn hybrid_open_container_inner(
     .map_err(|e| format!("hybrid_open failed: {e:?}"))
 }
 
+// --- TOTP / HOTP inner helpers (native-testable, no `JsError`) --------------
+
+/// Map a case-insensitive algorithm string to an [`OtpAlgorithm`], defaulting
+/// `""` to SHA-1 and rejecting anything unknown. Mirrors the CLI's
+/// `totp_algorithm_from_str` so the two clients accept the same JSON.
+fn otp_algorithm_from_str(s: &str) -> Result<OtpAlgorithm, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "" | "sha1" => Ok(OtpAlgorithm::Sha1),
+        "sha256" => Ok(OtpAlgorithm::Sha256),
+        "sha512" => Ok(OtpAlgorithm::Sha512),
+        other => Err(format!(
+            "unknown OTP algorithm {other:?}: expected sha1, sha256, or sha512"
+        )),
+    }
+}
+
+/// Validate a JS Number (`f64`) as a non-negative integer and cast it to `u64`.
+/// JS has no native u64, so time/counter values arrive as `f64`; reject anything
+/// non-finite, negative, fractional, or beyond `u64` range rather than silently
+/// truncating.
+fn u64_from_f64(name: &str, v: f64) -> Result<u64, String> {
+    if !v.is_finite() || v < 0.0 || v.fract() != 0.0 {
+        return Err(format!("{name} must be a non-negative integer, got {v}"));
+    }
+    // f64 represents integers exactly only up to 2^53, but the round-trip is
+    // still monotone up to u64::MAX; reject anything that would overflow the cast.
+    if v > u64::MAX as f64 {
+        return Err(format!("{name} is too large to be a u64: {v}"));
+    }
+    Ok(v as u64)
+}
+
+fn totp_inner(
+    key: &[u8],
+    unix_time: f64,
+    period: u32,
+    t0: f64,
+    digits: u32,
+    algorithm: &str,
+) -> Result<u32, String> {
+    let unix_time = u64_from_f64("unix_time", unix_time)?;
+    let t0 = u64_from_f64("t0", t0)?;
+    let algorithm = otp_algorithm_from_str(algorithm)?;
+    core_totp(key, unix_time, period, t0, digits, algorithm)
+        .map_err(|e| format!("totp failed: {e}"))
+}
+
+fn hotp_inner(key: &[u8], counter: f64, digits: u32, algorithm: &str) -> Result<u32, String> {
+    let counter = u64_from_f64("counter", counter)?;
+    let algorithm = otp_algorithm_from_str(algorithm)?;
+    core_hotp(key, counter, digits, algorithm).map_err(|e| format!("hotp failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +889,82 @@ mod tests {
         // ephemeral secret we sealed with (offsets are correct).
         let eph_pub = core_x25519_public_key(&HYB_EPH_SECRET);
         assert_eq!(&c[9..9 + X25519_PUBLIC_KEY_LEN], eph_pub.as_slice());
+    }
+
+    // --- TOTP / HOTP: RFC vectors through the wasm wrappers ---------------
+    //
+    // These assert the SAME official known-answer vectors sigil-core is checked
+    // against (RFC 4226 App D / RFC 6238 App B), but *through* the f64/string
+    // wrapper shells, so the JS-facing contract is proven correct independent of
+    // any clock.
+
+    /// RFC 6238 Appendix B keys — a distinct ASCII length per hash.
+    const RFC_KEY_SHA1: &[u8] = b"12345678901234567890";
+    const RFC_KEY_SHA256: &[u8] = b"12345678901234567890123456789012";
+    const RFC_KEY_SHA512: &[u8] =
+        b"1234567890123456789012345678901234567890123456789012345678901234";
+
+    #[test]
+    fn totp_rfc6238_vectors_through_wrapper() {
+        // T=59, 8 digits, period 30, t0 0 — one vector per hash.
+        assert_eq!(
+            totp_inner(RFC_KEY_SHA1, 59.0, 30, 0.0, 8, "sha1").unwrap(),
+            94287082
+        );
+        assert_eq!(
+            totp_inner(RFC_KEY_SHA256, 59.0, 30, 0.0, 8, "sha256").unwrap(),
+            46119246
+        );
+        assert_eq!(
+            totp_inner(RFC_KEY_SHA512, 59.0, 30, 0.0, 8, "sha512").unwrap(),
+            90693936
+        );
+        // A large time (2e10) is still an exact f64 integer and must verify.
+        assert_eq!(
+            totp_inner(RFC_KEY_SHA1, 20000000000.0, 30, 0.0, 8, "sha1").unwrap(),
+            65353130
+        );
+        // "" defaults to SHA-1.
+        assert_eq!(
+            totp_inner(RFC_KEY_SHA1, 59.0, 30, 0.0, 8, "").unwrap(),
+            94287082
+        );
+    }
+
+    #[test]
+    fn hotp_rfc4226_vectors_through_wrapper() {
+        // RFC 4226 Appendix D, counters 0 and 1, 6 digits, SHA-1.
+        assert_eq!(hotp_inner(RFC_KEY_SHA1, 0.0, 6, "sha1").unwrap(), 755224);
+        assert_eq!(hotp_inner(RFC_KEY_SHA1, 1.0, 6, "SHA1").unwrap(), 287082);
+    }
+
+    #[test]
+    fn format_code_wrapper_pads() {
+        // The wasm shell must preserve leading zeros exactly like the core.
+        assert_eq!(format_code(1, 6), "000001");
+        assert_eq!(format_code(73921, 6), "073921");
+        assert_eq!(format_code(94287082, 8), "94287082");
+    }
+
+    #[test]
+    fn otp_unknown_algorithm_rejected() {
+        assert!(totp_inner(RFC_KEY_SHA1, 59.0, 30, 0.0, 8, "md5").is_err());
+        assert!(hotp_inner(RFC_KEY_SHA1, 0.0, 6, "sha3-256").is_err());
+    }
+
+    #[test]
+    fn otp_rejects_non_integer_negative_and_nan_time() {
+        assert!(totp_inner(RFC_KEY_SHA1, 59.5, 30, 0.0, 8, "sha1").is_err());
+        assert!(totp_inner(RFC_KEY_SHA1, -1.0, 30, 0.0, 8, "sha1").is_err());
+        assert!(totp_inner(RFC_KEY_SHA1, f64::NAN, 30, 0.0, 8, "sha1").is_err());
+        assert!(totp_inner(RFC_KEY_SHA1, f64::INFINITY, 30, 0.0, 8, "sha1").is_err());
+        assert!(hotp_inner(RFC_KEY_SHA1, 1.5, 6, "sha1").is_err());
+    }
+
+    #[test]
+    fn otp_out_of_range_params_rejected() {
+        // digits below MIN, and a zero period, must surface as errors (not panic).
+        assert!(totp_inner(RFC_KEY_SHA1, 59.0, 30, 0.0, 5, "sha1").is_err());
+        assert!(totp_inner(RFC_KEY_SHA1, 59.0, 0, 0.0, 8, "sha1").is_err());
     }
 }

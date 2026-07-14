@@ -19,6 +19,10 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > that client **closing the client↔server sync loop** by push/pulling opaque
 > containers to the dev `sigild` op-log (`sync.mjs`) with live-server + real-CLI
 > cross-client interop,
+> the RFC 4226/6238 **TOTP/HOTP** primitive and encrypted CLI TOTP vault, and its
+> **browser TOTP vault** that makes the authenticator work **cross-client** (a
+> secret added on one client and synced through the opaque op-log yields the same
+> code on the other),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -74,3 +78,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0021](0021-wasm-hybrid-public-key-encryption.md) | Hybrid public-key encryption in the wasm client (`SIGILhyb` interop) | Accepted (2026-07) |
 | [0022](0022-wasm-client-server-sync-loop.md) | Client↔server sync loop for the wasm client (`sync.mjs` over the dev op-log) | Accepted (2026-07) |
 | [0023](0023-totp-hotp-primitive-and-cli-vault.md) | TOTP/HOTP primitive in `sigil-core` + encrypted CLI TOTP vault (first product feature) | Accepted (2026-07) |
+| [0024](0024-wasm-totp-vault-and-cross-client-totp.md) | Browser TOTP vault + cross-client TOTP through the op-log (wasm `totp`/`hotp`/`format_code`, mirrored vault JSON) | Accepted (2026-07) |

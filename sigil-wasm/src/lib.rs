@@ -34,7 +34,11 @@
 //! exactly why the testable logic is kept out of it.
 
 use sigil_core::{
-    open_record as core_open_record, seal_record as core_seal_record, Argon2Params, NONCE_LEN,
+    hybrid_open as core_hybrid_open, hybrid_seal as core_hybrid_seal,
+    ml_kem768_keygen as core_ml_kem768_keygen, open_record as core_open_record,
+    seal_record as core_seal_record, x25519_public_key as core_x25519_public_key, Argon2Params,
+    ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
+    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
 use wasm_bindgen::prelude::*;
 
@@ -70,6 +74,41 @@ const CLI_AAD: &[u8] = b"sigil-cli/1";
 /// including `salt_len`): magic(8)+version(1)+m_cost(4)+t_cost(4)+p_cost(4)+
 /// salt_len(1) = 22. Mirrors `cli/src/lib.rs::FIXED_HEADER_LEN`.
 const CLI_FIXED_HEADER_LEN: usize = 22;
+
+// --- CLI-compatible `SIGILhyb` hybrid public-key container -------------------
+//
+// The PUBLIC-KEY (no-password) path. These constants MUST match
+// `cli/src/lib.rs` byte-for-byte, or a container sealed here will not open with
+// `sigil hybrid-open` (and vice versa). From that file:
+//   pub const HYBRID_MAGIC: &[u8; 8]      = b"SIGILhyb";
+//   pub const HYBRID_FORMAT_VERSION: u8   = 1;
+//   pub const HYBRID_AAD: &[u8]           = b"sigil-hybrid-cli/1";
+// The on-disk layout is:
+//   magic[8] | version:u8 | eph_x25519_pub[32] | mlkem_ct[1088] | envelope[..]
+//
+// The hybrid IDENTITY (a device's X25519 secret + ML-KEM keygen seed for the
+// secret half, X25519 public key + ML-KEM encaps key for the public half) is a
+// JSON file the CLI parses; this wasm crate never parses identity files — JS
+// bridges the JSON and hands the raw key bytes to the functions below.
+
+/// The 8-byte magic that prefixes every `SIGILhyb` container. MUST equal
+/// `cli/src/lib.rs::HYBRID_MAGIC` (`b"SIGILhyb"`).
+const HYBRID_MAGIC: &[u8; 8] = b"SIGILhyb";
+
+/// The `SIGILhyb` container format version this binding writes and reads. MUST
+/// equal `cli/src/lib.rs::HYBRID_FORMAT_VERSION` (`1`).
+const HYBRID_FORMAT_VERSION: u8 = 1;
+
+/// The fixed AEAD additional-authenticated-data tag the CLI binds into every
+/// hybrid-sealed record. The wasm MUST seal with this SAME AAD or
+/// `sigil hybrid-open` fails to authenticate. MUST equal
+/// `cli/src/lib.rs::HYBRID_AAD` (`b"sigil-hybrid-cli/1"`).
+const HYBRID_AAD: &[u8] = b"sigil-hybrid-cli/1";
+
+/// Byte length of the fixed prefix of a `SIGILhyb` container: magic(8) +
+/// version(1) + eph_x25519_pub(32) + mlkem_ct(1088) = 1129. The seal envelope
+/// bytes follow this prefix. Mirrors `cli/src/lib.rs::HYBRID_FIXED_PREFIX_LEN`.
+const HYBRID_FIXED_PREFIX_LEN: usize = 8 + 1 + X25519_PUBLIC_KEY_LEN + ML_KEM768_CIPHERTEXT_LEN;
 
 /// The XChaCha20-Poly1305 nonce length, in bytes (24). JavaScript should
 /// generate exactly this many random bytes for the `nonce` argument to
@@ -199,6 +238,99 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, JsEr
     open_container_inner(password, container).map_err(|e| JsError::new(&e))
 }
 
+// --- Hybrid PUBLIC-KEY (no-password) encryption: `SIGILhyb` interop ----------
+//
+// The public-key path, distinct from the password-based seal/open above. It
+// composes `sigil-core`'s REAL but UNAUDITED hybrid primitives (X25519 +
+// ML-KEM-768 -> shared secret -> XChaCha20-Poly1305). It is a CUSTOM
+// KEM-then-AEAD composition, NOT RFC 9180 HPKE, and the SYSTEM is NOT
+// "post-quantum secure". Do NOT protect real secrets. As everywhere in this
+// crate, ALL entropy (the ephemeral X25519 secret, the ML-KEM coin, and the
+// AEAD nonce) is CALLER-SUPPLIED from JavaScript — the module has no RNG.
+
+/// Derive a 32-byte X25519 **public** key from a 32-byte X25519 **secret**.
+///
+/// JS holds the secret (generated with `crypto.getRandomValues`); this returns
+/// the public key to publish in a recipient `.pub` identity (the CLI's
+/// `x25519_public_key` field). `secret` MUST be exactly 32 bytes.
+#[wasm_bindgen]
+pub fn hybrid_x25519_public(secret: &[u8]) -> Result<Vec<u8>, JsError> {
+    hybrid_x25519_public_inner(secret).map_err(|e| JsError::new(&e))
+}
+
+/// Derive the 1184-byte ML-KEM-768 **encapsulation key** from a 64-byte
+/// ML-KEM-768 keygen **seed**.
+///
+/// JS holds the seed; this returns the encapsulation key to publish in a
+/// recipient `.pub` identity (the CLI's `mlkem_encaps_key` field). The
+/// decapsulation key is NOT returned — the recipient re-derives it from the
+/// seed at open time (see [`hybrid_open_container`]). `seed` MUST be exactly 64
+/// bytes.
+#[wasm_bindgen]
+pub fn hybrid_mlkem_encaps_key(seed: &[u8]) -> Result<Vec<u8>, JsError> {
+    hybrid_mlkem_encaps_key_inner(seed).map_err(|e| JsError::new(&e))
+}
+
+/// Seal `plaintext` TO a recipient's hybrid public identity, producing a
+/// **CLI-compatible `SIGILhyb` container** that `sigil hybrid-open` can decrypt
+/// (and, conversely, that this binding's [`hybrid_open_container`] can decrypt
+/// when produced by `sigil hybrid-seal`).
+///
+/// Encapsulates a fresh hybrid shared secret to `(recipient_x25519_pub,
+/// recipient_mlkem_encaps_key)`, seals under the fixed hybrid AAD
+/// (`b"sigil-hybrid-cli/1"`), and packs the self-describing prefix — `magic ‖
+/// version=1 ‖ eph_x25519_pub(32) ‖ mlkem_ct(1088)` — in front of the envelope,
+/// exactly mirroring `cli/src/lib.rs`.
+///
+/// All entropy is caller-supplied (generate in JS with
+/// `crypto.getRandomValues`): `ephemeral_x25519_secret` (32) and `mlkem_coin`
+/// (32) MUST be fresh per call, and `aead_nonce` MUST be exactly [`nonce_len`]
+/// (24) bytes. Lengths are validated (32 / 1184 / 32 / 32 / 24); a bad length or
+/// a KEM-input rejection surfaces to JS as a thrown `Error`.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_seal_to_container(
+    recipient_x25519_pub: &[u8],
+    recipient_mlkem_encaps_key: &[u8],
+    ephemeral_x25519_secret: &[u8],
+    mlkem_coin: &[u8],
+    aead_nonce: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    hybrid_seal_to_container_inner(
+        recipient_x25519_pub,
+        recipient_mlkem_encaps_key,
+        ephemeral_x25519_secret,
+        mlkem_coin,
+        aead_nonce,
+        plaintext,
+    )
+    .map_err(|e| JsError::new(&e))
+}
+
+/// Open a **CLI-compatible `SIGILhyb` container** (one produced by
+/// `sigil hybrid-seal` or by [`hybrid_seal_to_container`]) with the recipient's
+/// secret identity, returning the recovered plaintext.
+///
+/// The recipient's secret identity is the raw `(x25519_secret, mlkem_seed)` pair
+/// — exactly what the CLI stores in its secret identity JSON. This re-derives
+/// the 2400-byte ML-KEM decapsulation key from the 64-byte seed (like the CLI),
+/// bounds-checks and parses the `SIGILhyb` header (bad magic, unsupported
+/// version, or a short container all surface as a thrown `Error`), slices out
+/// `eph_pub` / `mlkem_ct` / envelope, and decapsulates + decrypts. A wrong
+/// recipient identity or tampered container surfaces as a thrown `Error`; the
+/// plaintext is never returned in that case. `recipient_x25519_secret` MUST be
+/// 32 bytes and `recipient_mlkem_seed` MUST be 64 bytes.
+#[wasm_bindgen]
+pub fn hybrid_open_container(
+    recipient_x25519_secret: &[u8],
+    recipient_mlkem_seed: &[u8],
+    container: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    hybrid_open_container_inner(recipient_x25519_secret, recipient_mlkem_seed, container)
+        .map_err(|e| JsError::new(&e))
+}
+
 // --- Testable core-marshalling logic (no `JsError`, so it runs natively) ----
 
 #[allow(clippy::too_many_arguments)]
@@ -316,6 +448,117 @@ fn open_container_inner(password: &[u8], container: &[u8]) -> Result<Vec<u8>, St
     open_record_inner(password, salt, m_cost, t_cost, p_cost, envelope)
 }
 
+// --- Hybrid public-key inner helpers (native-testable) ----------------------
+
+/// Coerce a byte slice to a fixed `[u8; N]`, or a clear length-error naming the
+/// argument. Used to validate the exact key/entropy sizes before calling core.
+fn fixed<const N: usize>(name: &str, bytes: &[u8]) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("{name} must be exactly {N} bytes, got {}", bytes.len()))
+}
+
+fn hybrid_x25519_public_inner(secret: &[u8]) -> Result<Vec<u8>, String> {
+    let secret: [u8; X25519_SECRET_KEY_LEN] = fixed("x25519 secret", secret)?;
+    Ok(core_x25519_public_key(&secret).to_vec())
+}
+
+fn hybrid_mlkem_encaps_key_inner(seed: &[u8]) -> Result<Vec<u8>, String> {
+    let seed: [u8; ML_KEM768_KEYGEN_SEED_LEN] = fixed("mlkem keygen seed", seed)?;
+    let (encaps_key, _decaps_key) = core_ml_kem768_keygen(&seed);
+    Ok(encaps_key.to_vec())
+}
+
+fn hybrid_seal_to_container_inner(
+    recipient_x25519_pub: &[u8],
+    recipient_mlkem_encaps_key: &[u8],
+    ephemeral_x25519_secret: &[u8],
+    mlkem_coin: &[u8],
+    aead_nonce: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let recipient_x25519_pub: [u8; X25519_PUBLIC_KEY_LEN] =
+        fixed("recipient x25519 public key", recipient_x25519_pub)?;
+    let recipient_mlkem_encaps_key: [u8; ML_KEM768_ENCAPS_KEY_LEN] =
+        fixed("recipient mlkem encaps key", recipient_mlkem_encaps_key)?;
+    let ephemeral_x25519_secret: [u8; X25519_SECRET_KEY_LEN] =
+        fixed("ephemeral x25519 secret", ephemeral_x25519_secret)?;
+    let mlkem_coin: [u8; ML_KEM768_ENCAPS_COIN_LEN] = fixed("mlkem coin", mlkem_coin)?;
+    let aead_nonce: [u8; NONCE_LEN] = fixed("aead nonce", aead_nonce)?;
+
+    let (eph_pub, mlkem_ct, envelope) = core_hybrid_seal(
+        &recipient_x25519_pub,
+        &recipient_mlkem_encaps_key,
+        &ephemeral_x25519_secret,
+        &mlkem_coin,
+        &aead_nonce,
+        HYBRID_AAD,
+        plaintext,
+    )
+    .map_err(|e| format!("hybrid_seal failed: {e:?}"))?;
+
+    let mut out = Vec::with_capacity(HYBRID_FIXED_PREFIX_LEN + envelope.len());
+    out.extend_from_slice(HYBRID_MAGIC);
+    out.push(HYBRID_FORMAT_VERSION);
+    out.extend_from_slice(&eph_pub);
+    out.extend_from_slice(&mlkem_ct);
+    out.extend_from_slice(&envelope);
+    Ok(out)
+}
+
+fn hybrid_open_container_inner(
+    recipient_x25519_secret: &[u8],
+    recipient_mlkem_seed: &[u8],
+    container: &[u8],
+) -> Result<Vec<u8>, String> {
+    let recipient_x25519_secret: [u8; X25519_SECRET_KEY_LEN] =
+        fixed("recipient x25519 secret", recipient_x25519_secret)?;
+    let recipient_mlkem_seed: [u8; ML_KEM768_KEYGEN_SEED_LEN] =
+        fixed("recipient mlkem seed", recipient_mlkem_seed)?;
+
+    // Re-derive the decapsulation key from the stored seed (like the CLI, which
+    // stores only the 64-byte seed, not the expanded 2400-byte decaps key).
+    let (_encaps_key, mlkem_decaps_key) = core_ml_kem768_keygen(&recipient_mlkem_seed);
+
+    if container.len() < HYBRID_FIXED_PREFIX_LEN {
+        return Err("container is too short to hold the SIGILhyb prefix".to_string());
+    }
+
+    let (magic, rest) = container.split_at(8);
+    if magic != HYBRID_MAGIC.as_slice() {
+        return Err("not a SIGILhyb container (bad magic: expected \"SIGILhyb\")".to_string());
+    }
+
+    let version = rest[0];
+    if version != HYBRID_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported SIGILhyb container version {version}: expected {HYBRID_FORMAT_VERSION}"
+        ));
+    }
+
+    // After magic(8) + version(1): eph_x25519_pub[32] | mlkem_ct[1088] |
+    // envelope[..]. The length gate above guarantees these splits are in bounds.
+    let after_version = &rest[1..];
+    let (eph_pub_bytes, rest2) = after_version.split_at(X25519_PUBLIC_KEY_LEN);
+    let (mlkem_ct_bytes, envelope) = rest2.split_at(ML_KEM768_CIPHERTEXT_LEN);
+
+    let eph_pub: [u8; X25519_PUBLIC_KEY_LEN] = eph_pub_bytes
+        .try_into()
+        .expect("eph_pub slice is exactly X25519_PUBLIC_KEY_LEN by construction");
+    let mlkem_ct: [u8; ML_KEM768_CIPHERTEXT_LEN] = mlkem_ct_bytes
+        .try_into()
+        .expect("mlkem_ct slice is exactly ML_KEM768_CIPHERTEXT_LEN by construction");
+
+    core_hybrid_open(
+        &recipient_x25519_secret,
+        &mlkem_decaps_key,
+        &eph_pub,
+        &mlkem_ct,
+        envelope,
+    )
+    .map_err(|e| format!("hybrid_open failed: {e:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +665,117 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // --- Hybrid public-key `SIGILhyb` container interop -------------------
+
+    // Deterministic test material so the native tests are reproducible. The
+    // wasm module has no RNG; these mirror what JS would supply via
+    // crypto.getRandomValues.
+    const HYB_X25519_SECRET: [u8; X25519_SECRET_KEY_LEN] = [0x11; X25519_SECRET_KEY_LEN];
+    const HYB_MLKEM_SEED: [u8; ML_KEM768_KEYGEN_SEED_LEN] = [0x22; ML_KEM768_KEYGEN_SEED_LEN];
+    const HYB_EPH_SECRET: [u8; X25519_SECRET_KEY_LEN] = [0x33; X25519_SECRET_KEY_LEN];
+    const HYB_COIN: [u8; ML_KEM768_ENCAPS_COIN_LEN] = [0x44; ML_KEM768_ENCAPS_COIN_LEN];
+    const HYB_PLAINTEXT: &[u8] = b"a hybrid public-key secret (not really)";
+
+    fn hyb_nonce() -> Vec<u8> {
+        vec![0x55; NONCE_LEN]
+    }
+
+    /// Derive the recipient's public parts (as JS would) then seal to them.
+    fn hyb_seal() -> Vec<u8> {
+        let recipient_pub = hybrid_x25519_public_inner(&HYB_X25519_SECRET).unwrap();
+        let recipient_ek = hybrid_mlkem_encaps_key_inner(&HYB_MLKEM_SEED).unwrap();
+        hybrid_seal_to_container_inner(
+            &recipient_pub,
+            &recipient_ek,
+            &HYB_EPH_SECRET,
+            &HYB_COIN,
+            &hyb_nonce(),
+            HYB_PLAINTEXT,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hybrid_public_derivation_lengths() {
+        // The derived public parts must have the CLI/core-fixed sizes.
+        assert_eq!(
+            hybrid_x25519_public_inner(&HYB_X25519_SECRET)
+                .unwrap()
+                .len(),
+            X25519_PUBLIC_KEY_LEN
+        );
+        assert_eq!(
+            hybrid_mlkem_encaps_key_inner(&HYB_MLKEM_SEED)
+                .unwrap()
+                .len(),
+            ML_KEM768_ENCAPS_KEY_LEN
+        );
+        // Bad input lengths are rejected, not truncated.
+        assert!(hybrid_x25519_public_inner(&[0u8; 31]).is_err());
+        assert!(hybrid_mlkem_encaps_key_inner(&[0u8; 63]).is_err());
+    }
+
+    #[test]
+    fn hybrid_container_round_trip() {
+        let c = hyb_seal();
+        // The container must not leak the plaintext.
+        assert!(!contains(&c, HYB_PLAINTEXT));
+        let out = hybrid_open_container_inner(&HYB_X25519_SECRET, &HYB_MLKEM_SEED, &c).unwrap();
+        assert_eq!(out, HYB_PLAINTEXT);
+    }
+
+    #[test]
+    fn hybrid_wrong_recipient_fails() {
+        let c = hyb_seal();
+        // A different X25519 secret must not open it.
+        let other_x = [0x99; X25519_SECRET_KEY_LEN];
+        assert!(hybrid_open_container_inner(&other_x, &HYB_MLKEM_SEED, &c).is_err());
+        // A different ML-KEM seed must not open it either.
+        let other_seed = [0xAA; ML_KEM768_KEYGEN_SEED_LEN];
+        assert!(hybrid_open_container_inner(&HYB_X25519_SECRET, &other_seed, &c).is_err());
+    }
+
+    #[test]
+    fn hybrid_bad_magic_rejected() {
+        let mut c = hyb_seal();
+        c[0] ^= 0xff; // corrupt the first magic byte
+        assert!(hybrid_open_container_inner(&HYB_X25519_SECRET, &HYB_MLKEM_SEED, &c).is_err());
+    }
+
+    #[test]
+    fn hybrid_truncated_container_rejected() {
+        // Anything shorter than the fixed prefix must be rejected, not panic.
+        let short = vec![0u8; HYBRID_FIXED_PREFIX_LEN - 1];
+        assert!(hybrid_open_container_inner(&HYB_X25519_SECRET, &HYB_MLKEM_SEED, &short).is_err());
+    }
+
+    #[test]
+    fn hybrid_bad_secret_lengths_rejected() {
+        let c = hyb_seal();
+        // A wrong-length secret or seed is a clear error, never a panic.
+        assert!(hybrid_open_container_inner(&[0u8; 31], &HYB_MLKEM_SEED, &c).is_err());
+        assert!(hybrid_open_container_inner(&HYB_X25519_SECRET, &[0u8; 63], &c).is_err());
+    }
+
+    #[test]
+    fn hybrid_container_prefix_is_golden() {
+        // A byte-exact cross-check of the fixed prefix against the CLI layout
+        // (cli/src/lib.rs): magic ‖ version ‖ eph_pub[32] ‖ mlkem_ct[1088].
+        let c = hyb_seal();
+        assert!(c.len() > HYBRID_FIXED_PREFIX_LEN);
+        assert_eq!(&c[..8], b"SIGILhyb"); // magic
+        assert_eq!(c[8], 1); // version
+                             // eph_pub occupies bytes 9..41, mlkem_ct 41..1129.
+        assert_eq!(
+            HYBRID_FIXED_PREFIX_LEN,
+            9 + X25519_PUBLIC_KEY_LEN + ML_KEM768_CIPHERTEXT_LEN
+        );
+        assert_eq!(HYBRID_FIXED_PREFIX_LEN, 1129);
+        // The eph_pub in the container must equal the public key of the
+        // ephemeral secret we sealed with (offsets are correct).
+        let eph_pub = core_x25519_public_key(&HYB_EPH_SECRET);
+        assert_eq!(&c[9..9 + X25519_PUBLIC_KEY_LEN], eph_pub.as_slice());
     }
 }

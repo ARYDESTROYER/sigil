@@ -274,6 +274,27 @@ public, make no security claims, until the audit completes and trademark clears.
   seals → CLI opens). A DEMO of the UNAUDITED building block, **NOT** the product
   account/key-management model; the `SIGILcli` container is a pre-audit CLI/demo
   container, not a frozen product wire format; not for real secrets (ADR 0020).
+  **Now ALSO does HYBRID public-key (no-password) encryption (Phase 31):** the
+  `hybrid_x25519_public` / `hybrid_mlkem_encaps_key` / `hybrid_seal_to_container` /
+  `hybrid_open_container` exports encrypt a file **to** a device's hybrid identity
+  (**X25519 + ML-KEM-768**) and decrypt it, reading+writing the same **`SIGILhyb`
+  container** the CLI does (`HYBRID_MAGIC` `SIGILhyb`, `HYBRID_FORMAT_VERSION` 1,
+  `eph_x25519_pub[32]`, `mlkem_ct[1088]`, then the envelope; fixed AEAD `HYBRID_AAD =
+  "sigil-hybrid-cli/1"`) — the **FIRST browser exercise of the PQ-hybrid encryption
+  path**. All entropy stays JS-supplied (X25519 secret, ML-KEM keygen seed,
+  ephemeral X25519 secret, ML-KEM coin, AEAD nonce all via `crypto.getRandomValues`
+  → both `Cargo.lock`s stay `getrandom`==0); the wasm crate does **not** parse
+  identity files, so Node bridges the CLI identity JSON (fields `x25519_public_key`
+  / `mlkem_encaps_key` / `x25519_secret` / `mlkem_seed`, std-base64). The `HYBRID_*`
+  format consts are **MIRRORED — not shared** — both `cli/src/lib.rs` and
+  `sigil-wasm/src/lib.rs` define `HYBRID_MAGIC` / `HYBRID_FORMAT_VERSION` /
+  `HYBRID_AAD`, each with a sync comment; **they MUST stay byte-for-byte in sync**.
+  Guarded by a native golden fixed-prefix test plus a Node interop test
+  (`sigil-wasm/test/hybrid-interop.mjs`) that **shells to the real built `sigil`
+  binary in BOTH directions** (A: wasm seals → `sigil hybrid-open`; B: `sigil
+  hybrid-seal` → wasm opens). A DEMO of the UNAUDITED building blocks — a **custom
+  KEM-then-AEAD, NOT RFC 9180 HPKE**, not the product key-management model, not for
+  real secrets; the **system is NOT "post-quantum secure"** (ADR 0021).
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)
@@ -315,6 +336,7 @@ cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
 node sigil-wasm/test/roundtrip.mjs                  # prints PASS, exits 0
 node sigil-wasm/test/interop.mjs                    # wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build

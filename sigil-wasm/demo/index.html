@@ -124,6 +124,63 @@
     <label>Plaintext recovered from uploaded container</label>
     <pre id="uploadRecovered"></pre>
 
+    <hr style="margin: 2rem 0; border: none; border-top: 1px solid rgba(127,127,127,0.3);" />
+
+    <h2>Hybrid PUBLIC-KEY encryption (<code>SIGILhyb</code>)</h2>
+    <p class="muted">
+      The no-password, public-key path. A device generates a HYBRID IDENTITY
+      (an X25519 key pair + an ML-KEM-768 keypair-seed); senders encrypt TO its
+      shareable <code>.pub</code> and only the holder of the secret identity can
+      decrypt. This composes <code>sigil-core</code>'s hybrid primitives
+      (X25519 + ML-KEM-768 → shared secret → XChaCha20-Poly1305). The secret,
+      the ephemeral X25519 secret, the ML-KEM coin, and the nonce are ALL
+      generated here in JS with <code>crypto.getRandomValues</code>. The
+      container is byte-compatible with <code>sigil hybrid-seal</code> /
+      <code>sigil hybrid-open</code>.
+      <strong>CUSTOM KEM-then-AEAD, NOT RFC 9180 HPKE; the system is NOT
+      post-quantum secure. UNAUDITED — do not protect real secrets.</strong>
+    </p>
+
+    <div class="row">
+      <button id="hybGen">1. Generate hybrid identity</button>
+      <button id="hybPubDownload">Download .pub</button>
+    </div>
+    <label>Your shareable PUBLIC identity (give this to senders)</label>
+    <pre id="hybPub"></pre>
+    <p class="muted">
+      The matching SECRET identity is held in memory for this page only (it is
+      NOT downloaded). Regenerate to get a fresh pair.
+    </p>
+
+    <label for="hybPlaintext">Plaintext to hybrid-seal</label>
+    <textarea id="hybPlaintext">a short hybrid note (not a real secret)</textarea>
+
+    <div class="row">
+      <button id="hybSeal">2. Hybrid-seal → download .hyb</button>
+      <label for="hybRecipientPub" style="display: inline-flex; align-items: center; margin: 0; font-weight: 600; cursor: pointer;">
+        Recipient .pub (optional; defaults to your own):
+        <input id="hybRecipientPub" type="file" accept=".pub,application/json" style="margin-left: 0.5rem; font-weight: 400;" />
+      </label>
+    </div>
+    <p class="muted">
+      Seals to the recipient <code>.pub</code> you load, or — if none is loaded —
+      to your OWN identity above, so you can immediately open it below (a
+      self-round-trip). The container is a <code>SIGILhyb</code> file; open it on
+      the command line with
+      <code>sigil hybrid-open --key your.key --in note.hyb --out note.txt</code>.
+    </p>
+
+    <div class="row">
+      <label for="hybContainerFile" style="display: inline-flex; align-items: center; margin: 0; font-weight: 600; cursor: pointer;">
+        3. Open a .hyb with YOUR secret identity:
+        <input id="hybContainerFile" type="file" accept=".hyb,application/octet-stream" style="margin-left: 0.5rem; font-weight: 400;" />
+      </label>
+    </div>
+    <label>Hybrid status</label>
+    <pre id="hybStatus"></pre>
+    <label>Plaintext recovered from hybrid container</label>
+    <pre id="hybRecovered"></pre>
+
     <script type="module" src="./main.js"></script>
   </body>
 </html>

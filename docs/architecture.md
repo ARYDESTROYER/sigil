@@ -197,6 +197,30 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   product's account / key-management model, and not for real secrets; the
   `SIGILcli` container is a **pre-audit CLI/demo container, not a frozen product
   wire format** (see [ADR 0020](decisions/0020-shared-client-container-format.md)).
+  **It now also does HYBRID public-key (no-password) encryption** — the
+  `hybrid_x25519_public` / `hybrid_mlkem_encaps_key` / `hybrid_seal_to_container` /
+  `hybrid_open_container` exports encrypt a file **to** a device's hybrid identity
+  (**X25519 + ML-KEM-768**) and decrypt it, reading and writing the same
+  self-describing **`SIGILhyb` container** the CLI does (magic `SIGILhyb`,
+  version `1`, `eph_x25519_pub[32]`, `mlkem_ct[1088]`, then the envelope; AEAD
+  `AAD = sigil-hybrid-cli/1`). This is the **FIRST time the PQ-hybrid encryption
+  path is exercised in a browser client** — the wasm client column now reaches all
+  the way to the hybrid KEM-then-AEAD flow. All entropy stays JS-supplied (the
+  X25519 secret, ML-KEM keygen seed, per-message ephemeral X25519 secret, ML-KEM
+  coin, and AEAD nonce all come from `crypto.getRandomValues`, so both lockfiles
+  stay `getrandom`-free); the wasm crate does **not** parse identity files, so Node
+  bridges the CLI's identity JSON (fields `x25519_public_key` / `mlkem_encaps_key`
+  / `x25519_secret` / `mlkem_seed`, standard-base64) into raw key bytes. Like
+  `SIGILcli`, the `SIGILhyb` format constants are **mirrored** in
+  `sigil-wasm/src/lib.rs` and `cli/src/lib.rs` (`HYBRID_MAGIC` / `HYBRID_AAD`; **no
+  shared crate**) and pinned by a native golden fixed-prefix test plus a Node
+  interop test (`test/hybrid-interop.mjs`) that shells to the **real** built CLI
+  binary in **both** directions (wasm seals → `sigil hybrid-open`; `sigil
+  hybrid-seal` → wasm opens). Honest framing: these are the same **UNAUDITED**
+  building blocks, the composition is a **CUSTOM KEM-then-AEAD, NOT RFC 9180
+  HPKE**, it is a **DEMO — not the product key-management model**, and the **system
+  is still NOT "post-quantum secure"** (see
+  [ADR 0021](decisions/0021-wasm-hybrid-public-key-encryption.md)).
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),

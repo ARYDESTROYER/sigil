@@ -191,9 +191,15 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   format with the `sigil` CLI** (`seal_to_container` / `open_container` read and
   write the same `SIGILcli` container), so you can **seal in the browser and open
   with `sigil open`** — and vice-versa; a `node sigil-wasm/test/interop.mjs` proof
-  shells to the real CLI binary in both directions. A **standalone crate** (own
-  lockfile), **UNAUDITED**, a **demo of a building block** — not the product's
-  account/key-management model, and not for real secrets. (Public copy still obeys
+  shells to the real CLI binary in both directions. It can also do **password-less
+  HYBRID public-key encryption in the browser** — `hybrid_seal_to_container` /
+  `hybrid_open_container` encrypt a file **to** a device's hybrid identity (X25519
+  + ML-KEM-768) into the same `SIGILhyb` container the CLI uses, interoperable with
+  `sigil hybrid-seal` / `sigil hybrid-open` both ways (proven by `node
+  sigil-wasm/test/hybrid-interop.mjs`). A **standalone crate** (own lockfile),
+  **UNAUDITED**, a **demo of a building block** — a custom KEM-then-AEAD (not RFC
+  9180 HPKE), not the product's account/key-management model, and not for real
+  secrets; the system is **not** "post-quantum secure". (Public copy still obeys
   [`web/apps/marketing/MARKETING-CLAIMS.md`](web/apps/marketing/MARKETING-CLAIMS.md).)
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**

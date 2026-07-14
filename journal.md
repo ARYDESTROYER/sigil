@@ -11,7 +11,24 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 30, `main` @ origin, clean tree).** Phase 30 made
+**Where we are (through Phase 31, `main` @ origin, clean tree).** Phase 31 brought
+**HYBRID public-key (no-password) encryption to `sigil-wasm`**: four new
+`#[wasm_bindgen]` exports — `hybrid_x25519_public` / `hybrid_mlkem_encaps_key` /
+`hybrid_seal_to_container` / `hybrid_open_container` — encrypt a file **to** a
+device's hybrid identity (**X25519 + ML-KEM-768**) into the same **`SIGILhyb`**
+container the CLI uses (`HYBRID_MAGIC` `SIGILhyb`, version 1, `eph_x25519_pub[32]`,
+`mlkem_ct[1088]`, envelope; AEAD `sigil-hybrid-cli/1`), the **FIRST browser
+exercise of the PQ-hybrid encryption path**. Entropy stays JS-supplied (X25519
+secret / ML-KEM seed / ephemeral secret / coin / nonce via `getRandomValues`) and
+Node bridges the CLI identity JSON (the wasm crate never parses identity files).
+`HYBRID_*` format consts are MIRRORED — not shared — in `cli/src/lib.rs` +
+`sigil-wasm/src/lib.rs` (MUST stay in sync), guarded by a native golden
+fixed-prefix test + a Node interop test (`test/hybrid-interop.mjs`) that shells to
+the REAL built CLI both directions (A: wasm seals / `sigil hybrid-open`; B: `sigil
+hybrid-seal` / wasm opens) — **bidirectional interop PASS**, both `Cargo.lock`s
+still **getrandom==0**. A custom KEM-then-AEAD (NOT RFC 9180 HPKE), UNAUDITED demo,
+NOT the product key model; the SYSTEM is NOT "post-quantum secure" (ADR 0021).
+Phase 30 made
 `sigil-wasm` **INTEROPERABLE with the `sigil` CLI**: new `seal_to_container`/
 `open_container` exports read+write the exact same `SIGILcli` container (magic
 `SIGILcli`, version 1, Argon2 params `u32`-LE, `u8`-len salt, envelope; AEAD
@@ -105,8 +122,16 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   write the CLI's `SIGILcli` container (AAD `sigil-cli/1`), format mirrored in both
   `cli/src/lib.rs` + `sigil-wasm/src/lib.rs` (MUST stay in sync), proven by a Node
   interop test shelling to the real CLI both directions. ADR 0020.
+  **Phase 31: now also HYBRID public-key** — `hybrid_x25519_public`/
+  `hybrid_mlkem_encaps_key`/`hybrid_seal_to_container`/`hybrid_open_container`
+  encrypt a file TO a device hybrid identity (X25519 + ML-KEM-768) into the CLI's
+  `SIGILhyb` container (AAD `sigil-hybrid-cli/1`); `HYBRID_*` consts mirrored in
+  `cli/src/lib.rs` + `sigil-wasm/src/lib.rs` (MUST stay in sync), proven by a Node
+  interop test (`test/hybrid-interop.mjs`) shelling to the real CLI both directions.
+  FIRST browser exercise of the PQ-hybrid path; custom KEM-then-AEAD not HPKE;
+  getrandom==0 preserved. ADR 0021.
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0020.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0021.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
@@ -3212,4 +3237,96 @@ guarded — the two copies **MUST stay byte-for-byte in sync**, enforced by test
   versioned container/wire format belongs in `sigil-core` or a purpose-built shared crate (at
   which point ADR 0020 would be superseded). Posture unchanged; the **system is NOT
   "post-quantum secure".**
+
+---
+
+## 2026-07-14 — Phase 31 (wasm HYBRID public-key encryption + `SIGILhyb` CLI interop)
+
+### What & why
+Brought **HYBRID public-key (no-password) encryption to `sigil-wasm`** — the wasm client
+column now reaches the **PQ-hybrid encryption path** for the first time. Until now the wasm
+binding only did the symmetric password path (`SIGILcli`, Phases 29/30). `sigil-core` has had
+a full hybrid public-key path since Phase 21 (`hybrid_seal`/`hybrid_open`, ADR 0013 — encrypt
+a record TO a recipient's **X25519 + ML-KEM-768** identity via a custom KEM-then-AEAD), and
+the CLI exposed it in Phase 23 (`hybrid-keygen`/`hybrid-seal`/`hybrid-open`, `SIGILhyb`
+container). This phase teaches the browser/Node binding to do the same, byte-compatible with
+the CLI both directions.
+
+Added four `#[wasm_bindgen]` exports in `sigil-wasm/src/lib.rs`:
+- `hybrid_x25519_public(secret) -> Uint8Array` (32-byte secret → 32-byte X25519 public key)
+  and `hybrid_mlkem_encaps_key(seed) -> Uint8Array` (64-byte seed → 1184-byte ML-KEM-768
+  encapsulation key) — the two raw derivations needed to build a recipient `.pub` identity.
+- `hybrid_seal_to_container(recipient_x25519_pub, recipient_mlkem_encaps_key, ephemeral_x25519_secret,
+  mlkem_coin, aead_nonce, plaintext) -> Uint8Array` — hybrid-encapsulates to the recipient,
+  seals under the fixed hybrid AAD `sigil-hybrid-cli/1`, and packs the self-describing prefix
+  `magic "SIGILhyb" ‖ version=1 ‖ eph_x25519_pub[32] ‖ mlkem_ct[1088]` in front of the
+  envelope, byte-mirroring `cli/src/lib.rs`.
+- `hybrid_open_container(recipient_x25519_secret, recipient_mlkem_seed, container) -> Uint8Array`
+  — validates the `SIGILhyb` magic + version, slices `eph_pub` + `mlkem_ct` + envelope, and
+  hybrid-decapsulates+opens. Rejects (throws) on bad magic, unsupported version, truncation,
+  or a wrong recipient / tampered ciphertext.
+
+### How (entropy JS-supplied; identity JSON bridged by Node)
+Two invariant-preserving choices (ADR 0021):
+- **All entropy stays JS-supplied** — the recipient X25519 secret + ML-KEM keygen seed and the
+  per-message ephemeral X25519 secret + ML-KEM coin + AEAD nonce are all generated in JS with
+  `crypto.getRandomValues` and passed in, so `sigil-wasm` stays **`getrandom`-free** (like the
+  core; both lockfiles keep `getrandom`-count 0).
+- **The wasm crate does NOT parse identity files** — Node bridges the CLI's identity JSON
+  (fields `x25519_public_key` / `mlkem_encaps_key` / `x25519_secret` / `mlkem_seed`,
+  standard-base64) into raw key bytes. The crate exposes just the two derivations it needs.
+
+The `SIGILhyb` format constants are **MIRRORED — not shared** — `HYBRID_MAGIC` (`b"SIGILhyb"`),
+`HYBRID_FORMAT_VERSION` (1), `HYBRID_AAD` (`b"sigil-hybrid-cli/1"`) in `sigil-wasm/src/lib.rs`
+mirror `cli/src/lib.rs`'s `HYBRID_MAGIC` / `HYBRID_AAD`, each with a comment tying it to the
+other file. Same rationale as ADR 0020: a pre-audit demo format is not worth a shared crate;
+the two copies **MUST stay byte-for-byte in sync**, enforced by the tests below.
+
+### How verified
+- **Bidirectional interop PASS:** `node sigil-wasm/test/hybrid-interop.mjs` (after
+  `build-wasm.sh`) **builds and shells to the REAL `sigil` binary** (`cargo build --bin sigil`,
+  no stale binary) and drives both directions with JS-generated entropy; Node bridges the CLI
+  identity JSON:
+  - **Direction A** — `sigil hybrid-keygen` writes a recipient identity → Node reads the
+    `.pub`, decodes the public parts → `hybrid_seal_to_container` writes the container (asserts
+    `SIGILhyb` magic + that it does NOT leak the plaintext marker) → `sigil hybrid-open`
+    recovers the plaintext (asserts equality).
+  - **Direction B** — Node generates recipient secret material → derives the publics via
+    `hybrid_x25519_public` / `hybrid_mlkem_encaps_key` → writes a CLI-format `.pub` → `sigil
+    hybrid-seal` writes the container → `hybrid_open_container` recovers the plaintext (asserts
+    equality).
+  Prints the `PASS: sigil-wasm <-> sigil CLI SIGILhyb hybrid public-key interop (A: … ; B: …)`
+  line and exits 0.
+- **Native golden + hybrid container tests** (`cargo test --manifest-path sigil-wasm/Cargo.toml`):
+  derive-publics → seal → open round-trip, wrong-recipient failure, bad-magic / truncated /
+  bad-length rejection, and a `SIGILhyb` golden fixed-prefix check.
+- **Both getrandom guards still == 0:** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` = **0**
+  AND `grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock` = **0** — the hybrid path keeps the
+  caller-supplied-entropy contract.
+
+### Docs (this pass — docs only, no code touched)
+- `docs/architecture.md`: §1 `sigil-wasm` bullet extended with the hybrid public-key path
+  (the four exports, the `SIGILhyb` byte layout + AAD, JS-supplied entropy, Node-bridged
+  identity JSON, mirrored-not-shared constants, golden + `hybrid-interop.mjs` tests, honest
+  framing).
+- `README.md`: `sigil-wasm/` bullet notes password-less hybrid public-key encryption in the
+  browser interoperable with the CLI; UNAUDITED; MARKETING-CLAIMS discipline (not
+  "post-quantum secure").
+- `CLAUDE.md`: `sigil-wasm` repo-map bullet records the hybrid exports + `SIGILhyb` interop +
+  the mirrored (must-stay-in-sync) `HYBRID_*` consts in both `cli/src/lib.rs` and
+  `sigil-wasm/src/lib.rs`; the build & test block gains the `hybrid-interop.mjs` line.
+- `docs/decisions/0021-wasm-hybrid-public-key-encryption.md` written (Nygard) + indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07); ADR banner extended. RESUME ANCHOR moved to
+  Phase 31.
+
+### ➡️ Still open (honest)
+- `hybrid_seal`/`hybrid_open` are a **CUSTOM KEM-then-AEAD composition, NOT RFC 9180 HPKE**,
+  over the **UNAUDITED** hybrid building blocks; `SIGILhyb` is a **CLI/demo container, not a
+  frozen product wire format**, and is **duplicated** in two crates (change one, change the
+  other; the golden + interop tests are the tripwire). It is **not** the product's account /
+  key-management model and must not protect real secrets. That the browser can now run the
+  hybrid path does **not** make the **system** post-quantum secure. A future real, versioned
+  container/wire format belongs in `sigil-core` or a purpose-built shared crate (at which point
+  ADRs 0020/0021 would be superseded). Posture unchanged; the **system is NOT "post-quantum
+  secure".**
 

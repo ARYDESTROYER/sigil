@@ -11,7 +11,29 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 32, `main` @ origin, clean tree).** Phase 32 **CLOSED
+**Where we are (through Phase 33, `main` @ origin, clean tree).** Phase 33 shipped
+the **FIRST REAL PRODUCT FEATURE** — the authenticator function itself. libsigil-core
+gained an **HOTP/TOTP** one-time-password primitive (`hotp`/`totp`/`format_code` over
+an `OtpAlgorithm` enum — SHA-1 (default)/SHA-256/SHA-512; `totp.rs`): **RFC 4226 HOTP**
+(dynamic truncation) + **RFC 6238 TOTP**, the FIRST primitive that implements an actual
+product FEATURE rather than a building block. It is verified GREEN against the **RFC
+4226 App D** and **RFC 6238 App B** known-answer vectors (`rfc4226_appendix_d_hotp_sha1`,
+`rfc6238_appendix_b_totp_all_hashes`, both PASS). `totp` takes the current Unix time as
+a CALLER-SUPPLIED `u64` — the core reads NO clock and NO RNG, so the wasm-pure/no-RNG
+contract (ADR 0007) is intact; two new deps `hmac` (keyed MAC; already transitive via
+`hkdf`, now direct) + the NEW `sha1` (HMAC-SHA-1 is the near-universal `otpauth://`
+default → interop requires it), both `default-features = false` so `getrandom`==0 in
+`libsigil/Cargo.lock` still holds. The demo CLI wired it into an **encrypted TOTP vault**
+— `sigil totp add|list|code|remove` (base32 + `otpauth://` import) — with the 2FA secrets
+sealed at rest in the SAME `SIGILcli` password container as `seal`/`open` (so a vault is
+just another opaque sealed container, E2EE at rest, op-log-syncable later). Live demo
+VERIFIED: `totp add work --secret <b32> --issuer Acme` + `totp add --uri
+"otpauth://totp/Acme:bob?..."` → `list` (2 entries, secret never printed) → `code work`
+→ `620863 (valid for 9s)`; the on-disk vault begins with magic `SIGILcli` (sealed-at-rest
+check); a WRONG password fails with `Aead(Authentication)` (no plaintext leak); `remove
+work` drops it. Core totp tests 8/8 PASS, CLI tests 40/40 PASS, core `getrandom`==0. Real
+but UNAUDITED (only GENERATES codes — verification left to callers); do NOT store real 2FA
+secrets yet. ADR 0023. Phase 32 **CLOSED
 THE CLIENT↔SERVER E2EE SYNC LOOP** for the client column: **`sigil-wasm/sync.mjs`**
 — a tiny, framework-free, dependency-free ESM transport (`pushContainer` /
 `pullContainers`, the JS twin of `sigil push` / `sigil pull`) — push/pulls **OPAQUE**
@@ -3431,3 +3453,63 @@ gained a **Sync** section (server-URL + vault-ID fields, Seal→Push / Pull→Op
   journal with a tamper-evident hash chain, not a mergeable log). A real product sync/auth
   model is a future, separate decision. Posture unchanged; the **system is NOT "post-quantum
   secure".**
+
+## 2026-07-14 — Phase 33 (FIRST product feature: HOTP/TOTP primitive + encrypted CLI TOTP vault)
+
+### What & why
+Sigil is an **authenticator**, but until now the repo had **no authenticator function** —
+every primitive was a general building block, none was the thing a user actually wants: a
+valid 2FA code. Phase 33 closes that: the **first primitive that implements an actual product
+FEATURE**. It lands in two layers, split along the no-clock/no-RNG boundary (ADR 0007):
+- **Core primitive** — `libsigil/core/src/totp.rs`: `hotp(key, counter, digits, algorithm)`
+  (RFC 4226 §5.3 dynamic truncation), `totp(key, unix_time, period, t0, digits, algorithm)`
+  (RFC 6238 §4, counter `T=(unix_time-t0)/period`), `format_code(code, digits)` (zero-padded),
+  over `OtpAlgorithm` (`Sha1` default / `Sha256` / `Sha512`) + `OtpError`
+  (InvalidDigits/InvalidPeriod/TimeBeforeT0). Digits bounded 6..=10 (`MIN_DIGITS`/`MAX_DIGITS`).
+- **CLI encrypted vault** — `sigil totp add|list|code|remove` (`cli/src/{lib,main}.rs`): a
+  `TotpVault` (versioned `TotpEntry` list) serialized to JSON and **sealed with the SAME
+  `SIGILcli` password container as `seal`/`open`** (`seal_vault`/`open_vault` wrap
+  `seal_to_container`/`open_container`) — so a TOTP vault is just another opaque sealed
+  container (E2EE at rest, op-log-syncable later, no new format). `add` takes `--secret <BASE32>`
+  or `--uri "otpauth://totp/..."`; `list` never prints the secret; `code` uses the system clock.
+
+### How (design decisions → ADR 0023)
+- **Caller-supplied time keeps the core pure.** `totp` takes `unix_time: u64` as an argument;
+  the core reads NO clock and NO RNG, so `no_std`/`wasm32-unknown-unknown`/`getrandom`-free holds
+  (ADR 0007). The CLI supplies the wall clock (`SystemTime::now`) and the entropy (Argon2 salt /
+  AEAD nonce, as it already did).
+- **Two new getrandom-free deps.** `hmac` (keyed MAC — already transitive via `hkdf`, now a
+  DIRECT dep) + the NEW `sha1` (HMAC-SHA-1 is the near-universal `otpauth://` default → interop
+  REQUIRES it; `sha2` already present). Both `default-features = false` → no `getrandom`/`rand`.
+- **Vault reuses the minimal-audit-surface `SIGILcli` sealing** — no new at-rest format, no new
+  crypto; inherits wrong-password/tamper → authentication failure, never plaintext.
+
+### How verified (GREEN)
+- **RFC known-answer vectors PASS**: `totp::tests::rfc4226_appendix_d_hotp_sha1` (ten 6-digit
+  SHA-1 HOTP values, counters 0..=9) and `rfc6238_appendix_b_totp_all_hashes` (8-digit codes at
+  six reference times × SHA-1/256/512). Core totp suite **8/8 ok**; core `getrandom`==0.
+- **CLI tests 40/40 ok.**
+- **Live `sigil totp` demo**: `totp add work --secret <b32> --issuer Acme --digits 6` +
+  `totp add --uri "otpauth://totp/Acme:bob?secret=...&period=30"` → `list` shows 2 entries
+  (secret never printed) → `code work` → `620863 (valid for 9s)` → on-disk vault begins with
+  magic **`SIGILcli`** (sealed-at-rest check) → WRONG password → `Aead(Authentication)` (no
+  plaintext leak) → `remove work` drops it.
+
+### Docs (this pass — docs only, no code touched)
+- `docs/crypto-spec.md` — new **HOTP/TOTP** section (signatures, RFC-vector verification,
+  caller-supplied-time invariant, `hmac`/`sha1` getrandom-free deps, honest UNAUDITED framing).
+- `docs/architecture.md` — added `totp` to the `libsigil/core` component list (first product
+  *feature*) + the CLI TOTP-vault note + diagram lines.
+- `docs/decisions/0023-totp-hotp-primitive-and-cli-vault.md` — new ADR; indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07).
+- `CLAUDE.md` — libsigil bullet (totp primitive + `hmac`/`sha1` deps) + cli bullet (`sigil totp`
+  vault subcommands). `README.md` — TOTP vault as the first authenticator feature (UNAUDITED,
+  MARKETING-CLAIMS discipline).
+
+### ➡️ Still open (honest)
+- **Generate-only, UNAUDITED, dev-only.** The module only GENERATES codes — verification
+  (constant-time compare + validity window) is left to callers; no key zeroization. The OTP math
+  is RFC-vector-checked but the build is unaudited. **Do NOT store real 2FA secrets yet.**
+- **Not yet the product account/sync model.** The vault is a local CLI file; multi-device sync,
+  enrollment, and recovery are future. It *could* ride the op-log unchanged (opaque container),
+  but that path isn't wired. The **system is still NOT "post-quantum secure".**

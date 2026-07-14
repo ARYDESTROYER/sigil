@@ -123,6 +123,21 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     envelope's `kem_ct` field stays reserved — the ML-KEM ciphertext travels
     alongside the envelope. See
     [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
+  - the **HOTP / TOTP one-time-password primitive**
+    ([`../libsigil/core/src/totp.rs`](../libsigil/core/src/totp.rs): `hotp` /
+    `totp` / `format_code`, over an `OtpAlgorithm` enum — SHA-1 (default) /
+    SHA-256 / SHA-512) — **RFC 4226 HOTP** (dynamic truncation) and **RFC 6238
+    TOTP**, checked against the RFC 4226 Appendix D / RFC 6238 Appendix B
+    known-answer vectors. This is the **first primitive that implements an actual
+    product *feature*** (generating a 2FA code) rather than a general building
+    block. Consistent with the no-clock / no-RNG invariant, **`totp` takes the
+    current Unix time as a caller-supplied `u64` argument** — the core reads no
+    clock and no randomness, so the wasm-pure build is preserved. It adds two
+    `getrandom`-free deps: `hmac` (the keyed MAC, already transitively present via
+    `hkdf`, now direct) and the **new** `sha1` (HMAC-SHA-1 is the near-universal
+    `otpauth://` default, so interop requires it; `sha2` is already a dep). Real
+    but UNAUDITED; it only *generates* codes (verification is left to callers). See
+    [`decisions/0023-totp-hotp-primitive-and-cli-vault.md`](decisions/0023-totp-hotp-primitive-and-cli-vault.md).
 
   Consistent with the above, **`core` generates NO randomness** — the Argon2 salt,
   the AEAD nonce, the Ed25519 signing seed, the ML-DSA-65 keygen seed (`xi`), the
@@ -159,8 +174,17 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   ML-KEM-768 encapsulation key). This is the **first user-facing use of the hybrid
   encryption path**, but it is still a **demo over UNAUDITED primitives**: a
   **custom KEM-then-AEAD** composition (**NOT** RFC 9180 HPKE), and **not** the
-  product's account / key-management model. A **standalone crate** with its own
-  lockfile (see [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
+  product's account / key-management model. It now **also** has an **encrypted
+  TOTP vault** — `sigil totp add` / `list` / `code` / `remove` (with base32 and
+  `otpauth://` import) — the **first user-facing product feature**: it generates
+  RFC 4226/6238 codes with the core's `totp` primitive and stores the 2FA secrets
+  in a `TotpVault` **sealed at rest with the same `SIGILcli` password container as
+  `seal`/`open`** (so a vault is just another opaque sealed container — E2EE at
+  rest, and syncable through the op-log later with no new format). The CLI supplies
+  the wall clock and the entropy; the core supplies only the OTP math (see
+  [`decisions/0023-totp-hotp-primitive-and-cli-vault.md`](decisions/0023-totp-hotp-primitive-and-cli-vault.md)).
+  A **standalone crate** with its own lockfile (see
+  [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
   not-for-real-secrets banner.
 - **`sigil-wasm`** ([`../sigil-wasm/`](../sigil-wasm/)) — a thin
   [`wasm-bindgen`](https://rustwasm.github.io/wasm-bindgen/) binding over the
@@ -357,12 +381,14 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    │   │   hybrid KEM: X25519 & ML-KEM-768 → HKDF combiner               │    │
    │   │   hybrid signature: Ed25519 || ML-DSA-65 (verify needs both)    │    │
    │   │   hybrid public-key seal / open  (KEM-then-AEAD to a pubkey)    │    │
+   │   │   HOTP / TOTP codes  (RFC 4226/6238; caller-supplied time)      │    │
    │   └───────────────┬───────────────────────────────┬────────────────┘    │
    │                   │ Rust path-dep                  │ C-ABI               │
    │      ┌────────────┴───────────┐        ┌───────────┴───────────────┐     │
    │      │ cli  (sigil)           │        │ libsigil/ffi  + sigil.h    │     │
    │      │ seal/open file         │        │ sigil_seal / sigil_open /  │     │
-   │      │ push/pull (dev HTTP)   │        │ sigil_buffer_free          │     │
+   │      │ totp vault (2FA codes) │        │ sigil_buffer_free          │     │
+   │      │ push/pull (dev HTTP)   │        │                            │     │
    │      └────────────┬───────────┘        └───────────┬───────────────┘     │
    │                   │                                 │                     │
    └───────────────────┼─────────────────────────────────┼────────────────────┘

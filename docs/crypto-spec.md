@@ -254,6 +254,81 @@ Honest framing:
   hybrid identity and encrypt to a recipient's hybrid public key. Still the same
   custom KEM-then-AEAD, **UNAUDITED**, and not wired into a product flow.
 
+## HOTP / TOTP one-time-password primitive (`hotp` / `totp`)
+
+**Status (pre-audit, UNAUDITED).** `sigil-core` now implements the **authenticator
+primitive** the product is named for: **RFC 4226 HOTP** and **RFC 6238 TOTP**, in
+[`libsigil/core/src/totp.rs`](../libsigil/core/src/totp.rs). This is the **first
+primitive that implements an actual product feature** rather than a general
+cryptographic building block. The OTP math is **real** and checked against the
+official RFC known-answer vectors; it is still **UNAUDITED** and pre-audit.
+
+The primitive is three functions over an `OtpAlgorithm` selector
+(`Sha1` (default) / `Sha256` / `Sha512`), returning `OtpError` for out-of-range
+arguments:
+
+```rust
+pub fn hotp(key: &[u8], counter: u64, digits: u32,
+            algorithm: OtpAlgorithm) -> Result<u32, OtpError>;
+
+pub fn totp(key: &[u8], unix_time: u64, period: u32, t0: u64, digits: u32,
+            algorithm: OtpAlgorithm) -> Result<u32, OtpError>;
+
+pub fn format_code(code: u32, digits: u32) -> String;   // zero-padded
+```
+
+- **`hotp`** is RFC 4226 §5.3: `HMAC-H(key, counter_be64)` under the chosen hash,
+  then **dynamic truncation** — the low nibble of the last MAC byte is an offset,
+  a big-endian **31-bit** integer (top bit masked) is read from
+  `MAC[offset..offset+4]`, and reduced modulo `10^digits`.
+- **`totp`** is RFC 6238 §4: it forms the time counter
+  `T = (unix_time - t0) / period` and defers to `hotp`. `t0` is the epoch offset
+  (usually `0`) and `period` the time step in seconds (usually `30`).
+- **`format_code`** renders the numeric code as a zero-padded fixed-width string
+  (so `073921` keeps its leading zero).
+- `digits` is bounded `MIN_DIGITS..=MAX_DIGITS` (**6..=10**); `OtpError` covers
+  `InvalidDigits`, `InvalidPeriod` (zero period), and `TimeBeforeT0`.
+
+**No clock, no RNG — the caller supplies the time.** Consistent with
+[ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md), `totp` takes the
+current Unix time as a **`u64` argument** and reads no system clock; the native
+binary (or the browser) supplies it, exactly as callers supply salts, nonces, and
+seeds. There is no in-core time source and no randomness here, so the
+`wasm32-unknown-unknown` / `no_std` / `getrandom`-free build is preserved.
+
+**Dependencies (both `getrandom`-free).** The HMAC uses RustCrypto
+[`hmac`](https://docs.rs/hmac) (already in the tree transitively via `hkdf`, now a
+direct dependency) with `sha1` for HMAC-SHA-1 and the existing `sha2` for
+SHA-256/512. `sha1` is **new** and required for interop: real-world authenticator
+apps and `otpauth://` provisioning are overwhelmingly HMAC-SHA-1, so SHA-1 is the
+default and interoperability *demands* it (this is HMAC-SHA-1, a keyed MAC — not
+SHA-1 as a collision-resistant hash). Both crates are `default-features = false`,
+which keeps `getrandom`/`rand` out and the core lockfile guard
+(`grep -c 'name = "getrandom"' libsigil/Cargo.lock` == 0) intact.
+
+**Verified against the RFC vectors.** In-module tests check `hotp` against **RFC
+4226 Appendix D** (the ten 6-digit HMAC-SHA-1 values for counters 0..=9) and
+`totp` against the complete **RFC 6238 Appendix B** table (8-digit codes at six
+reference times for SHA-1 / SHA-256 / SHA-512, with the RFC's per-hash key
+lengths).
+
+**Scope / caveats (honest, pre-audit).** The module **only generates** codes; it
+does **not** verify a user-entered code — a constant-time compare and any validity
+window are the caller's responsibility. It does **not** zeroize the key or
+intermediate HMAC state beyond what the dependencies do. It is a **real but
+UNAUDITED** building block; do **not** store real 2FA secrets in this pre-audit
+build.
+
+**First product-feature consumer: the CLI's encrypted TOTP vault.** The demo
+`cli` wires this primitive into a `sigil totp` vault (`add` / `list` / `code` /
+`remove`, with base32 and `otpauth://` import). Secrets are stored in a
+`TotpVault` JSON that is **sealed at rest with the same `SIGILcli` password
+container as `seal`/`open`** (Argon2id + XChaCha20-Poly1305), so a TOTP vault is
+just another opaque sealed container — E2EE at rest, and syncable through the
+op-log later with no new format. The CLI supplies the wall clock and the entropy;
+the core supplies only the OTP math. See
+[ADR 0023](decisions/0023-totp-hotp-primitive-and-cli-vault.md).
+
 ## Migration plan (intended)
 
 1. **Today** — all new data at suite `0x12`.

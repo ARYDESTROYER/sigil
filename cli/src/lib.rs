@@ -48,10 +48,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sigil_core::{
     hybrid_open, hybrid_seal, ml_kem768_keygen, open_record, public_key_from_seed, seal_record,
-    sign, x25519_public_key, Argon2Params, HybridSealError, RecordError, ML_KEM768_CIPHERTEXT_LEN,
-    ML_KEM768_DECAPS_KEY_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
-    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN,
-    X25519_SECRET_KEY_LEN,
+    sign, x25519_public_key, Argon2Params, HybridSealError, OtpAlgorithm, RecordError,
+    ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_DECAPS_KEY_LEN, ML_KEM768_ENCAPS_COIN_LEN,
+    ML_KEM768_ENCAPS_KEY_LEN, ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, SIG_PUBLIC_KEY_LEN,
+    SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
 
 /// The 8-byte magic that prefixes every container.
@@ -128,6 +128,12 @@ pub enum CliError {
     /// failure (wrong recipient identity or tampered container). The plaintext is
     /// never returned in this case.
     HybridSeal(HybridSealError),
+    /// A TOTP-vault operation failed at the CLI layer: an unparseable
+    /// `otpauth://` URI, an invalid base32 secret, an unknown algorithm/digit
+    /// count, a duplicate/absent label, or a vault whose decrypted JSON does not
+    /// parse. Never carries a secret key or a generated code. Carries a short
+    /// message.
+    Totp(String),
 }
 
 impl From<RecordError> for CliError {
@@ -178,6 +184,7 @@ impl core::fmt::Display for CliError {
             // user sees Hybrid / Aead / Envelope without claiming more than we
             // know. Never includes plaintext.
             CliError::HybridSeal(e) => write!(f, "could not hybrid-open record: {e:?}"),
+            CliError::Totp(e) => write!(f, "totp vault error: {e}"),
         }
     }
 }
@@ -1183,6 +1190,403 @@ fn parse_state(text: &str) -> Result<std::collections::BTreeMap<String, u64>, Cl
     })
 }
 
+// ---------------------------------------------------------------------------
+// TOTP vault: the FIRST real product feature. A list of TOTP secrets, sealed at
+// rest with the SAME password container as `seal`/`open` (a `SIGILcli` file whose
+// plaintext is the entries JSON), so a TOTP vault is just another opaque sealed
+// container and can be synced through the op-log later.
+//
+// STATUS: pre-audit, UNAUDITED, DEV-ONLY. Code GENERATION uses `sigil-core`'s
+// RFC 4226 / RFC 6238 primitive (checked against the official RFC vectors); the
+// vault-at-rest uses the same Argon2id + XChaCha20-Poly1305 container as seal/open.
+// Do NOT store real 2FA secrets in this pre-audit build.
+// ---------------------------------------------------------------------------
+
+/// The TOTP-vault JSON version this build writes and reads (the *inner* plaintext
+/// version; the outer container is a normal `SIGILcli` file).
+pub const TOTP_VAULT_VERSION: u8 = 1;
+
+/// Default number of digits for a TOTP code when none is specified.
+pub const TOTP_DEFAULT_DIGITS: u32 = 6;
+
+/// Default TOTP period (time step) in seconds when none is specified.
+pub const TOTP_DEFAULT_PERIOD: u32 = 30;
+
+/// One TOTP secret in the vault.
+///
+/// The `secret` is the RAW key bytes stored as standard-base64 in the JSON (the
+/// on-the-wire provisioning form is base32, but we store the decoded bytes). The
+/// `algorithm` is one of `"sha1"`, `"sha256"`, `"sha512"` (lowercase).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TotpEntry {
+    /// Human label for the account, e.g. `"alice@example.com"`. Unique within a
+    /// vault (used to look an entry up).
+    pub label: String,
+    /// Optional issuer/service name, e.g. `"GitHub"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Standard-base64 of the RAW secret key bytes (decoded from the base32
+    /// provisioning form). SECRET material — never printed by `list`.
+    pub secret: String,
+    /// The HMAC hash: `"sha1"` (default), `"sha256"`, or `"sha512"`.
+    pub algorithm: String,
+    /// Number of digits in the generated code (typically 6).
+    pub digits: u32,
+    /// Time step in seconds (typically 30).
+    pub period: u32,
+}
+
+/// The decrypted plaintext of a TOTP vault: a versioned list of [`TotpEntry`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TotpVault {
+    /// Inner vault format version. Always [`TOTP_VAULT_VERSION`].
+    pub version: u8,
+    /// The stored TOTP entries.
+    pub entries: Vec<TotpEntry>,
+}
+
+impl Default for TotpVault {
+    fn default() -> Self {
+        TotpVault {
+            version: TOTP_VAULT_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+/// Map a lowercase algorithm string to a [`OtpAlgorithm`], defaulting `""` to
+/// SHA-1. Accepts `sha1`/`sha256`/`sha512` case-insensitively.
+///
+/// # Errors
+/// - [`CliError::Totp`] for any other value.
+pub fn totp_algorithm_from_str(s: &str) -> Result<OtpAlgorithm, CliError> {
+    match s.to_ascii_lowercase().as_str() {
+        "" | "sha1" => Ok(OtpAlgorithm::Sha1),
+        "sha256" => Ok(OtpAlgorithm::Sha256),
+        "sha512" => Ok(OtpAlgorithm::Sha512),
+        other => Err(CliError::Totp(format!(
+            "unknown algorithm {other:?}: expected sha1, sha256, or sha512"
+        ))),
+    }
+}
+
+/// The canonical lowercase name for an [`OtpAlgorithm`] (what we store in JSON).
+#[must_use]
+pub fn totp_algorithm_name(a: OtpAlgorithm) -> &'static str {
+    match a {
+        OtpAlgorithm::Sha1 => "sha1",
+        OtpAlgorithm::Sha256 => "sha256",
+        OtpAlgorithm::Sha512 => "sha512",
+        // OtpAlgorithm is #[non_exhaustive]; treat any future arm as sha1's name
+        // is wrong, so name it explicitly-unknown to avoid silently mislabeling.
+        _ => "sha1",
+    }
+}
+
+/// Decode an RFC 4648 base32 string into raw bytes.
+///
+/// Case-insensitive; ASCII whitespace and `=` padding are ignored (so a secret
+/// pasted with spaces, e.g. from a provisioning screen, still decodes). Rejects
+/// any other non-alphabet character and an all-empty input.
+///
+/// # Errors
+/// - [`CliError::Totp`] on an invalid character or an empty decode.
+pub fn base32_decode(input: &str) -> Result<Vec<u8>, CliError> {
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut out = Vec::new();
+    for c in input.chars() {
+        if c == '=' || c.is_whitespace() {
+            continue;
+        }
+        let up = c.to_ascii_uppercase();
+        let val: u32 = match up {
+            'A'..='Z' => (up as u8 - b'A') as u32,
+            '2'..='7' => (up as u8 - b'2') as u32 + 26,
+            _ => {
+                return Err(CliError::Totp(format!(
+                    "invalid base32 character {c:?} in secret"
+                )))
+            }
+        };
+        acc = (acc << 5) | val;
+        nbits += 5;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+            // Keep only the remaining low bits so `acc` cannot overflow across a
+            // long secret. `(1 << 0) - 1 == 0` handles the nbits==0 case.
+            acc &= (1u32 << nbits) - 1;
+        }
+    }
+    if out.is_empty() {
+        return Err(CliError::Totp(
+            "base32 secret decoded to zero bytes".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Build a [`TotpEntry`] from raw parts, base64-encoding the raw `secret` bytes.
+///
+/// Validates `digits` against the core's supported range up front (a bad digit
+/// count would otherwise only surface later at code-generation time).
+///
+/// # Errors
+/// - [`CliError::Totp`] if `digits`/`period` are out of range.
+pub fn new_totp_entry(
+    label: &str,
+    issuer: Option<String>,
+    secret: &[u8],
+    algorithm: OtpAlgorithm,
+    digits: u32,
+    period: u32,
+) -> Result<TotpEntry, CliError> {
+    if label.is_empty() {
+        return Err(CliError::Totp("label must not be empty".to_string()));
+    }
+    if !(sigil_core::MIN_DIGITS..=sigil_core::MAX_DIGITS).contains(&digits) {
+        return Err(CliError::Totp(format!(
+            "digits {digits} out of range {}..={}",
+            sigil_core::MIN_DIGITS,
+            sigil_core::MAX_DIGITS
+        )));
+    }
+    if period == 0 {
+        return Err(CliError::Totp("period must be non-zero".to_string()));
+    }
+    Ok(TotpEntry {
+        label: label.to_string(),
+        issuer,
+        secret: BASE64.encode(secret),
+        algorithm: totp_algorithm_name(algorithm).to_string(),
+        digits,
+        period,
+    })
+}
+
+/// Minimal percent-decoder for `otpauth://` label/issuer fields (`%XX` → byte).
+/// Unknown/short escapes are passed through literally. UTF-8 is best-effort.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Map an ASCII hex digit byte to its 0..=15 value, or `None`.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parse an `otpauth://totp/...` provisioning URI into a [`TotpEntry`].
+///
+/// Understands the standard shape
+/// `otpauth://totp/LABEL?secret=BASE32&issuer=..&algorithm=..&digits=..&period=..`.
+/// `LABEL` may be `Issuer:Account` — the account becomes the label and the prefix
+/// seeds the issuer (a `?issuer=` query overrides it). `secret` is required.
+///
+/// Only the `totp` type is accepted (not `hotp`, which has no time step).
+///
+/// # Errors
+/// - [`CliError::Totp`] on a missing/invalid scheme, a missing/invalid `secret`,
+///   an unknown algorithm, or non-integer `digits`/`period`.
+pub fn parse_otpauth_uri(uri: &str) -> Result<TotpEntry, CliError> {
+    // Case-insensitive scheme+type prefix.
+    let lower = uri.to_ascii_lowercase();
+    let prefix = "otpauth://totp/";
+    if !lower.starts_with(prefix) {
+        if lower.starts_with("otpauth://hotp/") {
+            return Err(CliError::Totp(
+                "otpauth hotp:// URIs are not supported (no time step); use a totp:// URI"
+                    .to_string(),
+            ));
+        }
+        return Err(CliError::Totp("not an otpauth://totp/ URI".to_string()));
+    }
+    // Slice the ORIGINAL (case-preserving) string past the prefix.
+    let rest = &uri[prefix.len()..];
+    let (label_part, query) = match rest.split_once('?') {
+        Some((l, q)) => (l, q),
+        None => (rest, ""),
+    };
+
+    let label_decoded = percent_decode(label_part);
+    // A "Issuer:Account" label seeds the issuer and reduces the label to Account.
+    let (issuer_from_label, label) = match label_decoded.split_once(':') {
+        Some((iss, acct)) => (Some(iss.trim().to_string()), acct.trim().to_string()),
+        None => (None, label_decoded.trim().to_string()),
+    };
+
+    let mut secret_b32: Option<String> = None;
+    let mut issuer_from_query: Option<String> = None;
+    let mut algorithm = OtpAlgorithm::Sha1;
+    let mut digits = TOTP_DEFAULT_DIGITS;
+    let mut period = TOTP_DEFAULT_PERIOD;
+
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "secret" => secret_b32 = Some(v.to_string()),
+            "issuer" => issuer_from_query = Some(percent_decode(v)),
+            "algorithm" => algorithm = totp_algorithm_from_str(v)?,
+            "digits" => {
+                digits = v
+                    .parse::<u32>()
+                    .map_err(|_| CliError::Totp(format!("digits {v:?} is not an integer")))?
+            }
+            "period" => {
+                period = v
+                    .parse::<u32>()
+                    .map_err(|_| CliError::Totp(format!("period {v:?} is not an integer")))?
+            }
+            _ => { /* ignore unknown params (e.g. counter, image) */ }
+        }
+    }
+
+    let secret_b32 =
+        secret_b32.ok_or_else(|| CliError::Totp("otpauth URI has no secret".to_string()))?;
+    let secret = base32_decode(&secret_b32)?;
+    // A `?issuer=` query wins over the label prefix.
+    let issuer = issuer_from_query
+        .or(issuer_from_label)
+        .filter(|s| !s.is_empty());
+    if label.is_empty() {
+        return Err(CliError::Totp(
+            "otpauth URI has an empty account label".to_string(),
+        ));
+    }
+
+    new_totp_entry(&label, issuer, &secret, algorithm, digits, period)
+}
+
+impl TotpVault {
+    /// Find an entry by exact label.
+    #[must_use]
+    pub fn find(&self, label: &str) -> Option<&TotpEntry> {
+        self.entries.iter().find(|e| e.label == label)
+    }
+
+    /// Add `entry`, rejecting a duplicate label.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] if an entry with the same label already exists.
+    pub fn add(&mut self, entry: TotpEntry) -> Result<(), CliError> {
+        if self.find(&entry.label).is_some() {
+            return Err(CliError::Totp(format!(
+                "an entry labelled {:?} already exists",
+                entry.label
+            )));
+        }
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    /// Remove the entry with `label`, returning it.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] if no entry has that label.
+    pub fn remove(&mut self, label: &str) -> Result<TotpEntry, CliError> {
+        match self.entries.iter().position(|e| e.label == label) {
+            Some(i) => Ok(self.entries.remove(i)),
+            None => Err(CliError::Totp(format!("no entry labelled {label:?}"))),
+        }
+    }
+}
+
+impl TotpEntry {
+    /// Decode this entry's stored (base64) secret into raw key bytes.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] if the stored secret is not valid base64.
+    pub fn secret_bytes(&self) -> Result<Vec<u8>, CliError> {
+        BASE64
+            .decode(self.secret.as_bytes())
+            .map_err(|e| CliError::Totp(format!("stored secret is not valid base64: {e}")))
+    }
+
+    /// The [`OtpAlgorithm`] this entry names.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] if the stored algorithm string is unrecognized.
+    pub fn otp_algorithm(&self) -> Result<OtpAlgorithm, CliError> {
+        totp_algorithm_from_str(&self.algorithm)
+    }
+
+    /// Generate the current code for this entry at `unix_time`, returning the
+    /// zero-padded code string and the whole seconds remaining in the current
+    /// period.
+    ///
+    /// The caller (native binary) supplies `unix_time` from the system clock;
+    /// `sigil-core` reads no clock. Uses `sigil_core::totp` + `format_code`.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] on a bad stored secret/algorithm, or if the core
+    ///   rejects the parameters.
+    pub fn code_at(&self, unix_time: u64) -> Result<(String, u64), CliError> {
+        let secret = self.secret_bytes()?;
+        let algorithm = self.otp_algorithm()?;
+        let code = sigil_core::totp(&secret, unix_time, self.period, 0, self.digits, algorithm)
+            .map_err(|e| CliError::Totp(format!("could not compute code: {e}")))?;
+        let formatted = sigil_core::format_code(code, self.digits);
+        let remaining = u64::from(self.period) - (unix_time % u64::from(self.period));
+        Ok((formatted, remaining))
+    }
+}
+
+/// Serialize a [`TotpVault`] to JSON and seal it under `password` into a
+/// `SIGILcli` container (the same format as [`seal_to_container`]).
+///
+/// # Errors
+/// - [`CliError::Totp`] if the vault cannot be serialized.
+/// - [`CliError::Rng`] / [`CliError::Record`] from the underlying seal.
+pub fn seal_vault(
+    password: &[u8],
+    vault: &TotpVault,
+    params: Argon2Params,
+) -> Result<Vec<u8>, CliError> {
+    let json = serde_json::to_vec(vault)
+        .map_err(|e| CliError::Totp(format!("could not serialize vault: {e}")))?;
+    seal_to_container(password, &json, params)
+}
+
+/// Open a `SIGILcli` container produced by [`seal_vault`] under `password` and
+/// parse the inner JSON into a [`TotpVault`].
+///
+/// # Errors
+/// - [`CliError::Record`] on a wrong password or tampered container (no plaintext
+///   is leaked).
+/// - [`CliError::Totp`] if the decrypted bytes are not a valid vault, or the
+///   inner version is unsupported.
+pub fn open_vault(password: &[u8], container: &[u8]) -> Result<TotpVault, CliError> {
+    let plaintext = open_container(password, container)?;
+    let vault: TotpVault = serde_json::from_slice(&plaintext)
+        .map_err(|e| CliError::Totp(format!("decrypted vault is not valid JSON: {e}")))?;
+    if vault.version != TOTP_VAULT_VERSION {
+        return Err(CliError::Totp(format!(
+            "unsupported vault version {}: expected {TOTP_VAULT_VERSION}",
+            vault.version
+        )));
+    }
+    Ok(vault)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2020,5 +2424,141 @@ mod tests {
             hybrid_open_container(&sk, truncated),
             Err(CliError::HybridSeal(_))
         ));
+    }
+
+    // --- TOTP vault ---------------------------------------------------------
+
+    /// The RFC 6238 SHA-1 secret `"12345678901234567890"` is base32
+    /// `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ`. Decoding it must recover the ASCII.
+    #[test]
+    fn base32_decodes_rfc6238_seed() {
+        let bytes = base32_decode("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").expect("decode");
+        assert_eq!(bytes, b"12345678901234567890");
+        // Case-insensitive + spaces + padding are ignored.
+        let spaced = base32_decode("gezd gnbv gy3t qojq gezd gnbv gy3t qojq====").expect("decode");
+        assert_eq!(spaced, b"12345678901234567890");
+    }
+
+    #[test]
+    fn base32_rejects_bad_input() {
+        assert!(matches!(base32_decode("!!!!"), Err(CliError::Totp(_))));
+        assert!(matches!(base32_decode(""), Err(CliError::Totp(_))));
+        // '1', '0', '8', '9' are not in the RFC 4648 base32 alphabet.
+        assert!(matches!(base32_decode("01890189"), Err(CliError::Totp(_))));
+    }
+
+    /// FIXED-TIME KAT cross-check: an entry built from the RFC 6238 SHA-1 secret,
+    /// 8 digits, period 30, generated at unix_time=59 must equal the published
+    /// RFC 6238 Appendix B value 94287082. This pins the CLI's algorithm wiring to
+    /// the core primitive at a fixed time (the live `sigil totp code` uses the real
+    /// clock, so this test is what proves correctness).
+    #[test]
+    fn entry_code_matches_rfc6238_vector_at_fixed_time() {
+        let secret = base32_decode("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").expect("decode");
+        let entry = new_totp_entry("rfc", None, &secret, OtpAlgorithm::Sha1, 8, 30).expect("entry");
+        let (code, _remaining) = entry.code_at(59).expect("code");
+        assert_eq!(code, "94287082");
+
+        // SHA-256 / SHA-512 vectors at the same time, with their RFC key lengths.
+        let s256 = b"12345678901234567890123456789012";
+        let e256 = new_totp_entry("s256", None, s256, OtpAlgorithm::Sha256, 8, 30).expect("entry");
+        assert_eq!(e256.code_at(59).expect("code").0, "46119246");
+
+        let s512 = b"1234567890123456789012345678901234567890123456789012345678901234";
+        let e512 = new_totp_entry("s512", None, s512, OtpAlgorithm::Sha512, 8, 30).expect("entry");
+        assert_eq!(e512.code_at(59).expect("code").0, "90693936");
+    }
+
+    #[test]
+    fn code_at_reports_remaining_seconds() {
+        let secret = base32_decode("GEZDGNBVGY3TQOJQ").expect("decode");
+        let entry = new_totp_entry("x", None, &secret, OtpAlgorithm::Sha1, 6, 30).expect("entry");
+        // At t=59, 59 % 30 == 29, so 30 - 29 == 1 second remains.
+        assert_eq!(entry.code_at(59).expect("code").1, 1);
+        // At t=60 a fresh window: 30 - 0 == 30.
+        assert_eq!(entry.code_at(60).expect("code").1, 30);
+    }
+
+    #[test]
+    fn otpauth_uri_parses_full_form() {
+        let uri = "otpauth://totp/GitHub:alice%40example.com?secret=GEZDGNBVGY3TQOJQ&issuer=GitHub&algorithm=SHA256&digits=8&period=60";
+        let e = parse_otpauth_uri(uri).expect("parse");
+        assert_eq!(e.label, "alice@example.com");
+        assert_eq!(e.issuer.as_deref(), Some("GitHub"));
+        assert_eq!(e.algorithm, "sha256");
+        assert_eq!(e.digits, 8);
+        assert_eq!(e.period, 60);
+        // GEZDGNBVGY3TQOJQ (16 base32 chars) decodes to the 10 ASCII bytes "1234567890".
+        assert_eq!(e.secret_bytes().unwrap(), b"1234567890");
+    }
+
+    #[test]
+    fn otpauth_uri_defaults_and_errors() {
+        // Minimal URI: default algorithm sha1, digits 6, period 30; issuer from
+        // the label prefix.
+        let e =
+            parse_otpauth_uri("otpauth://totp/Acme:bob?secret=GEZDGNBVGY3TQOJQ").expect("parse");
+        assert_eq!(e.label, "bob");
+        assert_eq!(e.issuer.as_deref(), Some("Acme"));
+        assert_eq!(e.algorithm, "sha1");
+        assert_eq!(e.digits, TOTP_DEFAULT_DIGITS);
+        assert_eq!(e.period, TOTP_DEFAULT_PERIOD);
+
+        assert!(matches!(
+            parse_otpauth_uri("otpauth://totp/x"),
+            Err(CliError::Totp(_))
+        ));
+        assert!(matches!(
+            parse_otpauth_uri("https://example.com"),
+            Err(CliError::Totp(_))
+        ));
+        assert!(matches!(
+            parse_otpauth_uri("otpauth://hotp/x?secret=GEZDGNBVGY3TQOJQ"),
+            Err(CliError::Totp(_))
+        ));
+    }
+
+    #[test]
+    fn vault_seal_open_round_trip_and_ops() {
+        let mut vault = TotpVault::default();
+        let secret = base32_decode("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").expect("decode");
+        vault
+            .add(
+                new_totp_entry(
+                    "acct",
+                    Some("Svc".to_string()),
+                    &secret,
+                    OtpAlgorithm::Sha1,
+                    6,
+                    30,
+                )
+                .expect("entry"),
+            )
+            .expect("add");
+
+        // Duplicate label rejected.
+        assert!(matches!(
+            vault.add(
+                new_totp_entry("acct", None, &secret, OtpAlgorithm::Sha1, 6, 30).expect("entry")
+            ),
+            Err(CliError::Totp(_))
+        ));
+
+        let sealed = seal_vault(PASSWORD, &vault, FAST).expect("seal vault");
+        // It really is a normal SIGILcli container.
+        assert_eq!(&sealed[..8], MAGIC.as_slice());
+
+        let opened = open_vault(PASSWORD, &sealed).expect("open vault");
+        assert_eq!(opened, vault);
+        assert_eq!(opened.find("acct").unwrap().issuer.as_deref(), Some("Svc"));
+
+        // Wrong password cannot open the vault (and leaks no secret).
+        assert!(open_vault(b"nope", &sealed).is_err());
+
+        // Remove works.
+        let mut v2 = opened;
+        v2.remove("acct").expect("remove");
+        assert!(v2.find("acct").is_none());
+        assert!(matches!(v2.remove("acct"), Err(CliError::Totp(_))));
     }
 }

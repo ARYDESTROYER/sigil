@@ -89,3 +89,14 @@ ml-kem = { version = "0.2.3", default-features = false, features = ["determinist
 # ed25519's `signature` 2.x — so the tree carries both; none of them add
 # `getrandom`.
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# HOTP/TOTP one-time-password primitive (RFC 4226 / RFC 6238). `hmac` provides
+# the keyed MAC; it was already in the tree transitively (hkdf 0.12 pulls the same
+# hmac 0.12), and we now depend on it DIRECTLY for the OTP HMAC. `sha1` is NEW:
+# the TOTP default (and the near-universal choice for real 2FA apps and
+# `otpauth://` provisioning) is HMAC-SHA-1, so interop REQUIRES it; `sha2`
+# (SHA-256/512) is already a dep above. Both are `default-features = false`, which
+# is what keeps them RNG-free — neither has any `getrandom`/`rand` feature enabled
+# — so the wasm32-unknown-unknown / no_std build is preserved. The OTP code reads
+# no clock either: the caller passes the Unix time in (see `totp.rs`).
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }

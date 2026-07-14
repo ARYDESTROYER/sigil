@@ -81,6 +81,7 @@ mod mldsa;
 mod mlkem;
 mod record;
 mod sig;
+mod totp;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hybrid::{
@@ -107,6 +108,7 @@ pub use record::{open_record, seal_record, RecordError};
 pub use sig::{
     public_key_from_seed, sign, verify, SigError, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
 };
+pub use totp::{format_code, hotp, totp, OtpAlgorithm, OtpError, MAX_DIGITS, MIN_DIGITS};
 
 /// Envelope format version. Every encrypted record begins with this byte.
 /// See `docs/crypto-spec.md` for the full layout.

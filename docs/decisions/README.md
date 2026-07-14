@@ -73,3 +73,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0020](0020-shared-client-container-format.md) | Shared `SIGILcli` client container format (wasm ↔ CLI interop) | Accepted (2026-07) |
 | [0021](0021-wasm-hybrid-public-key-encryption.md) | Hybrid public-key encryption in the wasm client (`SIGILhyb` interop) | Accepted (2026-07) |
 | [0022](0022-wasm-client-server-sync-loop.md) | Client↔server sync loop for the wasm client (`sync.mjs` over the dev op-log) | Accepted (2026-07) |
+| [0023](0023-totp-hotp-primitive-and-cli-vault.md) | TOTP/HOTP primitive in `sigil-core` + encrypted CLI TOTP vault (first product feature) | Accepted (2026-07) |

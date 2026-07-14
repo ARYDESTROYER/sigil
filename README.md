@@ -85,7 +85,15 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   (a `SIGIL_ERR_HYBRID` status code plus fixed-size length `#define`s, both C-ABI
   round-trips proven). **These FFI exports are real but UNAUDITED building blocks —
   a CUSTOM KEM-then-AEAD construction, NOT RFC 9180 HPKE, and NOT wired into any
-  product flow; the system is NOT "post-quantum secure".**
+  product flow; the system is NOT "post-quantum secure".** libsigil-core now also
+  has the **first primitive that implements an actual product feature** rather than
+  a building block: a real (unaudited) **HOTP/TOTP** one-time-password primitive
+  (`hotp`/`totp`/`format_code`, SHA-1/256/512) — **RFC 4226 / RFC 6238**, verified
+  against the official RFC known-answer vectors. `totp` takes the current Unix time
+  as a caller-supplied argument, so the core still reads no clock and no randomness
+  (staying wasm-pure/`getrandom`-free); the two new deps (`hmac`, `sha1`) are both
+  `default-features = false`. It only generates codes (verification is left to
+  callers) and is UNAUDITED. This is what the `sigil totp` vault (below) is built on.
 - `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a
@@ -177,7 +185,15 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   decrypts it, via the core's `hybrid_seal`/`hybrid_open` — the **first user-facing
   use of the hybrid encryption path** (a demo; a **custom KEM-then-AEAD**
   construction, **NOT RFC 9180 HPKE**; not the product's key-management model).
-  Standalone crate; **UNAUDITED**; not for real secrets.
+  Also `sigil totp add`/`list`/`code`/`remove` — the **first authenticator
+  feature**: generate **2FA (TOTP) codes** from secrets stored in an **encrypted
+  vault**. Add a secret by base32 (`--secret`) or by pasting an `otpauth://` URI
+  (`--uri`), then `sigil totp code <label>` prints the current code. The codes come
+  from the core's RFC 4226/6238 primitive, and the secrets are sealed at rest in the
+  **same `SIGILcli` password container** as `seal`/`open` (Argon2id +
+  XChaCha20-Poly1305), so a vault is just another opaque, syncable sealed container.
+  Standalone crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build
+  is not audited; **do not store real 2FA secrets yet**.
 - `sigil-wasm/` — a thin **`wasm-bindgen`** binding over the libsigil core's
   record API that runs **`seal_record` / `open_record` in the browser (and Node)**
   — the first thing to actually consume the wasm-pure core in a JS runtime. It

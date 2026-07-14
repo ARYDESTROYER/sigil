@@ -11,10 +11,12 @@
 use std::process::ExitCode;
 
 use sigil_cli::{
-    cursor_key, generate_hybrid_identity, generate_key, hybrid_open_container,
-    hybrid_seal_to_container, load_hybrid_public, load_hybrid_secret, load_key, open_container,
-    pull_ops, push_op, read_cursor, save_hybrid_public, save_hybrid_secret, save_key,
-    seal_to_container, write_cursor, PULL_STATE_FILE,
+    base32_decode, cursor_key, generate_hybrid_identity, generate_key, hybrid_open_container,
+    hybrid_seal_to_container, load_hybrid_public, load_hybrid_secret, load_key, new_totp_entry,
+    open_container, open_vault, parse_otpauth_uri, pull_ops, push_op, read_cursor,
+    save_hybrid_public, save_hybrid_secret, save_key, seal_to_container, seal_vault,
+    totp_algorithm_from_str, write_cursor, TotpVault, PULL_STATE_FILE, TOTP_DEFAULT_DIGITS,
+    TOTP_DEFAULT_PERIOD,
 };
 use sigil_core::Argon2Params;
 
@@ -45,6 +47,16 @@ sigil — pre-audit demonstration CLI over the libsigil core
 USAGE:
   sigil seal --in <file> --out <file>    Seal <in> into a password-encrypted container at <out>
   sigil open --in <file> --out <file>    Open a password-encrypted container <in> into <out>
+  sigil totp add <label> --secret <BASE32> [--issuer X] [--algorithm sha1|sha256|sha512]
+                         [--digits 6] [--period 30] [--vault <file>]
+                                         Add a TOTP secret to the encrypted vault
+  sigil totp add --uri \"otpauth://totp/...\" [--vault <file>]
+                                         Import a TOTP secret from an otpauth:// URI
+  sigil totp list [--vault <file>]       List vault entries (label/issuer/algorithm/digits/period)
+  sigil totp code <label> [--vault <file>]
+                                         Print the CURRENT code for <label> (uses the system clock)
+  sigil totp remove <label> [--vault <file>]
+                                         Delete an entry from the vault
   sigil keygen --out <file>              Generate a DEV device key (0600) and print its public key
   sigil hybrid-keygen --out <file>       Generate a hybrid identity: secret <file> (0600) + shareable <file>.pub
   sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>
@@ -66,6 +78,24 @@ PASSWORD (seal/open only):
 
     SIGIL_PASSWORD='correct horse battery staple' sigil seal --in secret.txt --out secret.sigil
     SIGIL_PASSWORD='correct horse battery staple' sigil open --in secret.sigil --out secret.txt
+
+TOTP VAULT (totp add/list/code/remove) — the authenticator feature:
+  A TOTP vault is an encrypted list of 2FA secrets, sealed AT REST with the SAME
+  password container as seal/open (SIGIL_PASSWORD provides the password). Codes
+  are generated with the real RFC 4226/6238 primitive in sigil-core.
+
+  The vault path is --vault <file>, else the default $HOME/.sigil/totp-vault.sigil
+  (the .sigil dir is created 0700; the vault file is written 0600). Example:
+
+    export SIGIL_PASSWORD='correct horse battery staple'
+    sigil totp add work --secret GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ --issuer Acme --digits 6
+    sigil totp add --uri \"otpauth://totp/Acme:bob?secret=GEZDGNBVGY3TQOJQ&period=30\"
+    sigil totp list
+    sigil totp code work
+    sigil totp remove work
+
+  !! PRE-AUDIT / UNAUDITED / DEV-ONLY !! The OTP math is standard and RFC-vector
+  checked, but the build is unaudited. Do NOT store real 2FA secrets yet.
 
 HYBRID PUBLIC-KEY ENCRYPTION (hybrid-keygen / hybrid-seal / hybrid-open) — NO password:
   This is the PUBLIC-KEY path, distinct from the password-based seal/open above.
@@ -223,6 +253,7 @@ fn run() -> Result<(), String> {
             let a = parse_hybrid_open(args)?;
             cmd_hybrid_open(&a)
         }
+        "totp" => cmd_totp(args),
         "push" => {
             let p = parse_push(args)?;
             cmd_push(&p)
@@ -635,5 +666,281 @@ fn cmd_pull(p: &PullArgs) -> Result<(), String> {
     let new_cursor = saved.max(max_seq);
     write_cursor(&state_path, &key, new_cursor).map_err(|e| e.to_string())?;
     println!("cursor for {} now at {}", p.vault, new_cursor);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `sigil totp` — the encrypted TOTP-secret vault (the first product feature).
+// ---------------------------------------------------------------------------
+
+/// Resolve the vault path: `--vault <file>` if given, else the default
+/// `$HOME/.sigil/totp-vault.sigil` (falling back to the CWD if `$HOME` is unset).
+fn resolve_vault_path(flag: Option<String>) -> std::path::PathBuf {
+    if let Some(f) = flag {
+        return std::path::PathBuf::from(f);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home)
+            .join(".sigil")
+            .join("totp-vault.sigil"),
+        _ => std::path::PathBuf::from("totp-vault.sigil"),
+    }
+}
+
+/// Read+decrypt the vault at `path`. If the file does not exist, returns an empty
+/// vault (used by `add`, so the first add creates the vault).
+fn load_vault_or_empty(path: &std::path::Path, password: &[u8]) -> Result<TotpVault, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => open_vault(password, &bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TotpVault::default()),
+        Err(e) => Err(format!("could not read vault {:?}: {e}", path)),
+    }
+}
+
+/// Read+decrypt the vault at `path`, erroring if it does not exist (used by
+/// `list`/`code`/`remove`, which need an existing vault).
+fn load_vault_required(path: &std::path::Path, password: &[u8]) -> Result<TotpVault, String> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "no vault at {:?}; add an entry first with `sigil totp add`",
+                path
+            )
+        } else {
+            format!("could not read vault {:?}: {e}", path)
+        }
+    })?;
+    open_vault(password, &bytes).map_err(|e| e.to_string())
+}
+
+/// Seal `vault` under `password` and write it to `path` with mode 0600, creating
+/// the parent directory (mode 0700) if needed.
+fn save_vault(path: &std::path::Path, password: &[u8], vault: &TotpVault) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|e| format!("could not create vault dir {:?}: {e}", parent))?;
+        }
+    }
+
+    let sealed =
+        seal_vault(password, vault, Argon2Params::RECOMMENDED).map_err(|e| e.to_string())?;
+
+    // Create with 0600 up front so the sealed vault is never briefly world-readable.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("could not create vault {:?}: {e}", path))?;
+    use std::io::Write as _;
+    f.write_all(&sealed)
+        .map_err(|e| format!("could not write vault {:?}: {e}", path))?;
+    // Re-assert 0600 in case the file pre-existed with looser permissions.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("could not set vault permissions {:?}: {e}", path))
+}
+
+/// The current wall-clock time as Unix seconds. Native-only; the core reads no
+/// clock, so the binary supplies the time.
+fn now_unix_secs() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| format!("system clock is before the Unix epoch: {e}"))
+}
+
+/// Dispatch `sigil totp <sub> ...`.
+fn cmd_totp(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let Some(sub) = args.next() else {
+        return Err("missing totp subcommand: add | list | code | remove".to_string());
+    };
+    let rest: Vec<String> = args.collect();
+    match sub.as_str() {
+        "add" => cmd_totp_add(rest),
+        "list" => cmd_totp_list(rest),
+        "code" => cmd_totp_code(rest),
+        "remove" => cmd_totp_remove(rest),
+        other => Err(format!(
+            "unknown totp subcommand {other:?}; try add | list | code | remove"
+        )),
+    }
+}
+
+/// Split the args into an optional leading positional (the `<label>`) plus the
+/// flag map. A positional is any leading token that does not start with `--`.
+fn take_positional(args: &[String]) -> (Option<String>, &[String]) {
+    match args.first() {
+        Some(first) if !first.starts_with("--") => (Some(first.clone()), &args[1..]),
+        _ => (None, args),
+    }
+}
+
+/// Pull `--vault <file>` (if present) from a flag list, returning the resolved
+/// vault path and the remaining flags.
+fn extract_vault_flag(mut flags: Vec<String>) -> Result<(std::path::PathBuf, Vec<String>), String> {
+    let mut vault: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut it = flags.drain(..);
+    while let Some(f) = it.next() {
+        if f == "--vault" {
+            let v = it
+                .next()
+                .ok_or_else(|| "--vault requires a value".to_string())?;
+            if vault.replace(v).is_some() {
+                return Err("--vault given more than once".to_string());
+            }
+        } else {
+            rest.push(f);
+        }
+    }
+    Ok((resolve_vault_path(vault), rest))
+}
+
+fn cmd_totp_add(args: Vec<String>) -> Result<(), String> {
+    let (label, flags) = take_positional(&args);
+    let (vault_path, flags) = extract_vault_flag(flags.to_vec())?;
+
+    // Parse the add flags.
+    let mut uri: Option<String> = None;
+    let mut secret: Option<String> = None;
+    let mut issuer: Option<String> = None;
+    let mut algorithm: Option<String> = None;
+    let mut digits: Option<u32> = None;
+    let mut period: Option<u32> = None;
+
+    let mut it = flags.into_iter();
+    while let Some(f) = it.next() {
+        let mut next = || it.next().ok_or_else(|| format!("{f} requires a value"));
+        match f.as_str() {
+            "--uri" => uri = Some(next()?),
+            "--secret" => secret = Some(next()?),
+            "--issuer" => issuer = Some(next()?),
+            "--algorithm" => algorithm = Some(next()?),
+            "--digits" => {
+                digits = Some(
+                    next()?
+                        .parse()
+                        .map_err(|_| "--digits must be an integer".to_string())?,
+                )
+            }
+            "--period" => {
+                period = Some(
+                    next()?
+                        .parse()
+                        .map_err(|_| "--period must be an integer".to_string())?,
+                )
+            }
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+
+    let password = password_from_env()?;
+    let mut vault = load_vault_or_empty(&vault_path, &password)?;
+
+    let entry = if let Some(uri) = uri {
+        // --uri import path: a leading positional label / other flags are ignored
+        // in favor of the URI's own fields.
+        if secret.is_some() {
+            return Err("--uri and --secret are mutually exclusive".to_string());
+        }
+        parse_otpauth_uri(&uri).map_err(|e| e.to_string())?
+    } else {
+        let label =
+            label.ok_or_else(|| "missing <label> (or use --uri \"otpauth://...\")".to_string())?;
+        let secret_b32 = secret.ok_or_else(|| {
+            "missing --secret <BASE32> (or use --uri \"otpauth://...\")".to_string()
+        })?;
+        let secret_bytes = base32_decode(&secret_b32).map_err(|e| e.to_string())?;
+        let algo = totp_algorithm_from_str(algorithm.as_deref().unwrap_or("sha1"))
+            .map_err(|e| e.to_string())?;
+        new_totp_entry(
+            &label,
+            issuer,
+            &secret_bytes,
+            algo,
+            digits.unwrap_or(TOTP_DEFAULT_DIGITS),
+            period.unwrap_or(TOTP_DEFAULT_PERIOD),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let label = entry.label.clone();
+    vault.add(entry).map_err(|e| e.to_string())?;
+    save_vault(&vault_path, &password, &vault)?;
+    println!("added {label:?} to vault {}", vault_path.display());
+    Ok(())
+}
+
+fn cmd_totp_list(args: Vec<String>) -> Result<(), String> {
+    let (vault_path, rest) = extract_vault_flag(args)?;
+    if let Some(x) = rest.first() {
+        return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
+    }
+    let password = password_from_env()?;
+    let vault = load_vault_required(&vault_path, &password)?;
+
+    if vault.entries.is_empty() {
+        println!("vault {} is empty", vault_path.display());
+        return Ok(());
+    }
+    println!(
+        "vault {} ({} entries):",
+        vault_path.display(),
+        vault.entries.len()
+    );
+    for e in &vault.entries {
+        let issuer = e.issuer.as_deref().unwrap_or("-");
+        // Never print the secret.
+        println!(
+            "  {label}  issuer={issuer}  algorithm={algo}  digits={digits}  period={period}s",
+            label = e.label,
+            algo = e.algorithm,
+            digits = e.digits,
+            period = e.period,
+        );
+    }
+    Ok(())
+}
+
+fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
+    let (label, flags) = take_positional(&args);
+    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+    if let Some(x) = rest.first() {
+        return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
+    }
+    let label = label.ok_or_else(|| "missing <label>".to_string())?;
+
+    let password = password_from_env()?;
+    let vault = load_vault_required(&vault_path, &password)?;
+    let entry = vault
+        .find(&label)
+        .ok_or_else(|| format!("no entry labelled {label:?} in the vault"))?;
+
+    let now = now_unix_secs()?;
+    let (code, remaining) = entry.code_at(now).map_err(|e| e.to_string())?;
+    println!("{code}  (valid for {remaining}s)");
+    Ok(())
+}
+
+fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
+    let (label, flags) = take_positional(&args);
+    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+    if let Some(x) = rest.first() {
+        return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
+    }
+    let label = label.ok_or_else(|| "missing <label>".to_string())?;
+
+    let password = password_from_env()?;
+    let mut vault = load_vault_required(&vault_path, &password)?;
+    vault.remove(&label).map_err(|e| e.to_string())?;
+    save_vault(&vault_path, &password, &vault)?;
+    println!("removed {label:?} from vault {}", vault_path.display());
     Ok(())
 }

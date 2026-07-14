@@ -90,6 +90,19 @@ public, make no security claims, until the audit completes and trademark clears.
   composition — NOT RFC 9180 HPKE — and the FIRST wiring of a hybrid primitive into
   an encryption flow; still real but UNAUDITED and STANDALONE (not the product's
   account / key-management / vault-storage model, not used by sigild/CLI). ADR 0013.**
+  **The core now also has the FIRST primitive that implements an actual product
+  FEATURE (not a building block): an **HOTP/TOTP** one-time-password primitive
+  (`hotp`/`totp`/`format_code` over an `OtpAlgorithm` enum — SHA-1 (default)/
+  SHA-256/SHA-512; `OtpError` for out-of-range digits/period/time; `totp.rs`) — RFC
+  4226 HOTP (dynamic truncation) + RFC 6238 TOTP, verified against the RFC 4226
+  App D / RFC 6238 App B known-answer vectors. `totp` takes the current Unix time as
+  a CALLER-SUPPLIED `u64` arg (the core reads NO clock and NO RNG, preserving the
+  wasm-pure/no-RNG contract, ADR 0007); it only GENERATES codes (verification left
+  to callers). Adds two getrandom-free deps: `hmac` (keyed MAC, already transitive
+  via `hkdf`, now DIRECT) + the NEW `sha1` (HMAC-SHA-1 is the near-universal
+  `otpauth://` default, so interop requires it; `sha2` already present) — both
+  `default-features = false` so the `getrandom`==0 core-lockfile guard holds. Real
+  but UNAUDITED. ADR 0023.**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), **plus the hybrid encryption path
@@ -237,6 +250,17 @@ public, make no security claims, until the audit completes and trademark clears.
   `hybrid-open --key <secret>` decrypts it — via the core's `hybrid_seal`/`hybrid_open`
   (dev/UNAUDITED; custom KEM-then-AEAD, NOT RFC 9180 HPKE; the FIRST user-facing use
   of the hybrid encryption path — a demo, NOT the product key-management model).
+  Also **`sigil totp add|list|code|remove`** — the FIRST user-facing product
+  FEATURE: an **encrypted TOTP (2FA) vault**. `totp add <label> --secret <BASE32>
+  [--issuer X] [--algorithm sha1|sha256|sha512] [--digits 6] [--period 30]`, or
+  `totp add --uri "otpauth://totp/..."` (base32 + otpauth import); `list` (never
+  prints the secret), `code <label>` (current code via the system clock), `remove
+  <label>`. Codes are generated with the core's RFC 4226/6238 `totp` primitive; the
+  secrets are stored in a `TotpVault` JSON **sealed at rest with the SAME `SIGILcli`
+  password container as `seal`/`open`** (`SIGIL_PASSWORD`), so a vault is just
+  another opaque sealed container (E2EE at rest, op-log-syncable later). Vault path
+  is `--vault <file>` else `$HOME/.sigil/totp-vault.sigil` (dir 0700, file 0600).
+  Dev/UNAUDITED — do NOT store real 2FA secrets yet. ADR 0023.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.

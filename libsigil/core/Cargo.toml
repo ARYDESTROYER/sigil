@@ -21,7 +21,7 @@ description = "Pure heart of libsigil: crypto-agility envelope + algorithm-suite
 # build. We pass nonces in from the caller, so the AEAD never needs an RNG. The
 # `alloc` feature gives us `Vec`-based encrypt/decrypt on this no_std crate.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-hkdf = { version = "0.12", default-features = false }
+hkdf = { version = "0.13", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 # Argon2id password-stretching KDF (pre-audit). `default-features = false` keeps
 # `getrandom` out: argon2's default `rand`/`password-hash` features pull in

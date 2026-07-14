@@ -12,7 +12,8 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > its managed, versioned op-log schema migrations with a hash-chain-verified
 > backup/restore runbook,
 > the first client-side consumer of the wasm-pure core (the `sigil-wasm`
-> `wasm-bindgen` binding, with JS-supplied entropy),
+> `wasm-bindgen` binding, with JS-supplied entropy) and its `SIGILcli`-container
+> interop with the CLI (seal in one, open in the other),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -64,3 +65,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0017](0017-oplog-scale-and-observability.md) | Op-log scale & observability — pagination, per-vault rate limiting, `/metrics`, fail-fast config | Accepted (2026-07) |
 | [0018](0018-managed-oplog-migrations-and-backup-integrity.md) | Managed op-log schema migrations and hash-chain-verified backup/restore | Accepted (2026-07) |
 | [0019](0019-wasm-client-bindings.md) | WebAssembly client binding (`sigil-wasm`) — separate crate, JS-supplied entropy | Accepted (2026-07) |
+| [0020](0020-shared-client-container-format.md) | Shared `SIGILcli` client container format (wasm ↔ CLI interop) | Accepted (2026-07) |

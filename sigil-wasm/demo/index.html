@@ -95,6 +95,35 @@
       params from the last Seal are held in memory and reused by Open.
     </p>
 
+    <hr style="margin: 2rem 0; border: none; border-top: 1px solid rgba(127,127,127,0.3);" />
+
+    <h2>Interop with the <code>sigil</code> CLI</h2>
+    <p class="muted">
+      This path uses the CLI-compatible <code>SIGILcli</code> container format
+      (self-describing: magic, version, Argon2 params, salt, then the envelope,
+      with AAD <code>sigil-cli/1</code>). <strong>Download</strong> seals the
+      plaintext above and saves a <code>.sigil</code> file you can open on the
+      command line with
+      <code>SIGIL_PASSWORD='…' sigil open --in note.sigil --out note.txt</code>.
+      <strong>Upload</strong> reads a container — one from this demo <em>or</em>
+      one written by <code>sigil seal</code> — and opens it here. Use the same
+      password in both places.
+    </p>
+
+    <div class="row">
+      <button id="download">Seal → download .sigil</button>
+      <label for="containerFile" style="display: inline-flex; align-items: center; margin: 0; font-weight: 600; cursor: pointer;">
+        Open a .sigil file:
+        <input id="containerFile" type="file" accept=".sigil,application/octet-stream" style="margin-left: 0.5rem; font-weight: 400;" />
+      </label>
+    </div>
+
+    <label>Container status</label>
+    <pre id="containerStatus"></pre>
+
+    <label>Plaintext recovered from uploaded container</label>
+    <pre id="uploadRecovered"></pre>
+
     <script type="module" src="./main.js"></script>
   </body>
 </html>

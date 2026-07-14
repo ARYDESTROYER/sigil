@@ -258,9 +258,22 @@ public, make no security claims, until the audit completes and trademark clears.
   0.13.1, which bundles wasm-bindgen 0.2.100 matching the `=0.2.100` pin),
   producing `pkg-web/` (browser ESM) + `pkg-node/` (Node CJS) — both **gitignored
   build artifacts, never committed**. Verified by a Node round-trip test
-  (`test/roundtrip.mjs`) + native unit tests + a browser `demo/`. A DEMO of the
-  UNAUDITED building block, **NOT** the product account/key-management model; not
-  for real secrets.
+  (`test/roundtrip.mjs`) + native unit tests + a browser `demo/`. **INTEROPERABLE
+  with the `sigil` CLI (Phase 30):** the `seal_to_container`/`open_container`
+  exports read+write the exact same **`SIGILcli` container** the CLI does (magic
+  `SIGILcli`, `FORMAT_VERSION` 1, the three Argon2 params as `u32` LE, a `u8`-length
+  salt, then the envelope; fixed AEAD `AAD = "sigil-cli/1"`), so **seal-in-browser →
+  `sigil open`** and **`sigil seal` → open-in-browser** both round-trip. The format
+  constants are **MIRRORED — not shared** — in `cli/src/lib.rs` (`MAGIC`,
+  `FORMAT_VERSION`, `AAD`, `FIXED_HEADER_LEN`) and `sigil-wasm/src/lib.rs`
+  (`CLI_MAGIC`, `CLI_FORMAT_VERSION`, `CLI_AAD`, `CLI_FIXED_HEADER_LEN`), each with a
+  comment tying it to the other file; **they MUST stay byte-for-byte in sync** (no
+  shared crate for this pre-audit demo format). Guarded by a native golden-header
+  test plus a Node interop test (`sigil-wasm/test/interop.mjs`) that **shells to the
+  real built `sigil` binary in BOTH directions** (A: CLI seals → wasm opens; B: wasm
+  seals → CLI opens). A DEMO of the UNAUDITED building block, **NOT** the product
+  account/key-management model; the `SIGILcli` container is a pre-audit CLI/demo
+  container, not a frozen product wire format; not for real secrets (ADR 0020).
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)
@@ -301,6 +314,7 @@ cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
 node sigil-wasm/test/roundtrip.mjs                  # prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build

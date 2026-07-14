@@ -42,6 +42,8 @@ design end to end.
 ```ts
 seal_record(password, salt, nonce, m_cost, t_cost, p_cost, aad, plaintext): Uint8Array
 open_record(password, salt, m_cost, t_cost, p_cost, envelope): Uint8Array
+seal_to_container(password, salt, nonce, m_cost, t_cost, p_cost, plaintext): Uint8Array
+open_container(password, container): Uint8Array
 nonce_len(): number            // 24 (XChaCha20-Poly1305 nonce length)
 recommended_salt_len(): number // 16
 version(): string
@@ -51,6 +53,44 @@ All byte arguments are `Uint8Array`. `seal_record` returns the encoded envelope
 (the AEAD nonce is stored **inside** it); the caller MUST persist `salt` and the
 three Argon2 cost params separately to `open` later. A wrong password / bad nonce
 length / tampered ciphertext throws a JS `Error`.
+
+## CLI-compatible `SIGILcli` container interop
+
+`seal_to_container` / `open_container` are the **interop** path: they read and
+write the exact same self-describing container the [`sigil` CLI](../cli) does, so
+you can **seal in the browser and open with `sigil open`**, and vice-versa.
+
+The format is **byte-identical** to `cli/src/lib.rs` (all integers
+little-endian):
+
+```text
+  magic[8] = "SIGILcli" | version:u8 = 1 | m_cost:u32 | t_cost:u32 | p_cost:u32 |
+  salt_len:u8 | salt[salt_len] | envelope[..]
+```
+
+and the AEAD **AAD** bound at seal time is the fixed ASCII tag `sigil-cli/1` —
+the wasm seals with the same AAD, or the CLI's `open` would fail authentication.
+`open_container` reads the params + salt back out of the header (self-describing),
+so you do **not** carry them separately. The container header constants are
+mirrored in `sigil-wasm/src/lib.rs` with a comment tying each value back to the
+CLI; a native golden test asserts the header bytes byte-for-byte, and the Node
+interop test below drives both directions against the **real** CLI binary.
+
+Unlike the CLI (which draws its own OS entropy), `seal_to_container` takes the
+salt and nonce as arguments — keep the caller-supplied-entropy contract by
+generating them in JS with `crypto.getRandomValues`. Example:
+
+```js
+// Seal in the browser -> a file you can `sigil open`.
+const salt = new Uint8Array(recommended_salt_len());  crypto.getRandomValues(salt);
+const nonce = new Uint8Array(nonce_len());            crypto.getRandomValues(nonce);
+const container = seal_to_container(password, salt, nonce, 8, 1, 1, plaintext);
+// ... download `container` as note.sigil, then on a shell:
+//   SIGIL_PASSWORD='…' sigil open --in note.sigil --out note.txt
+
+// Open a container written by `sigil seal` (its params ride in the header).
+const plaintext = open_container(password, uploadedBytes);
+```
 
 ## Build
 
@@ -84,6 +124,25 @@ asserts equality, and asserts that opening with the **wrong password** throws. I
 prints a `PASS` line and exits 0 on success (non-zero on any failure). This is
 the proof the wasm-pure core works in a JS runtime with caller-supplied entropy.
 
+## Run the CLI interop test
+
+```bash
+./build-wasm.sh                     # produces pkg-node/ (must run first)
+node test/interop.mjs
+```
+
+This proves the `SIGILcli` container is byte-compatible in **both** directions by
+shelling out to the **real** `sigil` binary (it runs `cargo build --bin sigil`
+first, so no stale binary):
+
+- **Direction A** — `sigil seal` writes a container, Node reads the bytes and
+  `open_container` recovers the plaintext (asserts equality);
+- **Direction B** — `seal_to_container` (with a JS-generated salt + nonce) writes
+  a container, `sigil open` decrypts it (asserts equality).
+
+It prints a `PASS` line naming both directions and exits non-zero on any
+mismatch. It builds the CLI itself but needs `pkg-node/` from `./build-wasm.sh`.
+
 ## Serve the browser demo
 
 ```bash
@@ -95,7 +154,11 @@ python3 -m http.server 8000         # from this directory
 The demo (`demo/index.html` + `demo/main.js`) has a password field, a plaintext
 textarea, and Seal / Open buttons; Seal generates the salt+nonce via
 `window.crypto.getRandomValues`, shows the envelope as base64, and keeps
-`(salt, params)` in memory for Open. It carries a loud pre-audit banner.
+`(salt, params)` in memory for Open. It also has an **interop** section that uses
+`seal_to_container` / `open_container`: **Seal → download .sigil** saves a
+CLI-compatible container you can open with `sigil open`, and the file picker
+**opens** a `.sigil` container (from the demo *or* from `sigil seal`) right in the
+browser. It carries a loud pre-audit banner.
 
 ## Native unit tests
 

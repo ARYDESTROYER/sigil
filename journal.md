@@ -11,7 +11,16 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 29, `main` @ origin, clean tree).** Phase 29 opened
+**Where we are (through Phase 30, `main` @ origin, clean tree).** Phase 30 made
+`sigil-wasm` **INTEROPERABLE with the `sigil` CLI**: new `seal_to_container`/
+`open_container` exports read+write the exact same `SIGILcli` container (magic
+`SIGILcli`, version 1, Argon2 params `u32`-LE, `u8`-len salt, envelope; AEAD
+`sigil-cli/1`), so **seal-in-browser ↔ `sigil open`** works both ways. Format
+constants are MIRRORED (not shared) in `cli/src/lib.rs` + `sigil-wasm/src/lib.rs`
+with a sync comment, guarded by a native golden-header test + a Node interop test
+(`test/interop.mjs`) that shells to the REAL built CLI both directions — VERIFIED
+GREEN, both `Cargo.lock`s still getrandom==0. A pre-audit CLI/demo container, NOT a
+frozen product wire format (ADR 0020). Phase 29 opened
 the **CLIENT COLUMN** (reserved until now): **`sigil-wasm`**, a standalone
 `wasm-bindgen` binding that runs the core's `seal_record`/`open_record` in the
 **browser + Node** — the FIRST thing to actually consume the wasm-pure core in a
@@ -92,8 +101,12 @@ wasm-pure, `getrandom`-free, caller-supplied-entropy (no in-core RNG):
   (wasm-pack 0.13.1 / wasm-bindgen 0.2.100) → gitignored `pkg-web/`+`pkg-node/`;
   Node round-trip test + native `*_inner` tests + browser `demo/`. FIRST consumer
   of the wasm-pure core; UNAUDITED demo, not the product key model. ADR 0019.
+  **Phase 30: now CLI-interoperable** — `seal_to_container`/`open_container` read+
+  write the CLI's `SIGILcli` container (AAD `sigil-cli/1`), format mirrored in both
+  `cli/src/lib.rs` + `sigil-wasm/src/lib.rs` (MUST stay in sync), proven by a Node
+  interop test shelling to the real CLI both directions. ADR 0020.
 - web marketing splash; deploy = validated skeletons + manual GHCR publish +
-  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0019.
+  loopback stack (**nothing deployed/exposed; no domain**). ADRs 0001–0020.
 
 **HARD INVARIANTS (never break; the commit gate checks them every phase):**
 - `grep -c 'name = "getrandom"' libsigil/Cargo.lock` MUST be **0** (core is
@@ -3121,3 +3134,82 @@ is deliberately **`getrandom`-free**, unlike `cli/`.
   secrets. `pkg-*` require a `wasm-pack` build step (artifacts gitignored). No real web app,
   admin console, or extension yet (still reserved dirs). Posture unchanged; the **system is
   NOT "post-quantum secure".**
+
+---
+
+## 2026-07-14 — Phase 30 (wasm ↔ CLI `SIGILcli` container interop)
+
+### What & why
+Made `sigil-wasm` **interoperable with the `sigil` CLI**: a file sealed in the browser now
+opens with `sigil open`, and a file sealed with `sigil seal` opens in the browser. Until
+now the wasm binding only exposed the bare `seal_record`/`open_record` envelope (salt +
+Argon2 params carried out-of-band), so it shared the *crypto* with the CLI but not the
+*packaging* — the two clients could not read each other's files. The CLI already defines a
+small self-describing on-disk **`SIGILcli` container** (`cli/src/lib.rs`): the raw envelope
+prefixed with the salt + the three Argon2 cost params (which the envelope itself does not
+carry). This phase teaches the wasm binding to read+write that exact container.
+
+Added two `#[wasm_bindgen]` exports in `sigil-wasm/src/lib.rs`:
+- `seal_to_container(password, salt, nonce, m_cost, t_cost, p_cost, plaintext) -> Uint8Array`
+  — seals under the CLI's fixed AAD `sigil-cli/1` and packs the self-describing header
+  `magic "SIGILcli" ‖ version=1 ‖ m_cost/t_cost/p_cost (u32 LE) ‖ salt_len(u8) ‖ salt` in
+  front of the envelope, byte-mirroring `cli/src/lib.rs`.
+- `open_container(password, container) -> Uint8Array` — validates magic + version, reads the
+  params + salt back out of the header, slices the envelope tail, re-derives the key and
+  authenticates+decrypts. Rejects (throws) on bad magic, unsupported version, a declared
+  salt that overruns the buffer, a truncated header, wrong password, or tampered ciphertext.
+
+### How (format is MIRRORED, not shared)
+Decided **against a shared crate** for the container format and **mirrored** the constants
+into `sigil-wasm/src/lib.rs` instead — `CLI_MAGIC`/`CLI_FORMAT_VERSION`/`CLI_AAD`/
+`CLI_FIXED_HEADER_LEN` mirror `cli/src/lib.rs`'s `MAGIC`/`FORMAT_VERSION`/`AAD`/
+`FIXED_HEADER_LEN`, each carrying a comment naming the CLI value it must equal. Rationale
+(ADR 0020): this is a **pre-audit demo container, not a product wire format**; a shared
+crate is real structural weight (a fourth Cargo unit, wasm-purity + lockfile isolation to
+re-litigate) for a format we expect to replace. The duplication is small and mechanically
+guarded — the two copies **MUST stay byte-for-byte in sync**, enforced by tests below.
+
+### How verified
+- **Bidirectional interop PASS:** `node sigil-wasm/test/interop.mjs` (after `build-wasm.sh`)
+  **builds and shells to the REAL `sigil` binary** (`cargo build --bin sigil`, no stale
+  binary) and drives both directions against a random 16-byte salt + 24-byte nonce from
+  `webcrypto.getRandomValues`:
+  - **Direction A** — `sigil seal` writes a container → Node reads the bytes → `open_container`
+    recovers the plaintext (asserts equality + that the CLI wrote a `SIGILcli` magic).
+  - **Direction B** — `seal_to_container` writes a container → asserts it does NOT leak the
+    plaintext marker → `sigil open` decrypts it (asserts equality).
+  Prints the `PASS: sigil-wasm <-> sigil CLI SIGILcli container interop (A: … ; B: …)` line
+  and exits 0.
+- **Native golden-header + container tests** (`cargo test --manifest-path sigil-wasm/Cargo.toml`):
+  `container_round_trip`, `container_wrong_password_fails`, `container_bad_magic_rejected`,
+  `container_truncated_header_rejected`, `container_declared_salt_overrun_rejected`, and
+  `container_header_is_golden` (asserts the emitted 38-byte header byte-for-byte against a
+  hand-built expected header — any drift from `cli/src/lib.rs`'s layout fails here).
+- **Both getrandom guards still == 0:** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` =
+  **0** AND `grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock` = **0** — the interop path
+  keeps the caller-supplied-entropy contract (JS supplies salt+nonce).
+
+### Docs (this pass — docs only, no code touched)
+- `docs/architecture.md`: §1 `sigil-wasm` bullet extended with the CLI interop
+  (`seal_to_container`/`open_container`, the `SIGILcli` byte layout + AAD, mirrored-not-shared
+  constants, golden + Node-interop tests); the client-container diagram box relabeled
+  "SIGILcli container (cli + sigil-wasm)".
+- `README.md`: `sigil-wasm/` bullet notes the shared container (seal in one, open in the
+  other) + the interop test; MARKETING-CLAIMS discipline reiterated.
+- `CLAUDE.md`: `sigil-wasm` repo-map bullet records the interop + `seal_to_container`/
+  `open_container` exports + the mirrored (must-stay-in-sync) constants in both
+  `cli/src/lib.rs` and `sigil-wasm/src/lib.rs` + the `test/interop.mjs` build-and-test line.
+- `docs/decisions/0020-shared-client-container-format.md` written (Nygard) + indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07); ADR banner extended. RESUME ANCHOR moved
+  to Phase 30.
+
+### ➡️ Still open (honest)
+- The `SIGILcli` container is a **pre-audit CLI/demo container, NOT a frozen product wire
+  format**, over the **UNAUDITED** symmetric `seal_record`/`open_record` building block. It
+  is **not** the product's account / key-management / session model and must not protect real
+  secrets. The format is **duplicated** in two crates — a real, bounded maintenance cost
+  (change one, change the other; the golden + interop tests are the tripwire). A future real,
+  versioned container/wire format belongs in `sigil-core` or a purpose-built shared crate (at
+  which point ADR 0020 would be superseded). Posture unchanged; the **system is NOT
+  "post-quantum secure".**
+

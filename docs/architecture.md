@@ -182,9 +182,21 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   [`../sigil-wasm/build-wasm.sh`](../sigil-wasm/build-wasm.sh) (wasm-pack) into
   gitignored `pkg-web/` (browser ESM) + `pkg-node/` (Node CJS) artifacts, and is
   exercised by a Node round-trip test, native `#[cfg(test)]` unit tests, and a
-  browser `demo/`. It wraps **only** the symmetric `seal_record` / `open_record`
-  path — a **DEMONSTRATION** of the UNAUDITED building block, **NOT** the product's
-  account / key-management model, and not for real secrets.
+  browser `demo/`. **It is now INTEROPERABLE with the `sigil` CLI:** the
+  `seal_to_container` / `open_container` exports read and write the exact same
+  self-describing **`SIGILcli` container** the CLI does (magic `SIGILcli`,
+  version `1`, the three Argon2 cost params as `u32` little-endian, a `u8`-prefixed
+  salt, then the envelope; AEAD `AAD = sigil-cli/1`), so **seal-in-browser →
+  `sigil open`** and **`sigil seal` → open-in-browser** both round-trip. The
+  container constants are **mirrored** in `sigil-wasm/src/lib.rs` and
+  `cli/src/lib.rs` (each value carries a comment tying it to the other file — there
+  is **no shared crate**), guarded by a native golden-header test plus a Node
+  interop test (`test/interop.mjs`) that shells to the **real** built CLI binary in
+  both directions. It wraps **only** the symmetric `seal_record` / `open_record` /
+  container path — a **DEMONSTRATION** of the UNAUDITED building block, **NOT** the
+  product's account / key-management model, and not for real secrets; the
+  `SIGILcli` container is a **pre-audit CLI/demo container, not a frozen product
+  wire format** (see [ADR 0020](decisions/0020-shared-client-container-format.md)).
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
@@ -346,7 +358,7 @@ trust boundary runs on the client.
                                    ▼
                           encoded envelope bytes
                                    │
-   ┌───────────────────────────────┴──────────────── CLI container (cli) ─────┐
+   ┌────────────────────────── SIGILcli container (cli + sigil-wasm) ──────────┐
    │  magic "SIGILcli" | ver | m_cost | t_cost | p_cost | salt_len | salt |    │
    │  envelope-bytes                                                          │
    │  (salt + Argon2 params live HERE, not in the envelope; the nonce lives   │

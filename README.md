@@ -187,9 +187,14 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   passed in, so it stays **`getrandom`-free**, exactly like the core. Build with
   `./sigil-wasm/build-wasm.sh` (uses `wasm-pack` to emit gitignored `pkg-web/` +
   `pkg-node/`); prove it with `node sigil-wasm/test/roundtrip.mjs` or serve
-  `sigil-wasm/demo/` for an in-browser seal/open page. A **standalone crate**
-  (own lockfile), **UNAUDITED**, a **demo of a building block** — not the product's
-  account/key-management model, and not for real secrets.
+  `sigil-wasm/demo/` for an in-browser seal/open page. It also **shares a container
+  format with the `sigil` CLI** (`seal_to_container` / `open_container` read and
+  write the same `SIGILcli` container), so you can **seal in the browser and open
+  with `sigil open`** — and vice-versa; a `node sigil-wasm/test/interop.mjs` proof
+  shells to the real CLI binary in both directions. A **standalone crate** (own
+  lockfile), **UNAUDITED**, a **demo of a building block** — not the product's
+  account/key-management model, and not for real secrets. (Public copy still obeys
+  [`web/apps/marketing/MARKETING-CLAIMS.md`](web/apps/marketing/MARKETING-CLAIMS.md).)
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,

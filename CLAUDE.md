@@ -385,7 +385,20 @@ public, make no security claims, until the audit completes and trademark clears.
   `codeForEntry(T=59)` == RFC vector `94287082` == an independent Node HMAC-SHA-1 TOTP,
   and the server returned the bytes verbatim (opaque). UNAUDITED, dev/localhost, GENERATE
   only (no verification / constant-time compare / zeroization); do NOT store real 2FA
-  secrets.
+  secrets. **The browser now also does TOTP import/export, at parity with the CLI** —
+  another framework-free ESM module **`sigil-wasm/totp-migration.mjs`** gives it the
+  same Google Authenticator bulk import (`otpauth-migration://offline?data=…`) + single
+  `otpauth://` import/export as `sigil totp import`/`export`: `decodeMigrationUri` /
+  `encodeMigrationUri` / `parseOtpauthUri` / `buildOtpauthUri` (+ `base32Encode`), wired
+  into the demo (`demo/index.html` + `demo/main.js`). It is a **hand-rolled,
+  dependency-free proto3 codec that MIRRORS `cli/src/migration.rs` (+ the `otpauth://`
+  parse/build in `cli/src/lib.rs`) — no protobuf library, no wasm bridge; the codec now
+  lives in BOTH Rust (cli) and JS (sigil-wasm) and MUST stay in sync**. Guarded by a
+  Node CLI↔JS cross-tool agreement test **`sigil-wasm/test/migration-interop.mjs`**
+  (builds the real CLI; proves both codecs wire-compatible BOTH ways — a GOLDEN Google
+  Authenticator vector via JS, `sigil totp export --migration` decoded in JS [RUST→JS],
+  and a JS-encoded migration URI imported by the CLI [JS→RUST]). `export` reveals the
+  2FA secrets IN THE CLEAR by design; UNAUDITED, dev-only. ADR 0026.
 - `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
 
 ## Toolchains (this machine — macOS arm64)
@@ -430,6 +443,7 @@ node sigil-wasm/test/interop.mjs                    # wasm<->CLI SIGILcli intero
 node sigil-wasm/test/hybrid-interop.mjs             # wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
 node sigil-wasm/test/sync-interop.mjs               # wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
 node sigil-wasm/test/totp-interop.mjs               # cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build

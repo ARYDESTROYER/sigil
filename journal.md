@@ -11,7 +11,30 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 35, `main` @ origin, clean tree).** Phase 35 gave the
+**Where we are (through Phase 36, `main` @ origin, clean tree).** Phase 36 brought the
+**browser client to TOTP import/export parity with the CLI**, so **both clients now
+have full 2FA import/export**. A framework-free, dependency-free ESM module
+**`sigil-wasm/totp-migration.mjs`** gives the browser the same Google Authenticator
+bulk import (`otpauth-migration://offline?data=<BASE64>`) + single-account `otpauth://`
+import/export as the CLI (`decodeMigrationUri` / `encodeMigrationUri` / `parseOtpauthUri`
+/ `buildOtpauthUri` + `base32Encode`), wired into the demo (`demo/index.html` +
+`demo/main.js`). It is a **hand-rolled, dependency-free proto3 codec that MIRRORS
+`cli/src/migration.rs`** (+ the `otpauth://` parse/build in `cli/src/lib.rs`) — no
+protobuf library, no wasm bridge — so the migration codec now lives in BOTH Rust (cli)
+and JS (sigil-wasm) and MUST stay in sync, exactly like the `SIGILcli`/`SIGILhyb`
+container constants and the `TotpVault`/`TotpEntry` vault JSON. VERIFIED GREEN by a Node
+CLI↔JS cross-tool agreement test **`sigil-wasm/test/migration-interop.mjs`** (no server;
+builds the real `sigil` CLI) proving both codecs wire-compatible THREE ways: **GOLDEN**
+— the canonical documented Google Authenticator example URI decodes in JS to secret
+base32 `JBSWY3DPEHPK3PXP`, name `Example:alice@google.com`, issuer `Example`, sha1, 6
+digits (the same golden vector the CLI's own Rust test asserts); **RUST→JS** — `sigil
+totp export --migration` decodes in JS to the CLI's accounts (names/algorithms/digits +
+every secret base32 == the CLI's own `otpauth://` export); and **JS→RUST** — a
+JS-`encodeMigrationUri` URI is accepted by `sigil totp import` and confirmed by `totp
+list` + the CLI's `otpauth://` export carrying the exact secret bytes. No vault-schema /
+container change (pure edge translation). `export` reveals the 2FA secrets IN THE CLEAR
+by design (an export IS plaintext provisioning material). Dev/UNAUDITED — do NOT
+import/export real 2FA secrets yet. ADR 0026. Phase 35 gave the
 CLI **TOTP import/export** so users can migrate 2FA **in** (adoption) and back **out**
 (no lock-in). `sigil totp import <ARG>` ingests a **Google Authenticator** bulk-export
 `otpauth-migration://offline?data=<BASE64>` URI, a single `otpauth://` URI, or a file
@@ -3693,3 +3716,72 @@ GREEN; this pass is docs-only.
 - **Hand-maintained schema.** The protobuf schema is hand-written, not generated — kept honest
   by the golden vector + round-trip tests. Vault stays TOTP-only (HOTP skipped). Public copy still
   obeys `web/apps/marketing/MARKETING-CLAIMS.md`.
+
+---
+
+## 2026-07-15 — Phase 36 (browser TOTP import/export: parity with the CLI; migration codec MIRRORED cli ↔ sigil-wasm)
+
+### What & why
+- Phase 35 gave the **CLI** TOTP import/export; the **browser/wasm** client still had none —
+  it could add only one base32 secret at a time and had no way to migrate 2FA in or out. This
+  phase brings the browser to **parity**, so **BOTH clients now have full 2FA import/export**.
+  A user's 2FA overwhelmingly already lives in Google Authenticator, so a browser client you
+  cannot migrate into — or out of — is the same adoption/trust liability it was for the CLI.
+
+### How (design decisions → ADR 0026)
+- **Mirror the codec in JS, don't share the Rust one via wasm.** New framework-free,
+  dependency-free ESM module **`sigil-wasm/totp-migration.mjs`** is a line-for-line mirror of
+  `cli/src/migration.rs` (+ the `otpauth://` parse/build in `cli/src/lib.rs`) — the same
+  hand-rolled proto3 codec (varint = 0, length-delimited = 2; NO protobuf library; 10-byte varint
+  cap + bounds-checked lengths → throws, never overruns; unknown fields skipped). Public surface:
+  `decodeMigrationUri` / `encodeMigrationUri` (the `otpauth-migration://offline?data=…` bulk form),
+  `parseOtpauthUri` / `buildOtpauthUri` (single-account `otpauth://`), and `base32Encode` (inverse
+  of `totp-vault.mjs`'s `base32Decode`). Consistent with the existing `SIGILcli`/`SIGILhyb`
+  container + `TotpVault`/`TotpEntry` vault mirrors — small no-crypto marshalling kept in both
+  places, pinned by a cross-tool test, no shared crate / wasm bridge.
+- **The codec now lives in TWO places (Rust cli + JS sigil-wasm) and MUST stay in sync.** The
+  guard is the cross-tool test below; if either side changes the wire behavior it fails.
+- **Demo wiring** — `demo/index.html` + `demo/main.js` import (paste an `otpauth-migration://` or
+  `otpauth://` URI) + export (each entry as `otpauth://`, or one combined `otpauth-migration://`),
+  matching `sigil totp import` / `sigil totp export`.
+- **No vault-schema / container change** — pure edge translation over the existing
+  `TotpVault`/`TotpEntry` JSON in the `SIGILcli` container.
+
+### Verified GREEN
+- **`sigil-wasm/test/migration-interop.mjs`** — a pure codec-agreement proof (no server/network;
+  builds the real `sigil` CLI) proving the JS and Rust codecs wire-compatible THREE ways:
+  - **GOLDEN** — the canonical documented Google Authenticator example URI decodes in JS to secret
+    base32 `JBSWY3DPEHPK3PXP`, name `Example:alice@google.com`, issuer `Example`, sha1, 6 digits —
+    the SAME golden vector the CLI's own Rust test asserts.
+  - **RUST→JS** — `sigil totp export --migration` decodes in JS to the CLI's stored accounts (all
+    names/algorithms/digits + every secret base32 == the CLI's own `otpauth://` export).
+  - **JS→RUST** — a JS-`encodeMigrationUri` URI is accepted by `sigil totp import` and confirmed by
+    `totp list` + the CLI's `otpauth://` export carrying the exact secret bytes.
+
+### Docs (this pass — docs only, no code touched)
+- `docs/architecture.md` — sigil-wasm bullet extended: the browser now imports/exports TOTP
+  (Google Authenticator `otpauth-migration://` + `otpauth://`) at CLI parity, codec MIRRORED
+  Rust (cli) ↔ JS (sigil-wasm) with the Node cross-tool agreement test; honest dev/UNAUDITED +
+  export-reveals-secrets framing.
+- `docs/decisions/0026-browser-totp-import-export.md` — new Nygard ADR (context: client parity /
+  browser should import from Google Authenticator too; decision: mirror the migration protobuf
+  codec in JS rather than sharing the Rust one via wasm, consistent with the container/vault
+  mirrors, and prove agreement with a Node CLI↔JS cross-tool test on the golden vector +
+  round-trips; consequences: codec now in two places kept in sync by the test, still UNAUDITED/dev,
+  export reveals secrets). Indexed in `docs/decisions/README.md` (Accepted, 2026-07) + noted in
+  its status preamble.
+- `CLAUDE.md` — sigil-wasm bullet extended with `totp-migration.mjs` (JS otpauth + migration codec
+  mirroring `cli/src/migration.rs`), the demo import/export, and the `migration-interop.mjs`
+  cross-tool test; the codec-mirrored-and-must-stay-in-sync note; test added to the build-test list.
+- `README.md` — short note that the browser can import from Google Authenticator + export at CLI
+  parity; codec mirrored + cross-tool test; export in the clear; UNAUDITED, MARKETING-CLAIMS.
+- `journal.md` — this entry + RESUME ANCHOR bumped to through Phase 36 (TOTP import/export now on
+  BOTH clients).
+
+### ➡️ Still open (honest)
+- **Dev-only / UNAUDITED.** Do NOT import or export real 2FA secrets in this build. `export`
+  reveals secrets in the clear **by design** (an export IS plaintext provisioning material).
+- **Hand-maintained schema in two languages now.** The proto3 codec is hand-written on both the
+  Rust and JS sides — kept honest only by `migration-interop.mjs`; a change to one side must
+  update the other or the test fails. Vault stays TOTP-only (HOTP warned-and-skipped). Public copy
+  still obeys `web/apps/marketing/MARKETING-CLAIMS.md`.

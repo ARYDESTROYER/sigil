@@ -320,6 +320,26 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   no-auth, generation only (no verification / constant-time compare /
   zeroization); do not store real 2FA secrets
   (see [ADR 0024](decisions/0024-wasm-totp-vault-and-cross-client-totp.md)).
+  **The browser client now also IMPORTS and EXPORTS TOTP, at parity with the CLI** —
+  so **both** clients have full import/export. A framework-free, dependency-free ESM
+  module ([`../sigil-wasm/totp-migration.mjs`](../sigil-wasm/totp-migration.mjs))
+  gives the browser the same Google Authenticator bulk-import
+  (`otpauth-migration://offline?data=…`) and single-account `otpauth://` import/export
+  the `sigil totp import` / `sigil totp export` CLI has (`decodeMigrationUri` /
+  `encodeMigrationUri` / `parseOtpauthUri` / `buildOtpauthUri`), and the demo `demo/`
+  wires import + export over it. Like the container and vault formats, the migration
+  **protobuf codec is MIRRORED — not shared — between the Rust CLI
+  ([`../cli/src/migration.rs`](../cli/src/migration.rs)) and this JS module** (a
+  hand-rolled, dependency-free proto3 codec on both sides — no protobuf library, no
+  wasm bridge) and must stay in sync. Agreement is pinned by a Node CLI↔JS cross-tool
+  test ([`../sigil-wasm/test/migration-interop.mjs`](../sigil-wasm/test/migration-interop.mjs))
+  that builds the **real** CLI and proves both codecs are wire-compatible **both ways**
+  — a GOLDEN Google Authenticator vector decoded via JS, `sigil totp export
+  --migration` decoded in JS (RUST→JS), and a JS-encoded migration URI imported by the
+  CLI (JS→RUST). Honest framing: still **dev / UNAUDITED**, and `export` reveals the
+  2FA secrets **in the clear by design** (an export is plaintext provisioning
+  material); do not import/export real 2FA secrets in this build (see
+  [ADR 0026](decisions/0026-browser-totp-import-export.md)).
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
   middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),

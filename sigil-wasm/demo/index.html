@@ -275,6 +275,35 @@
     <label>Vault (live codes, refreshing each second)</label>
     <div id="totpList"><span class="muted">(empty — add a secret above)</span></div>
 
+    <hr style="margin: 1.5rem 0; border: none; border-top: 1px dashed rgba(127,127,127,0.3);" />
+
+    <h3 style="margin-bottom: 0.25rem;">Import / Export (otpauth &amp; Google Authenticator)</h3>
+    <p class="muted" style="margin-top: 0.25rem;">
+      Import a single <code>otpauth://totp/…</code> URI or a Google Authenticator
+      bulk <code>otpauth-migration://offline?data=…</code> URI (the QR export).
+      Export the in-page vault back to either form. Wire-compatible with
+      <code>sigil totp import/export</code> (codec mirrors the CLI's).
+    </p>
+
+    <label for="totpImportUri">Import URI (otpauth:// or otpauth-migration://)</label>
+    <textarea id="totpImportUri" rows="3" autocomplete="off"
+      style="width: 100%; font-family: monospace; font-size: 0.85rem;"
+      placeholder="otpauth://totp/Acme:bob?secret=GEZDGNBVGY3TQOJQ&issuer=Acme  — or —  otpauth-migration://offline?data=…"></textarea>
+    <div class="row">
+      <button id="totpImport">Import</button>
+    </div>
+
+    <div class="row" style="margin-top: 1rem;">
+      <button id="totpExportOtpauth">Export (otpauth)</button>
+      <button id="totpExportMigration">Export (migration)</button>
+    </div>
+    <p class="banner" style="font-weight: 500;">
+      !! An EXPORT contains your TOTP SECRETS IN THE CLEAR — anyone who reads the
+      output can generate your codes. Treat it like a password. !!
+    </p>
+    <label>Export output</label>
+    <pre id="totpExportOut"><span class="muted">(nothing exported yet)</span></pre>
+
     <label for="totpVaultId" style="margin-top: 1.5rem;">Op-log vault ID (uses the Server URL above)</label>
     <input id="totpVaultId" type="text" autocomplete="off" value="totp-demo" />
 

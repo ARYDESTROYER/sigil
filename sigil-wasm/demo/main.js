@@ -35,7 +35,14 @@ import {
   sealVault,
   codeForEntry,
   base32Decode,
+  base64ToBytes,
 } from "../totp-vault.mjs";
+import {
+  parseOtpauthUri,
+  buildOtpauthUri,
+  decodeMigrationUri,
+  encodeMigrationUri,
+} from "../totp-migration.mjs";
 
 // totp-vault.mjs takes the wasm binding as an injected `wasm` object; adapt the
 // named ESM imports into the shape it expects (the same functions the CLI uses).
@@ -486,6 +493,80 @@ async function main() {
       renderTotp();
     } catch (e) {
       $("totpStatus").textContent = "Add error: " + e;
+    }
+  });
+
+  // Add a parsed TotpEntry (the vault shape, secret = base64) into the in-page
+  // vault via addEntry (which takes RAW secret bytes), skipping a duplicate
+  // label. Returns "added" | "duplicate".
+  function addParsedEntry(entry) {
+    if (totpVault.entries.some((e) => e.label === entry.label)) return "duplicate";
+    addEntry(totpVault, {
+      label: entry.label,
+      issuer: entry.issuer,
+      secretBytes: base64ToBytes(entry.secret),
+      algorithm: entry.algorithm,
+      digits: entry.digits,
+      period: entry.period,
+    });
+    return "added";
+  }
+
+  // Import an otpauth:// (single) or otpauth-migration:// (bulk) URI.
+  $("totpImport").addEventListener("click", () => {
+    try {
+      const uri = $("totpImportUri").value.trim();
+      if (!uri) {
+        $("totpStatus").textContent = "Paste an otpauth:// or otpauth-migration:// URI first.";
+        return;
+      }
+      let entries;
+      if (uri.toLowerCase().startsWith("otpauth-migration://")) {
+        entries = decodeMigrationUri(uri); // may warn+skip HOTP entries
+      } else if (uri.toLowerCase().startsWith("otpauth://")) {
+        entries = [parseOtpauthUri(uri)];
+      } else {
+        throw new Error("not an otpauth:// or otpauth-migration:// URI");
+      }
+      let imported = 0;
+      let duplicate = 0;
+      for (const entry of entries) {
+        if (addParsedEntry(entry) === "added") imported++;
+        else duplicate++;
+      }
+      $("totpStatus").textContent =
+        `Imported ${imported} entr${imported === 1 ? "y" : "ies"}` +
+        (duplicate > 0 ? `, skipped ${duplicate} duplicate` : "") +
+        `. Vault now has ${totpVault.entries.length}.`;
+      renderTotp();
+    } catch (e) {
+      $("totpStatus").textContent = "Import error: " + e;
+    }
+  });
+
+  // Export the vault as one otpauth:// URI per entry.
+  $("totpExportOtpauth").addEventListener("click", () => {
+    try {
+      if (totpVault.entries.length === 0) {
+        $("totpExportOut").textContent = "(vault is empty — add or import an entry first)";
+        return;
+      }
+      $("totpExportOut").textContent = totpVault.entries.map(buildOtpauthUri).join("\n");
+    } catch (e) {
+      $("totpExportOut").textContent = "Export error: " + e;
+    }
+  });
+
+  // Export the WHOLE vault as one Google Authenticator otpauth-migration:// URI.
+  $("totpExportMigration").addEventListener("click", () => {
+    try {
+      if (totpVault.entries.length === 0) {
+        $("totpExportOut").textContent = "(vault is empty — add or import an entry first)";
+        return;
+      }
+      $("totpExportOut").textContent = encodeMigrationUri(totpVault.entries);
+    } catch (e) {
+      $("totpExportOut").textContent = "Export error: " + e;
     }
   });
 

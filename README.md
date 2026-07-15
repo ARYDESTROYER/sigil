@@ -234,7 +234,14 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   vault the `sigil totp` CLI uses**, so a secret added on one client and synced
   through the opaque op-log yields the **same code on the other, cross-client**
   (proven by `node sigil-wasm/test/totp-interop.mjs`: CLI adds → op-log → browser
-  code == the RFC vector). UNAUDITED, generation only — **do not store real 2FA
+  code == the RFC vector). It can now also **import from Google Authenticator and
+  export**, matching the CLI — `sigil-wasm/totp-migration.mjs` gives the browser the
+  same `otpauth-migration://` bulk import + `otpauth://` import/export as `sigil totp
+  import`/`export`, and the demo wires it up. The migration codec is **mirrored** in
+  Rust (`cli/src/migration.rs`) and JS (`sigil-wasm/totp-migration.mjs`) and kept in
+  sync by a CLI↔JS cross-tool test (`node sigil-wasm/test/migration-interop.mjs`), so
+  **both clients have full 2FA import/export**; `export` prints secrets **in the clear**
+  by design. UNAUDITED, generation only — **do not store real 2FA
   secrets yet**. A **standalone crate** (own lockfile),
   **UNAUDITED**, a **demo of a building block** — a custom KEM-then-AEAD (not RFC
   9180 HPKE), not the product's account/key-management/sync model, and not for real

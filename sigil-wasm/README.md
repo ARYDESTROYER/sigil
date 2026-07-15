@@ -327,6 +327,41 @@ sealVault(wasm, password, vault, salt, nonce, params) -> containerBytes
 base32Decode(str) -> Uint8Array   // RFC 4648, case-insensitive (for a provisioning secret)
 ```
 
+### Import / export — otpauth &amp; Google Authenticator (`totp-migration.mjs`)
+
+`totp-migration.mjs` gives the browser the **same TOTP import/export the CLI has**,
+so it is a full-featured authenticator client. It is a framework-free,
+dependency-free ESM module and a **line-for-line mirror of `cli/src/migration.rs`**
+(plus the `otpauth://` parse/build in `cli/src/lib.rs`) — **keep the two in sync**.
+Like the Rust side, the protobuf codec is **hand-rolled** (only proto3 wire types
+0 = varint and 2 = length-delimited), bounds-checked so a truncated payload throws
+rather than overruns. It works in both Node and the browser and speaks the vault
+`TotpEntry` shape (base64 raw secret):
+
+```js
+parseOtpauthUri(uri) -> entry            // single otpauth://totp/… URI
+buildOtpauthUri(entry) -> "otpauth://…"  // secret base32-encoded for the URI
+decodeMigrationUri(uri) -> [entry, …]    // Google Authenticator bulk otpauth-migration://; HOTP skipped (console.warn)
+encodeMigrationUri(entries) -> "otpauth-migration://offline?data=…"
+base32Encode(bytes) -> string            // RFC 4648, no padding (inverse of totp-vault.mjs base32Decode)
+```
+
+The demo's TOTP section wires these into an **Import** control (paste an
+`otpauth://` or `otpauth-migration://` URI → adds the account(s) to the in-page
+vault) and **Export (otpauth)** / **Export (migration)** buttons — each behind a
+loud *"contains secrets in the clear"* warning. An export URI carries the OTP
+**SECRETS IN THE CLEAR** (it is the plaintext provisioning form). **UNAUDITED /
+DEV — do not handle real 2FA secrets in this build.**
+
+The cross-tool agreement test (`test/migration-interop.mjs`) proves the JS codec
+and the Rust CLI codec are wire-compatible **both ways** — a golden Google
+Authenticator vector via JS, a `sigil totp export --migration` decoded in JS, and a
+JS-encoded migration URI imported by `sigil totp import`:
+
+```bash
+node test/migration-interop.mjs
+```
+
 ### Run the cross-client TOTP interop test
 
 ```bash
@@ -382,7 +417,10 @@ carries a loud pre-audit banner.
 Last, a **TOTP authenticator vault** section: enter a base32 secret + a label and
 **Add to vault** to keep an in-page `TotpVault`, which shows each entry's **live**
 code refreshing every second with a countdown to the next period (the browser
-clock supplies the time). **Seal → Push vault** seals the whole vault into a
+clock supplies the time). An **Import / Export** control (via `totp-migration.mjs`)
+imports a single `otpauth://` URI or a Google Authenticator bulk
+`otpauth-migration://` URI into the vault, and exports the vault back to either
+form behind a loud secrets-in-the-clear warning. **Seal → Push vault** seals the whole vault into a
 `SIGILcli` container (via `totp-vault.mjs` + `sync.mjs`) and pushes the opaque
 bytes to the dev op-log; **Pull → Open vault** pulls it back and decrypts it — so
 the vault round-trips through a local sigild and is cross-compatible with

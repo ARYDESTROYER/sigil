@@ -24,7 +24,9 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > secret added on one client and synced through the opaque op-log yields the same
 > code on the other), the CLI's **TOTP import/export** (Google Authenticator
 > `otpauth-migration://` bulk import via a hand-rolled dependency-free protobuf codec,
-> plus `otpauth://`, for migrate-in / no-lock-in),
+> plus `otpauth://`, for migrate-in / no-lock-in) and the **browser client's matching
+> TOTP import/export** (the migration codec mirrored in JS and proven wire-compatible
+> with the CLI by a Node cross-tool test, so both clients have full import/export),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -82,3 +84,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0023](0023-totp-hotp-primitive-and-cli-vault.md) | TOTP/HOTP primitive in `sigil-core` + encrypted CLI TOTP vault (first product feature) | Accepted (2026-07) |
 | [0024](0024-wasm-totp-vault-and-cross-client-totp.md) | Browser TOTP vault + cross-client TOTP through the op-log (wasm `totp`/`hotp`/`format_code`, mirrored vault JSON) | Accepted (2026-07) |
 | [0025](0025-totp-import-export.md) | TOTP import/export — Google Authenticator `otpauth-migration://` (hand-rolled protobuf) + `otpauth://` | Accepted (2026-07) |
+| [0026](0026-browser-totp-import-export.md) | Browser TOTP import/export — mirror the migration codec in JS (`totp-migration.mjs`) + CLI↔JS cross-tool test | Accepted (2026-07) |

@@ -11,7 +11,26 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 34, `main` @ origin, clean tree).** Phase 34 made the
+**Where we are (through Phase 35, `main` @ origin, clean tree).** Phase 35 gave the
+CLI **TOTP import/export** so users can migrate 2FA **in** (adoption) and back **out**
+(no lock-in). `sigil totp import <ARG>` ingests a **Google Authenticator** bulk-export
+`otpauth-migration://offline?data=<BASE64>` URI, a single `otpauth://` URI, or a file
+of URIs (one per line, `#` comments skipped); `sigil totp export [<label>]` prints
+entries as `otpauth://` URIs or (with `--migration`) ONE combined
+`otpauth-migration://` URI, to stdout or `--out <file>` (0600). The migration format
+is a **protobuf** `MigrationPayload`, decoded/encoded by a **hand-rolled, dependency-free
+protobuf codec** (`cli/src/migration.rs`: proto3 varint + length-delimited wire types
+only — NO protobuf crate, mirroring the hand-rolled base32) with `decode_migration_uri`/
+`encode_migration_uri` + the `MigrationOtp`↔`TotpEntry` converters. VERIFIED GREEN by a
+**golden vector** (the canonical documented Google Authenticator export decodes to
+secret `JBSWY3DPEHPK3PXP` = `b"Hello!" ‖ DE AD BE EF`, name `Example:alice@google.com`,
+issuer `Example`, SHA1/SIX/TOTP) and **encode→decode + `TotpEntry`→migration→back
+round-trips** (plus truncation + unknown-field-skip tests). HOTP entries in a payload
+are **warned-and-skipped** (vault is TOTP-only); the vault's `TotpVault` JSON schema is
+**UNCHANGED** (browser mirror intact); duplicate labels are skipped, not overwritten.
+`export` prints **SECRETS IN THE CLEAR** by design (an export IS plaintext provisioning
+material) behind a loud stderr warning. No new dep; Dev/UNAUDITED — do NOT import/export
+real 2FA secrets yet. ADR 0025. Phase 34 made the
 authenticator work **CROSS-CLIENT (CLI ↔ browser) through the opaque server** — the
 **first end-to-end product feature spanning two clients and the op-log**. `sigil-wasm`
 gained three `#[wasm_bindgen]` OTP exports over the core primitive (ADR 0023) — `totp`
@@ -3606,3 +3625,71 @@ CLI ↔ browser interop; the cross-client test is the guard.
 - **Not the product account / key-management / sync model.** No real auth / enrollment / CRDT;
   the mirrored vault JSON is a pre-audit demo shape, not a frozen wire format. The **system is
   still NOT "post-quantum secure".** Public copy still obeys `web/apps/marketing/MARKETING-CLAIMS.md`.
+
+---
+
+## 2026-07-15 — Phase 35 (CLI TOTP import/export: Google Authenticator `otpauth-migration://` + `otpauth://`)
+
+### What & why
+The vault could generate codes but the only way to populate it was one account at a time, and
+there was **no way out**. Phase 35 adds **import** (adoption: migrate existing 2FA in — above
+all from **Google Authenticator**, whose bulk export is an `otpauth-migration://offline?data=`
+protobuf QR) and **export** (trust / no-lock-in: take secrets back out). Code + tests already
+GREEN; this pass is docs-only.
+
+- **Hand-rolled protobuf codec** — `cli/src/migration.rs`. NO protobuf crate and no codegen:
+  just the two proto3 wire types the format uses (varint = 0, length-delimited = 2), mirroring
+  the hand-rolled base32 elsewhere in the crate. `decode_migration_payload` /
+  `encode_migration_payload` parse/render `MigrationPayload` + `OtpParameters` into `MigrationOtp`
+  records (raw enum ints); `decode_migration_uri` / `encode_migration_uri` wrap the base64 + scheme
+  layer (decode tolerates standard/URL-safe, padded or not). Varint capped at 10 bytes, every
+  length bounds-checked (truncated/hostile input → `CliError::Totp`, never a panic); unknown
+  fields skipped by wire type. Semantic mapping isolated in `migration_otp_to_entry` /
+  `entry_to_migration_otp` so the codec stays schema-agnostic + independently testable.
+- **CLI** — `cli/src/main.rs`. `sigil totp import <ARG>` = an `otpauth-migration://` URI (bulk),
+  a single `otpauth://` URI, or a file of URIs (one/line, blank + `#` skipped); duplicate labels
+  skipped (not overwritten), vault re-sealed only if ≥1 imported. `sigil totp export [<label>]`
+  = each entry as an `otpauth://` URI, or (with `--migration`) ONE combined
+  `otpauth-migration://` URI, to stdout or a 0600 `--out <file>`, behind a LOUD stderr warning.
+- **Vault schema UNCHANGED** — import/export translates only at the edges over the existing
+  `TotpVault`/`TotpEntry` JSON in the same `SIGILcli` container, so the browser mirror
+  (ADR 0024) stays byte-compatible; no new at-rest format.
+- **HOTP warned-and-skipped** — a migration payload may carry counter-based HOTP; the vault is
+  TOTP-only (schema deliberately not extended) → `ImportedOtp::SkippedHotp`, counted + warned,
+  never fatal. MD5/unspecified algorithm + out-of-range digits rejected per entry, not fatally.
+
+### Verified GREEN
+- **Golden vector** (`golden_google_authenticator_example_decodes_to_documented_values`): the
+  canonical documented Google Authenticator export decodes to raw secret `b"Hello!" ‖ DE AD BE EF`
+  (base32 `JBSWY3DPEHPK3PXP`), name `Example:alice@google.com`, issuer `Example`, SHA1 / SIX /
+  TOTP — and maps to a well-formed `TotpEntry` (period defaults to 30).
+- **Round-trips**: `encode_migration_payload`→`decode_migration_payload` is the identity across
+  varied algorithm/digits/type/issuer + a 200-byte secret (2-byte varint length) and survives the
+  full URI wrapper; `TotpEntry`→`entry_to_migration_otp`→encode→decode→`migration_otp_to_entry`
+  returns the same entry.
+- Plus HOTP-skipped, MD5/unspecified-rejected, unspecified-digits-defaults-to-6, truncated-payload
+  -rejected-without-panic, unknown-fields-skipped. No new dependency (uses the CLI's existing
+  `base64`).
+
+### Docs (this pass — docs only, no code touched)
+- `docs/architecture.md` — CLI bullet extended: `totp import`/`export`, Google Authenticator
+  `otpauth-migration://` via the hand-rolled `cli/src/migration.rs` protobuf decoder + `otpauth://`,
+  vault schema unchanged / browser mirror intact, HOTP warned-and-skipped, export-reveals-secrets
+  honest framing.
+- `docs/decisions/0025-totp-import-export.md` — new Nygard ADR (context: adoption needs import /
+  trust needs export; decision: hand-rolled dependency-free protobuf codec over a crate, keep the
+  vault schema, warn+skip HOTP; consequences: hand-maintained decoder verified by golden vector +
+  round-trip, export reveals secrets by nature, still UNAUDITED/dev). Indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07) + noted in its status preamble.
+- `CLAUDE.md` — cli bullet extended with `sigil totp import/export`, the hand-rolled migration
+  protobuf codec (dependency-free), and the vault-schema-unchanged / browser-mirror-intact note.
+- `README.md` — short note that `totp import`/`export` support Google Authenticator migration +
+  `otpauth://`; UNAUDITED, do not use for real secrets yet, MARKETING-CLAIMS discipline.
+- `journal.md` — this entry + RESUME ANCHOR bumped to through Phase 35.
+
+### ➡️ Still open (honest)
+- **Dev-only / UNAUDITED.** Do NOT import or export real 2FA secrets in this build. `export`
+  reveals secrets in the clear **by design** (an export IS plaintext provisioning material).
+- **Hand-maintained schema.** The protobuf schema is hand-written, not generated — kept honest
+  by the golden vector + round-trip tests. Vault stays TOTP-only (HOTP skipped). Public copy still
+  obeys `web/apps/marketing/MARKETING-CLAIMS.md`.

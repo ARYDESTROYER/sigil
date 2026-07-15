@@ -43,6 +43,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod migration;
+
+pub use migration::{
+    decode_migration_payload, decode_migration_uri, encode_migration_payload, encode_migration_uri,
+    entry_to_migration_otp, migration_otp_to_entry, ImportedOtp, MigrationOtp,
+};
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -1327,6 +1334,33 @@ pub fn base32_decode(input: &str) -> Result<Vec<u8>, CliError> {
     Ok(out)
 }
 
+/// Encode raw bytes into an RFC 4648 base32 string (uppercase, UNPADDED).
+///
+/// The inverse of [`base32_decode`] (which ignores case and `=` padding), so
+/// `base32_decode(base32_encode(x)) == x`. Used to render a secret back into the
+/// base32 provisioning form for an `otpauth://` export URI. Empty input yields an
+/// empty string.
+#[must_use]
+pub fn base32_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::new();
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &b in input {
+        acc = (acc << 8) | u32::from(b);
+        nbits += 8;
+        while nbits >= 5 {
+            nbits -= 5;
+            out.push(ALPHABET[((acc >> nbits) & 0x1f) as usize] as char);
+        }
+    }
+    if nbits > 0 {
+        // Left-align the remaining low bits into a final 5-bit group.
+        out.push(ALPHABET[((acc << (5 - nbits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
 /// Build a [`TotpEntry`] from raw parts, base64-encoding the raw `secret` bytes.
 ///
 /// Validates `digits` against the core's supported range up front (a bad digit
@@ -1367,7 +1401,7 @@ pub fn new_totp_entry(
 
 /// Minimal percent-decoder for `otpauth://` label/issuer fields (`%XX` → byte).
 /// Unknown/short escapes are passed through literally. UTF-8 is best-effort.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1474,6 +1508,58 @@ pub fn parse_otpauth_uri(uri: &str) -> Result<TotpEntry, CliError> {
     }
 
     new_totp_entry(&label, issuer, &secret, algorithm, digits, period)
+}
+
+/// Percent-encode `s` for an `otpauth://` URI, escaping everything outside the
+/// RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`). The inverse of
+/// [`percent_decode`], so an exported label/issuer parses back to the original.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Render a [`TotpEntry`] as an `otpauth://totp/...` provisioning URI.
+///
+/// The secret is base32-encoded (the provisioning form); the label/issuer are
+/// percent-encoded. When an issuer is present the path is `Issuer:Account` AND an
+/// `issuer=` query is added (both, per the Key URI convention). `algorithm` is
+/// upper-cased (e.g. `SHA1`) as is conventional. The output round-trips through
+/// [`parse_otpauth_uri`].
+///
+/// This is an EXPORT: the returned URI contains the secret IN THE CLEAR. Callers
+/// must warn before printing it.
+///
+/// # Errors
+/// - [`CliError::Totp`] if the entry's stored secret is not valid base64.
+pub fn entry_to_otpauth_uri(entry: &TotpEntry) -> Result<String, CliError> {
+    let secret_b32 = base32_encode(&entry.secret_bytes()?);
+    let account = percent_encode(&entry.label);
+    let issuer = entry.issuer.as_deref().filter(|s| !s.is_empty());
+
+    let label_path = match issuer {
+        Some(iss) => format!("{}:{}", percent_encode(iss), account),
+        None => account,
+    };
+
+    let mut uri = format!("otpauth://totp/{label_path}?secret={secret_b32}");
+    if let Some(iss) = issuer {
+        uri.push_str(&format!("&issuer={}", percent_encode(iss)));
+    }
+    uri.push_str(&format!(
+        "&algorithm={}",
+        entry.algorithm.to_ascii_uppercase()
+    ));
+    uri.push_str(&format!("&digits={}", entry.digits));
+    uri.push_str(&format!("&period={}", entry.period));
+    Ok(uri)
 }
 
 impl TotpVault {
@@ -2516,6 +2602,46 @@ mod tests {
             parse_otpauth_uri("otpauth://hotp/x?secret=GEZDGNBVGY3TQOJQ"),
             Err(CliError::Totp(_))
         ));
+    }
+
+    #[test]
+    fn base32_encode_is_inverse_of_decode() {
+        for raw in [
+            b"1234567890".as_slice(),
+            b"Hello!\xde\xad\xbe\xef".as_slice(),
+            b"a".as_slice(),
+            &[0u8; 20],
+        ] {
+            let encoded = base32_encode(raw);
+            assert_eq!(base32_decode(&encoded).expect("decode"), raw);
+        }
+        // Matches the documented base32 of the GA example secret.
+        assert_eq!(base32_encode(b"Hello!\xde\xad\xbe\xef"), "JBSWY3DPEHPK3PXP");
+    }
+
+    #[test]
+    fn otpauth_export_import_round_trip() {
+        let secret = base32_decode("GEZDGNBVGY3TQOJQ").expect("decode");
+        let entry = new_totp_entry(
+            "alice@example.com",
+            Some("GitHub".to_string()),
+            &secret,
+            OtpAlgorithm::Sha256,
+            8,
+            60,
+        )
+        .expect("entry");
+        // Export to an otpauth:// URI, then parse it back: the entry must survive.
+        let uri = entry_to_otpauth_uri(&entry).expect("export uri");
+        assert!(uri.starts_with("otpauth://totp/GitHub:alice%40example.com?"));
+        let parsed = parse_otpauth_uri(&uri).expect("re-parse");
+        assert_eq!(parsed, entry);
+
+        // An entry with no issuer round-trips too (no `Issuer:` path prefix).
+        let no_issuer =
+            new_totp_entry("solo", None, &secret, OtpAlgorithm::Sha1, 6, 30).expect("entry");
+        let uri2 = entry_to_otpauth_uri(&no_issuer).expect("export uri");
+        assert_eq!(parse_otpauth_uri(&uri2).expect("re-parse"), no_issuer);
     }
 
     #[test]

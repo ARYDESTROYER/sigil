@@ -261,6 +261,19 @@ public, make no security claims, until the audit completes and trademark clears.
   another opaque sealed container (E2EE at rest, op-log-syncable later). Vault path
   is `--vault <file>` else `$HOME/.sigil/totp-vault.sigil` (dir 0700, file 0600).
   Dev/UNAUDITED — do NOT store real 2FA secrets yet. ADR 0023.
+  Also **`sigil totp import <ARG>`/`export [<label>]`** — migrate 2FA in/out (no
+  lock-in). `import` ingests a **Google Authenticator** bulk-export
+  `otpauth-migration://offline?data=…` URI, a single `otpauth://` URI, or a file of
+  URIs (one per line, `#` comments skipped); duplicate-label, HOTP, and invalid
+  entries are skipped. `export` prints each entry as an `otpauth://` URI, or (with
+  `--migration`) ONE combined `otpauth-migration://` URI, to stdout or `--out <file>`
+  (0600) — **export prints SECRETS IN THE CLEAR** (by design; loud stderr warning
+  first). The migration format is decoded/encoded by a **hand-rolled, dependency-free
+  protobuf codec** (`cli/src/migration.rs`: `decode_migration_uri`/`encode_migration_uri`
+  + the `MigrationOtp`↔`TotpEntry` converters), golden-vector (a real Google
+  Authenticator export) + round-trip verified. The vault's `TotpVault` JSON schema is
+  **UNCHANGED** (browser mirror intact); HOTP entries are warned-and-skipped since the
+  vault is TOTP-only. Dev/UNAUDITED. ADR 0025.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.

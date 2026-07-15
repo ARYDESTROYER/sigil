@@ -11,12 +11,13 @@
 use std::process::ExitCode;
 
 use sigil_cli::{
-    base32_decode, cursor_key, generate_hybrid_identity, generate_key, hybrid_open_container,
-    hybrid_seal_to_container, load_hybrid_public, load_hybrid_secret, load_key, new_totp_entry,
-    open_container, open_vault, parse_otpauth_uri, pull_ops, push_op, read_cursor,
-    save_hybrid_public, save_hybrid_secret, save_key, seal_to_container, seal_vault,
-    totp_algorithm_from_str, write_cursor, TotpVault, PULL_STATE_FILE, TOTP_DEFAULT_DIGITS,
-    TOTP_DEFAULT_PERIOD,
+    base32_decode, cursor_key, decode_migration_uri, encode_migration_uri, entry_to_migration_otp,
+    entry_to_otpauth_uri, generate_hybrid_identity, generate_key, hybrid_open_container,
+    hybrid_seal_to_container, load_hybrid_public, load_hybrid_secret, load_key,
+    migration_otp_to_entry, new_totp_entry, open_container, open_vault, parse_otpauth_uri,
+    pull_ops, push_op, read_cursor, save_hybrid_public, save_hybrid_secret, save_key,
+    seal_to_container, seal_vault, totp_algorithm_from_str, write_cursor, ImportedOtp, TotpEntry,
+    TotpVault, PULL_STATE_FILE, TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD,
 };
 use sigil_core::Argon2Params;
 
@@ -57,6 +58,13 @@ USAGE:
                                          Print the CURRENT code for <label> (uses the system clock)
   sigil totp remove <label> [--vault <file>]
                                          Delete an entry from the vault
+  sigil totp import <ARG> [--vault <file>]
+                                         Import 2FA secrets: <ARG> is an
+                                         otpauth-migration:// URI (Google Authenticator bulk
+                                         export), an otpauth:// URI, or a file with one URI per line
+  sigil totp export [<label>] [--vault <file>] [--migration] [--out <file>]
+                                         Export entries as otpauth:// URIs (or ONE
+                                         otpauth-migration:// URI with --migration). PRINTS SECRETS.
   sigil keygen --out <file>              Generate a DEV device key (0600) and print its public key
   sigil hybrid-keygen --out <file>       Generate a hybrid identity: secret <file> (0600) + shareable <file>.pub
   sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>
@@ -96,6 +104,24 @@ TOTP VAULT (totp add/list/code/remove) — the authenticator feature:
 
   !! PRE-AUDIT / UNAUDITED / DEV-ONLY !! The OTP math is standard and RFC-vector
   checked, but the build is unaudited. Do NOT store real 2FA secrets yet.
+
+TOTP IMPORT / EXPORT (totp import/export) — migrate 2FA in and out:
+  import ingests either a Google Authenticator bulk-export migration URI
+  (otpauth-migration://offline?data=<BASE64>, hand-rolled protobuf decode), a
+  single otpauth:// URI, or a text file with one such URI per line. HOTP entries
+  and duplicate labels are SKIPPED; the vault is re-sealed with any new TOTP
+  entries. export is the inverse: it prints each entry as an otpauth:// URI, or —
+  with --migration — one otpauth-migration:// URI holding them all.
+
+    sigil totp import \"otpauth-migration://offline?data=CjUK...AB\"
+    sigil totp import ./exported-uris.txt
+    sigil totp export                     # every entry as otpauth:// URIs
+    sigil totp export work                # just the 'work' entry
+    sigil totp export --migration         # ONE migration URI for all entries
+    sigil totp export --migration --out backup.txt   # write to a 0600 file
+
+  !! export prints your SECRETS IN THE CLEAR (that is what a 2FA export is). It
+  warns on stderr; treat the output like a password. !!
 
 HYBRID PUBLIC-KEY ENCRYPTION (hybrid-keygen / hybrid-seal / hybrid-open) — NO password:
   This is the PUBLIC-KEY path, distinct from the password-based seal/open above.
@@ -767,8 +793,10 @@ fn cmd_totp(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         "list" => cmd_totp_list(rest),
         "code" => cmd_totp_code(rest),
         "remove" => cmd_totp_remove(rest),
+        "import" => cmd_totp_import(rest),
+        "export" => cmd_totp_export(rest),
         other => Err(format!(
-            "unknown totp subcommand {other:?}; try add | list | code | remove"
+            "unknown totp subcommand {other:?}; try add | list | code | remove | import | export"
         )),
     }
 }
@@ -942,5 +970,217 @@ fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
     vault.remove(&label).map_err(|e| e.to_string())?;
     save_vault(&vault_path, &password, &vault)?;
     println!("removed {label:?} from vault {}", vault_path.display());
+    Ok(())
+}
+
+/// Collect the TOTP entries carried by a single `otpauth-migration://` or
+/// `otpauth://` URI, appending to `entries` and bumping the skip counters.
+/// A malformed migration/otpauth URI is counted as invalid (not fatal), so a
+/// bulk import of many URIs keeps going.
+fn collect_from_uri(
+    uri: &str,
+    entries: &mut Vec<TotpEntry>,
+    skipped_hotp: &mut usize,
+    skipped_invalid: &mut usize,
+) -> Result<(), String> {
+    let lower = uri.to_ascii_lowercase();
+    if lower.starts_with("otpauth-migration://") {
+        // Bulk export: one URI, many accounts. A bad payload is fatal for THIS
+        // URI (we cannot parse further), but per-account mapping errors are not.
+        let params = decode_migration_uri(uri).map_err(|e| e.to_string())?;
+        for p in &params {
+            match migration_otp_to_entry(p) {
+                Ok(ImportedOtp::Totp(e)) => entries.push(*e),
+                Ok(ImportedOtp::SkippedHotp) => {
+                    eprintln!(
+                        "sigil: skipping HOTP entry {:?} (the vault stores TOTP only)",
+                        p.name
+                    );
+                    *skipped_hotp += 1;
+                }
+                Err(e) => {
+                    eprintln!("sigil: skipping invalid entry {:?}: {e}", p.name);
+                    *skipped_invalid += 1;
+                }
+            }
+        }
+        Ok(())
+    } else if lower.starts_with("otpauth://") {
+        match parse_otpauth_uri(uri) {
+            Ok(e) => {
+                entries.push(e);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("sigil: skipping invalid otpauth URI: {e}");
+                *skipped_invalid += 1;
+                Ok(())
+            }
+        }
+    } else {
+        Err(format!(
+            "unrecognized entry (not otpauth:// or otpauth-migration://): {uri:?}"
+        ))
+    }
+}
+
+/// `sigil totp import <ARG> [--vault <file>]` — import 2FA secrets.
+///
+/// `<ARG>` is an `otpauth-migration://offline?data=…` URI (Google Authenticator
+/// bulk export), a single `otpauth://totp/…` URI, or a PATH to a file with one
+/// such URI per line (`#` comments and blank lines ignored). Duplicate labels
+/// (already present in the vault) are SKIPPED, not overwritten. HOTP entries and
+/// unparseable/invalid entries are skipped. The vault is re-sealed only if at
+/// least one entry was imported.
+fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
+    let (arg, flags) = take_positional(&args);
+    let arg = arg.ok_or_else(|| {
+        "missing <ARG>: an otpauth-migration:// URI, an otpauth:// URI, or a file path".to_string()
+    })?;
+    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+    if let Some(x) = rest.first() {
+        return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
+    }
+
+    let password = password_from_env()?;
+    let mut vault = load_vault_or_empty(&vault_path, &password)?;
+
+    // Resolve the arg to a list of URI strings: a URI is used directly; anything
+    // else is treated as a file with one URI per line.
+    let lower = arg.to_ascii_lowercase();
+    let uris: Vec<String> =
+        if lower.starts_with("otpauth-migration://") || lower.starts_with("otpauth://") {
+            vec![arg.clone()]
+        } else {
+            let text = std::fs::read_to_string(&arg)
+                .map_err(|e| format!("could not read import file {arg:?}: {e}"))?;
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        };
+
+    let mut entries: Vec<TotpEntry> = Vec::new();
+    let mut skipped_hotp = 0usize;
+    let mut skipped_invalid = 0usize;
+    for uri in &uris {
+        collect_from_uri(uri, &mut entries, &mut skipped_hotp, &mut skipped_invalid)?;
+    }
+
+    // De-dup by label against the existing vault (and within this batch): SKIP a
+    // label that already exists rather than overwrite it.
+    let mut imported = 0usize;
+    let mut skipped_dup = 0usize;
+    for e in entries {
+        if vault.find(&e.label).is_some() {
+            eprintln!("sigil: skipping {:?}: already in the vault", e.label);
+            skipped_dup += 1;
+            continue;
+        }
+        vault.add(e).map_err(|e| e.to_string())?;
+        imported += 1;
+    }
+
+    if imported > 0 {
+        save_vault(&vault_path, &password, &vault)?;
+    }
+    println!(
+        "imported {imported} into {} ({} duplicate, {} HOTP, {} invalid skipped)",
+        vault_path.display(),
+        skipped_dup,
+        skipped_hotp,
+        skipped_invalid
+    );
+    Ok(())
+}
+
+/// `sigil totp export [<label>] [--vault <file>] [--migration] [--out <file>]`.
+///
+/// Default: print each entry (or just `<label>`) as an `otpauth://totp/…` URI.
+/// With `--migration`: emit ALL selected entries as ONE
+/// `otpauth-migration://offline?data=…` URI. The output carries SECRETS in the
+/// clear, so a LOUD warning is printed to stderr first. Output goes to stdout
+/// unless `--out <file>` is given (written mode 0600).
+fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
+    let (label, flags) = take_positional(&args);
+    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+
+    let mut migration = false;
+    let mut out: Option<String> = None;
+    let mut it = rest.into_iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--migration" => migration = true,
+            "--out" => {
+                out = Some(
+                    it.next()
+                        .ok_or_else(|| "--out requires a value".to_string())?,
+                )
+            }
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+
+    let password = password_from_env()?;
+    let vault = load_vault_required(&vault_path, &password)?;
+
+    let selected: Vec<&TotpEntry> = match &label {
+        Some(l) => vec![vault
+            .find(l)
+            .ok_or_else(|| format!("no entry labelled {l:?} in the vault"))?],
+        None => vault.entries.iter().collect(),
+    };
+    if selected.is_empty() {
+        return Err("vault is empty; nothing to export".to_string());
+    }
+
+    // LOUD warning: an export is plaintext secret material.
+    eprintln!(
+        "!! WARNING: this export contains your TOTP SECRETS IN THE CLEAR. Anyone who reads it can\n\
+         !! generate your codes. Treat the output like a password — do not paste it into logs,\n\
+         !! chats, or shared terminals. !!"
+    );
+
+    let output = if migration {
+        let mut otps = Vec::with_capacity(selected.len());
+        for e in &selected {
+            otps.push(entry_to_migration_otp(e).map_err(|err| err.to_string())?);
+        }
+        encode_migration_uri(&otps)
+    } else {
+        let mut lines = Vec::with_capacity(selected.len());
+        for e in &selected {
+            lines.push(entry_to_otpauth_uri(e).map_err(|err| err.to_string())?);
+        }
+        lines.join("\n")
+    };
+
+    match out {
+        Some(path) => {
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let p = std::path::Path::new(&path);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(p)
+                .map_err(|e| format!("could not create export file {path:?}: {e}"))?;
+            f.write_all(output.as_bytes())
+                .map_err(|e| format!("could not write export file {path:?}: {e}"))?;
+            f.write_all(b"\n")
+                .map_err(|e| format!("could not write export file {path:?}: {e}"))?;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("could not set export permissions {path:?}: {e}"))?;
+            println!(
+                "wrote {} entr{} to {path} (mode 0600)",
+                selected.len(),
+                if selected.len() == 1 { "y" } else { "ies" }
+            );
+        }
+        None => println!("{output}"),
+    }
     Ok(())
 }

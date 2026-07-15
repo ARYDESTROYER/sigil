@@ -192,8 +192,16 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   from the core's RFC 4226/6238 primitive, and the secrets are sealed at rest in the
   **same `SIGILcli` password container** as `seal`/`open` (Argon2id +
   XChaCha20-Poly1305), so a vault is just another opaque, syncable sealed container.
-  Standalone crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build
-  is not audited; **do not store real 2FA secrets yet**.
+  `sigil totp import`/`export` **migrate 2FA in and out** so you are not locked in:
+  `import` ingests a **Google Authenticator** bulk-export migration URI
+  (`otpauth-migration://offline?data=…`, decoded by a hand-rolled dependency-free
+  protobuf codec), a single `otpauth://` URI, or a file of URIs; `export` is the
+  inverse — it prints each entry as an `otpauth://` URI, or (with `--migration`) one
+  combined `otpauth-migration://` URI. **`export` prints your secrets IN THE CLEAR**
+  (that is what a 2FA export is) — by design, guarded by a loud warning. Standalone
+  crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build is not
+  audited; **do not store real 2FA secrets yet**. Public copy obeys
+  `web/apps/marketing/MARKETING-CLAIMS.md`.
 - `sigil-wasm/` — a thin **`wasm-bindgen`** binding over the libsigil core's
   record API that runs **`seal_record` / `open_record` in the browser (and Node)**
   — the first thing to actually consume the wasm-pure core in a JS runtime. It

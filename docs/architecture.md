@@ -183,6 +183,19 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   rest, and syncable through the op-log later with no new format). The CLI supplies
   the wall clock and the entropy; the core supplies only the OTP math (see
   [`decisions/0023-totp-hotp-primitive-and-cli-vault.md`](decisions/0023-totp-hotp-primitive-and-cli-vault.md)).
+  The vault also **imports and exports** existing 2FA — `sigil totp import` ingests a
+  **Google Authenticator** bulk-export migration URI
+  (`otpauth-migration://offline?data=…`, parsed by a hand-rolled, dependency-free
+  protobuf decoder in [`../cli/src/migration.rs`](../cli/src/migration.rs)), a single
+  `otpauth://` URI, or a file of URIs, and `sigil totp export` prints entries back as
+  `otpauth://` URIs or one combined `otpauth-migration://` URI — so users can migrate
+  their 2FA **in** (adoption) and back **out** (no lock-in). The vault's on-disk
+  `TotpVault` JSON schema is **unchanged** (the browser mirror stays intact); HOTP
+  entries in a migration payload are warned-and-skipped because the vault is TOTP-only.
+  Honest framing: still **dev / UNAUDITED**, and `export` reveals the secrets in the
+  clear **by design** (an export is plaintext provisioning material) behind a loud
+  warning (see
+  [`decisions/0025-totp-import-export.md`](decisions/0025-totp-import-export.md)).
   A **standalone crate** with its own lockfile (see
   [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
   not-for-real-secrets banner.

@@ -11,7 +11,25 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 38, `main` @ origin, clean tree).** Phase 38 built the
+**Where we are (through Phase 39, `main` @ origin, clean tree).** Phase 39 hardened the
+`web/apps/webapp` authenticator toward shippable: it is now an **installable PWA that
+works fully OFFLINE** — a web **manifest** (`app/manifest.ts`) + a hand-rolled **service
+worker** (`public/sw.js`, registered by `app/register-sw.tsx`) that precaches the app
+shell and runtime-caches JS/CSS/`.wasm` **cache-first**, so after the first online load
+codes still **generate with no network** in the wasm. The SW caches **only static
+assets** (the sealed vault stays in `localStorage`; cross-origin sync untouched → the
+zero-knowledge boundary is intact). It is also **accessible** (ARIA/keyboard/focus/
+live-region, **axe-clean**). A **separate `webapp` CI job** (`.github/workflows/web.yml`)
+builds `@sigil/wasm` with a Rust + wasm-pack toolchain and runs the Playwright suite;
+the marketing `build` job stays Rust-free, and `web/packages/sigil-wasm/build.sh` was made
+**cross-platform** for the Linux runner. Proven GREEN by headless Playwright:
+`tests/offline.spec.ts` (offline reload still computes the TOTP in cached wasm) +
+`tests/a11y.spec.ts` (`@axe-core/playwright`, no serious/critical) + the Phase 38
+`tests/wasm.spec.ts` still green; marketing still green. Honest: the `webapp` CI job is
+by-eye / YAML-parse-only locally like the repo's other CI mirrors — not run on real
+GitHub Actions from here; still dev / no-index / UNAUDITED, **not deployed**. ADR 0029;
+details in the Phase 39 entry below.
+Phase 38 built the
 `web/apps/webapp` page from a single-code TOTP *view* into a **real (dev) authenticator
 UI** — a **multi-account encrypted TOTP vault** (`app/authenticator.tsx`) over the same
 `@sigil/wasm` loader. Accounts **seal into a `SIGILcli` container** (same sealed format
@@ -3983,3 +4001,82 @@ GREEN; this pass is docs-only.
 - **Local, single-browser persistence only.** The dev Sync panel round-trips the sealed container
   through the opaque op-log, but that is dev / localhost / plain-HTTP / no-auth — not multi-device
   or enrollment.
+
+---
+
+## 2026-07-16 — Phase 39 (webapp toward shippable: installable OFFLINE PWA + accessibility + a webapp CI job)
+
+### What & why
+- Phase 38 made the webapp a real (dev) authenticator with a persisted, sealed TOTP vault, but two
+  gaps remained before it could be called shippable-shaped: (1) **an authenticator must work
+  offline** — you reach for 2FA mid-login on a flaky/absent network, and a plain web page still
+  fails to *load* offline even though it computes codes locally; (2) **shippable means accessible +
+  under CI** — but the webapp is NOT Rust-free (it compiles `sigil-core` to wasm), so it can't join
+  the Rust-free marketing CI job, and its `build.sh` was hard-coded to this macOS box. Phase 39
+  closes all three with **no new runtime dependency** and **no posture change** (still dev /
+  no-index / UNAUDITED, not deployed).
+
+### How (design decisions → ADR 0029)
+- **Hand-rolled service worker, not a PWA framework.** `public/sw.js` (registered by
+  `app/register-sw.tsx`) precaches the app shell (`"/"`) on install and serves **same-origin GET**
+  **cache-first**, writing every successful HTML/JS/CSS/`.wasm`/icon response into one named cache
+  at runtime; navigations are network-first with a cached-shell fallback. Chosen over Workbox /
+  `next-pwa` to keep the caching policy legible and add zero deps.
+- **Web manifest** (`app/manifest.ts`, Next's typed `MetadataRoute.Manifest`) → installable
+  (name/icons/`display: standalone`). A manifest never makes a site crawlable, so robots.ts +
+  `X-Robots-Tag` + layout metadata keep the no-index posture unchanged.
+- **Static assets only — never secrets.** The SW caches only public static assets; it never caches
+  the sealed vault (stays in `localStorage`) and never touches cross-origin requests (the dev sync
+  to localhost sigild is left alone) → zero-knowledge boundary intact.
+- **Accessibility.** Labelled landmarks/controls, keyboard-operable, visible focus, code updates
+  announced via a live region.
+- **Separate `webapp` CI job.** `.github/workflows/web.yml` keeps the Rust-free `build` job
+  (marketing) and adds a second `webapp` job that installs a Rust toolchain +
+  `wasm-bindgen-cli`/`wasm-pack`, builds `@sigil/wasm`, then runs webapp typecheck/lint/build + the
+  Playwright suite (incl. offline + axe). The two jobs are isolated so marketing stays Rust-free.
+- **`build.sh` made OS-agnostic.** `web/packages/sigil-wasm/build.sh` now prepends only
+  toolchain dirs that exist (macOS rustup path, `~/.cargo/bin`, Homebrew) and discovers
+  `wasm-bindgen` from PATH first (falling back to a wasm-pack cache under either the macOS or Linux
+  cache dir), so the same script builds on this laptop and on a Linux CI runner.
+
+### Verified GREEN (gated first-hand)
+- **Headless Playwright PASS** (chromium): `tests/offline.spec.ts` — first online load registers the
+  SW and computes the code, one controlled reload populates the runtime cache, then going **offline**
+  and reloading still renders the shell AND still computes the RFC 6238 code **`287082`** in the
+  cached wasm (proving codes generate with no network). `tests/a11y.spec.ts` — `@axe-core/playwright`
+  on the setup and unlocked views reports **no serious/critical** violations. The Phase 38
+  `tests/wasm.spec.ts` feature smokes (add-account == RFC vector, GA import, lock/reload/unlock
+  persistence) still pass.
+- **Marketing still green + its CI job stays Rust-free** — the root `web` scripts still filter to
+  marketing only. `libsigil/core`, `cli/`, `sigild/`, and the repo-root `sigil-wasm` crate are
+  untouched; `getrandom` count stays 0.
+
+### Docs (this pass)
+- `docs/architecture.md` — the `web/apps/webapp` component + diagram footer now note it is an
+  installable offline PWA (manifest + service worker; static assets cached, sealed vault stays in
+  localStorage), accessible/axe-clean, with a separate Rust+wasm-pack `webapp` CI job (marketing
+  stays Rust-free); the Playwright proofs (`offline.spec.ts`, `a11y.spec.ts`) cited.
+- `docs/deployment.md` — the stubbed-clients bullet now records the separate `webapp` CI job
+  (Rust + wasm-pack + Playwright), honestly flagged as by-eye / YAML-parse-only locally and NOT run
+  on real GitHub Actions from here (like the other CI mirrors); webapp still dev-only / not deployed.
+- `CLAUDE.md` — the `web/apps/webapp` map entry updated (installable offline PWA + accessible), plus
+  the new `webapp` CI job alongside the Rust-free marketing job and the cross-platform `build.sh`.
+- `README.md` — the webapp bullet now says installable / offline-capable / accessible (dev,
+  UNAUDITED) authenticator PWA.
+- `docs/decisions/0029-webapp-pwa-offline-a11y-and-ci.md` — new Nygard ADR (context: an
+  authenticator must work offline, and shippable needs a11y + CI; decision: hand-rolled service
+  worker with runtime cache-first + app-shell precache rather than a PWA framework dep, a web
+  manifest, axe-in-Playwright, a separate Rust+wasm-pack CI job, OS-agnostic `build.sh`;
+  consequences: SW caches static assets only — never secrets, offline works after first load, the
+  CI job is by-eye/unrun-on-real-CI, still dev/UNAUDITED/not-deployed). Indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07).
+- `journal.md` — this entry + RESUME ANCHOR bumped to through Phase 39.
+
+### ➡️ Still open (honest)
+- **Dev / no-index / UNAUDITED, NOT deployed.** PWA installability + offline do not change posture;
+  no host target, no domain. Not the product's final client / key-management / sync model.
+- **The `webapp` CI job is by-eye / unrun-on-real-CI** — YAML validated + mirrors the known-green
+  local commands, but not executed on real GitHub Actions from this machine (like every other CI
+  mirror in this repo). It is also heavier/slower than marketing (Rust + wasm-pack + a browser).
+- **Manual cache versioning.** `sw.js` invalidates on a manual `CACHE` bump; no automatic
+  asset-revision pipeline yet.

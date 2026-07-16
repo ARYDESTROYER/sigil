@@ -35,3 +35,39 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm build
+
+  # The webapp is NOT Rust-free (it compiles the sigil-core to wasm), so it runs
+  # in its own job with a Rust toolchain. Mirrors the known-green local gate:
+  #   build @sigil/wasm -> typecheck -> lint -> build -> Playwright (incl. the
+  #   OFFLINE + axe runtime proofs). Real CI is by-eye until this runs on GitHub.
+  webapp:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # Prebuilt binaries so build.sh finds `wasm-bindgen` on PATH (Linux).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.100,wasm-pack
+      - run: pnpm install --frozen-lockfile
+      - run: corepack pnpm --filter @sigil/wasm build
+      - run: corepack pnpm --filter webapp typecheck
+      - run: corepack pnpm --filter webapp lint
+      - run: corepack pnpm --filter webapp build
+      - run: corepack pnpm --filter webapp exec playwright install --with-deps chromium
+      - run: corepack pnpm --filter webapp exec playwright test

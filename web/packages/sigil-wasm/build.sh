@@ -27,8 +27,17 @@
 # secrets. See README.md.
 set -euo pipefail
 
-# Same toolchain pin as sigil-wasm/build-wasm.sh (macOS arm64).
-export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+# Put common Rust toolchain locations on PATH, OS-agnostically. On this macOS
+# arm64 box cargo lives under the rustup toolchain dir (no ~/.cargo/bin proxies);
+# on Linux CI cargo + a `cargo install`-ed wasm-bindgen-cli live in ~/.cargo/bin.
+# Only existing dirs are prepended, so a missing path on either OS is harmless.
+for _d in \
+  "$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin" \
+  "$HOME/.cargo/bin" \
+  "/opt/homebrew/bin"; do
+  [ -d "$_d" ] && case ":$PATH:" in *":$_d:"*) ;; *) PATH="$_d:$PATH" ;; esac
+done
+export PATH
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE="$(cd "$HERE/../../../sigil-wasm" && pwd)"
@@ -40,8 +49,13 @@ RAW="$CRATE/target/wasm32-unknown-unknown/release/sigil_wasm.wasm"
 # the cache by running wasm-pack once (it downloads the pinned wasm-bindgen).
 find_bindgen() {
   if command -v wasm-bindgen >/dev/null 2>&1; then command -v wasm-bindgen; return 0; fi
+  # Fall back to a wasm-pack-managed copy — macOS ($HOME/Library/Caches) or
+  # Linux ($HOME/.cache) cache locations.
   local c
-  c="$(ls -1 "$HOME/Library/Caches/.wasm-pack"/wasm-bindgen-cargo-install-*/wasm-bindgen 2>/dev/null | sort | tail -1 || true)"
+  c="$(ls -1 \
+        "$HOME/Library/Caches/.wasm-pack"/wasm-bindgen-cargo-install-*/wasm-bindgen \
+        "$HOME/.cache/.wasm-pack"/wasm-bindgen-cargo-install-*/wasm-bindgen \
+        2>/dev/null | sort | tail -1 || true)"
   if [ -n "$c" ] && [ -x "$c" ]; then echo "$c"; return 0; fi
   return 1
 }

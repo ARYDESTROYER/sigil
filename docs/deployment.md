@@ -302,14 +302,22 @@ To avoid any over-claim, the honest gaps:
   admin console / extension / native client consumes this server, and `libsigil`'s
   real-but-**unaudited** AEAD building block is **not wired into any product flow**.
   A **`web/apps/webapp`** Next.js app now exists — it runs the libsigil core via
-  **WebAssembly, entirely client-side** (a live TOTP demo over the **`@sigil/wasm`**
-  loader; [`decisions/0027-webapp-and-wasm-bundling.md`](decisions/0027-webapp-and-wasm-bundling.md)) —
+  **WebAssembly, entirely client-side** (an **installable, offline-capable, accessible**
+  encrypted-TOTP authenticator over the **`@sigil/wasm`** loader;
+  [`decisions/0027-webapp-and-wasm-bundling.md`](decisions/0027-webapp-and-wasm-bundling.md),
+  [`decisions/0029-webapp-pwa-offline-a11y-and-ci.md`](decisions/0029-webapp-pwa-offline-a11y-and-ci.md)) —
   but it is **dev / no-index / UNAUDITED and NOT deployed** (no build/host target here,
   same stealth `X-Robots-Tag noindex` + `robots.txt Disallow: /` posture as marketing).
   Unlike marketing, **building it requires the Rust + wasm-pack toolchain** (its
   `@sigil/wasm` dependency compiles the repo-root `sigil-wasm` crate to wasm), so it is
-  **deliberately kept OUT of the default `web` CI build** — the root `web` scripts still
-  filter to marketing only, keeping CI Rust-free — and it must be built/run explicitly.
+  **deliberately kept OUT of the default `web` CI job** — the root `web` scripts still
+  filter to marketing only, keeping that job Rust-free — and it must be built/run
+  explicitly. A **separate `webapp` CI job** in `.github/workflows/web.yml` now builds
+  `@sigil/wasm` (Rust + `wasm-pack`/`wasm-bindgen-cli` on the runner) and runs the
+  Playwright suite (including the offline + axe a11y proofs); like **every other CI
+  mirror in this repo**, that job has been **validated by-eye / YAML-parsed locally and
+  mirrors the known-green local commands — it has NOT been run on real GitHub Actions
+  from this machine**. The webapp itself remains dev-only and is not deployed.
 - **Nothing is applied or exposed.** No VM exists, no domain is registered, no
   image is published (the publish workflow is **manual-only** and has **not** been
   run — there is no GHCR auth here), no Nomad cluster runs, no public Caddy is

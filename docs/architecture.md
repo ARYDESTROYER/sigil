@@ -471,18 +471,38 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   vault mutation re-seals and re-persists the container. Fresh salt/nonce entropy comes
   from `crypto.getRandomValues`. An optional **Sync (dev)** panel round-trips the
   **sealed** container to/from a localhost sigild op-log over plain HTTP (opaque bytes
-  only; no TLS, no auth). Proven GREEN by headless Playwright feature smokes
-  (`tests/wasm.spec.ts`): add-account reproduces the RFC 6238 vector `287082`, a Google
-  Authenticator migration URI imports, and a lock/reload/unlock round-trip restores the
-  persisted vault ([ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)).
+  only; no TLS, no auth).
+  It is now an **installable PWA that works fully OFFLINE** — a web
+  **manifest** (`app/manifest.ts`) makes it installable, and a hand-rolled
+  **service worker** (`public/sw.js`, registered by `app/register-sw.tsx`)
+  precaches the app shell and **runtime-caches the JS/CSS/`.wasm`** cache-first, so
+  after the first online load the app still renders **and still computes codes in the
+  wasm with no network** (a real authenticator must). The SW caches **only public
+  static assets** — never a secret: the **sealed vault stays in `localStorage`** and
+  the SW leaves cross-origin (e.g. the dev sync) requests untouched. It is also
+  **accessible** — labelled landmarks/controls, keyboard-operable, visible focus, and
+  a live-region for code updates — and **axe-clean** (no serious/critical violations).
+  Proven GREEN by headless Playwright smokes: `tests/wasm.spec.ts` (add-account
+  reproduces the RFC 6238 vector `287082`, a Google Authenticator migration URI
+  imports, and a lock/reload/unlock round-trip restores the persisted vault —
+  [ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)),
+  `tests/offline.spec.ts` (after first load, going **offline** still renders the shell
+  and computes the TOTP in the cached wasm), and `tests/a11y.spec.ts`
+  (`@axe-core/playwright` on setup + unlocked views).
   It carries the **same no-index stealth posture as
   marketing** (`X-Robots-Tag noindex/nofollow/noarchive`, `X-Content-Type-Options
   nosniff`, `Referrer-Policy no-referrer`, `X-Frame-Options DENY`, plus an
-  `app/robots.ts` `Disallow: /`) and a loud **UNAUDITED / no-real-secrets** banner.
+  `app/robots.ts` `Disallow: /`; a manifest never makes a site crawlable) and a loud
+  **UNAUDITED / no-real-secrets** banner.
   It is **dev / no-index / UNAUDITED**, **not deployed**, and — because it needs the
   **Rust + wasm-pack toolchain** — it is **built via its own filter and kept OUT of the
-  default `web` CI build**, so marketing typecheck/lint/build and CI are unchanged and
-  stay Rust-free (see [ADR 0027](decisions/0027-webapp-and-wasm-bundling.md)).
+  default `web` CI job**, so marketing typecheck/lint/build stay Rust-free; a **separate
+  `webapp` CI job** (`.github/workflows/web.yml`) builds `@sigil/wasm` with a Rust +
+  wasm-pack toolchain and runs the Playwright suite (incl. the offline + axe proofs) —
+  like the repo's other CI mirrors it is validated by-eye / YAML-parse locally and has
+  not been run on real GitHub Actions from here (see
+  [ADR 0027](decisions/0027-webapp-and-wasm-bundling.md),
+  [ADR 0029](decisions/0029-webapp-pwa-offline-a11y-and-ci.md)).
 
 ```
                          CLIENT SIDE  (all cryptography lives here)
@@ -531,6 +551,8 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    web/apps/webapp (Next.js) + @sigil/wasm: in-browser libsigil-via-WebAssembly
      authenticator — multi-account encrypted TOTP vault (add/import/export), password
      unlock + localStorage persistence of the SIGILcli-sealed container, codes in wasm;
+     installable, OFFLINE-capable (manifest + service worker: static assets cached, the
+     sealed vault stays in localStorage), accessible/axe-clean;
      client-side only; dev / no-index / UNAUDITED; not deployed.
 ```
 

@@ -230,10 +230,22 @@ public, make no security claims, until the audit completes and trademark clears.
   / `otpauth://` / **Google Authenticator `otpauth-migration://` import**, **export**
   back out, live **codes + countdowns computed in the wasm**; entropy via
   `crypto.getRandomValues`; optional dev **Sync** of the sealed container to a localhost
-  op-log (ADR 0028). Playwright-proven (add-account == RFC vector, GA import,
-  lock/reload/unlock persistence). **Dev / no-index / UNAUDITED, not deployed**, kept
-  OUT of the default `web` CI build (needs the Rust + wasm-pack toolchain). Do NOT store
-  real 2FA secrets.
+  op-log (ADR 0028). **Now an installable, offline-capable, accessible PWA (Phase 39,
+  ADR 0029):** a web **manifest** (`app/manifest.ts`) makes it installable, and a
+  hand-rolled **service worker** (`public/sw.js`, registered by `app/register-sw.tsx`)
+  precaches the app shell and runtime-caches JS/CSS/`.wasm` **cache-first**, so after the
+  first online load codes still **generate offline in the wasm with no network** — the SW
+  caches **only static assets** (the **sealed vault stays in `localStorage`**; cross-origin
+  sync is left untouched). It is also **accessible** (ARIA/keyboard/focus/live-region,
+  axe-clean). Playwright-proven (`tests/wasm.spec.ts` add-account == RFC vector + GA import
+  + lock/reload/unlock persistence; `tests/offline.spec.ts` offline TOTP; `tests/a11y.spec.ts`
+  axe). **Dev / no-index / UNAUDITED, not deployed**, kept OUT of the default `web` CI job
+  (needs the Rust + wasm-pack toolchain) — a **separate `webapp` CI job** in
+  `.github/workflows/web.yml` builds `@sigil/wasm` with a Rust + wasm-pack toolchain and
+  runs the Playwright suite, while the marketing job stays Rust-free; `web/packages/sigil-wasm/build.sh`
+  was made **cross-platform** (OS-agnostic PATH + wasm-bindgen discovery) for that runner.
+  Like the repo's other CI mirrors, the `webapp` job is validated by-eye / YAML-parse
+  locally and has not run on real GitHub Actions from here. Do NOT store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust

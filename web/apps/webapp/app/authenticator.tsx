@@ -54,11 +54,24 @@ export default function Authenticator() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [wasmError, setWasmError] = useState<string>("");
   const [vault, setVault] = useState<TotpVault | null>(null);
+  const [announce, setAnnounce] = useState<string>("");
 
   // The password lives ONLY in memory while unlocked (never persisted).
   const passwordRef = useRef<string>("");
 
   const now = useUnixClock();
+
+  // Announce phase transitions to assistive tech via the polite live region.
+  useEffect(() => {
+    const messages: Record<Phase, string> = {
+      loading: "Loading the WebAssembly crypto core.",
+      error: "Failed to load the crypto core.",
+      setup: "No vault yet. Create a vault to begin.",
+      locked: "Vault locked. Enter your password to unlock.",
+      unlocked: "Vault unlocked.",
+    };
+    setAnnounce(messages[phase]);
+  }, [phase]);
 
   // Load the wasm in the browser only, then decide the initial phase from
   // whether a sealed vault already exists in localStorage.
@@ -137,63 +150,67 @@ export default function Authenticator() {
     setPhase("setup");
   }
 
+  let content: React.ReactNode;
   if (phase === "loading") {
-    return (
+    content = (
       <Card>
-        <p data-testid="auth-status" className="text-sm text-neutral-500 dark:text-neutral-400">
+        <p data-testid="auth-status" className="text-sm text-neutral-600 dark:text-neutral-400">
           Loading WebAssembly crypto core…
         </p>
       </Card>
     );
-  }
-
-  if (phase === "error") {
-    return (
+  } else if (phase === "error") {
+    content = (
       <Card>
-        <p data-testid="auth-status" className="text-sm text-red-600 dark:text-red-400">
+        <p data-testid="auth-status" role="alert" className="text-sm text-red-700 dark:text-red-400">
           Failed to load the wasm core: {wasmError}
         </p>
       </Card>
     );
+  } else if (phase === "setup") {
+    content = <SetupPanel onCreate={createVault} />;
+  } else if (phase === "locked") {
+    content = <UnlockPanel onUnlock={unlock} onForget={forget} />;
+  } else if (!wasm || !vault) {
+    content = null;
+  } else {
+    content = (
+      <VaultView
+        wasm={wasm}
+        vault={vault}
+        now={now}
+        onAdd={(input) => withVault((d) => wasm.addEntry(d, input))}
+        onImportOtpauth={(uri) => {
+          const e = wasm.parseOtpauthUri(uri);
+          withVault((d) =>
+            wasm.addEntry(d, {
+              label: e.label,
+              issuer: e.issuer,
+              secretBytes: wasm.base64ToBytes(e.secret),
+              algorithm: e.algorithm,
+              digits: e.digits,
+              period: e.period,
+            }),
+          );
+        }}
+        onImportMigration={(uri) => importMigration(wasm, uri, withVault)}
+        onRemove={(label) =>
+          withVault((d) => {
+            d.entries = d.entries.filter((e) => e.label !== label);
+          })
+        }
+        onLock={lock}
+      />
+    );
   }
 
-  if (phase === "setup") {
-    return <SetupPanel onCreate={createVault} />;
-  }
-
-  if (phase === "locked") {
-    return <UnlockPanel onUnlock={unlock} onForget={forget} />;
-  }
-
-  // unlocked
-  if (!wasm || !vault) return null;
   return (
-    <VaultView
-      wasm={wasm}
-      vault={vault}
-      now={now}
-      onAdd={(input) => withVault((d) => wasm.addEntry(d, input))}
-      onImportOtpauth={(uri) => {
-        const e = wasm.parseOtpauthUri(uri);
-        withVault((d) =>
-          wasm.addEntry(d, {
-            label: e.label,
-            issuer: e.issuer,
-            secretBytes: wasm.base64ToBytes(e.secret),
-            algorithm: e.algorithm,
-            digits: e.digits,
-            period: e.period,
-          }),
-        );
-      }}
-      onImportMigration={(uri) => importMigration(wasm, uri, withVault)}
-      onRemove={(label) =>
-        withVault((d) => {
-          d.entries = d.entries.filter((e) => e.label !== label);
-        })
-      }
-      onLock={lock}
-    />
+    <>
+      <p data-testid="live-region" role="status" aria-live="polite" className="sr-only">
+        {announce}
+      </p>
+      {content}
+    </>
   );
 }
 
@@ -237,12 +254,14 @@ function Card({ children }: { children: React.ReactNode }) {
   );
 }
 
+const focusRing =
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-500 focus-visible:ring-offset-1 focus-visible:ring-offset-white dark:focus-visible:ring-neutral-400 dark:focus-visible:ring-offset-neutral-950";
 const inputCls =
-  "w-full rounded border border-neutral-300 bg-transparent px-3 py-2 text-sm dark:border-neutral-700";
+  `w-full rounded border border-neutral-400 bg-transparent px-3 py-2 text-sm dark:border-neutral-600 ${focusRing}`;
 const btnCls =
-  "rounded bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-300";
+  `rounded bg-neutral-900 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-300 ${focusRing}`;
 const btnGhost =
-  "rounded border border-neutral-300 px-3 py-2 text-sm font-medium hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800";
+  `rounded border border-neutral-400 px-3 py-2 text-sm font-medium hover:bg-neutral-100 dark:border-neutral-600 dark:hover:bg-neutral-800 ${focusRing}`;
 
 // ── Setup (no vault yet) ─────────────────────────────────────────────────────
 
@@ -278,7 +297,7 @@ function SetupPanel({ onCreate }: { onCreate: (password: string) => void }) {
   return (
     <Card>
       <h2 className="mb-1 text-lg font-semibold">Create your vault</h2>
-      <p className="mb-4 text-sm text-neutral-500 dark:text-neutral-400">
+      <p className="mb-4 text-sm text-neutral-600 dark:text-neutral-400">
         Your accounts are sealed with this password (Argon2id → XChaCha20-Poly1305)
         into a SIGILcli container. Only the sealed container is stored in your
         browser — the password never is. There is <strong>no recovery</strong> if
@@ -350,7 +369,7 @@ function UnlockPanel({
   return (
     <Card>
       <h2 className="mb-1 text-lg font-semibold">Unlock your vault</h2>
-      <p className="mb-4 text-sm text-neutral-500 dark:text-neutral-400">
+      <p className="mb-4 text-sm text-neutral-600 dark:text-neutral-400">
         A sealed vault is stored in this browser. Enter its password to decrypt it
         in memory.
       </p>
@@ -443,7 +462,7 @@ function VaultView({
 
       {vault.entries.length === 0 ? (
         <Card>
-          <p data-testid="empty-state" className="text-sm text-neutral-500 dark:text-neutral-400">
+          <p data-testid="empty-state" className="text-sm text-neutral-600 dark:text-neutral-400">
             No accounts yet. Add one below, paste an <code>otpauth://</code> URI, or
             import a Google Authenticator export.
           </p>
@@ -488,36 +507,43 @@ function AccountRow({
     error = msg(e);
   }
   const remaining = entry.period - (now % entry.period);
+  const who = entry.issuer ? `${entry.issuer}, ${entry.label}` : entry.label;
+  const codeLabel = error
+    ? `${who}: code unavailable`
+    : `${who}: code ${code.split("").join(" ")}, ${remaining} seconds remaining`;
 
   return (
     <li
       data-testid="account-row"
-      className="flex items-center gap-4 rounded-lg border border-neutral-300 p-4 dark:border-neutral-700"
+      className="flex items-center gap-3 rounded-lg border border-neutral-300 p-3 sm:gap-4 sm:p-4 dark:border-neutral-700"
     >
       <CountdownRing remaining={remaining} period={entry.period} />
       <div className="min-w-0 flex-1">
         <div data-testid="account-label" className="truncate text-sm font-medium">
           {entry.issuer ? (
             <>
-              <span className="text-neutral-500 dark:text-neutral-400">{entry.issuer}</span>
-              <span className="mx-1 text-neutral-400">·</span>
+              <span className="text-neutral-600 dark:text-neutral-400">{entry.issuer}</span>
+              <span className="mx-1 text-neutral-500" aria-hidden="true">
+                ·
+              </span>
             </>
           ) : null}
           {entry.label}
         </div>
-        <div className="text-xs text-neutral-400">
+        <div className="text-xs text-neutral-600 dark:text-neutral-400">
           {entry.algorithm.toUpperCase()} · {entry.digits} digits · {entry.period}s
         </div>
       </div>
       <div
         data-testid="account-code"
-        className="font-mono text-2xl tabular-nums tracking-widest"
+        aria-label={codeLabel}
+        className="font-mono text-xl tabular-nums tracking-widest sm:text-2xl"
       >
         {error ? "err" : code}
       </div>
       <button
         data-testid="account-remove"
-        aria-label={`Remove ${entry.label}`}
+        aria-label={`Remove ${who}`}
         className={btnGhost}
         type="button"
         onClick={onRemove}
@@ -536,8 +562,13 @@ function CountdownRing({ remaining, period }: { remaining: number; period: numbe
   const frac = Math.max(0, Math.min(1, remaining / period));
   const offset = c * (1 - frac);
   return (
-    <div className="relative shrink-0" style={{ width: size, height: size }}>
-      <svg width={size} height={size} className="-rotate-90">
+    <div
+      className="relative shrink-0"
+      style={{ width: size, height: size }}
+      role="img"
+      aria-label={`${remaining} seconds until this code refreshes`}
+    >
+      <svg width={size} height={size} className="-rotate-90" aria-hidden="true">
         <circle
           cx={size / 2}
           cy={size / 2}
@@ -560,7 +591,8 @@ function CountdownRing({ remaining, period }: { remaining: number; period: numbe
       </svg>
       <span
         data-testid="account-remaining"
-        className="absolute inset-0 flex items-center justify-center text-[10px] tabular-nums text-neutral-500 dark:text-neutral-400"
+        aria-hidden="true"
+        className="absolute inset-0 flex items-center justify-center text-[10px] tabular-nums text-neutral-600 dark:text-neutral-400"
       >
         {remaining}
       </span>
@@ -936,7 +968,7 @@ function SyncPanel({ wasm }: { wasm: Wasm }) {
   return (
     <Card>
       <h3 className="mb-1 text-base font-semibold">Sync (dev)</h3>
-      <p className="mb-3 text-xs text-neutral-500 dark:text-neutral-400">
+      <p className="mb-3 text-xs text-neutral-600 dark:text-neutral-400">
         Round-trips the <strong>sealed</strong> container through a dev sigild
         op-log over plain HTTP (localhost only, no TLS, no auth). Requires a local
         sigild with <code>SIGILD_ENABLE_DEV_OPS</code> on. The server only ever

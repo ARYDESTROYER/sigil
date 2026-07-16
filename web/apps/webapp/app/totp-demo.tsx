@@ -116,7 +116,7 @@ export default function TotpDemo() {
   return (
     <section className="rounded-lg border border-neutral-300 p-6 dark:border-neutral-700">
       <h2 className="mb-1 text-lg font-semibold">Live TOTP (computed in WebAssembly)</h2>
-      <p className="mb-4 text-sm text-neutral-500 dark:text-neutral-400">
+      <p className="mb-4 text-sm text-neutral-600 dark:text-neutral-400">
         The code below is produced by the real <code>sigil-core</code> RFC 6238
         engine compiled to wasm — not by JavaScript. Default seed is the public
         RFC test vector.
@@ -141,12 +141,12 @@ export default function TotpDemo() {
         >
           {code}
         </div>
-        <div className="pb-2 text-sm text-neutral-500 dark:text-neutral-400">
+        <div className="pb-2 text-sm text-neutral-600 dark:text-neutral-400">
           <span data-testid="totp-remaining">{remaining}</span>s until refresh
         </div>
       </div>
 
-      <p className="mt-4 text-xs text-neutral-500 dark:text-neutral-400">
+      <p className="mt-4 text-xs text-neutral-600 dark:text-neutral-400">
         wasm status:{" "}
         <span data-testid="wasm-status" className="font-mono">
           {status}

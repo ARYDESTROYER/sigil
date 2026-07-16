@@ -259,11 +259,17 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   JavaScript). Accounts seal into a `SIGILcli` container (interoperable with the CLI
   vault); a **password unlock** decrypts it in memory and **only the sealed container**
   is persisted in `localStorage` — a lost password is unrecoverable by design
-  ([ADR 0028](docs/decisions/0028-webapp-vault-persistence-and-unlock.md)). No-index,
+  ([ADR 0028](docs/decisions/0028-webapp-vault-persistence-and-unlock.md)). It is an
+  **installable, offline-capable, accessible** authenticator PWA — a manifest + service
+  worker cache the app shell / JS / `.wasm` so codes still generate with **no network**
+  (only static assets are cached; the sealed vault stays in `localStorage`), and it is
+  ARIA/keyboard/focus-accessible and axe-clean, with a **separate `webapp` CI job** that
+  builds `@sigil/wasm` and runs Playwright (offline + a11y proofs)
+  ([ADR 0029](docs/decisions/0029-webapp-pwa-offline-a11y-and-ci.md)). No-index,
   **not deployed**, and built via its own filter (needs the Rust + wasm-pack toolchain),
-  so it stays **out of the default `web` CI build** and marketing/CI are unchanged — see
+  so it stays **out of the default `web` CI job** and marketing/CI stay Rust-free — see
   [ADR 0027](docs/decisions/0027-webapp-and-wasm-bundling.md). Do not store real 2FA
-  secrets.
+  secrets (dev, UNAUDITED).
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.

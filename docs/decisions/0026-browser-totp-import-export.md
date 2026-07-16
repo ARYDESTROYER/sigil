@@ -91,5 +91,3 @@ test.** This gives the browser client full TOTP import/export at parity with the
   unaudited building blocks; **do not import or export real 2FA secrets in this
   build.** Public copy still obeys
   [`../../web/apps/marketing/MARKETING-CLAIMS.md`](../../web/apps/marketing/MARKETING-CLAIMS.md).
-</content>
-</invoke>

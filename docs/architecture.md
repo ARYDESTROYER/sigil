@@ -430,6 +430,40 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
   Next.js 15 stealth splash + early-access waitlist. No-index, wallable, no
   product surface.
+- **`web/apps/webapp` + `web/packages/sigil-wasm`**
+  ([`../web/apps/webapp/`](../web/apps/webapp/),
+  [`../web/packages/sigil-wasm/`](../web/packages/sigil-wasm/)) — **the first real
+  product client surface**: a Next.js 15 app-router app that runs the **libsigil core
+  compiled to WebAssembly, entirely client-side**. It consumes a workspace loader
+  package, **`@sigil/wasm`** ([`../web/packages/sigil-wasm/`](../web/packages/sigil-wasm/)),
+  whose `build.sh` compiles the **repo-root `sigil-wasm` Rust crate** (the same crate
+  the standalone `pkg-web`/`pkg-node` build uses) to wasm and re-exports the wasm
+  surface (`seal_record` / `open_record`, `seal_to_container` / `open_container`,
+  `hybrid_*`, `totp` / `hotp` / `format_code`) behind an `initWasm()` awaitable and a
+  typed `index.d.ts`, **plus re-uses the proven, wasm-agnostic JS helpers** from the
+  repo-root `sigil-wasm/{totp-vault,sync,totp-migration}.mjs` by relative import — the
+  same tested source those interop tests exercise ([ADR 0024](decisions/0024-wasm-totp-vault-and-cross-client-totp.md),
+  [ADR 0026](decisions/0026-browser-totp-import-export.md)), **not a rewrite** and
+  **no new crypto** (all crypto stays in `sigil-core`). It adds a wasm-bundling wrinkle:
+  because rustc 1.85+ force-enables the wasm `reference-types` + `multivalue` target
+  features, wasm-bindgen emits `externref`, which Next.js 15's bundled (old
+  `@webassemblyjs`) webpack parser cannot decode. `build.sh` therefore does a **3-step
+  strip** — (1) cargo build the crate to raw wasm, (2) delete the `target_features`
+  custom section so wasm-bindgen stays in the MVP subset (no `externref`), (3) run
+  `wasm-bindgen --target bundler` — and the app enables webpack
+  `experiments.asyncWebAssembly`. The app itself (`app/page.tsx` +
+  a `"use client"` `app/totp-demo.tsx` that dynamic-imports `@sigil/wasm` so wasm loads
+  in the browser only) is a **live TOTP demo**: it defaults to the PUBLIC RFC 6238 test
+  seed (`GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ` — not a real secret) and renders the
+  **wasm-computed** 6-digit code + countdown (via `codeForEntry` / `base32Decode`; the
+  wasm computes the code, never JS). It carries the **same no-index stealth posture as
+  marketing** (`X-Robots-Tag noindex/nofollow/noarchive`, `X-Content-Type-Options
+  nosniff`, `Referrer-Policy no-referrer`, `X-Frame-Options DENY`, plus an
+  `app/robots.ts` `Disallow: /`) and a loud **UNAUDITED / no-real-secrets** banner.
+  It is **dev / no-index / UNAUDITED**, **not deployed**, and — because it needs the
+  **Rust + wasm-pack toolchain** — it is **built via its own filter and kept OUT of the
+  default `web` CI build**, so marketing typecheck/lint/build and CI are unchanged and
+  stay Rust-free (see [ADR 0027](decisions/0027-webapp-and-wasm-bundling.md)).
 
 ```
                          CLIENT SIDE  (all cryptography lives here)
@@ -475,6 +509,8 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    └───────────────────────────────────────────────────────────────────────┘
 
    web/apps/marketing (Next.js): stealth splash + waitlist. Separate; no product surface.
+   web/apps/webapp (Next.js) + @sigil/wasm: in-browser libsigil-via-WebAssembly demo
+     (live TOTP; client-side only; dev / no-index / UNAUDITED; not deployed).
 ```
 
 ---
@@ -673,10 +709,11 @@ To avoid any over-claim, the honest gaps in the current architecture (the
 authoritative list, with rationale, is the **defer ledger** in
 [`sprint-72h.md`](sprint-72h.md)):
 
-- **No clients / extension (but the client column has started).** The native apps
+- **No clients / extension (but the client column has started, and now reaches a
+  real browser app).** The native apps
   (iOS/Android/macOS/Windows/Linux/watch) live in separate repos and consume
-  `libsigil` as a versioned artifact; none exist yet, and the web app, admin
-  console, and browser extension are still reserved directories. The **one**
+  `libsigil` as a versioned artifact; none exist yet, and the admin console and
+  browser extension are still reserved directories. The **one**
   client-side consumer that now exists is **`sigil-wasm`** — the first thing to
   actually link the wasm-pure core into a JS runtime — but it is a **demo of the
   UNAUDITED `seal_record` / `open_record` building block**, not a product client
@@ -685,7 +722,12 @@ authoritative list, with rationale, is the **defer ledger** in
   client↔server sync loop** by push/pulling opaque containers to a dev `sigild`
   op-log (`sync.mjs`; [ADR 0022](decisions/0022-wasm-client-server-sync-loop.md)),
   but only over **dev / localhost / plain-HTTP / no-auth** — this demonstrates the
-  E2EE sync architecture, it is **not** the product's sync / auth / CRDT model.
+  E2EE sync architecture, it is **not** the product's sync / auth / CRDT model. The
+  **`web/apps/webapp`** Next.js app (over the **`@sigil/wasm`** loader) is now the
+  first *browser app* running libsigil-via-WebAssembly client-side (a live TOTP
+  demo; [ADR 0027](decisions/0027-webapp-and-wasm-bundling.md)) — but it too is
+  **dev / no-index / UNAUDITED**, **not deployed**, and a demo, **not** a full
+  authenticator UI or the product key-management model.
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
   device-key signature check (contract v2: a per-request nonce plus a

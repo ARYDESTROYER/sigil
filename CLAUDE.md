@@ -219,6 +219,33 @@ public, make no security claims, until the audit completes and trademark clears.
   **dev** backend (no PITR/replication/object-store, no production change-management). Runbook
   in [`docs/deployment.md`](docs/deployment.md) §11–§12.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
+- `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
+  surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
+  workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
+  crate** to WebAssembly for a **wasm-pack `--target bundler`** target and re-exports
+  the wasm surface (`seal_record`/`open_record`, `seal_to_container`/`open_container`,
+  `hybrid_*`, `totp`/`hotp`/`format_code`, …) behind an `initWasm()` awaitable +
+  `index.d.ts`, PLUS re-uses the **proven, wasm-agnostic helpers** from the repo-root
+  `sigil-wasm/{totp-vault,sync,totp-migration}.mjs` by relative import (the same tested
+  code, not a rewrite). Key bundling detail: rustc 1.85+ force-enables the wasm
+  `reference-types`+`multivalue` target features, so wasm-bindgen emits `externref`,
+  which Next.js 15's bundled (old `@webassemblyjs`) webpack parser cannot decode
+  (`parseVec could not cast the value`); `build.sh` works around it with a **3-step
+  strip** — cargo build to raw wasm, delete the `target_features` custom section (keeps
+  the module in the MVP subset), then run `wasm-bindgen --target bundler` — output `pkg/`
+  is gitignored. `web/apps/webapp` is a real **Next.js 15.1.6 / React 19 / Tailwind 3 /
+  TS-strict** app-router app: `next.config.mjs` sets `webpack` `experiments.asyncWebAssembly
+  = true` and carries the SAME no-index stealth headers as marketing (`X-Robots-Tag
+  noindex/nofollow/noarchive`, nosniff, `no-referrer`, `X-Frame-Options DENY`) + an
+  `app/robots.ts` (`Disallow: /`). Its page is a **live TOTP demo** (`app/page.tsx` +
+  a `"use client"` `app/totp-demo.tsx` that dynamic-imports `@sigil/wasm` so the wasm
+  loads only in the browser): it defaults to the PUBLIC RFC 6238 test seed
+  (`GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ`, not a real secret) and shows the **wasm-computed**
+  6-digit code + countdown (via `codeForEntry`/`base32Decode`; the wasm computes the
+  code, never JS), with `?secret=` / `?t=` test hooks. **Dev / no-index / UNAUDITED**
+  (loud pre-audit banner); it is **built via its own filter** and needs the Rust +
+  wasm-pack toolchain — the default `web/` CI scripts still target **marketing only**,
+  so marketing typecheck/lint/build and CI are unchanged and stay Rust-free (ADR 0027).
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices).
@@ -399,7 +426,8 @@ public, make no security claims, until the audit completes and trademark clears.
   Authenticator vector via JS, `sigil totp export --migration` decoded in JS [RUST→JS],
   and a JS-encoded migration URI imported by the CLI [JS→RUST]). `export` reveals the
   2FA secrets IN THE CLEAR by design; UNAUDITED, dev-only. ADR 0026.
-- `extension/`, `web/apps/{webapp,admin}`, `web/packages/*` — reserved.
+- `extension/`, `web/apps/admin` — reserved. (`web/apps/webapp` +
+  `web/packages/sigil-wasm` are now real — see above.)
 
 ## Toolchains (this machine — macOS arm64)
 
@@ -457,9 +485,21 @@ $go -C sigild build ./...
 docker build --build-arg VERSION=$(git rev-parse --short HEAD) -t sigild:dev sigild
 
 # Web — typecheck / lint / build (NEXT_TELEMETRY_DISABLED=1)
+# NOTE: the root web scripts filter to MARKETING ONLY, so this stays Rust-free
+# (marketing is the only surface in the default web CI build).
 corepack pnpm -C web typecheck
 corepack pnpm -C web lint
 corepack pnpm -C web build
+
+# webapp + @sigil/wasm — the wasm client surface. NOT in the default web scripts
+# above; it needs the Rust + wasm-pack toolchain (build.sh compiles the repo-root
+# sigil-wasm crate and does the target_features/externref strip). Build the wasm
+# package first (webapp's own `prebuild` also runs it), then the app:
+corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg (gitignored)
+corepack pnpm --filter webapp typecheck
+corepack pnpm --filter webapp lint
+corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
+corepack pnpm --filter webapp exec playwright test   # headless chromium wasm smoke (tests/wasm.spec.ts)
 ```
 
 **Always run the relevant suite after changes and record the result in

@@ -249,6 +249,16 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   [`web/apps/marketing/MARKETING-CLAIMS.md`](web/apps/marketing/MARKETING-CLAIMS.md).)
 - `web/apps/marketing/` — Next.js 15 stealth splash + early-access waitlist +
   privacy/terms/imprint stubs. **No-index, password-wallable.**
+- `web/apps/webapp/` + `web/packages/sigil-wasm/` — the **first in-browser webapp**
+  (dev, UNAUDITED): a real Next.js 15 app that runs the **libsigil core via
+  WebAssembly entirely client-side** through the **`@sigil/wasm`** loader package
+  (which wasm-packs the `sigil-wasm` crate for a bundler target and reuses the proven
+  TOTP-vault / sync / migration JS helpers). Its page is a **live TOTP demo** whose
+  6-digit code is computed by the wasm, not JavaScript (default seed is the public RFC
+  6238 test vector — not a real secret). No-index, **not deployed**, and built via its
+  own filter (needs the Rust + wasm-pack toolchain), so it stays **out of the default
+  `web` CI build** and marketing/CI are unchanged — see
+  [ADR 0027](docs/decisions/0027-webapp-and-wasm-bundling.md).
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.
@@ -267,7 +277,7 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 ```
 libsigil/        Rust crypto core (workspace: core + ffi)
 sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
-web/             Next.js marketing (+ webapp/admin reserved), pnpm workspace
+web/             Next.js marketing + webapp (in-browser wasm demo) + @sigil/wasm loader (admin reserved), pnpm workspace
 extension/       Browser extension (reserved)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 sigil-wasm/      Rust wasm-bindgen binding — in-browser seal/open demo over the core (pre-audit)

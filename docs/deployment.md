@@ -298,9 +298,18 @@ To avoid any over-claim, the honest gaps:
   TLS-enabled Go-native listener and a PQ-capable client are prerequisites that
   do not exist on the build machine (LibreSSL can't negotiate the group). See
   [§3](#3-pq-tls-nuance-read-this-before-claiming-a-pq-proof).
-- **Clients are stubbed.** No webapp / admin console / extension / native client
-  consumes this server. `libsigil` has a real-but-**unaudited** AEAD building
-  block that is **not wired into any product flow**.
+- **Clients are stubbed, and the one browser app is dev-only / NOT deployed.** No
+  admin console / extension / native client consumes this server, and `libsigil`'s
+  real-but-**unaudited** AEAD building block is **not wired into any product flow**.
+  A **`web/apps/webapp`** Next.js app now exists — it runs the libsigil core via
+  **WebAssembly, entirely client-side** (a live TOTP demo over the **`@sigil/wasm`**
+  loader; [`decisions/0027-webapp-and-wasm-bundling.md`](decisions/0027-webapp-and-wasm-bundling.md)) —
+  but it is **dev / no-index / UNAUDITED and NOT deployed** (no build/host target here,
+  same stealth `X-Robots-Tag noindex` + `robots.txt Disallow: /` posture as marketing).
+  Unlike marketing, **building it requires the Rust + wasm-pack toolchain** (its
+  `@sigil/wasm` dependency compiles the repo-root `sigil-wasm` crate to wasm), so it is
+  **deliberately kept OUT of the default `web` CI build** — the root `web` scripts still
+  filter to marketing only, keeping CI Rust-free — and it must be built/run explicitly.
 - **Nothing is applied or exposed.** No VM exists, no domain is registered, no
   image is published (the publish workflow is **manual-only** and has **not** been
   run — there is no GHCR auth here), no Nomad cluster runs, no public Caddy is

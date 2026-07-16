@@ -1,0 +1,12 @@
+# Next.js build output (also covered by the repo-root .gitignore).
+/.next/
+/out/
+
+# Playwright artifacts + downloaded browsers.
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
+# Local env.
+.env*.local

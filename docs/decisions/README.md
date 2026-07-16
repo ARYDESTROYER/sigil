@@ -27,6 +27,9 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > plus `otpauth://`, for migrate-in / no-lock-in) and the **browser client's matching
 > TOTP import/export** (the migration codec mirrored in JS and proven wire-compatible
 > with the CLI by a Node cross-tool test, so both clients have full import/export),
+> the **first real browser webapp** (`web/apps/webapp` over the `@sigil/wasm` loader,
+> running libsigil-via-WebAssembly client-side as a live TOTP demo; dev / no-index /
+> UNAUDITED, kept out of the default web CI build),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -85,3 +88,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0024](0024-wasm-totp-vault-and-cross-client-totp.md) | Browser TOTP vault + cross-client TOTP through the op-log (wasm `totp`/`hotp`/`format_code`, mirrored vault JSON) | Accepted (2026-07) |
 | [0025](0025-totp-import-export.md) | TOTP import/export — Google Authenticator `otpauth-migration://` (hand-rolled protobuf) + `otpauth://` | Accepted (2026-07) |
 | [0026](0026-browser-totp-import-export.md) | Browser TOTP import/export — mirror the migration codec in JS (`totp-migration.mjs`) + CLI↔JS cross-tool test | Accepted (2026-07) |
+| [0027](0027-webapp-and-wasm-bundling.md) | Real webapp over a `@sigil/wasm` loader (Next.js `asyncWebAssembly` + the `target_features`/`externref` strip) | Accepted (2026-07) |

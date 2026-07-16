@@ -11,7 +11,16 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 36, `main` @ origin, clean tree).** Phase 36 brought the
+**Where we are (through Phase 37, `main` @ origin, clean tree).** Phase 37 turned the
+reserved `web/apps/webapp` into a **real Next.js 15 app that runs libsigil via
+WebAssembly, entirely client-side** — a live TOTP demo over a new **`@sigil/wasm`**
+workspace loader package (which wasm-packs the repo-root `sigil-wasm` crate for a
+bundler target and reuses the proven `totp-vault`/`sync`/`totp-migration` JS helpers).
+The first real browser product surface; dev / no-index / UNAUDITED, kept out of the
+default web CI build (needs the Rust + wasm-pack toolchain), marketing/CI unchanged.
+Proven GREEN in a real browser by a headless Playwright smoke (the wasm renders the
+RFC 6238 vector `287082` at t=59). ADR 0027; details in the Phase 37 entry below.
+Phase 36 brought the
 **browser client to TOTP import/export parity with the CLI**, so **both clients now
 have full 2FA import/export**. A framework-free, dependency-free ESM module
 **`sigil-wasm/totp-migration.mjs`** gives the browser the same Google Authenticator
@@ -3784,4 +3793,97 @@ GREEN; this pass is docs-only.
 - **Hand-maintained schema in two languages now.** The proto3 codec is hand-written on both the
   Rust and JS sides — kept honest only by `migration-interop.mjs`; a change to one side must
   update the other or the test fails. Vault stays TOTP-only (HOTP warned-and-skipped). Public copy
+  still obeys `web/apps/marketing/MARKETING-CLAIMS.md`.
+
+---
+
+## 2026-07-16 — Phase 37 (real webapp: `web/apps/webapp` runs libsigil via WebAssembly client-side, over a `@sigil/wasm` loader)
+
+### What & why
+- The client column had reached a real browser only through the throwaway `sigil-wasm/demo/`
+  page. The reserved `web/apps/webapp` was blocked on a real, importable wasm artifact + JS
+  helpers — which Phases 29–36 built and proved. Phase 37 turns the reserved directory into a
+  **real Next.js 15 app that runs the libsigil core via WebAssembly, entirely client-side** —
+  the **first real browser product surface**. It is a **live TOTP demo**, not yet a full
+  authenticator UI. Dev / no-index / UNAUDITED; **not deployed**.
+
+### How (design decisions → ADR 0027)
+- **New `@sigil/wasm` workspace loader package (`web/packages/sigil-wasm`).** Private,
+  `type: module` (name **`@sigil/wasm`**). Its `build.sh` generates **bundler-target** wasm
+  bindings from the **repo-root `sigil-wasm` Rust crate** and `index.mjs` re-exports the wasm
+  surface (`seal_record`/`open_record`, `seal_to_container`/`open_container`, `hybrid_*`,
+  `totp`/`hotp`/`format_code`) behind an `initWasm()` awaitable + a typed `index.d.ts`, **plus
+  re-uses the proven, wasm-agnostic helpers** from the repo-root
+  `sigil-wasm/{totp-vault,sync,totp-migration}.mjs` by RELATIVE import — the same tested source
+  the interop tests exercise, NOT a rewrite, NO new crypto.
+- **The `target_features`/`externref` strip (the load-bearing wasm-bundling detail).** rustc
+  1.85+ force-enables the wasm `reference-types`+`multivalue` target features, so wasm-bindgen
+  emits `externref`, which Next.js 15's bundled (old `@webassemblyjs`) webpack parser cannot
+  decode (`parseVec could not cast the value`). `build.sh` works around it with a **3-step
+  strip**: (1) `cargo build` the crate to raw wasm; (2) delete the `target_features` custom
+  section so wasm-bindgen stays in the MVP subset (no `externref`); (3) `wasm-bindgen --target
+  bundler` → gitignored `pkg/`. The app sets webpack `experiments.asyncWebAssembly = true`.
+- **The app (`web/apps/webapp`).** Next.js 15.1.6 / React 19 / Tailwind 3 / TS-strict app-router.
+  `next.config.mjs` carries the SAME no-index stealth headers as marketing (`X-Robots-Tag
+  noindex/nofollow/noarchive`, nosniff, `no-referrer`, `X-Frame-Options DENY`) + `app/robots.ts`
+  (`Disallow: /`). `app/page.tsx` + a `"use client"` `app/totp-demo.tsx` (dynamic-imports
+  `@sigil/wasm` so wasm loads in the browser only) is a **live TOTP demo**: default PUBLIC RFC
+  6238 seed `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ` (not a real secret), **wasm-computed** 6-digit code
+  + countdown via `codeForEntry`/`base32Decode` (wasm computes the code, never JS), `?secret=` /
+  `?t=` test hooks. Loud UNAUDITED / no-real-secrets banner in layout + page.
+- **Kept OUT of the default web CI build.** Root `web` scripts still filter to **marketing only**
+  (`pnpm --filter marketing …`), so marketing CI stays Rust-free. The webapp builds via its own
+  filter and needs the Rust + wasm-pack toolchain; a webapp `prebuild` runs the `@sigil/wasm`
+  build first.
+
+### Verified GREEN (gated first-hand)
+- **Marketing UNCHANGED** — typecheck / lint / build still green; root web scripts still filter
+  marketing only, so CI stays Rust-free. `libsigil/core`, `cli/`, `sigild/`, and the repo-root
+  `sigil-wasm` Rust crate are byte-for-byte untouched; `getrandom` count stays 0.
+- **`@sigil/wasm` build** succeeds (wasm-bindgen 0.2.100; the 3-step strip produces a
+  webpack-parseable module).
+- **webapp** typecheck + lint clean; `next build` succeeds with **ONE KNOWN-BENIGN warning** —
+  "The generated code contains 'async/await' because this module is using asyncWebAssembly"
+  (expected for `experiments.asyncWebAssembly`, not an error).
+- **Headless Playwright smoke PASSES 2/2** (`tests/wasm.spec.ts`, chromium): loads the page at
+  `?t=59` and asserts the **wasm-rendered** TOTP code is **`287082`** (the RFC 6238 SHA-1 6-digit
+  vector at unix 59), and a second seed recomputes to a different 6-digit code — **proving the
+  real libsigil wasm runs in a real browser**. Served pages return the no-index headers.
+- **Generated artifacts gitignored** (`.next`, `pkg`, `node_modules`, `test-results`, tsbuildinfo).
+- ⚠️ **Process note:** the Phase-37 build agent completed the actual build + gate but its workflow
+  failed at the final structured-output report step (not the build). The result was **salvaged and
+  re-gated first-hand**, so the GREEN above is confirmed, not assumed.
+
+### Docs (this pass)
+- `docs/architecture.md` — new `web/apps/webapp` + `@sigil/wasm` component in the map (first real
+  product client surface; the 3-step `target_features`/`externref` strip; dev/no-index/UNAUDITED;
+  marketing/CI unchanged); diagram footer + the "no clients / extension" gap updated to note the
+  browser app now exists (still a demo, not deployed).
+- `docs/deployment.md` — the "clients are stubbed" gap now notes the webapp exists but is
+  dev-only / NOT deployed, and that building it needs the Rust + wasm-pack toolchain, so it is
+  deliberately kept out of the default web CI build.
+- `CLAUDE.md` — repository map: `web/apps/webapp` + `web/packages/sigil-wasm` no longer reserved;
+  Build & test section gained the webapp/@sigil/wasm commands (with the marketing-only note + the
+  benign async-wasm warning).
+- `README.md` — short note that an in-browser webapp now exists (dev, UNAUDITED) running libsigil
+  via WebAssembly; layout line updated.
+- `docs/decisions/0027-webapp-and-wasm-bundling.md` — new Nygard ADR (context: demo proved the
+  client; reserved webapp was blocked on a real wasm artifact, now built; decision: real Next.js
+  app over a `@sigil/wasm` loader that wasm-packs the crate for a bundler target + asyncWebAssembly,
+  with the `target_features`/`externref` strip, reusing the proven JS helpers, kept out of default
+  web CI, no-index/UNAUDITED; consequences: two-toolchain build, headless-Playwright RFC-vector
+  proof, full authenticator UI is next, not deployed, the strip is a version-tied maintenance
+  point). Indexed in `docs/decisions/README.md` (Accepted, 2026-07) + noted in its status preamble.
+- `journal.md` — this entry + RESUME ANCHOR bumped to through Phase 37.
+
+### ➡️ Still open (honest)
+- **Dev / no-index / UNAUDITED, NOT deployed.** A live TOTP *view*, not a full authenticator UI
+  and not the product's account / key-management model. No real secrets. Full authenticator UI is
+  a later phase.
+- **The externref strip is a maintenance point.** It is tied to the current rustc / wasm-bindgen /
+  Next.js (webpack `@webassemblyjs`) versions; `build.sh` documents exactly why it exists so a
+  future reader doesn't mistake it for arbitrary. If a future Next.js parser learns `externref`,
+  the strip can be dropped.
+- **Two-toolchain build.** The webapp needs Rust + wasm-pack (unlike marketing), which is why it
+  stays out of the default web CI build; marketing/CI remain Node-only and Rust-free. Public copy
   still obeys `web/apps/marketing/MARKETING-CLAIMS.md`.

@@ -89,3 +89,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0025](0025-totp-import-export.md) | TOTP import/export — Google Authenticator `otpauth-migration://` (hand-rolled protobuf) + `otpauth://` | Accepted (2026-07) |
 | [0026](0026-browser-totp-import-export.md) | Browser TOTP import/export — mirror the migration codec in JS (`totp-migration.mjs`) + CLI↔JS cross-tool test | Accepted (2026-07) |
 | [0027](0027-webapp-and-wasm-bundling.md) | Real webapp over a `@sigil/wasm` loader (Next.js `asyncWebAssembly` + the `target_features`/`externref` strip) | Accepted (2026-07) |
+| [0028](0028-webapp-vault-persistence-and-unlock.md) | Webapp vault persistence + password-unlock model (persist only the `SIGILcli`-sealed container in `localStorage`; in-memory password) | Accepted (2026-07) |

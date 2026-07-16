@@ -219,6 +219,21 @@ public, make no security claims, until the audit completes and trademark clears.
   **dev** backend (no PITR/replication/object-store, no production change-management). Runbook
   in [`docs/deployment.md`](docs/deployment.md) §11–§12.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
+- `web/apps/webapp/` + `web/packages/sigil-wasm/` — Next.js 15 app running the libsigil
+  core via **WebAssembly, entirely client-side** (over the `@sigil/wasm` loader that
+  wasm-packs the repo-root `sigil-wasm` crate for a bundler target; ADR 0027). Now a
+  **real (dev) authenticator UI**: a multi-account **encrypted TOTP vault** that
+  **seals to a `SIGILcli` container** (Argon2id → XChaCha20-Poly1305, the same sealed
+  format as the CLI/browser vault, cross-client-interoperable) and **persists ONLY the
+  sealed container** in `localStorage` with an **in-memory password unlock** (password
+  never persisted; boots into a lock screen when a sealed vault exists). **Add** by form
+  / `otpauth://` / **Google Authenticator `otpauth-migration://` import**, **export**
+  back out, live **codes + countdowns computed in the wasm**; entropy via
+  `crypto.getRandomValues`; optional dev **Sync** of the sealed container to a localhost
+  op-log (ADR 0028). Playwright-proven (add-account == RFC vector, GA import,
+  lock/reload/unlock persistence). **Dev / no-index / UNAUDITED, not deployed**, kept
+  OUT of the default `web` CI build (needs the Rust + wasm-pack toolchain). Do NOT store
+  real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust

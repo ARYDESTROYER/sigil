@@ -452,11 +452,30 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   custom section so wasm-bindgen stays in the MVP subset (no `externref`), (3) run
   `wasm-bindgen --target bundler` — and the app enables webpack
   `experiments.asyncWebAssembly`. The app itself (`app/page.tsx` +
-  a `"use client"` `app/totp-demo.tsx` that dynamic-imports `@sigil/wasm` so wasm loads
-  in the browser only) is a **live TOTP demo**: it defaults to the PUBLIC RFC 6238 test
-  seed (`GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ` — not a real secret) and renders the
-  **wasm-computed** 6-digit code + countdown (via `codeForEntry` / `base32Decode`; the
-  wasm computes the code, never JS). It carries the **same no-index stealth posture as
+  a `"use client"` `app/authenticator.tsx`, plus a collapsed `app/totp-demo.tsx`
+  wasm self-check, that dynamic-import `@sigil/wasm` so wasm loads in the browser only)
+  is now a **real (dev) authenticator UI — a multi-account encrypted TOTP vault**, not
+  just a single-code demo. It **seals its accounts into a `SIGILcli` container**
+  (Argon2id → XChaCha20-Poly1305, the same sealed vault format the CLI and browser
+  helpers use, so the vault stays **cross-client-interoperable**) and **persists ONLY
+  the sealed container** to `localStorage` (key `sigil.webapp.vault.v1`) — the plaintext
+  vault and the password are **never persisted**; the password lives only in memory
+  while unlocked and vanishes on Lock / reload, so the app boots into a **password
+  unlock** flow whenever a sealed vault already exists (setup / locked / unlocked
+  phases). You **add accounts** by form (label / issuer / base32 secret / algorithm /
+  digits / period), by pasting an `otpauth://` URI, or by **importing a Google
+  Authenticator `otpauth-migration://` export** (duplicates skipped), and **export**
+  back out as `otpauth://` URIs or one combined migration URI (behind a loud
+  secrets-in-the-clear warning). Live **codes + countdown rings are computed in the
+  wasm** (`codeForEntry` / `base32Decode`; the wasm computes every code, never JS); each
+  vault mutation re-seals and re-persists the container. Fresh salt/nonce entropy comes
+  from `crypto.getRandomValues`. An optional **Sync (dev)** panel round-trips the
+  **sealed** container to/from a localhost sigild op-log over plain HTTP (opaque bytes
+  only; no TLS, no auth). Proven GREEN by headless Playwright feature smokes
+  (`tests/wasm.spec.ts`): add-account reproduces the RFC 6238 vector `287082`, a Google
+  Authenticator migration URI imports, and a lock/reload/unlock round-trip restores the
+  persisted vault ([ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)).
+  It carries the **same no-index stealth posture as
   marketing** (`X-Robots-Tag noindex/nofollow/noarchive`, `X-Content-Type-Options
   nosniff`, `Referrer-Policy no-referrer`, `X-Frame-Options DENY`, plus an
   `app/robots.ts` `Disallow: /`) and a loud **UNAUDITED / no-real-secrets** banner.
@@ -509,8 +528,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
    └───────────────────────────────────────────────────────────────────────┘
 
    web/apps/marketing (Next.js): stealth splash + waitlist. Separate; no product surface.
-   web/apps/webapp (Next.js) + @sigil/wasm: in-browser libsigil-via-WebAssembly demo
-     (live TOTP; client-side only; dev / no-index / UNAUDITED; not deployed).
+   web/apps/webapp (Next.js) + @sigil/wasm: in-browser libsigil-via-WebAssembly
+     authenticator — multi-account encrypted TOTP vault (add/import/export), password
+     unlock + localStorage persistence of the SIGILcli-sealed container, codes in wasm;
+     client-side only; dev / no-index / UNAUDITED; not deployed.
 ```
 
 ---
@@ -723,11 +744,15 @@ authoritative list, with rationale, is the **defer ledger** in
   op-log (`sync.mjs`; [ADR 0022](decisions/0022-wasm-client-server-sync-loop.md)),
   but only over **dev / localhost / plain-HTTP / no-auth** — this demonstrates the
   E2EE sync architecture, it is **not** the product's sync / auth / CRDT model. The
-  **`web/apps/webapp`** Next.js app (over the **`@sigil/wasm`** loader) is now the
-  first *browser app* running libsigil-via-WebAssembly client-side (a live TOTP
-  demo; [ADR 0027](decisions/0027-webapp-and-wasm-bundling.md)) — but it too is
-  **dev / no-index / UNAUDITED**, **not deployed**, and a demo, **not** a full
-  authenticator UI or the product key-management model.
+  **`web/apps/webapp`** Next.js app (over the **`@sigil/wasm`** loader) is now a
+  real *browser authenticator UI* running libsigil-via-WebAssembly client-side — a
+  multi-account encrypted TOTP vault with add/import (`otpauth://` + Google
+  Authenticator)/export, live wasm-computed codes, and a password unlock over a
+  `SIGILcli`-sealed container persisted (sealed-only) in `localStorage`
+  ([ADR 0027](decisions/0027-webapp-and-wasm-bundling.md),
+  [ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)) — but it too is
+  **dev / no-index / UNAUDITED**, **not deployed**, and **not** the product's
+  account / device / sync-auth or key-management model.
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
   device-key signature check (contract v2: a per-request nonce plus a

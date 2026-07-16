@@ -11,7 +11,20 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 37, `main` @ origin, clean tree).** Phase 37 turned the
+**Where we are (through Phase 38, `main` @ origin, clean tree).** Phase 38 built the
+`web/apps/webapp` page from a single-code TOTP *view* into a **real (dev) authenticator
+UI** — a **multi-account encrypted TOTP vault** (`app/authenticator.tsx`) over the same
+`@sigil/wasm` loader. Accounts **seal into a `SIGILcli` container** (same sealed format
+as the CLI / browser vault, cross-client-interoperable) and **only the sealed container
+is persisted** in `localStorage` (`sigil.webapp.vault.v1`); the **password lives only in
+memory** and unlocks by opening the container, so the app boots setup / locked /
+unlocked. Add by form / `otpauth://` / **Google Authenticator `otpauth-migration://`
+import**, **export** back out, live **codes + countdown rings computed in the wasm**;
+entropy via `crypto.getRandomValues`; optional dev Sync of the sealed container to a
+localhost op-log. Proven GREEN by headless Playwright feature smokes (add-account ==
+RFC vector `287082`; GA migration import; lock/reload/unlock persistence) with marketing
+still green. ADR 0028 (persistence + unlock model); details in the Phase 38 entry below.
+Phase 37 turned the
 reserved `web/apps/webapp` into a **real Next.js 15 app that runs libsigil via
 WebAssembly, entirely client-side** — a live TOTP demo over a new **`@sigil/wasm`**
 workspace loader package (which wasm-packs the repo-root `sigil-wasm` crate for a
@@ -3887,3 +3900,86 @@ GREEN; this pass is docs-only.
 - **Two-toolchain build.** The webapp needs Rust + wasm-pack (unlike marketing), which is why it
   stays out of the default web CI build; marketing/CI remain Node-only and Rust-free. Public copy
   still obeys `web/apps/marketing/MARKETING-CLAIMS.md`.
+
+---
+
+## 2026-07-16 — Phase 38 (real authenticator UI: `web/apps/webapp` multi-account encrypted TOTP vault + password unlock + sealed-container persistence)
+
+### What & why
+- Phase 37 shipped the webapp as a **live TOTP view** of one hard-coded RFC seed — stateless,
+  single-account, nothing persisted. Phase 38 turns that page into a **real (dev) authenticator
+  UI**: a **multi-account encrypted TOTP vault** that survives reloads. A 2FA app that forgets
+  every account on refresh is useless, so persistence was the gating gap. No new crypto, no new
+  format — it reuses the proven `SIGILcli` sealed vault + `TotpVault` schema + the wasm-computed
+  codes from Phases 33–36. Still dev / no-index / UNAUDITED; **not deployed**.
+
+### How (design decisions → ADR 0028)
+- **New `app/authenticator.tsx` (`"use client"`).** Dynamic-imports `@sigil/wasm` (browser-only,
+  no SSR crypto). Three phases decided purely by whether the `localStorage` key exists —
+  **setup** (create vault + password), **locked** (prompt for password), **unlocked** (vault open
+  in memory): `page.tsx` now renders `<Authenticator/>` with the old `totp-demo.tsx` demoted to a
+  collapsed "wasm self-check" `<details>`.
+- **Persist ONLY the sealed container.** Single `localStorage` key `sigil.webapp.vault.v1` holds
+  the base64 of the `SIGILcli`-sealed `TotpVault` — the **plaintext vault and the password are
+  never written to disk**. Every mutation (`withVault`) clones → mutates → **re-seals with a fresh
+  salt+nonce** (`crypto.getRandomValues`) → rewrites that one key; a rejected mutation (duplicate
+  label) throws BEFORE any persist, so the stored container is never corrupted.
+- **Password in memory only.** Held in a ref, cleared on **Lock** (and gone on reload / tab
+  close). **Unlock = open the container**; wrong password fails the AEAD → "wrong password or
+  tampered vault". Argon2id params are OWASP-interactive-ish (m=19456,t=2,p=1); the container is
+  self-describing so open needs none → stays CLI-interoperable.
+- **Add / import / export / sync.** Add by form (label/issuer/base32 secret/algorithm/digits/
+  period, with a local base32 pre-validate for a clear error), by `otpauth://` paste, or by
+  **Google Authenticator `otpauth-migration://` import** (duplicates skipped, reports
+  imported/skipped). **Export** reveals `otpauth://` URIs or one combined migration URI behind a
+  loud secrets-in-the-clear warning. Live **codes + SVG countdown rings computed in the wasm**
+  (`codeForEntry`; wasm computes every code, never JS). An optional **Sync (dev)** panel push/
+  pulls the **sealed** container to a localhost sigild op-log (opaque bytes; no TLS/auth).
+- **Forget vault** escape hatch on the locked screen (confirmed) — the only way out of a vault
+  whose password is lost (a lost password is unrecoverable by design).
+
+### Verified GREEN (gated first-hand)
+- **Headless Playwright feature smokes PASS** (`web/apps/webapp/tests/wasm.spec.ts`, chromium,
+  clock pinned via `?t=`): (1) **add-account** — creating a vault, adding the RFC 6238 base32 seed
+  as an account, and reading the code reproduces the vector **`287082`** through the REAL
+  add-account → in-memory vault → wasm path (not the demo seed); (2) **GA import** — the canonical
+  golden `otpauth-migration://` URI imports as `Example:alice@google.com` (Imported 1, count 1);
+  (3) **persistence** — add account → **reload** comes back LOCKED (plaintext+password gone, only
+  the sealed container survived) → **unlock** restores the account and its live code. The two
+  original wasm-render smokes still pass.
+- **Marketing still green + CI unchanged** — root `web` scripts still filter marketing only, so
+  marketing typecheck/lint/build and CI stay Rust-free. `libsigil/core`, `cli/`, `sigild/`, and
+  the repo-root `sigil-wasm` crate are untouched; `getrandom` count stays 0.
+
+### Docs (this pass)
+- `docs/architecture.md` — the `web/apps/webapp` component now describes the full authenticator
+  UI (multi-account encrypted TOTP vault, seals to `SIGILcli`, persists sealed-only in
+  localStorage with an in-memory password unlock, add/import/export, codes in wasm); diagram
+  footer + the "no clients" gap updated to say the browser app is now a real authenticator UI
+  (still dev/no-index/UNAUDITED, not the product key-management model).
+- `CLAUDE.md` — repository map gained a `web/apps/webapp` entry reflecting the authenticator UI
+  (vault, add/import/export, password unlock + localStorage persistence of the sealed container,
+  live codes); build/test commands unchanged.
+- `README.md` — the webapp bullet now says it is a working (dev, UNAUDITED) authenticator with an
+  encrypted multi-account TOTP vault + import/export + password unlock; layout line updated.
+- `docs/decisions/0028-webapp-vault-persistence-and-unlock.md` — new Nygard ADR (context: a real
+  authenticator needs to persist accounts across reloads with no backend; decision: persist ONLY
+  the `SIGILcli`-sealed container in localStorage, password in memory, unlock by opening it, reuse
+  the shared sealed vault format, entropy via `crypto.getRandomValues`; consequences: lost password
+  = unrecoverable by design, localStorage is not hardened → dev only, no account/device/sync-auth
+  model yet, cross-client-interoperable for free, still UNAUDITED). Indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07).
+- `journal.md` — this entry + RESUME ANCHOR bumped to through Phase 38.
+
+### ➡️ Still open (honest)
+- **Dev / no-index / UNAUDITED, NOT deployed.** A real authenticator UI, but of the same unaudited
+  building blocks and **not** the product's account / device / key-management model. No real 2FA
+  secrets.
+- **A lost password = an unrecoverable local vault, by design.** No backend, no recovery key, no
+  escrow — only the password opens the vault; "Forget vault" is the only way out.
+- **`localStorage` is not a hardened secret store.** We persist only the sealed container (never
+  plaintext / never the password), but this stays a dev build; a production client wants a stronger
+  store + per-device keys.
+- **Local, single-browser persistence only.** The dev Sync panel round-trips the sealed container
+  through the opaque op-log, but that is dev / localhost / plain-HTTP / no-auth — not multi-device
+  or enrollment.

@@ -1,8 +1,9 @@
+import Authenticator from "./authenticator";
 import TotpDemo from "./totp-demo";
 
-// Server component shell. TotpDemo is a client component that loads the wasm in
-// the browser only (dynamic import inside an effect), so nothing crypto-related
-// evaluates during SSR.
+// Server component shell. Authenticator + TotpDemo are client components that
+// load the wasm in the browser only (dynamic import inside an effect), so nothing
+// crypto-related evaluates during SSR.
 export default function Home() {
   return (
     <main className="mx-auto max-w-2xl px-6 py-12">
@@ -21,13 +22,23 @@ export default function Home() {
         </p>
       </div>
 
-      <h1 className="mb-2 text-2xl font-bold">Sigil webapp</h1>
+      <h1 className="mb-2 text-2xl font-bold">Sigil authenticator</h1>
       <p className="mb-8 text-sm text-neutral-500 dark:text-neutral-400">
-        A minimal client-side demo running the libsigil core in the browser via
-        WebAssembly. A full authenticator UI comes later.
+        A client-side, end-to-end-encrypted (dev) TOTP authenticator. Codes are
+        computed by the libsigil core compiled to WebAssembly; your vault is
+        sealed with a password and never leaves this browser in the clear.
       </p>
 
-      <TotpDemo />
+      <Authenticator />
+
+      <details className="mt-10">
+        <summary className="cursor-pointer text-sm font-medium text-neutral-500 hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200">
+          wasm self-check (dev)
+        </summary>
+        <div className="mt-4">
+          <TotpDemo />
+        </div>
+      </details>
     </main>
   );
 }

@@ -11,7 +11,50 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 43, `main` @ origin, clean tree).** Phase 43 opened the
+**Where we are (through Phase 44, `main` @ origin, clean tree).** Phase 44 finished the **auth story across the CLI + browser clients**: the webapp and
+the MV3 extension can now **enroll and authenticate as real devices** against `sigild`'s
+multi-device model (**contract v3**, ADR 0031) — previously only the `sigil` CLI could. Three
+thin `#[wasm_bindgen]` shells over `sigil-core`'s Ed25519 — **`ed25519_public_key(seed)`**,
+**`ed25519_sign(seed, message)`**, **`ed25519_verify(public_key, message, signature)`** — give a
+browser real signing; the seed is a **CALLER argument** (JS `crypto.getRandomValues`) and Ed25519
+is deterministic, so **both `libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock` are still
+`getrandom`==0** (re-confirmed) and Rust tests are now **26** incl. an **RFC 8032 KAT**. NEW
+**`sigil-wasm/device-auth.mjs`** (framework-free, dependency-free, Node + browser) is the CLIENT
+half: `generateDeviceSeed`/`devicePublicKey`, `enrollDevice`, `signedFetch`/`makeSignedFetch`,
+`pushContainerAuthed`/`pullContainersAuthed`, `grantVaultAccess`/`listVaultGrants`,
+`revokeSelf`/`revokeDeviceAdmin`/`listDevices`, `sealDeviceIdentity`/`openDeviceIdentity`,
+`DeviceAuthError`+`explainAuthStatus` — **ALL signing is `wasm.ed25519_sign`; there is NO JS-side
+signing**. ⚠️ The canonical layout (`canonicalV3Message`/`canonicalEnrollMessage`/
+`enrollTokenHash`) is **MIRRORED from `sigild/internal/api/deviceauth.go` + `cli/src/lib.rs` and
+now lives in THREE implementations that MUST stay byte-identical** — drift does not fail loudly,
+it silently 401s. `sync.mjs` gained **ONE optional `opts.fetch`** (+ additive `err.status`), so
+the unauthenticated path is behaviourally identical (why the older interop tests still pass).
+**SECRETS (ADR 0033): the 32-byte device seed is NEVER stored in plaintext** — it is sealed into
+a **SECOND `SIGILcli` container under the SAME vault password** (in the wasm) and only that is
+persisted (`localStorage` `sigil.webapp.device.v1`, `chrome.storage.local`
+`sigil.extension.device.v1`; sealed plaintext `{version, device_id, seed, base_url}`), a separate
+container **deliberately** so the CLI-mirrored `TotpVault` schema stays byte-compatible; the
+decrypted seed is **memory-only while unlocked** (lock/reload/forget drop it; forget deletes the
+sealed identity), and the enrollment token is an in-memory bearer secret cleared after use. ⚠️
+**`extension/manifest.json` gained `host_permissions ["http://127.0.0.1/*",
+"http://localhost/*"]`** — MV3 pages cannot fetch cross-origin without one; deliberately
+**LOOPBACK-ONLY** so the build cannot reach a remote server (`permissions` is still `["storage"]`).
+**VERIFIED FIRST-HAND:** fmt clean, clippy `-D warnings` clean, 26 Rust tests; **ALL SEVEN Node
+tests pass** (roundtrip, interop, hybrid-interop, sync-interop, totp-interop, migration-interop,
+device-auth-interop); webapp typecheck/lint/build green + **Playwright 8/8**; **extension 3/3**
+(real unpacked extension in chromium); marketing still green and Rust-free; **nothing changed
+under `sigild/`, `cli/`, `libsigil/` or `desktop/`**. The device-auth interop test boots a **REAL
+`sigild` with `SIGILD_DEVICE_AUTH=1`** and proves: unsigned → 401; A enrolls; identity round-trips
+the sealed container with **no plaintext seed at rest**; A pushes/claims/pulls/opens byte-verbatim;
+B enrolled but **403** on A's vault; after a read grant B pulls yet is still 403 on write; an admin
+revoke makes B **401** while A is unaffected; tampered body + stale timestamp both 401; a spent
+enrollment token 401. Honest: **the enrollment UI is NOT Playwright-covered** (protocol proven in
+Node; UI suites still pass), still the **DEV op-log over plain HTTP, no TLS, loopback only**, the
+server model is **dev-gated + UNAUDITED** with **trust-on-first-write** ownership and **no account
+model / session issuance / key rotation / enrollment rate limiting**, and the **native `desktop/`
+client still has no sync or enrollment**. ADR 0033 (+ a browser-client note appended to ADR 0031);
+details in the Phase 44 entry below.
+Phase 43 opened the
 **NATIVE client column**: a new top-level **`desktop/`** —
 a **Tauri v2 desktop authenticator** whose Rust backend links libsigil **NATIVELY**. That is
 the whole point: `web/apps/webapp` and `extension/` both run the core as **WebAssembly**, so
@@ -4768,3 +4811,146 @@ GREEN; this pass is docs-only.
   Phases 41–42 (contract v3, grants, revocation) is unused here.
 - **No mobile client.** The native column is open, not finished.
 - **Not wired into CI** (like `extension/`); the gates above are local only.
+
+---
+
+## 2026-07-16 — Phase 44 (the browser clients authenticate: `device-auth.mjs`, wasm Ed25519, and a sealed device identity)
+
+### What & why
+- Phases 41–42 built the server's **multi-device auth model (contract v3)** and taught the
+  **`sigil` CLI** to speak it. Every other client was still an **anonymous writer**: the webapp
+  and the extension could only sync against a wide-open dev op-log, so the whole device model —
+  enrollment, per-vault grants, revocation — was unreachable from the two surfaces a real user
+  would actually touch.
+- Phase 44 closes that: the **browser clients now enroll and sign as real devices**, so the auth
+  story is complete across the CLI + browser column. Nothing on the server changed — the client
+  half was the entire missing piece.
+- **No new protocol ADR** (that is ADR 0031; a "Browser client support" note was appended to it).
+  The one genuinely new decision — **how a browser stores its device identity** — is recorded as
+  **ADR 0033**.
+
+### How
+- **Three wasm exports over `sigil-core`'s Ed25519.** `sigil-wasm/src/lib.rs` gains
+  `ed25519_public_key(seed)`, `ed25519_sign(seed, message)` and
+  `ed25519_verify(public_key, message, signature)` — thin `#[wasm_bindgen]` shells over the
+  existing core primitive, no new crypto. The 32-byte seed is a **CALLER argument** (JS draws it
+  with `crypto.getRandomValues`) and Ed25519 signing is deterministic, so the crate draws **no**
+  entropy and the caller-supplied-entropy invariant (ADR 0007) holds unchanged. The `@sigil/wasm`
+  loader re-exports all three.
+- **NEW `sigil-wasm/device-auth.mjs`** — framework-free, dependency-free ESM that runs in **Node
+  and the browser**, implementing the CLIENT half of contract v3: `generateDeviceSeed` /
+  `devicePublicKey`, `enrollDevice`, `signedFetch` / `makeSignedFetch`, `pushContainerAuthed` /
+  `pullContainersAuthed`, `grantVaultAccess` / `listVaultGrants`, `revokeSelf` /
+  `revokeDeviceAdmin` / `listDevices`, `sealDeviceIdentity` / `openDeviceIdentity`, plus
+  `DeviceAuthError` and `explainAuthStatus` (which renders the server's deliberately coarse
+  401-vs-403 without inventing an oracle). **ALL signing is `wasm.ed25519_sign` — there is NO
+  JS-side signing**; `enrollTokenHash` is lowercase-hex SHA-256 via `crypto.subtle`.
+- **The canonical layout now lives in THREE implementations.** `canonicalV3Message` /
+  `canonicalEnrollMessage` / `enrollTokenHash` are **MIRRORED — not shared — from
+  `sigild/internal/api/deviceauth.go` (the source of truth) and `cli/src/lib.rs`**. ⚠️ Go, Rust
+  and JS **must stay byte-identical**: drift does **not** fail loudly, it silently 401s every
+  request. The interop tests are the only guard.
+- **`sync.mjs` extended ADDITIVELY.** One optional `opts.fetch` (default `globalThis.fetch`) plus
+  an additive `err.status`. The **unauthenticated path is behaviourally identical** — which is
+  exactly why the five older Node interop tests still pass untouched — and the authenticated path
+  just injects `makeSignedFetch`. The transport still does **no** crypto and never inspects a
+  container.
+- **SECRET HANDLING — the device seed is NEVER stored in plaintext (ADR 0033).** It is sealed
+  into a **SECOND `SIGILcli` container under the SAME vault password** (Argon2id →
+  XChaCha20-Poly1305, sealed and opened **inside the wasm**), and only that container is
+  persisted: `localStorage` key **`sigil.webapp.device.v1`**, `chrome.storage.local` key
+  **`sigil.extension.device.v1`**. The sealed plaintext is `{version, device_id, seed, base_url}`.
+  It is a **separate container rather than a field in the vault JSON deliberately**, so the
+  CLI-mirrored `TotpVault` schema stays byte-compatible (the CLI, the desktop app and the
+  migration codec are untouched). The decrypted seed lives **only in memory while the vault is
+  unlocked** — lock, reload and forget all drop it, and **forget deletes the sealed identity
+  too**. The enrollment token is a bearer secret held in memory only, cleared after use, never
+  stored or logged.
+- **Webapp** (`web/apps/webapp/app/authenticator.tsx`): the Sync panel grows a **Device identity**
+  section — enroll with a single-use token + label, or Forget; `push`/`pull` route through
+  `pushContainerAuthed` / `pullContainersAuthed` when enrolled and stay unauthenticated when not.
+- **Extension** (`extension/src/popup/popup.{html,js}`, `extension/build.sh`): the popup gains the
+  same Sync + enrollment panel over the newly-vendored `sync.mjs` + `device-auth.mjs` (copied
+  **verbatim**, as always — no reimplementation).
+- ⚠️ **`extension/manifest.json` gained `"host_permissions": ["http://127.0.0.1/*",
+  "http://localhost/*"]`** — MV3 extension pages **cannot** fetch cross-origin without an explicit
+  host permission. It is deliberately **LOOPBACK-ONLY**, with an explanatory comment in the
+  manifest, so this build **cannot reach a remote server**. `"permissions"` is still `["storage"]`
+  and nothing else. Documented honestly rather than glossed: this is a real expansion of a
+  previously host-permission-free extension.
+
+### ✅ Verified GREEN (first-hand)
+- **Rust:** `cargo fmt … --check` clean; `cargo clippy --all-targets -- -D warnings` clean;
+  **26 tests** in `sigil-wasm`, including an **RFC 8032 known-answer vector** for the new Ed25519
+  shells.
+- **ALL SEVEN Node tests PASS:** `roundtrip.mjs`, `interop.mjs`, `hybrid-interop.mjs`,
+  `sync-interop.mjs`, `totp-interop.mjs`, `migration-interop.mjs`, and the new
+  **`device-auth-interop.mjs`**.
+- **The live device-auth proof** (`device-auth-interop.mjs` boots a **REAL `sigild`** with
+  `SIGILD_ENABLE_DEV_OPS=1` + `SIGILD_DEVICE_AUTH=1`) asserts, in order: an **unsigned request is
+  refused 401**; **device A enrolls**; the identity **round-trips through the password-sealed
+  container with NO plaintext seed at rest** (and a wrong password cannot open it); **A pushes,
+  claims the vault (trust-on-first-write), pulls and opens it byte-verbatim**; **device B is
+  enrolled but 403 on A's vault**; **after a read grant B can pull but is still 403 on write**;
+  **an admin revoke makes B 401 while A is unaffected**; **a tampered body and a stale timestamp
+  are both 401**; and **reusing a spent enrollment token is 401**.
+- **Webapp:** typecheck / lint / build green; **Playwright 8/8**.
+- **Extension:** `corepack pnpm -C extension test` → **3/3**, driving the **real unpacked
+  extension** in chromium.
+- **Marketing** build still green and **Rust-free**.
+- **Lockfile invariant intact:** `grep -c 'name = "getrandom"'` is **0** in **both**
+  `libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock` — the seed is JS-supplied, so nothing pulled
+  an RNG into the wasm-pure crates.
+- **Blast radius:** nothing under `sigild/`, `cli/`, `libsigil/` or `desktop/` changed.
+
+### ⚠️ Honest caveats (documented, not hidden)
+1. **The enrollment UI is NOT covered by a Playwright test** in either browser client. The auth
+   protocol itself is proven **live in Node**; the existing UI suites still pass and assert no
+   page errors — but nobody has clicked the enroll button in a headless browser.
+2. **Still the DEV op-log over PLAIN HTTP — no TLS, loopback only.** Request signing proves who
+   sent a request; it is not transport security.
+3. **The server-side model is still dev-gated and UNAUDITED.** Ownership is
+   **trust-on-first-write**, and there is still **no account model, no session issuance, no key
+   rotation, and no rate limiting on enrollment attempts**.
+4. **The canonical message layout now lives in THREE implementations** (sigild Go, cli Rust,
+   sigil-wasm JS) that **must stay byte-identical** — the interop tests are what guard that, and
+   a drift fails silently as a 401 rather than loudly.
+5. **The seed is exposed in memory while the vault is unlocked** (signing needs it): no
+   zeroization, no `mlock`, no enclave. Sealing defends the **stored** key, not a live process,
+   and neither client defends against a compromised browser/extension host or a malicious script
+   with access to the same origin.
+6. **The native `desktop/` client still has no sync and no device enrollment** — the auth story
+   is complete for the CLI + browser column only.
+
+### Docs (this pass)
+- `docs/api.md` — the CLI client-support section now points onward, and a new **"Client support
+  (the browser + Node clients)"** subsection maps the `device-auth.mjs` surface onto all five
+  device routes, notes that all signing happens in the wasm, that `sync.mjs` changed additively,
+  and that the canonical layout lives in three implementations kept in sync by the interop tests.
+- `docs/architecture.md` — the `sigil-wasm` bullet records the three Ed25519 exports +
+  `device-auth.mjs` + the live interop proof; the webapp and extension bullets record enrollment,
+  signed sync, the **sealed** device identity and (extension) the **loopback-only** host
+  permission; the stale "the extension has no sync" claim is corrected in both the component map
+  and §6.
+- `CLAUDE.md` — `sigil-wasm/`, webapp and `extension/` repository-map bullets updated; the Build
+  & test block now **names all seven** Node tests (and the webapp's 8 Playwright specs).
+- `README.md` — one honest sentence that all four clients that talk to the dev server can now
+  enroll and authenticate as devices (with the `desktop/` exception stated).
+- `docs/threat-model.md` — a new **"Browser clients holding a device identity"** subsection: the
+  seed is sealed at rest under the vault password, it **is** exposed in memory while unlocked, the
+  enrollment token is a bearer secret, the extension's reach is bounded by a loopback-only host
+  permission — and an explicit statement that none of this defends against a compromised
+  browser/extension host or same-origin script access.
+- `docs/decisions/0031-multi-device-auth-model.md` — a **"Browser client support (added Phase
+  44)"** note appended (no new protocol ADR).
+- `docs/decisions/0033-browser-device-identity-storage.md` — **NEW ADR 0033** (sealed second
+  `SIGILcli` container vs. plaintext web storage vs. a `TotpVault` field), plus its index row and
+  a banner line in `docs/decisions/README.md`.
+- `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 44**.
+
+### ➡️ Still open (honest)
+- **No browser test for enrollment** — the highest-value next gate for this column.
+- **No TLS anywhere in the sync path**, and no shared (multi-instance) replay store.
+- **No account model, session issuance, key rotation, re-enrollment or recovery** — a lost vault
+  password still destroys the device identity along with the vault.
+- **`desktop/` remains sync-less**, so contract v3 is still unused in the native column.

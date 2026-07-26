@@ -36,10 +36,12 @@
 use sigil_core::{
     format_code as core_format_code, hotp as core_hotp, hybrid_open as core_hybrid_open,
     hybrid_seal as core_hybrid_seal, ml_kem768_keygen as core_ml_kem768_keygen,
-    open_record as core_open_record, seal_record as core_seal_record, totp as core_totp,
+    open_record as core_open_record, public_key_from_seed as core_public_key_from_seed,
+    seal_record as core_seal_record, sign as core_sign, totp as core_totp, verify as core_verify,
     x25519_public_key as core_x25519_public_key, Argon2Params, OtpAlgorithm,
     ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
-    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
+    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
+    X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
 use wasm_bindgen::prelude::*;
 
@@ -390,6 +392,53 @@ pub fn format_code(code: u32, digits: u32) -> String {
     core_format_code(code, digits)
 }
 
+// --- Ed25519 signatures (device identity / op-log request auth) -------------
+//
+// A thin binding over `sigil-core`'s CLASSICAL Ed25519 primitive. It exists so a
+// BROWSER client can hold a device identity and sign sigild's op-log request-auth
+// contract v3 (and the device-enrollment proof of possession) with the SAME real
+// crypto the `sigil` CLI uses — see `sigil-wasm/device-auth.mjs`, which mirrors
+// `cli/src/lib.rs` byte for byte.
+//
+// The caller-supplied-entropy invariant carries through unchanged: the 32-byte
+// seed is a caller ARGUMENT (JS draws it from `crypto.getRandomValues`), and
+// Ed25519 signing is deterministic (RFC 8032), so nothing here draws entropy and
+// the crate stays `getrandom`-free.
+//
+// UNAUDITED, like everything else here. The seed is SECRET key material: JS must
+// not log it or persist it in plaintext.
+
+/// Derive the 32-byte Ed25519 public key from a caller-supplied 32-byte `seed`.
+///
+/// Deterministic and RNG-free: the same seed always yields the same public key.
+/// Throws a JS `Error` unless `seed` is exactly 32 bytes.
+#[wasm_bindgen]
+pub fn ed25519_public_key(seed: &[u8]) -> Result<Vec<u8>, JsError> {
+    ed25519_public_key_inner(seed).map_err(|e| JsError::new(&e))
+}
+
+/// Sign `message` with the caller-supplied 32-byte Ed25519 `seed`, returning the
+/// 64-byte signature.
+///
+/// Ed25519 signing is deterministic, so this draws no randomness. Throws a JS
+/// `Error` unless `seed` is exactly 32 bytes.
+#[wasm_bindgen]
+pub fn ed25519_sign(seed: &[u8], message: &[u8]) -> Result<Vec<u8>, JsError> {
+    ed25519_sign_inner(seed, message).map_err(|e| JsError::new(&e))
+}
+
+/// Strictly verify a 64-byte Ed25519 `signature` over `message` under
+/// `public_key` (32 bytes). Returns `true`/`false`; a wrong-length key or
+/// signature throws a JS `Error` (that is a caller bug, not a verdict).
+#[wasm_bindgen]
+pub fn ed25519_verify(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, JsError> {
+    ed25519_verify_inner(public_key, message, signature).map_err(|e| JsError::new(&e))
+}
+
 // --- Testable core-marshalling logic (no `JsError`, so it runs natively) ----
 
 #[allow(clippy::too_many_arguments)]
@@ -669,6 +718,28 @@ fn hotp_inner(key: &[u8], counter: f64, digits: u32, algorithm: &str) -> Result<
     let counter = u64_from_f64("counter", counter)?;
     let algorithm = otp_algorithm_from_str(algorithm)?;
     core_hotp(key, counter, digits, algorithm).map_err(|e| format!("hotp failed: {e}"))
+}
+
+// --- Ed25519 inner helpers (native-testable, no `JsError`) ------------------
+
+fn ed25519_public_key_inner(seed: &[u8]) -> Result<Vec<u8>, String> {
+    let seed: [u8; SIG_SEED_LEN] = fixed("ed25519 seed", seed)?;
+    Ok(core_public_key_from_seed(&seed).to_vec())
+}
+
+fn ed25519_sign_inner(seed: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+    let seed: [u8; SIG_SEED_LEN] = fixed("ed25519 seed", seed)?;
+    Ok(core_sign(&seed, message).to_vec())
+}
+
+fn ed25519_verify_inner(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool, String> {
+    let public_key: [u8; SIG_PUBLIC_KEY_LEN] = fixed("ed25519 public key", public_key)?;
+    let signature: [u8; SIGNATURE_LEN] = fixed("ed25519 signature", signature)?;
+    Ok(core_verify(&public_key, message, &signature).is_ok())
 }
 
 #[cfg(test)]
@@ -966,5 +1037,81 @@ mod tests {
         // digits below MIN, and a zero period, must surface as errors (not panic).
         assert!(totp_inner(RFC_KEY_SHA1, 59.0, 30, 0.0, 5, "sha1").is_err());
         assert!(totp_inner(RFC_KEY_SHA1, 59.0, 0, 0.0, 8, "sha1").is_err());
+    }
+
+    // --- Ed25519 (device identity) ------------------------------------------
+
+    /// RFC 8032 §7.1 Ed25519 TEST 1 (empty message) — an OFFICIAL known-answer
+    /// vector. Matching it proves the binding marshals bytes to the core without
+    /// mangling them, so a browser-signed request is interop-correct with sigild's
+    /// Go `crypto/ed25519` verifier.
+    #[test]
+    fn ed25519_rfc8032_test1_known_answer_vector() {
+        let seed: [u8; SIG_SEED_LEN] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let expected_pk: [u8; SIG_PUBLIC_KEY_LEN] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let expected_sig: [u8; SIGNATURE_LEN] = [
+            0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72, 0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e,
+            0x82, 0x8a, 0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74, 0xd8, 0x73, 0xe0, 0x65,
+            0x22, 0x49, 0x01, 0x55, 0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac, 0xc6, 0x1e,
+            0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b, 0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+            0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+        ];
+        let message: &[u8] = &[];
+
+        assert_eq!(
+            ed25519_public_key_inner(&seed).unwrap(),
+            expected_pk.to_vec()
+        );
+        assert_eq!(
+            ed25519_sign_inner(&seed, message).unwrap(),
+            expected_sig.to_vec()
+        );
+        assert!(ed25519_verify_inner(&expected_pk, message, &expected_sig).unwrap());
+    }
+
+    #[test]
+    fn ed25519_sign_verify_round_trip_and_rejections() {
+        let seed = [0x42u8; SIG_SEED_LEN];
+        let pk = ed25519_public_key_inner(&seed).unwrap();
+        // A realistic contract-v3 message shape (see device-auth.mjs).
+        let msg =
+            b"sigil-oplog-auth-v3\ndev_abc\nPOST\n/v1/vaults/v/ops\n\n1717900000\nbm9uY2U=\nBODY";
+        let sig = ed25519_sign_inner(&seed, msg).unwrap();
+        assert_eq!(sig.len(), SIGNATURE_LEN);
+        assert!(ed25519_verify_inner(&pk, msg, &sig).unwrap());
+
+        // Deterministic: same (seed, message) -> identical signature.
+        assert_eq!(ed25519_sign_inner(&seed, msg).unwrap(), sig);
+
+        // A tampered message, a tampered signature, and a different key all fail
+        // as a VERDICT (false), not an error.
+        let mut tampered_msg = msg.to_vec();
+        tampered_msg[0] ^= 0x01;
+        assert!(!ed25519_verify_inner(&pk, &tampered_msg, &sig).unwrap());
+        let mut bad_sig = sig.clone();
+        bad_sig[0] ^= 0x01;
+        assert!(!ed25519_verify_inner(&pk, msg, &bad_sig).unwrap());
+        let other_pk = ed25519_public_key_inner(&[0x43u8; SIG_SEED_LEN]).unwrap();
+        assert!(!ed25519_verify_inner(&other_pk, msg, &sig).unwrap());
+    }
+
+    #[test]
+    fn ed25519_rejects_wrong_lengths() {
+        assert!(ed25519_public_key_inner(&[0u8; 31]).is_err());
+        assert!(ed25519_public_key_inner(&[0u8; 33]).is_err());
+        assert!(ed25519_sign_inner(&[0u8; 31], b"m").is_err());
+        let seed = [0x42u8; SIG_SEED_LEN];
+        let pk = ed25519_public_key_inner(&seed).unwrap();
+        let sig = ed25519_sign_inner(&seed, b"m").unwrap();
+        assert!(ed25519_verify_inner(&pk[..31], b"m", &sig).is_err());
+        assert!(ed25519_verify_inner(&pk, b"m", &sig[..63]).is_err());
     }
 }

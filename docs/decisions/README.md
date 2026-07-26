@@ -40,7 +40,10 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > per-device Ed25519 keys, enrollment via an operator token **plus** proof of
 > possession, per-vault grants with trust-on-first-write ownership, and revocation;
 > opt-in, dev-gated, mutually exclusive with the legacy single-static-key v2, and
-> still UNAUDITED),
+> still UNAUDITED) and the **browser clients speaking that contract** (the wasm gains
+> Ed25519 signing, `sigil-wasm/device-auth.mjs` implements the client half for the
+> webapp + extension, and each browser keeps its device seed **sealed** in a second
+> `SIGILcli` container rather than plaintext in web storage),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -105,3 +108,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0030](0030-browser-extension-client.md) | MV3 browser-extension client — popup TOTP authenticator over the vendored wasm + proven helpers (sealed-only `chrome.storage.local`, in-memory password) | Accepted (2026-07) |
 | [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07) |
 | [0032](0032-native-desktop-client.md) | Native desktop client — Tauri v2 shell over a headless core crate, `sigil-core` linked natively (no wasm), re-using `cli/`'s container/vault/migration logic and sharing the CLI's vault file | Accepted (2026-07) |
+| [0033](0033-browser-device-identity-storage.md) | Browser device-identity storage — seal the Ed25519 device seed in a second `SIGILcli` container under the vault password (never plaintext web storage, never a `TotpVault` field) | Accepted (2026-07) |

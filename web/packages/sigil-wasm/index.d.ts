@@ -86,6 +86,19 @@ export function hybrid_open_container(
   container: Uint8Array,
 ): Uint8Array;
 
+/** Derive the 32-byte Ed25519 public key from a 32-byte seed. */
+export function ed25519_public_key(seed: Uint8Array): Uint8Array;
+
+/** Sign a message with a 32-byte Ed25519 seed, returning the 64-byte signature. */
+export function ed25519_sign(seed: Uint8Array, message: Uint8Array): Uint8Array;
+
+/** Strictly verify an Ed25519 signature. Throws on wrong-length inputs. */
+export function ed25519_verify(
+  public_key: Uint8Array,
+  message: Uint8Array,
+  signature: Uint8Array,
+): boolean;
+
 /** The XChaCha20-Poly1305 nonce length in bytes (24). */
 export function nonce_len(): number;
 
@@ -108,6 +121,9 @@ export interface SigilWasm {
   hybrid_mlkem_encaps_key: typeof hybrid_mlkem_encaps_key;
   hybrid_seal_to_container: typeof hybrid_seal_to_container;
   hybrid_open_container: typeof hybrid_open_container;
+  ed25519_public_key: typeof ed25519_public_key;
+  ed25519_sign: typeof ed25519_sign;
+  ed25519_verify: typeof ed25519_verify;
   nonce_len: typeof nonce_len;
   recommended_salt_len: typeof recommended_salt_len;
   version: typeof version;
@@ -188,16 +204,157 @@ export interface PulledContainer {
   hash?: string;
 }
 
+/** Optional transport injection: a fetch-shaped function (e.g. a signing fetch). */
+export interface SyncOptions {
+  fetch?: (url: string, init?: RequestInit) => Promise<Response>;
+}
+
 export function pushContainer(
   baseUrl: string,
   vaultId: string,
   containerBytes: Uint8Array,
+  opts?: SyncOptions,
 ): Promise<PushResult>;
 export function pullContainers(
   baseUrl: string,
   vaultId: string,
   sinceOpt?: number,
+  opts?: SyncOptions,
 ): Promise<PulledContainer[]>;
+
+// ── device-auth helpers (sigild multi-device contract v3) ───────────────────
+
+/** A local device identity: the server-assigned id plus the SECRET 32-byte seed. */
+export interface DeviceIdentity {
+  deviceId: string;
+  /** SECRET Ed25519 seed. Never persist this in plaintext. */
+  seed: Uint8Array;
+  /** The server this identity was enrolled with (informational). */
+  baseUrl?: string;
+}
+
+/** An HTTP failure carrying the status, so 401 and 403 are distinguishable. */
+export class DeviceAuthError extends Error {
+  status: number;
+  body: string;
+}
+
+export const DEVICE_SEED_LEN: number;
+export const DEVICE_IDENTITY_VERSION: number;
+
+export function generateDeviceSeed(): Uint8Array;
+export function devicePublicKey(
+  wasm: Pick<SigilWasm, "ed25519_public_key">,
+  seed: Uint8Array,
+): Uint8Array;
+export function explainAuthStatus(status: number): string;
+export function enrollTokenHash(token: string): Promise<string>;
+export function canonicalV3Message(
+  deviceId: string,
+  method: string,
+  path: string,
+  query: string,
+  timestamp: string,
+  nonce: string,
+  body: Uint8Array,
+): Uint8Array;
+export function canonicalEnrollMessage(
+  tokenHashHex: string,
+  timestamp: string,
+  nonce: string,
+  publicKeyB64: string,
+  label: string,
+): Uint8Array;
+
+export function enrollDevice(
+  wasm: Pick<SigilWasm, "ed25519_public_key" | "ed25519_sign">,
+  args: { baseUrl: string; token: string; label?: string; seed: Uint8Array },
+): Promise<{
+  deviceId: string;
+  publicKey: Uint8Array;
+  publicKeyB64: string;
+  label: string;
+  status: string;
+  createdAt: string;
+}>;
+
+export function signedFetch(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity & { baseUrl: string },
+  method: string,
+  path: string,
+  query?: string,
+  bodyBytes?: Uint8Array | null,
+  headers?: Record<string, string>,
+): Promise<Response>;
+
+export function makeSignedFetch(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+): (url: string, init?: RequestInit) => Promise<Response>;
+
+export function pushContainerAuthed(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+  vaultId: string,
+  containerBytes: Uint8Array,
+): Promise<PushResult>;
+
+export function pullContainersAuthed(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+  vaultId: string,
+  sinceOpt?: number,
+): Promise<PulledContainer[]>;
+
+export function grantVaultAccess(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+  vaultId: string,
+  granteeDeviceId: string,
+  permission?: "read" | "write",
+): Promise<unknown>;
+
+export function listVaultGrants(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+  vaultId: string,
+): Promise<unknown>;
+
+export function revokeSelf(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+): Promise<unknown>;
+
+export function revokeDeviceAdmin(args: {
+  baseUrl: string;
+  adminToken: string;
+  deviceId: string;
+}): Promise<unknown>;
+
+export function listDevices(args: { baseUrl: string; adminToken: string }): Promise<unknown>;
+
+/** Seal a device identity into a password-protected SIGILcli container. */
+export function sealDeviceIdentity(
+  wasm: Pick<SigilWasm, "seal_to_container">,
+  password: string | Uint8Array,
+  identity: DeviceIdentity,
+  salt: Uint8Array,
+  nonce: Uint8Array,
+  params: Argon2Params,
+): Uint8Array;
+
+/** Open a sealed device-identity container. Throws on a wrong password. */
+export function openDeviceIdentity(
+  wasm: Pick<SigilWasm, "open_container">,
+  password: string | Uint8Array,
+  containerBytes: Uint8Array,
+): DeviceIdentity;
 
 // ── totp-migration helpers ──────────────────────────────────────────────────
 

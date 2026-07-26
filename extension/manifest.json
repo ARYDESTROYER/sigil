@@ -8,6 +8,8 @@
     "default_popup": "src/popup/popup.html"
   },
   "permissions": ["storage"],
+  "_comment_host_permissions": "LOOPBACK ONLY. The dev Sync panel talks to a local sigild op-log; MV3 extension pages need an explicit host permission to fetch cross-origin. Deliberately scoped to localhost so this build can never reach a remote server.",
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
   "_comment_key": "PUBLIC key only (no private half exists in this repo). It pins the unpacked extension ID to pfjbkipclodhghopppjjgnlbhkmhlekp so the headless test can address chrome-extension://<id>/... deterministically without a background service worker. Not a secret; not a signing key.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu7Oa1SEq3Hx0OnVMwTx1D3RX9wDvSV/cx2GnNIJyZxY2f/txykkZikCUq+6yyWqoJ5ZwfQF1eMPCKyrOuRW0fagID0GFgHPR0I6BUxRHdxo+1dYWAl1RQVI2rC35ybqwC7jKqj+xfpw8x/SJyJvAQgWg1dbQhmQ0wTBjFKJV/w0kPJLCsDnVkZ/MyN9L6fQyYKeLZ4tS6/HU3/YLD228IBqJ4YbI7/cWRmoC07CmRT7BoCiiU+gCuKBWV+ZVMDeXRf9k+XP4L1etsB2cx4zEJo/I6TteOsVkiCQ1dtaprPhQG6ooq18Cvn/oPfwn55NEB6G0bdLFU5Qzm4E6DpKfdQIDAQAB",
   "content_security_policy": {

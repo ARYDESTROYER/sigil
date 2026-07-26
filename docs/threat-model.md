@@ -83,6 +83,56 @@ production security claim.
   file backend was not extended.
 - **Plain HTTP in dev.** Nothing here substitutes for transport security.
 
+### Browser clients holding a device identity (webapp + MV3 extension)
+
+The webapp and the extension now enroll and sign as devices through
+`sigil-wasm/device-auth.mjs` (see
+[ADR 0033](decisions/0033-browser-device-identity-storage.md)), which puts a
+long-lived Ed25519 **signing key inside a browser profile**. What that does and does
+not buy:
+
+- **The device seed is sealed at rest, not plaintext.** The 32-byte seed is sealed
+  into a **second `SIGILcli` container under the same vault password** (Argon2id →
+  XChaCha20-Poly1305, inside the wasm) and only that container is persisted —
+  `localStorage` key `sigil.webapp.device.v1`, `chrome.storage.local` key
+  `sigil.extension.device.v1`. So an attacker with **offline** access to the profile
+  directory, a stolen backup, or a `localStorage` dump gets ciphertext, not a usable
+  signing key; unsealing it costs the same Argon2id work as the vault itself. This is
+  the same property the vault already had ([ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)),
+  extended to the key.
+- **The seed IS exposed in memory while the vault is unlocked.** Signing requires it,
+  so between unlock and lock the seed sits in JS heap memory alongside the decrypted
+  vault. Lock, reload, and Forget all drop it; Forget also deletes the sealed
+  identity container. There is no zeroization, no `mlock`, and no secure enclave.
+- **The enrollment token is a bearer secret held in memory only.** It is typed in,
+  sent in `X-Sigil-Enroll-Token`, and cleared immediately after use — never persisted
+  and never logged by the client. It is single-**attempt**, so a failed enrollment
+  burns it.
+- **The extension's reach is bounded by the manifest.** MV3 pages cannot `fetch`
+  cross-origin without a host permission, and the manifest grants only
+  `http://127.0.0.1/*` + `http://localhost/*`, so this build **cannot** talk to a
+  remote server even if a URL were pasted in. That is a deployment bound, not a
+  cryptographic one.
+
+**What this explicitly does NOT defend against:**
+
+- **A compromised browser or extension host.** Anything that can run code in the
+  client's context while the vault is unlocked can read the decrypted seed and the
+  vault, sign arbitrary requests as that device, or capture the password as it is
+  typed. Sealing at rest defends the *stored* key, not a live process (this is
+  adversary classes 9 and 10 in the table above, still unimplemented).
+- **A malicious script with access to the same origin.** `localStorage` and the wasm
+  bindings are origin-scoped, not script-scoped: XSS in the webapp's origin, a
+  malicious dependency in its bundle, or a hostile page sharing the origin defeats
+  this entirely. The extension's separate origin and CSP (`script-src 'self'
+  'wasm-unsafe-eval'`) narrow but do not eliminate that class.
+- **Transport attacks.** The dev sync path is **plain HTTP over loopback with no
+  TLS**; request signing proves *who sent it*, not confidentiality of the
+  request-response metadata.
+- **Key rotation, re-enrollment, or recovery for a browser identity.** Losing the
+  vault password destroys the device identity along with the vault; the only recovery
+  is an operator revoke plus a fresh enrollment token.
+
 **Zero-knowledge is unaffected by the auth model.** The registry stores **auth
 metadata only** — Ed25519 **public** keys, server-assigned IDs, labels,
 permissions, timestamps, and a bearer token's SHA-256 digest. Migration

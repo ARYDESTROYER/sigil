@@ -25,6 +25,9 @@ export const {
   open_record,
   seal_to_container,
   open_container,
+  ed25519_public_key,
+  ed25519_sign,
+  ed25519_verify,
   hybrid_x25519_public,
   hybrid_mlkem_encaps_key,
   hybrid_seal_to_container,
@@ -51,3 +54,7 @@ export async function initWasm() {
 export * from "../../../sigil-wasm/totp-vault.mjs";
 export * from "../../../sigil-wasm/sync.mjs";
 export * from "../../../sigil-wasm/totp-migration.mjs";
+// The client half of sigild's multi-device auth (contract v3 + enrollment). Same
+// source as sigil-wasm/test/device-auth-interop.mjs, which proves it against a
+// live server.
+export * from "../../../sigil-wasm/device-auth.mjs";

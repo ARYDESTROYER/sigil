@@ -309,7 +309,10 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   with the password held in memory, and asks for **one permission** (`storage`). It
   vendors the wasm + the proven JS helpers via `extension/build.sh` rather than
   reimplementing them ([ADR 0030](docs/decisions/0030-browser-extension-client.md)).
-  **Dev, UNAUDITED, loaded unpacked and published to no store**; no sync. Do not store
+  Its dev **Sync** panel can enroll this browser as a device and sign requests, and the
+  manifest's `host_permissions` are deliberately **loopback-only** (`127.0.0.1` /
+  `localhost`) so the build cannot reach a remote server.
+  **Dev, UNAUDITED, loaded unpacked and published to no store**. Do not store
   real 2FA secrets.
 - `desktop/` — a **native desktop client** (Tauri v2): the same encrypted TOTP vault
   as a real application window, with add/import (`otpauth://` + Google
@@ -350,6 +353,11 @@ deploy/          terraform / nomad / caddy / systemd + local/ (loopback smoke) +
 docs/            architecture, threat model, crypto spec, op-log API, sprint plan
 docs/decisions/  Architecture Decision Records (ADRs)
 ```
+
+All four clients that talk to the dev sync server — the `sigil` CLI, the `sigil-wasm`
+JS client, `web/apps/webapp` and the MV3 extension — can now **enroll and authenticate
+as devices** against a `SIGILD_DEVICE_AUTH` dev server (loopback plain HTTP, no TLS,
+UNAUDITED; the native `desktop/` app still has no sync).
 
 One native client now lives **in this repo** — `desktop/`, which links `libsigil`
 directly as a Rust dependency. The remaining native platform clients

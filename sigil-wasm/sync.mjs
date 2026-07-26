@@ -11,6 +11,13 @@
 // only environment-specific bit is base64 decoding, which is feature-detected
 // (Buffer in Node, atob in the browser).
 //
+// AUTHENTICATION is OPTIONAL and injected, never built in: both functions take
+// an optional `opts.fetch` — any `fetch`-shaped function. With it omitted they
+// use `globalThis.fetch` and behave EXACTLY as they always have (the
+// unauthenticated dev path, byte-identical). `device-auth.mjs` supplies a
+// signing fetch (`makeSignedFetch`) to speak sigild's multi-device contract v3,
+// so the transport itself stays auth-agnostic and does no cryptography.
+//
 // The sigild op-log HTTP contract this speaks (dev-only, unauthenticated when
 // SIGILD_OPLOG_PUBKEY is unset):
 //   PUSH  POST {base}/v1/vaults/{vaultId}/ops   body = RAW container bytes
@@ -51,17 +58,22 @@ function joinUrl(baseUrl, path) {
 //   baseUrl        e.g. "http://127.0.0.1:8080"
 //   vaultId        the vault to append to (opaque id; a single path segment)
 //   containerBytes Uint8Array | ArrayBuffer | Buffer — the RAW sealed container
+//   opts.fetch     OPTIONAL fetch-shaped function (default globalThis.fetch);
+//                  device-auth.mjs passes a contract-v3 signing fetch here
 //   -> { seq }     the monotonic sequence assigned by the server
 //
 // Throws a clear Error on any non-201 response.
-export async function pushContainer(baseUrl, vaultId, containerBytes) {
+export async function pushContainer(baseUrl, vaultId, containerBytes, opts = {}) {
   const body =
     containerBytes instanceof Uint8Array
       ? containerBytes
       : new Uint8Array(containerBytes);
 
+  // `.bind` matters: browsers reject a WebIDL `fetch` invoked with a `this` that
+  // is not the global (Illegal invocation).
+  const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const url = joinUrl(baseUrl, `/v1/vaults/${encodeURIComponent(vaultId)}/ops`);
-  const res = await globalThis.fetch(url, {
+  const res = await doFetch(url, {
     method: "POST",
     // Opaque bytes — an octet-stream, never decoded by the server.
     headers: { "Content-Type": "application/octet-stream" },
@@ -70,11 +82,15 @@ export async function pushContainer(baseUrl, vaultId, containerBytes) {
 
   if (res.status !== 201) {
     const text = await res.text().catch(() => "");
-    throw new Error(
+    const err = new Error(
       `pushContainer: expected 201 from ${url}, got ${res.status} ${res.statusText}${
         text ? ` — ${text.trim()}` : ""
       }`,
     );
+    // Additive: carry the status so an auth-aware caller can tell 401 from 403
+    // without parsing the message. The message text itself is unchanged.
+    err.status = res.status;
+    throw err;
   }
 
   const json = await res.json();
@@ -91,28 +107,33 @@ export async function pushContainer(baseUrl, vaultId, containerBytes) {
 //   baseUrl   e.g. "http://127.0.0.1:8080"
 //   vaultId   the vault to read
 //   sinceOpt  fetch ops with seq > sinceOpt (default 0 = from the start)
+//   opts.fetch OPTIONAL fetch-shaped function (default globalThis.fetch)
 //   -> [{ seq, container: Uint8Array, hash }]
 //
 // The server pages: it returns up to `limit` ops plus { next, has_more }. This
 // loops since=next until has_more is false, accumulating every op, so the caller
 // gets the whole vault in one call regardless of size.
-export async function pullContainers(baseUrl, vaultId, sinceOpt = 0) {
+export async function pullContainers(baseUrl, vaultId, sinceOpt = 0, opts = {}) {
   let since = Number(sinceOpt) || 0;
   const out = [];
+  const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
 
   for (;;) {
     const url = joinUrl(
       baseUrl,
       `/v1/vaults/${encodeURIComponent(vaultId)}/ops?since=${since}&limit=${PULL_PAGE_LIMIT}`,
     );
-    const res = await globalThis.fetch(url, { method: "GET" });
+    const res = await doFetch(url, { method: "GET" });
     if (res.status !== 200) {
       const text = await res.text().catch(() => "");
-      throw new Error(
+      const err = new Error(
         `pullContainers: expected 200 from ${url}, got ${res.status} ${res.statusText}${
           text ? ` — ${text.trim()}` : ""
         }`,
       );
+      // Additive: see pushContainer — the status rides along for auth-aware callers.
+      err.status = res.status;
+      throw err;
     }
 
     const json = await res.json();

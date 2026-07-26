@@ -39,9 +39,12 @@ cp "$WASM_SRC/pkg-web/sigil_wasm_bg.wasm" "$VENDOR/"
 cp "$WASM_SRC/pkg-web/sigil_wasm.d.ts"    "$VENDOR/"
 
 # (2) The proven, wasm-agnostic JS helpers — copied verbatim, NOT reimplemented.
-#     totp-migration.mjs imports "./totp-vault.mjs", so they must stay siblings.
+#     totp-migration.mjs imports "./totp-vault.mjs" and device-auth.mjs imports
+#     "./sync.mjs", so all four must stay siblings.
 cp "$WASM_SRC/totp-vault.mjs"     "$VENDOR/"
 cp "$WASM_SRC/totp-migration.mjs" "$VENDOR/"
+cp "$WASM_SRC/sync.mjs"           "$VENDOR/"
+cp "$WASM_SRC/device-auth.mjs"    "$VENDOR/"
 
 # A provenance stamp so a stale vendor/ is obvious.
 cat > "$VENDOR/BUILD-INFO.txt" <<EOF

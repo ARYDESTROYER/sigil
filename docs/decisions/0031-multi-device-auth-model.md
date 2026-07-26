@@ -266,6 +266,40 @@ end to end: plain HTTP in dev, trust-on-first-write, single-attempt tokens,
 per-process replay cache, no account model, no session issuance, no rotation.
 See [`../api.md` → Client support](../api.md#client-support-the-sigil-cli).
 
+## Browser client support (added Phase 44, 2026-07-16)
+
+The **browser clients now implement this contract too** — `web/apps/webapp` and the
+MV3 `extension/`, both through
+[`../../sigil-wasm/device-auth.mjs`](../../sigil-wasm/device-auth.mjs) (a
+framework-free ESM module that also runs in Node). Again **no separate protocol
+ADR**: this is the same decision's client half, not a new one. It mirrors the
+canonical messages defined above as `canonicalV3Message` / `canonicalEnrollMessage` /
+`enrollTokenHash`, and every signature is produced by `sigil-core`'s Ed25519 compiled
+to wasm (`ed25519_sign`) — there is no JS-side signing and no placeholder. The
+existing transport `sync.mjs` was extended **additively** with a single optional
+`opts.fetch`, so the unauthenticated dev path is behaviourally unchanged.
+
+Two consequences worth stating here:
+
+1. **The canonical layout now lives in THREE implementations** — Go
+   (`sigild/internal/api/deviceauth.go`, the source of truth), Rust
+   (`cli/src/lib.rs`), and JS (`device-auth.mjs`) — which **must stay byte-identical**.
+   Drift does not fail loudly; it silently yields `401` on every request. The interop
+   tests (`sigil-wasm/test/device-auth-interop.mjs` against a live server, plus the
+   CLI's own) are what hold the three in agreement.
+2. **How a browser stores its device identity was a genuinely new decision** and is
+   recorded separately as [ADR 0033](0033-browser-device-identity-storage.md): sealed
+   in a second `SIGILcli` container under the vault password, rather than plaintext in
+   web storage or as a field inside the CLI-mirrored `TotpVault` JSON.
+
+Every honest limitation listed above is unchanged and applies to the browser clients
+as well: plain HTTP over loopback, trust-on-first-write ownership, single-attempt
+tokens, a per-process replay cache, no account model, no session issuance, no
+rotation. The MV3 extension additionally required a **loopback-only** host permission
+(`http://127.0.0.1/*`, `http://localhost/*`) because MV3 pages cannot fetch
+cross-origin otherwise. See
+[`../api.md` → Client support (the browser + Node clients)](../api.md#client-support-the-browser--node-clients).
+
 ## References
 
 - Code: [`../../sigild/internal/api/deviceauth.go`](../../sigild/internal/api/deviceauth.go),

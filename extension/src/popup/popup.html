@@ -139,6 +139,42 @@
         </div>
         <textarea id="export-out" rows="4" readonly hidden data-testid="export-out"></textarea>
       </details>
+
+      <details class="panel">
+        <summary data-testid="sync-toggle">Sync (dev)</summary>
+        <p class="hint">
+          Round-trips the <strong>sealed</strong> container through a local dev
+          sigild op-log over plain HTTP. The server only ever sees opaque bytes.
+          If that sigild has device auth on, enroll below and every request is
+          signed by this device&rsquo;s Ed25519 key (computed in the wasm).
+        </p>
+        <label for="sync-url">Server URL</label>
+        <input id="sync-url" spellcheck="false" value="http://127.0.0.1:8080" data-testid="sync-url" />
+        <label for="sync-vault">Vault id</label>
+        <input id="sync-vault" spellcheck="false" value="extension-demo" data-testid="sync-vault" />
+
+        <h3>Device identity</h3>
+        <p id="device-state" class="hint" data-testid="device-state">
+          Not enrolled &mdash; sync requests are unauthenticated.
+        </p>
+        <div id="device-enroll-fields">
+          <label for="device-token">Enrollment token <span class="dim">(single use)</span></label>
+          <input id="device-token" type="password" autocomplete="off" spellcheck="false" data-testid="device-token" />
+          <label for="device-label">Device label</label>
+          <input id="device-label" value="browser extension" data-testid="device-label" />
+          <button type="button" id="device-enroll" data-testid="device-enroll">
+            Enroll this browser
+          </button>
+        </div>
+        <button type="button" id="device-forget" hidden data-testid="device-forget">
+          Forget device
+        </button>
+
+        <div class="row">
+          <button type="button" id="sync-push" data-testid="sync-push">Push</button>
+          <button type="button" id="sync-pull" data-testid="sync-pull">Pull</button>
+        </div>
+      </details>
     </section>
 
     <footer class="foot">

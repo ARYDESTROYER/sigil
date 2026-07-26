@@ -847,8 +847,9 @@ Any device with **read** access to the vault may see who else can reach it.
 
 ### Client support (the `sigil` CLI)
 
-The **`sigil` CLI implements contract v3** — it is the first (and so far only)
-client that speaks it, covering four of the five device routes above. Commands (see
+The **`sigil` CLI implements contract v3** — it was the first client to speak it,
+covering four of the five device routes above (the **browser clients** now speak it
+too — see [below](#client-support-the-browser--node-clients)). Commands (see
 [`../cli/src/main.rs`](../cli/src/main.rs)):
 
 | Command | Route it calls |
@@ -884,6 +885,49 @@ The CLI builds the same canonical bytes as the server
 [`../cli/src/lib.rs`](../cli/src/lib.rs)), with a fresh CSPRNG nonce and the
 current unix seconds per request. It is the same **dev-only, plain-HTTP,
 UNAUDITED** posture as the server side: no TLS, do not point it at a remote host.
+
+### Client support (the browser + Node clients)
+
+The **browser clients speak contract v3 as well**, through
+[`../sigil-wasm/device-auth.mjs`](../sigil-wasm/device-auth.mjs) — a framework-free,
+dependency-free ESM module that runs in Node **and** the browser and is used by
+`web/apps/webapp` (via the `@sigil/wasm` loader) and by the MV3 `extension/` (via
+its vendored copy). It covers **all five** device routes:
+
+| Module function | Route it calls |
+|-----------------|----------------|
+| `enrollDevice(wasm, {baseUrl, token, label, seed})` | `POST /v1/devices/enroll` (token **plus** proof of possession) |
+| `pushContainerAuthed` / `pullContainersAuthed` | `POST` / `GET /v1/vaults/{vaultID}/ops`, v3-signed |
+| `grantVaultAccess` / `listVaultGrants` | `POST` / `GET /v1/vaults/{vaultID}/grants` |
+| `revokeSelf` / `revokeDeviceAdmin` | `POST /v1/devices/{deviceID}/revoke` (self-signed, or admin token) |
+| `listDevices` | `GET /v1/devices` (admin token) |
+
+Supporting surface: `generateDeviceSeed` / `devicePublicKey` (a 32-byte seed from
+`crypto.getRandomValues`, public key derived in the wasm), `signedFetch` /
+`makeSignedFetch` (a `fetch`-shaped signer), `sealDeviceIdentity` /
+`openDeviceIdentity` (the identity is stored **sealed**, never in plaintext — see
+[ADR 0033](decisions/0033-browser-device-identity-storage.md)), and
+`DeviceAuthError` / `explainAuthStatus`, which turn the deliberately coarse `401`
+vs `403` bodies into a plain-language explanation without inventing an oracle.
+**All signing is `ed25519_sign` in the wasm** (`sigil-core`'s real Ed25519, added
+to the binding alongside `ed25519_public_key` / `ed25519_verify`); the enrollment
+token's SHA-256 digest comes from `crypto.subtle`. There is no JS-side signing.
+
+The existing transport [`../sigil-wasm/sync.mjs`](../sigil-wasm/sync.mjs) was
+extended **additively** with one optional `opts.fetch` (defaulting to the global
+`fetch`) plus an additive `err.status`, so the **unauthenticated** dev path is
+behaviourally identical and the authenticated path simply injects the signer.
+
+**The canonical message layout now exists in three implementations** —
+[`../sigild/internal/api/deviceauth.go`](../sigild/internal/api/deviceauth.go)
+(Go, the source of truth), [`../cli/src/lib.rs`](../cli/src/lib.rs) (Rust), and
+`device-auth.mjs` (JS: `canonicalV3Message` / `canonicalEnrollMessage` /
+`enrollTokenHash`) — and they **must stay byte-identical**; a one-byte drift does
+not fail loudly, it just yields `401` on every request. That is what the interop
+tests guard: [`../sigil-wasm/test/device-auth-interop.mjs`](../sigil-wasm/test/device-auth-interop.mjs)
+boots a **real** sigild with `SIGILD_DEVICE_AUTH=1` and drives the JS client
+against it (enroll, claim, grant, revoke, tamper, stale, token reuse). Same
+**dev-only, plain-HTTP, UNAUDITED** posture as the CLI: no TLS, loopback only.
 
 ### Default posture (all five routes)
 

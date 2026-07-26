@@ -318,7 +318,20 @@ public, make no security claims, until the audit completes and trademark clears.
   runs the Playwright suite, while the marketing job stays Rust-free; `web/packages/sigil-wasm/build.sh`
   was made **cross-platform** (OS-agnostic PATH + wasm-bindgen discovery) for that runner.
   Like the repo's other CI mirrors, the `webapp` job is validated by-eye / YAML-parse
-  locally and has not run on real GitHub Actions from here. Do NOT store real 2FA secrets.
+  locally and has not run on real GitHub Actions from here. **Now also ENROLLS + signs
+  as a device (Phase 44, ADR 0033):** the Sync panel (`app/authenticator.tsx`) can
+  `enrollDevice` this browser against a `SIGILD_DEVICE_AUTH` dev sigild and then
+  push/pull via `pushContainerAuthed`/`pullContainersAuthed` (contract v3 signatures
+  produced IN THE WASM); with no identity it stays unauthenticated exactly as before,
+  and `explainAuthStatus` renders 401-vs-403 plainly. **The Ed25519 device seed is NEVER
+  stored in plaintext**: it is sealed into a **SECOND `SIGILcli` container under the SAME
+  vault password** and only that container is persisted (`localStorage` key
+  **`sigil.webapp.device.v1`**, sealed plaintext `{version, device_id, seed, base_url}`);
+  the decrypted seed is memory-only while unlocked — lock / reload / forget drop it, and
+  forget deletes the sealed identity too. The enrollment token is an in-memory bearer
+  secret cleared after use, never stored or logged. ⚠️ The enrollment UI itself is NOT
+  Playwright-covered (the protocol is proven live in Node); the existing 8-test suite
+  still passes. Do NOT store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -558,6 +571,39 @@ public, make no security claims, until the audit completes and trademark clears.
   Authenticator vector via JS, `sigil totp export --migration` decoded in JS [RUST→JS],
   and a JS-encoded migration URI imported by the CLI [JS→RUST]). `export` reveals the
   2FA secrets IN THE CLEAR by design; UNAUDITED, dev-only. ADR 0026.
+  **Now also AUTHENTICATES as an enrolled device (Phase 44) — the CLIENT half of
+  sigild's multi-device auth contract v3 (ADR 0031) for JavaScript.** Three thin-shell
+  `#[wasm_bindgen]` exports over sigil-core's classical Ed25519 —
+  **`ed25519_public_key(seed)`**, **`ed25519_sign(seed, message)`**,
+  **`ed25519_verify(public_key, message, signature)`** — let a browser client hold a
+  device identity and sign with the SAME real crypto the CLI uses. The 32-byte seed is a
+  **CALLER argument** (JS `crypto.getRandomValues`) and Ed25519 signing is
+  deterministic, so **both `libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock` stay
+  `getrandom`==0**; an RFC 8032 KAT pins it (Rust tests now **26**). On top of them,
+  **`sigil-wasm/device-auth.mjs`** is a framework-free, dependency-free ESM module
+  (Node + browser) exporting `generateDeviceSeed` / `devicePublicKey`, `enrollDevice`,
+  `signedFetch` / `makeSignedFetch`, `pushContainerAuthed` / `pullContainersAuthed`,
+  `grantVaultAccess` / `listVaultGrants`, `revokeSelf` / `revokeDeviceAdmin` /
+  `listDevices`, `sealDeviceIdentity` / `openDeviceIdentity`, plus `DeviceAuthError` +
+  `explainAuthStatus`. **ALL signing is `wasm.ed25519_sign` — there is NO JS-side
+  signing**; the enrollment token digest is `crypto.subtle` SHA-256 (lowercase hex).
+  The canonical layouts (`canonicalV3Message` / `canonicalEnrollMessage` /
+  `enrollTokenHash`) are **MIRRORED — not shared — from
+  `sigild/internal/api/deviceauth.go` (source of truth) and `cli/src/lib.rs`**, so the
+  layout now lives in **THREE implementations (Go, Rust, JS) that MUST stay
+  byte-identical** — drift does NOT fail loudly, it just 401s every request; the interop
+  tests are the guard. **`sync.mjs` was extended ADDITIVELY** with ONE optional
+  `opts.fetch` (default `globalThis.fetch`) + an additive `err.status`, so the
+  UNAUTHENTICATED path is behaviourally identical (which is why the older interop tests
+  still pass). Proven by **`sigil-wasm/test/device-auth-interop.mjs`**, which boots a
+  LIVE `sigild` with `SIGILD_DEVICE_AUTH=1` and asserts: unsigned request → 401; device
+  A enrolls; the identity round-trips a password-sealed container with **no plaintext
+  seed at rest**; A pushes/claims/pulls/opens byte-verbatim; device B enrolled but 403
+  on A's vault; after a read grant B pulls but is still 403 on write; an admin revoke
+  makes B 401 while A is unaffected; a tampered body and a stale timestamp are both 401;
+  a spent enrollment token is 401. Dev / localhost / plain-HTTP / no TLS, UNAUDITED —
+  request auth for a DEV op-log, NOT the product account/session/key-management model.
+  ADR 0033 (how browser clients store the identity).
 - `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
   whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
   as **WebAssembly inside the extension page** — the **second real product client
@@ -567,9 +613,9 @@ public, make no security claims, until the audit completes and trademark clears.
   is plain ESM) runs the repo-root `sigil-wasm/build-wasm.sh` (wasm-pack
   `--target web`) and **vendors** into a **gitignored `extension/vendor/`** the
   wasm-bindgen bindings (`sigil_wasm.js` + `sigil_wasm_bg.wasm` + `.d.ts`) plus
-  **verbatim copies** of the proven, framework-free `sigil-wasm/totp-vault.mjs` and
-  `totp-migration.mjs` (+ a `BUILD-INFO.txt` provenance stamp, so a stale `vendor/`
-  is obvious). The **source** is `manifest.json` + `src/popup/popup.{html,css,js}`
+  **verbatim copies** of the proven, framework-free `sigil-wasm/totp-vault.mjs`,
+  `totp-migration.mjs`, `sync.mjs` and `device-auth.mjs` (+ a `BUILD-INFO.txt`
+  provenance stamp, so a stale `vendor/` is obvious). The **source** is `manifest.json` + `src/popup/popup.{html,css,js}`
   (UI glue + storage only; `popup.js` imports the vendored wasm via
   `chrome.runtime.getURL("vendor/sigil_wasm_bg.wasm")`). The vault seals into the
   **SAME `SIGILcli` container** the CLI and the webapp use (Argon2id →
@@ -582,8 +628,20 @@ public, make no security claims, until the audit completes and trademark clears.
   **Google Authenticator `otpauth-migration://` import**, **export** back out
   (`otpauth://` or one migration URI, behind a loud secrets-in-the-clear warning),
   remove / lock / forget-vault; **codes + countdowns are computed in the wasm**,
-  never in JS; salt+nonce from `crypto.getRandomValues`. **Minimal surface:**
-  `"permissions": ["storage"]` and nothing else (no host permissions, no `tabs`, no
+  never in JS; salt+nonce from `crypto.getRandomValues`. **Now ALSO has a dev Sync
+  panel and can ENROLL as a device (Phase 44, ADR 0033):** over the vendored
+  `sync.mjs` + `device-auth.mjs` it push/pulls the sealed container to a localhost
+  sigild — unauthenticated with no identity, or signed under **contract v3** via
+  `pushContainerAuthed`/`pullContainersAuthed` once enrolled. **The Ed25519 device seed
+  is NEVER stored in plaintext**: sealed into a **SECOND `SIGILcli` container under the
+  SAME vault password**, persisted at `chrome.storage.local` key
+  **`sigil.extension.device.v1`**; the seed is memory-only while unlocked and the
+  single-use enrollment token is cleared right after use. ⚠️ **`manifest.json` gained
+  `"host_permissions": ["http://127.0.0.1/*", "http://localhost/*"]`** — MV3 extension
+  pages cannot fetch cross-origin without an explicit host permission; it is
+  deliberately **LOOPBACK-ONLY** (with an explanatory comment in the manifest) so the
+  build **cannot reach a remote server**. The rest stays **minimal:**
+  `"permissions": ["storage"]` and nothing else (no `tabs`, no
   `clipboardWrite`), **no background service worker / content script / options
   page**, and the MV3 CSP widened by exactly one keyword
   (`script-src 'self' 'wasm-unsafe-eval'`); a pinned **public** manifest `key` fixes
@@ -596,12 +654,13 @@ public, make no security claims, until the audit completes and trademark clears.
   extensions) and asserts the wasm instantiates in-page → RFC 6238 `287082` at
   `?t=59`, storage holds **only** the sealed container (no plaintext secret / label /
   password), reload → locked → right password restores the vault, and the
-  `otpauth://` + migration import/export paths round-trip. **Dev / UNAUDITED /
-  loaded unpacked / published to NO store**; **no sync** (it never talks to
-  `sigild`); generate-only (no verification / constant-time compare / zeroization);
-  the reserved-stub ambitions (phishing protection, passkey provider, content
-  scripts) are **NOT** implemented; **not** wired into CI. Do NOT store real 2FA
-  secrets. ADR 0030.
+  `otpauth://` + migration import/export paths round-trip (3 specs). ⚠️ The new
+  enrollment UI is **NOT** Playwright-covered (the protocol is proven live in Node).
+  **Dev / UNAUDITED / loaded unpacked / published to NO store**; sync is **loopback
+  plain-HTTP only, no TLS**; generate-only (no verification / constant-time compare /
+  zeroization); the reserved-stub ambitions (phishing protection, passkey provider,
+  content scripts) are **NOT** implemented. Do NOT store real 2FA
+  secrets. ADR 0030, ADR 0033.
 - `desktop/` — **the NATIVE client column** (fourth client surface, FIRST native
   one): a **Tauri v2** desktop authenticator. **THE ARCHITECTURAL POINT: `sigil-core`
   is a plain NATIVE Rust dependency here — there is NO wasm, `wasm-bindgen` or
@@ -702,18 +761,19 @@ cargo test  --manifest-path cli/Cargo.toml
 grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
-# clippy/test exercise the *_inner helpers; build-wasm.sh emits pkg-web/pkg-node
-# (needs wasm-pack); then the Node round-trip proves seal/open in a JS runtime.
+# clippy/test exercise the *_inner helpers (26 tests); build-wasm.sh emits
+# pkg-web/pkg-node (needs wasm-pack); then the SEVEN Node tests below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/7 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/7 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/7 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/7 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/7 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/7 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/7 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build
@@ -741,7 +801,7 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium wasm smoke (tests/wasm.spec.ts)
+corepack pnpm --filter webapp exec playwright test   # headless chromium: 8 specs (wasm + offline + a11y), PASS
 
 # extension — the MV3 popup authenticator. A STANDALONE pnpm project (NOT part of
 # the web/ workspace), one devDependency (@playwright/test). It needs the Rust +

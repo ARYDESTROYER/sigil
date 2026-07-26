@@ -39,9 +39,31 @@ import {
   decodeMigrationUri,
   encodeMigrationUri,
 } from "../../vendor/totp-migration.mjs";
+import { pushContainer, pullContainers } from "../../vendor/sync.mjs";
+import {
+  generateDeviceSeed,
+  enrollDevice,
+  pushContainerAuthed,
+  pullContainersAuthed,
+  sealDeviceIdentity,
+  openDeviceIdentity,
+  explainAuthStatus,
+} from "../../vendor/device-auth.mjs";
 
 /** chrome.storage.local key holding ONLY the sealed container, base64. */
 const STORAGE_KEY = "sigil.extension.vault.v1";
+
+/**
+ * chrome.storage.local key holding the SEALED device identity — a SECOND
+ * SIGILcli container, sealed with the SAME vault password, whose plaintext is
+ * {device_id, seed, base_url}.
+ *
+ * The Ed25519 device SEED is secret signing key material, so it is NEVER stored
+ * in plaintext: it is only recoverable while the vault is unlocked (the password
+ * is memory-only). It lives in its own container rather than inside the vault
+ * JSON so the CLI-mirrored TotpVault schema stays byte-compatible.
+ */
+const DEVICE_KEY = "sigil.extension.device.v1";
 
 /**
  * Argon2id parameters used when (re)sealing. The container is self-describing
@@ -56,6 +78,8 @@ const ARGON2 = { m_cost: 19456, t_cost: 2, p_cost: 1 };
 let password = "";
 /** @type {{version:number,entries:object[]}|null} */
 let vault = null;
+/** @type {{deviceId:string,seed:Uint8Array,baseUrl:string}|null} memory-only. */
+let device = null;
 /** @type {number|null} pinned unix time from the ?t= TEST HOOK, else null. */
 let pinnedTime = null;
 /** @type {number|undefined} setInterval handle for the 1 s tick. */
@@ -101,6 +125,74 @@ async function persist(v) {
   const nonce = crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
   const container = sealVault(wasm, password, v, salt, nonce, ARGON2);
   await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(container) });
+}
+
+// ── device identity (sealed at rest, exactly like the vault) ─────────────────
+
+/**
+ * Seal the device identity under the CURRENT vault password and store ONLY the
+ * container. `null` forgets the identity.
+ */
+async function persistDevice(d) {
+  if (!d) {
+    await chrome.storage.local.remove(DEVICE_KEY);
+    device = null;
+    renderDevice();
+    return;
+  }
+  const salt = crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+  const nonce = crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+  const container = sealDeviceIdentity(wasm, password, d, salt, nonce, ARGON2);
+  await chrome.storage.local.set({ [DEVICE_KEY]: bytesToBase64(container) });
+  device = d;
+  renderDevice();
+}
+
+/**
+ * Decrypt the stored device identity with the just-accepted password. A
+ * container that will not open (e.g. sealed under an older password) is treated
+ * as "no device" rather than blocking the unlock.
+ */
+async function loadDevice(pw) {
+  const got = await chrome.storage.local.get(DEVICE_KEY);
+  const sealed = got[DEVICE_KEY];
+  device = null;
+  if (sealed) {
+    try {
+      device = openDeviceIdentity(wasm, pw, base64ToBytes(sealed));
+    } catch {
+      device = null;
+    }
+  }
+  renderDevice();
+}
+
+/** Show either the enrollment form or the enrolled-device summary. */
+function renderDevice() {
+  const state = $("device-state");
+  const fields = $("device-enroll-fields");
+  const forget = $("device-forget");
+  if (!state || !fields || !forget) return;
+  if (device) {
+    state.textContent = `Enrolled as ${device.deviceId} — sync requests are signed by this device.`;
+    fields.hidden = true;
+    forget.hidden = false;
+  } else {
+    state.textContent = "Not enrolled — sync requests are unauthenticated.";
+    fields.hidden = false;
+    forget.hidden = true;
+  }
+}
+
+/**
+ * Turn a failure into a message. A device-auth failure carries the HTTP status,
+ * so 401 (not authenticated) and 403 (not authorized for this vault) are spelled
+ * out instead of shown as a generic error.
+ */
+function authErr(e) {
+  const status = e && typeof e.status === "number" ? e.status : 0;
+  if (status === 401 || status === 403 || status === 501) return explainAuthStatus(status);
+  return err(e);
 }
 
 /**
@@ -230,6 +322,8 @@ async function copy(text) {
 function lock() {
   password = "";
   vault = null;
+  device = null; // the device seed leaves memory with the password
+  renderDevice();
   $("accounts").replaceChildren();
   $("accounts").dataset.labels = "";
   $("export-out").hidden = true;
@@ -290,6 +384,7 @@ $("setup-form").addEventListener("submit", async (ev) => {
     password = pw;
     vault = newVault();
     await persist(vault);
+    await loadDevice(pw);
     $("setup-pw").value = "";
     $("setup-pw2").value = "";
     unlocked();
@@ -309,6 +404,7 @@ $("unlock-form").addEventListener("submit", async (ev) => {
     if (!sealed) throw new Error("no sealed vault is stored");
     vault = openVault(wasm, pw, base64ToBytes(sealed));
     password = pw;
+    await loadDevice(pw);
     $("unlock-pw").value = "";
     unlocked();
   } catch (e) {
@@ -321,9 +417,11 @@ $("unlock-form").addEventListener("submit", async (ev) => {
 $("lock").addEventListener("click", lock);
 
 $("destroy").addEventListener("click", async () => {
-  await chrome.storage.local.remove(STORAGE_KEY);
+  await chrome.storage.local.remove([STORAGE_KEY, DEVICE_KEY]);
   password = "";
   vault = null;
+  device = null;
+  renderDevice();
   show("setup");
   say("Sealed vault deleted.");
 });
@@ -424,10 +522,78 @@ function showExport(text) {
   say("Export shown below — it contains your secrets in the clear.", "error");
 }
 
+// ── sync (dev): sealed container to/from a local sigild op-log ───────────────
+//
+// Two modes, chosen automatically: with NO device identity the requests are
+// unauthenticated (exactly as the sigil-wasm sync transport always behaved);
+// with one enrolled they are signed under sigild's multi-device contract v3
+// (the Ed25519 signature is computed IN THE WASM).
+
+$("device-enroll").addEventListener("click", async () => {
+  const token = $("device-token").value.trim();
+  const label = $("device-label").value.trim();
+  if (!token) return say("Paste the single-use enrollment token first.", "error");
+  try {
+    say("Enrolling this browser as a device…");
+    // The seed is drawn here (CSPRNG) and passed INTO the wasm; the wasm draws none.
+    const seed = generateDeviceSeed();
+    const baseUrl = $("sync-url").value.trim();
+    const enrolled = await enrollDevice(wasm, { baseUrl, token, label, seed });
+    // Persist SEALED under the vault password — never the raw seed.
+    await persistDevice({ deviceId: enrolled.deviceId, seed, baseUrl });
+    $("device-token").value = ""; // single-use: drop it immediately
+    say(`Enrolled as ${enrolled.deviceId}.`);
+  } catch (e) {
+    say(`Enrollment failed: ${authErr(e)}`, "error");
+  }
+});
+
+$("device-forget").addEventListener("click", async () => {
+  await persistDevice(null);
+  say("Device identity deleted. Sync is unauthenticated again.");
+});
+
+$("sync-push").addEventListener("click", async () => {
+  try {
+    say("Pushing…");
+    const got = await chrome.storage.local.get(STORAGE_KEY);
+    const sealed = got[STORAGE_KEY];
+    if (!sealed) throw new Error("no sealed vault to push");
+    const container = base64ToBytes(sealed);
+    const baseUrl = $("sync-url").value.trim();
+    const vaultId = $("sync-vault").value.trim();
+    const { seq } = device
+      ? await pushContainerAuthed(wasm, device, baseUrl, vaultId, container)
+      : await pushContainer(baseUrl, vaultId, container);
+    say(`Pushed sealed container as op #${seq}${device ? " (signed)" : ""}.`);
+  } catch (e) {
+    say(`Push failed: ${authErr(e)}`, "error");
+  }
+});
+
+$("sync-pull").addEventListener("click", async () => {
+  try {
+    say("Pulling…");
+    const baseUrl = $("sync-url").value.trim();
+    const vaultId = $("sync-vault").value.trim();
+    const ops = device
+      ? await pullContainersAuthed(wasm, device, baseUrl, vaultId, 0)
+      : await pullContainers(baseUrl, vaultId, 0);
+    if (ops.length === 0) return say("No ops on the server for that vault id.");
+    const latest = ops[ops.length - 1];
+    // Store the SEALED bytes only; lock + unlock to decrypt with your password.
+    await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(latest.container) });
+    say(`Pulled op #${latest.seq}. Lock and unlock to decrypt the pulled vault.`);
+  } catch (e) {
+    say(`Pull failed: ${authErr(e)}`, "error");
+  }
+});
+
 window.addEventListener("unload", () => {
   if (ticker) clearInterval(ticker);
   password = "";
   vault = null;
+  device = null;
 });
 
 boot();

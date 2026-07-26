@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { TotpEntry, TotpVault } from "@sigil/wasm";
+import type { DeviceIdentity, TotpEntry, TotpVault } from "@sigil/wasm";
 
 // The full @sigil/wasm module surface (wasm bindings + the proven JS helpers).
 // Imported dynamically in the browser only (inside an effect) so the wasm never
@@ -12,6 +12,15 @@ type Wasm = typeof import("@sigil/wasm");
 // plaintext vault and the password are NEVER persisted — they live in memory
 // while unlocked and vanish on Lock / reload.
 const STORAGE_KEY = "sigil.webapp.vault.v1";
+
+// localStorage key holding the SEALED device identity — a SECOND SIGILcli
+// container, sealed with the SAME vault password, whose plaintext is
+// {device_id, seed, base_url}. The Ed25519 device SEED is secret signing key
+// material, so it is NEVER written in plaintext: it is only readable while the
+// vault is unlocked (the password lives in memory only). Kept in its own
+// container rather than inside the vault JSON so the CLI-mirrored TotpVault
+// schema stays byte-compatible.
+const DEVICE_KEY = "sigil.webapp.device.v1";
 
 // Argon2id parameters used when (re)sealing. The container is self-describing
 // (it stores these), so open needs none and the vault stays CLI-interoperable
@@ -55,6 +64,9 @@ export default function Authenticator() {
   const [wasmError, setWasmError] = useState<string>("");
   const [vault, setVault] = useState<TotpVault | null>(null);
   const [announce, setAnnounce] = useState<string>("");
+  // The enrolled device identity, decrypted in memory while unlocked (null when
+  // this browser has not enrolled). Its seed never leaves memory in the clear.
+  const [device, setDevice] = useState<DeviceIdentity | null>(null);
 
   // The password lives ONLY in memory while unlocked (never persisted).
   const passwordRef = useRef<string>("");
@@ -117,12 +129,44 @@ export default function Authenticator() {
     return draft;
   }
 
+  // Seal the device identity under the CURRENT vault password and store only the
+  // sealed container. Passing null forgets the identity entirely.
+  function persistDevice(m: Wasm, d: DeviceIdentity | null): void {
+    if (!d) {
+      window.localStorage.removeItem(DEVICE_KEY);
+      setDevice(null);
+      return;
+    }
+    const salt = crypto.getRandomValues(new Uint8Array(m.recommended_salt_len()));
+    const nonce = crypto.getRandomValues(new Uint8Array(m.nonce_len()));
+    const container = m.sealDeviceIdentity(m, passwordRef.current, d, salt, nonce, ARGON2);
+    window.localStorage.setItem(DEVICE_KEY, m.bytesToBase64(container));
+    setDevice(d);
+  }
+
+  // Decrypt the stored device identity with the just-accepted password. A
+  // container that will not open (e.g. sealed under an older password) is
+  // treated as "no device" rather than blocking the unlock.
+  function loadDevice(m: Wasm, password: string): void {
+    const stored = window.localStorage.getItem(DEVICE_KEY);
+    if (!stored) {
+      setDevice(null);
+      return;
+    }
+    try {
+      setDevice(m.openDeviceIdentity(m, password, m.base64ToBytes(stored)));
+    } catch {
+      setDevice(null);
+    }
+  }
+
   function createVault(password: string): void {
     if (!wasm) throw new Error("wasm not ready");
     const v = wasm.newVault();
     persist(wasm, v, password);
     passwordRef.current = password;
     setVault(v);
+    loadDevice(wasm, password);
     setPhase("unlocked");
   }
 
@@ -134,19 +178,23 @@ export default function Authenticator() {
     const v = wasm.openVault(wasm, password, container); // throws on wrong password
     passwordRef.current = password;
     setVault(v);
+    loadDevice(wasm, password);
     setPhase("unlocked");
   }
 
   function lock(): void {
     passwordRef.current = "";
     setVault(null);
+    setDevice(null); // the seed leaves memory with the password
     setPhase("locked");
   }
 
   function forget(): void {
     window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(DEVICE_KEY);
     passwordRef.current = "";
     setVault(null);
+    setDevice(null);
     setPhase("setup");
   }
 
@@ -179,6 +227,8 @@ export default function Authenticator() {
         wasm={wasm}
         vault={vault}
         now={now}
+        device={device}
+        onDeviceChange={(d) => persistDevice(wasm, d)}
         onAdd={(input) => withVault((d) => wasm.addEntry(d, input))}
         onImportOtpauth={(uri) => {
           const e = wasm.parseOtpauthUri(uri);
@@ -428,6 +478,8 @@ function VaultView({
   wasm,
   vault,
   now,
+  device,
+  onDeviceChange,
   onAdd,
   onImportOtpauth,
   onImportMigration,
@@ -437,6 +489,8 @@ function VaultView({
   wasm: Wasm;
   vault: TotpVault;
   now: number;
+  device: DeviceIdentity | null;
+  onDeviceChange: (d: DeviceIdentity | null) => void;
   onAdd: (input: AddInput) => void;
   onImportOtpauth: (uri: string) => void;
   onImportMigration: (uri: string) => { imported: number; skipped: number };
@@ -483,7 +537,7 @@ function VaultView({
 
       <AddAccountPanel onAdd={onAdd} onImportOtpauth={onImportOtpauth} onImportMigration={onImportMigration} />
       <ExportPanel wasm={wasm} vault={vault} />
-      <SyncPanel wasm={wasm} />
+      <SyncPanel wasm={wasm} device={device} onDeviceChange={onDeviceChange} />
     </div>
   );
 }
@@ -920,12 +974,72 @@ function ExportPanel({ wasm, vault }: { wasm: Wasm; vault: TotpVault }) {
 }
 
 // ── Sync (optional dev feature — sealed container to/from a sigild op-log) ────
+//
+// Two modes, chosen automatically:
+//   * NO device identity  -> unauthenticated push/pull, exactly as before (a
+//     sigild with only SIGILD_ENABLE_DEV_OPS on).
+//   * device ENROLLED     -> every request is signed under sigild's multi-device
+//     contract v3 (X-Sigil-Device + timestamp + fresh nonce + Ed25519 signature
+//     produced IN THE WASM), so a sigild with SIGILD_DEVICE_AUTH=1 accepts it.
+//
+// The enrollment token is a single-use bearer secret: it is sent in a header and
+// is never stored or logged. The device SEED is generated here with
+// crypto.getRandomValues and is persisted ONLY inside a password-sealed
+// container (see DEVICE_KEY) — never in plaintext.
 
-function SyncPanel({ wasm }: { wasm: Wasm }) {
+function SyncPanel({
+  wasm,
+  device,
+  onDeviceChange,
+}: {
+  wasm: Wasm;
+  device: DeviceIdentity | null;
+  onDeviceChange: (d: DeviceIdentity | null) => void;
+}) {
   const [url, setUrl] = useState("http://127.0.0.1:8080");
   const [vaultId, setVaultId] = useState("webapp-demo");
+  const [token, setToken] = useState("");
+  const [label, setLabel] = useState("this browser");
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Map any failure to a message; a device-auth failure carries the status, so
+  // 401 (not authenticated) and 403 (not authorized for this vault) are called
+  // out explicitly rather than shown as a generic HTTP error.
+  function authMsg(e: unknown): string {
+    const status = (e as { status?: number } | null)?.status;
+    if (status === 401 || status === 403 || status === 501) {
+      return wasm.explainAuthStatus(status);
+    }
+    return msg(e);
+  }
+
+  async function enroll() {
+    setBusy(true);
+    setStatus("Enrolling this browser as a device…");
+    try {
+      const seed = wasm.generateDeviceSeed();
+      const enrolled = await wasm.enrollDevice(wasm, {
+        baseUrl: url.trim(),
+        token: token.trim(),
+        label: label.trim(),
+        seed,
+      });
+      // Persist SEALED (under the vault password) — never the raw seed.
+      onDeviceChange({ deviceId: enrolled.deviceId, seed, baseUrl: url.trim() });
+      setToken(""); // single-use; drop it from memory immediately
+      setStatus(`Enrolled as device ${enrolled.deviceId}. Sync requests are now signed.`);
+    } catch (e) {
+      setStatus(`Enrollment failed: ${authMsg(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function forgetDevice() {
+    onDeviceChange(null);
+    setStatus("Device identity deleted from this browser. Sync is unauthenticated again.");
+  }
 
   async function push() {
     setBusy(true);
@@ -934,10 +1048,14 @@ function SyncPanel({ wasm }: { wasm: Wasm }) {
       const stored = window.localStorage.getItem(STORAGE_KEY);
       if (!stored) throw new Error("no sealed vault to push");
       const container = wasm.base64ToBytes(stored);
-      const { seq } = await wasm.pushContainer(url.trim(), vaultId.trim(), container);
-      setStatus(`Pushed sealed container as op #${seq}.`);
+      const { seq } = device
+        ? await wasm.pushContainerAuthed(wasm, device, url.trim(), vaultId.trim(), container)
+        : await wasm.pushContainer(url.trim(), vaultId.trim(), container);
+      setStatus(
+        `Pushed sealed container as op #${seq}${device ? " (signed as this device)" : ""}.`,
+      );
     } catch (e) {
-      setStatus(`Push failed: ${msg(e)}`);
+      setStatus(`Push failed: ${authMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -947,7 +1065,9 @@ function SyncPanel({ wasm }: { wasm: Wasm }) {
     setBusy(true);
     setStatus("Pulling…");
     try {
-      const ops = await wasm.pullContainers(url.trim(), vaultId.trim());
+      const ops = device
+        ? await wasm.pullContainersAuthed(wasm, device, url.trim(), vaultId.trim(), 0)
+        : await wasm.pullContainers(url.trim(), vaultId.trim());
       if (ops.length === 0) {
         setStatus("No ops on the server for that vault id.");
         return;
@@ -959,7 +1079,7 @@ function SyncPanel({ wasm }: { wasm: Wasm }) {
         `Pulled op #${latest.seq}. Sealed vault saved locally — Lock and Unlock to decrypt it.`,
       );
     } catch (e) {
-      setStatus(`Pull failed: ${msg(e)}`);
+      setStatus(`Pull failed: ${authMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -970,9 +1090,10 @@ function SyncPanel({ wasm }: { wasm: Wasm }) {
       <h3 className="mb-1 text-base font-semibold">Sync (dev)</h3>
       <p className="mb-3 text-xs text-neutral-600 dark:text-neutral-400">
         Round-trips the <strong>sealed</strong> container through a dev sigild
-        op-log over plain HTTP (localhost only, no TLS, no auth). Requires a local
-        sigild with <code>SIGILD_ENABLE_DEV_OPS</code> on. The server only ever
-        sees opaque bytes.
+        op-log over plain HTTP (localhost only, no TLS). Requires a local sigild
+        with <code>SIGILD_ENABLE_DEV_OPS</code> on. The server only ever sees
+        opaque bytes. If that sigild also has <code>SIGILD_DEVICE_AUTH=1</code>,
+        enroll below and every request is signed by this device.
       </p>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="block text-sm">
@@ -996,6 +1117,71 @@ function SyncPanel({ wasm }: { wasm: Wasm }) {
           />
         </label>
       </div>
+
+      <div className="mt-4 rounded border border-neutral-200 p-3 dark:border-neutral-800">
+        <h4 className="mb-1 text-sm font-semibold">Device identity</h4>
+        {device ? (
+          <>
+            <p data-testid="device-id" className="mb-2 break-all font-mono text-xs">
+              {device.deviceId}
+            </p>
+            <p className="mb-2 text-xs text-neutral-600 dark:text-neutral-400">
+              Requests are signed with this device&rsquo;s Ed25519 key. The key is
+              stored only inside a container sealed with your vault password.
+            </p>
+            <button
+              data-testid="device-forget"
+              className={btnGhost}
+              type="button"
+              onClick={forgetDevice}
+              disabled={busy}
+            >
+              Forget device
+            </button>
+          </>
+        ) : (
+          <>
+            <p className="mb-2 text-xs text-neutral-600 dark:text-neutral-400">
+              Not enrolled — sync requests are unauthenticated. Paste a single-use
+              enrollment token from the server operator to enroll this browser.
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="block text-sm">
+                <span className="mb-1 block font-medium">Enrollment token</span>
+                <input
+                  data-testid="device-token"
+                  className={`${inputCls} font-mono`}
+                  type="password"
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="mb-1 block font-medium">Device label</span>
+                <input
+                  data-testid="device-label"
+                  className={inputCls}
+                  value={label}
+                  onChange={(e) => setLabel(e.target.value)}
+                  autoComplete="off"
+                />
+              </label>
+            </div>
+            <button
+              data-testid="device-enroll"
+              className={`${btnGhost} mt-3`}
+              type="button"
+              onClick={enroll}
+              disabled={busy || token.trim() === ""}
+            >
+              Enroll this browser
+            </button>
+          </>
+        )}
+      </div>
+
       <div className="mt-3 flex gap-3">
         <button data-testid="sync-push" className={btnGhost} type="button" onClick={push} disabled={busy}>
           Push

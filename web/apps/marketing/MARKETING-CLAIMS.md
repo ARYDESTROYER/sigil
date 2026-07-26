@@ -14,7 +14,8 @@ the marketing surface. CI and reviewers should reject PRs that violate it.
   libsigil exists, is correct, and ships. (No shipping client exists yet.)
 - "available now", "download today", pricing numbers, or launch dates — pricing
   and launch are out of scope for the stealth splash.
-- The committed brand "Sigil" / domain `sigil.app` as final — name is a working
+- The committed brand "Sigil" / any domain (`sigilapp.io` is the provisional one
+  named in `CLAUDE.md`; no domain is registered) as final — name is a working
   placeholder pending trademark clearance.
 - "trusted by", customer logos, testimonials — none exist.
 

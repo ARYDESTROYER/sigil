@@ -288,7 +288,8 @@ func (h *handlers) authenticateDevice(r *http.Request, body []byte) (store.Devic
 //
 // This rule is deliberately simple and is a DEV model. It is not an account
 // model: it assumes the first writer of a vault ID is its legitimate owner, so
-// an attacker who reaches an unclaimed vault ID before the real owner takes it.
+// an attacker who reaches an unclaimed vault ID BEFORE the real owner claims it
+// as their own — and the real owner is then locked out of their own vault ID.
 // Vault IDs are client-chosen high-entropy identifiers, which is what makes that
 // tolerable pre-audit — it is NOT sufficient for production.
 func (h *handlers) authorizeVault(r *http.Request, dev store.Device, vaultID string, need accessNeed) authOutcome {

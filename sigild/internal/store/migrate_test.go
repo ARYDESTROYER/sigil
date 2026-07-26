@@ -12,6 +12,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -129,20 +130,55 @@ func migrateTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// dropOplogTables removes every table the migration set creates so a test
-// starts from a genuinely fresh DB. It must be extended whenever a migration
-// adds a table.
+// dropOplogTables removes every table in the test database so a test starts
+// from a genuinely fresh DB.
+//
+// It DISCOVERS the tables rather than hardcoding a list. An earlier version
+// enumerated them by hand with the note "must be extended whenever a migration
+// adds a table" — and that invariant duly broke: migrations 0003 (billing) and
+// 0004 (key sharing) added four tables that were never added here, two of them
+// carrying `REFERENCES sigil_devices ... ON DELETE CASCADE`. Those foreign keys
+// made `DROP TABLE sigil_devices` fail with SQLSTATE 2BP01, which aborted the
+// teardown HALF-DONE and left the database wedged: schema_migrations still
+// claimed the latest version, so the auto-migrator applied nothing, and every
+// subsequent Postgres test failed on a missing relation until someone manually
+// dropped the schema.
+//
+// Discovering the tables removes the fragile human invariant entirely: a future
+// migration can add as many tables as it likes and this still cleans up. CASCADE
+// handles the dependency order for us, so no topological sort is needed either.
+//
+// This is a TEST-ONLY helper and only ever runs against the throwaway database
+// named by SIGILD_TEST_POSTGRES.
 func dropOplogTables(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	for _, stmt := range []string{
-		`DROP TABLE IF EXISTS sigil_vault_ops`,
-		`DROP TABLE IF EXISTS sigil_device_grants`,
-		`DROP TABLE IF EXISTS sigil_enrollment_tokens`,
-		`DROP TABLE IF EXISTS sigil_devices`,
-		`DROP TABLE IF EXISTS schema_migrations`,
-	} {
+
+	rows, err := pool.Query(ctx,
+		`SELECT tablename FROM pg_tables WHERE schemaname = current_schema()`)
+	if err != nil {
+		t.Fatalf("list tables: %v", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			t.Fatalf("scan table name: %v", err)
+		}
+		tables = append(tables, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate tables: %v", err)
+	}
+
+	for _, name := range tables {
+		// pgx cannot parameterise an identifier, so quote it explicitly. The
+		// name comes from pg_tables (not from user input), and CASCADE drops
+		// dependent foreign keys so ordering does not matter.
+		stmt := fmt.Sprintf(`DROP TABLE IF EXISTS %q CASCADE`, name)
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			t.Fatalf("drop (%s): %v", stmt, err)
 		}

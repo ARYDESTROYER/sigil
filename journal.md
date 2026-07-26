@@ -5244,7 +5244,7 @@ GREEN; this pass is docs-only.
 - **Enforce entitlement** somewhere (the op-log routes are the obvious consumer), which
   needs the account model first.
 - **Decide whether billing stays in `sigild`** — the ADR deliberately leaves it open.
-- Nothing was committed in this phase; the working tree carries Phase 45 code + these docs.
+- (Committed after this entry was written: Phase 45 is `9d87eb5` on `main`.)
 
 ---
 
@@ -5435,4 +5435,4 @@ gained `--at <unix>` so a code is reproducible across two machines in a proof.
   wasm `hybrid_*` exports already; they need the keyring + the four routes.
 - **Wire the hybrid SIGNATURE into something** — it is now the only hybrid construction
   still used by nothing.
-- Nothing was committed in this phase; the working tree carries Phase 46 code + these docs.
+- (Committed after this entry was written: Phase 46 is `ab50783` on `main`.)

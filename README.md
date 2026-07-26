@@ -1,6 +1,8 @@
 # Sigil (working name)
 
-A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
+A paid, multi-platform authenticator, **designed** end-to-end encrypted and
+post-quantum-ready. (Design intent, not a shipped guarantee — nothing here is
+audited; see the status note below.)
 
 > **STATUS: pre-launch / pre-audit skeleton.** This repository is the
 > foundation scaffold from the 72-hour deployment sprint — _not_ a shipping

@@ -28,8 +28,9 @@
 
 ## What this is
 
-**Sigil (working name)** — a paid, multi-platform, end-to-end-encrypted,
-post-quantum-*ready* authenticator. This repo is the **pre-launch / pre-audit
+**Sigil (working name)** — a paid, multi-platform authenticator, **designed**
+end-to-end-encrypted and post-quantum-*ready* (design intent, not a shipped
+guarantee — nothing here is audited). This repo is the **pre-launch / pre-audit
 foundation scaffold** from the 72-hour deployment sprint. It is **not** a
 shipping product: the sync server and clients are stubbed, and `libsigil` has
 **real but UNAUDITED** crypto building blocks — an Argon2id KDF, an
@@ -181,7 +182,9 @@ public, make no security claims, until the audit completes and trademark clears.
   altering / inserting / deleting / reordering any op changes that op's hash and every
   hash after it. `Op` carries `Hash`; **File's on-disk format is bumped v1→v2** to persist
   the hash, **Postgres gains a hash column** (assigned inside the same advisory-lock tx as
-  `seq`), Mem holds it in-process. `GET …/ops` returns each op's hex `hash`; a new
+  `seq`), Mem holds it in-process. `GET …/ops` returns each op's **std-base64**
+  `hash` (NOT hex — `handlers.go` emits `base64.StdEncoding`, and `docs/api.md`
+  is the authority); a new
   **`GET /v1/vaults/{vaultID}/ops/verify`** recomputes the chain server-side and returns
   `{vaultID, ok, count, tip_hash, broken_at_seq}` (`VerifyChain`) — both **dev-gated**
   (`501` when dev-ops off) and **auth-guarded** exactly like the other ops routes. The

@@ -9,8 +9,13 @@ export default function manifest(): MetadataRoute.Manifest {
   return {
     name: "Sigil authenticator (dev)",
     short_name: "Sigil",
+    // MARKETING-CLAIMS.md forbids unqualified present-tense "end-to-end
+    // encrypted". This string is the most consumer-facing text this surface has
+    // (the OS/browser install prompt renders it, and may TRUNCATE it), so the
+    // qualifier has to live in the same clause rather than in a trailing
+    // sentence that can be cut off. "Designed ..." is the sanctioned phrasing.
     description:
-      "Client-side, end-to-end-encrypted TOTP authenticator. Pre-audit dev build.",
+      "Pre-audit dev build (UNAUDITED). Client-side TOTP authenticator, designed end-to-end encrypted.",
     start_url: "/",
     scope: "/",
     display: "standalone",

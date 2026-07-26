@@ -104,3 +104,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0029](0029-webapp-pwa-offline-a11y-and-ci.md) | Webapp as an offline-capable, accessible PWA (hand-rolled service worker + manifest) + a Rust/wasm-pack webapp CI job | Accepted (2026-07) |
 | [0030](0030-browser-extension-client.md) | MV3 browser-extension client — popup TOTP authenticator over the vendored wasm + proven helpers (sealed-only `chrome.storage.local`, in-memory password) | Accepted (2026-07) |
 | [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07) |
+| [0032](0032-native-desktop-client.md) | Native desktop client — Tauri v2 shell over a headless core crate, `sigil-core` linked natively (no wasm), re-using `cli/`'s container/vault/migration logic and sharing the CLI's vault file | Accepted (2026-07) |

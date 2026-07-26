@@ -1,0 +1,36 @@
+# `desktop/` — the NATIVE client column.
+#
+# STATUS: pre-audit. This workspace is a DEMONSTRATION desktop authenticator over
+# the REAL but **UNAUDITED** libsigil core. It MUST NOT be used to protect real
+# 2FA secrets. It makes no security claims.
+#
+# IMPORTANT: like `cli/` and `sigil-wasm/`, this workspace is INTENTIONALLY
+# OUTSIDE the `libsigil/` cargo workspace and carries its OWN `desktop/Cargo.lock`.
+# That separation is what lets it depend on native-only crates (getrandom via
+# sigil-cli, Tauri's platform stack, ...) without ever perturbing
+# `libsigil/Cargo.lock`, which MUST stay getrandom-free so `sigil-core` keeps
+# compiling to `wasm32-unknown-unknown`.
+#
+# Unlike the webapp and the browser extension — which run libsigil compiled to
+# WebAssembly — this column links `sigil-core` (via `sigil-cli`) as a NATIVE Rust
+# dependency. No wasm is in the loop.
+[workspace]
+resolver = "2"
+members = ["core", "src-tauri"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+# 1.85: transitively path-depends on sigil-core, which pulls ml-dsa 0.1.1
+# (edition 2024, MSRV 1.85).
+rust-version = "1.85"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[workspace.dependencies]
+# The real (UNAUDITED) crypto building block, plus the reference NATIVE consumer
+# that already owns the SIGILcli container + TotpVault schema + migration codec.
+# Path dependencies only; this does NOT add these crates to the libsigil workspace.
+sigil-core = { path = "../libsigil/core" }
+sigil-cli = { path = "../cli" }
+sigil-desktop-core = { path = "core" }

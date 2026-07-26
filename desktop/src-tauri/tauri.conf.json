@@ -1,0 +1,39 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "productName": "Sigil Desktop (PRE-AUDIT)",
+  "version": "0.0.0",
+  "identifier": "dev.sigil.desktop.preaudit",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Sigil Desktop \u2014 PRE-AUDIT \u00b7 UNAUDITED \u00b7 no real secrets",
+        "width": 520,
+        "height": 820,
+        "minWidth": 420,
+        "minHeight": 560,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    },
+    "withGlobalTauri": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": "app",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "copyright": "Apache-2.0 OR MIT. Pre-audit demonstration build. Not signed, not notarized, not distributed.",
+    "shortDescription": "Pre-audit Sigil desktop authenticator (UNAUDITED).",
+    "longDescription": "A private, pre-launch demonstration desktop authenticator over the real-but-UNAUDITED libsigil core, linked natively. Do not store real 2FA secrets."
+  }
+}

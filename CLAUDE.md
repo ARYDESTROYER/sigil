@@ -602,8 +602,74 @@ public, make no security claims, until the audit completes and trademark clears.
   the reserved-stub ambitions (phishing protection, passkey provider, content
   scripts) are **NOT** implemented; **not** wired into CI. Do NOT store real 2FA
   secrets. ADR 0030.
-- `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm` and
-  `extension/` are now real — see above.)
+- `desktop/` — **the NATIVE client column** (fourth client surface, FIRST native
+  one): a **Tauri v2** desktop authenticator. **THE ARCHITECTURAL POINT: `sigil-core`
+  is a plain NATIVE Rust dependency here — there is NO wasm, `wasm-bindgen` or
+  `wasm-pack` anywhere under `desktop/`** (unlike `web/apps/webapp` and `extension/`,
+  which run the core as WebAssembly). The core still reads **no clock and no RNG**
+  (ADR 0007), so the native app supplies both: **entropy** via `sigil-cli`'s native
+  `getrandom` path inside `seal_to_container`, and the **clock** via
+  `std::time::SystemTime` (`sigil_desktop_core::now_unix`) passed **into** the core's
+  `totp` as a `u64`. **Two crates:** **`sigil-desktop-core`** (`desktop/core`) holds
+  **ALL** the authenticator logic **headless** and is `#![forbid(unsafe_code)]` +
+  `#![deny(missing_docs)]` — `VaultSession` (`create`/`unlock`/`open_or_create`,
+  `with_params`, `entries_at`/`entries_now`, `add_secret_base32`, `add_uri`,
+  `import_text`/`import_file`, `remove`, `export_uris`, `export_migration_uri`,
+  `save`), the `EntryView`/`ImportSummary` view models, `DesktopError`,
+  `default_vault_path`, and the `BANNER_TITLE`/`BANNER_BODY`/`EXPORT_WARNING`
+  constants; **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
+  a `Mutex<Option<VaultSession>>` app state, and **ten `#[tauri::command]`s**
+  (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`,
+  `export_uris`, `export_migration`). `desktop/ui` is framework-free HTML/CSS/JS —
+  **no npm, no bundler, no CDN**. The split is deliberate: a GUI can't be clicked by a
+  test runner, so all behaviour lives where tests can drive it. **REUSE, NOT
+  REIMPLEMENT (the rule for this directory): NO crypto, container format or vault
+  schema is defined here.** `sigil-desktop-core` path-depends on `sigil-core` **and on
+  the `sigil-cli` LIBRARY target**, taking the `SIGILcli` container
+  (`seal_vault`/`open_vault`), the `TotpVault`/`TotpEntry` schema and
+  `TotpEntry::code_at`, `base32_decode`, `new_totp_entry`, `totp_algorithm_from_str`,
+  `parse_otpauth_uri`/`entry_to_otpauth_uri`, and the Google Authenticator migration
+  codec (`decode_migration_uri`/`encode_migration_uri`/`entry_to_migration_otp`/
+  `migration_otp_to_entry`) straight from `cli/` — so there is **no fourth at-rest
+  format and NO mirrored schema to keep in sync** (unlike the Rust↔JS mirrors of ADRs
+  0020/0026), and **nothing under `cli/` was edited**. **SHARED VAULT:** the default
+  path is **`$HOME/.sigil/totp-vault.sigil`** — byte-for-byte the CLI's default
+  (fallback `./totp-vault.sigil` when `$HOME` is unset) — so the desktop app and
+  `sigil totp` literally drive **ONE vault file**; dir `0700`, file `0600`, and
+  `save()` writes a temp file then renames so an interrupted save can't truncate a
+  good vault. **ONLY the sealed container is persisted**; the password is
+  memory-only for the life of a `VaultSession` and **best-effort** zeroed on `Drop`
+  (no `zeroize`, no volatile guarantee — documented, not claimed). **Trust boundary:**
+  the webview holds **no** key material and does **no** crypto (password crosses the
+  IPC once at unlock; codes arrive already computed) and
+  `desktop/src-tauri/capabilities/default.json` grants **`core:default` ONLY** (no
+  fs/shell/http/dialog plugin), so the frontend reaches disk only through the explicit
+  commands; the export commands return `EXPORT_WARNING` **with** the payload so a UI
+  can't drop it. Features: create/unlock/lock, live list (issuer/label + code +
+  seconds remaining, recomputed ~1/s), add by base32 secret (algorithm/digits/period)
+  or `otpauth://` URI, Google Authenticator `otpauth-migration://` import, remove,
+  `otpauth://` + combined-migration export behind the loud warning; a pre-audit banner
+  is rendered in the window **and** printed to stderr at startup from the same Rust
+  constants. **`desktop/` is its OWN cargo workspace with its OWN `desktop/Cargo.lock`**
+  (members `core` + `src-tauri`), **deliberately OUTSIDE the `libsigil` workspace**
+  exactly like `cli/` and `sigil-wasm/`, so Tauri's platform stack and the transitive
+  native `getrandom` can **never** perturb `libsigil/Cargo.lock` (which must stay
+  `getrandom`==0). Proven by **`desktop/core/tests/cli_interop.rs`**, which builds the
+  **REAL `sigil` binary** and drives it as a subprocess against **ONE shared vault
+  file** in **both directions**, plus an RFC 6238 App B KAT in `desktop/core/src/lib.rs`
+  (`T=59` → `94287082` at 8 digits / `287082` at 6). ⚠️ The interop test pins the clock
+  by using **`period = u32::MAX`** (counter stays 0 until ~2106 ⇒ constant code) for the
+  exact cross-process equality assertions — a **deliberate test artifice, NOT product
+  behaviour**; an ordinary 30 s account is also checked with a bounded retry. **Dev /
+  UNAUDITED**, **NOT signed, NOT notarized, NOT distributed** (`tauri build` / the
+  `.app` bundler was **not** run — the applicable build is `cargo build --release`),
+  the **GUI is build-and-launch verified but NOT visually verified** on this machine
+  (screencapture denied → no screenshot proof), and there is **no sync, no device
+  enrollment, no QR scanning, no code verification, no hardened zeroization**; the
+  other native platforms (**mobile especially**) remain unbuilt. Do NOT store real 2FA
+  secrets. ADR 0032.
+- `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
+  `extension/` and `desktop/` are now real — see above.)
 
 ## Toolchains (this machine — macOS arm64)
 
@@ -689,6 +755,23 @@ corepack pnpm -C extension test               # `pretest` re-runs build.sh; 3 Pl
 # "chromium" — the headless SHELL cannot load extensions) and drives
 # chrome-extension://<pinned-id>/src/popup/popup.html?t=59.
 # Load it by hand: chrome://extensions -> Developer mode -> Load unpacked -> extension/
+
+# desktop — the NATIVE Tauri v2 authenticator. Its OWN cargo workspace with its own
+# desktop/Cargo.lock, INTENTIONALLY OUTSIDE the libsigil workspace (like cli/ and
+# sigil-wasm/) so Tauri's platform stack + the transitive native getrandom can never
+# perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
+cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
+cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
+cargo test  --manifest-path desktop/Cargo.toml   # 11 unit tests + 1 integration test
+grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
+# The integration test is THE INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
+# builds the real `sigil` binary itself and drives it against ONE shared vault file in
+# both directions, so it needs no setup (~20 s: real Argon2id + a CLI build).
+cargo test  --manifest-path desktop/Cargo.toml --test cli_interop -- --nocapture
+# The applicable build is cargo --release; `tauri build` (the .app bundler) has NOT
+# been run, and the binary is unsigned / unnotarized / undistributed.
+cargo build --manifest-path desktop/Cargo.toml --release   # -> ~8.6 MB native binary
+./desktop/target/release/sigil-desktop                     # opens the window (needs a GUI session)
 ```
 
 **Always run the relevant suite after changes and record the result in

@@ -602,6 +602,67 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   them (no constant-time compare, no zeroization). The reserved-stub ambitions
   (phishing protection, passkey provider, content scripts) are **not** implemented
   ([ADR 0030](decisions/0030-browser-extension-client.md)).
+- **`desktop`** ([`../desktop/`](../desktop/)) — **the fourth client surface and the
+  first NATIVE one**: a **Tauri v2** desktop authenticator. Unlike `web/apps/webapp`
+  and `extension`, which run the core compiled to **WebAssembly**, this column links
+  **`sigil-core` as a plain native Rust dependency** — there is **no wasm,
+  `wasm-bindgen` or `wasm-pack` anywhere under `desktop/`**. That is what makes it a
+  new column rather than a re-skin: the core still reads **no clock and no RNG**
+  ([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)), so the native app
+  supplies both — **entropy** through `sigil-cli`'s native `getrandom` path inside
+  `seal_to_container`, and the **clock** via `std::time::SystemTime`
+  (`sigil_desktop_core::now_unix`) passed *into* the core's `totp` as a `u64`.
+  It is **two crates**: **`sigil-desktop-core`** (`desktop/core`) holds **all** the
+  authenticator logic headless — `VaultSession` (`create`/`unlock`/`open_or_create`,
+  `entries_at`/`entries_now`, `add_secret_base32`, `add_uri`, `import_text`,
+  `remove`, `export_uris`, `export_migration_uri`, `save`), the `EntryView` /
+  `ImportSummary` view models, `DesktopError`, `default_vault_path` and the
+  `BANNER_TITLE` / `BANNER_BODY` / `EXPORT_WARNING` constants — and is
+  `#![forbid(unsafe_code)]`; **`sigil-desktop`** (`desktop/src-tauri`) is a thin
+  shell holding a `Mutex<Option<VaultSession>>` and **ten `#[tauri::command]`s**
+  (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`,
+  `export_uris`, `export_migration`). `desktop/ui` is framework-free HTML/CSS/JS —
+  **no npm, no bundler, no CDN**. The split is deliberate: a GUI cannot be clicked by
+  a test runner, so everything that could be wrong lives where a test can drive it.
+  It **reimplements nothing**: `sigil-desktop-core` path-depends on `sigil-core` **and
+  on the `sigil-cli` library target**, taking the `SIGILcli` container
+  (`seal_vault`/`open_vault`), the `TotpVault`/`TotpEntry` schema and
+  `TotpEntry::code_at`, `base32_decode`, `new_totp_entry`, `totp_algorithm_from_str`,
+  `parse_otpauth_uri`/`entry_to_otpauth_uri` and the Google Authenticator migration
+  codec straight from `cli/` — so there is **no fourth at-rest format and no mirrored
+  schema to keep in sync** (unlike the deliberate Rust↔JS mirrors of
+  [ADR 0020](decisions/0020-shared-client-container-format.md) and
+  [ADR 0026](decisions/0026-browser-totp-import-export.md)). Consequently the desktop
+  app and the `sigil` CLI **literally share one vault file**:
+  `$HOME/.sigil/totp-vault.sigil`, byte-for-byte the CLI's default (falling back to
+  `./totp-vault.sigil` when `$HOME` is unset), directory `0700` and file `0600`, with
+  `save()` writing a temp file and renaming it into place so an interrupted save
+  cannot truncate a good vault. **Only the sealed container is ever persisted**; the
+  password lives in memory for the life of a `VaultSession` and is **best-effort**
+  zeroed on `Drop` (no `zeroize`, no volatile guarantee — documented, not claimed).
+  **Trust boundary:** the webview holds **no** key material and does **no**
+  cryptography (the password crosses the IPC once at unlock; codes arrive already
+  computed), and `desktop/src-tauri/capabilities/default.json` grants **`core:default`
+  and nothing else** — no `fs`, `shell`, `http` or `dialog` plugin — so the frontend
+  reaches disk only through the explicit commands; the export commands return
+  `EXPORT_WARNING` *with* the payload so a UI cannot drop it. Features: create /
+  unlock / lock, a live list (issuer/label + code + seconds remaining, recomputed
+  ~1/s), add by base32 secret (algorithm/digits/period) or `otpauth://` URI, Google
+  Authenticator `otpauth-migration://` import, remove, and `otpauth://` / combined
+  migration export behind the loud warning; a pre-audit banner is rendered in the
+  window and printed to stderr at startup from the same Rust constants. `desktop/` is
+  its **own cargo workspace with its own `desktop/Cargo.lock`**, deliberately outside
+  the `libsigil` workspace (exactly like `cli/` and `sigil-wasm/`; see §4) so Tauri's
+  platform stack and the native `getrandom` can never enter `libsigil/Cargo.lock`.
+  Proven by `desktop/core/tests/cli_interop.rs`, which builds the **real `sigil`
+  binary** and drives it as a subprocess against **one shared vault file** in both
+  directions, plus an RFC 6238 Appendix B KAT in `desktop/core/src/lib.rs` (`T=59` →
+  `94287082` at 8 digits, `287082` at 6). It is **dev / UNAUDITED**, **not signed, not
+  notarized and not distributed** (`tauri build` was not run; the applicable build is
+  `cargo build --release`), the **GUI is build-and-launch verified but not visually
+  verified** here, and there is **no sync, no device enrollment, no QR scanning, no
+  code verification and no hardened zeroization** in this column
+  ([ADR 0032](decisions/0032-native-desktop-client.md)).
 
 ```
                          CLIENT SIDE  (all cryptography lives here)
@@ -657,6 +718,14 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
      encrypted TOTP vault (add/import/export), codes in wasm, ONLY the SIGILcli-sealed
      container in chrome.storage.local, in-memory password; permissions: ["storage"];
      no sync, no background worker; dev / UNAUDITED; not published to any store.
+   desktop (Tauri v2): the FIRST NATIVE client — sigil-core linked as a plain Rust
+     dependency, NO wasm. sigil-desktop-core (headless logic, all the tests) +
+     sigil-desktop (shell: 10 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
+     SIGILcli container + TotpVault schema + migration codec, and shares the CLI's
+     $HOME/.sigil/totp-vault.sigil, so desktop and `sigil totp` drive ONE vault file.
+     Sealed-only persistence, in-memory password; webview does no crypto (capability
+     = core:default only); own workspace + Cargo.lock. Dev / UNAUDITED; unsigned,
+     unnotarized, not distributed.
 ```
 
 ---
@@ -782,7 +851,7 @@ KEM/signature primitives are **not yet wired into the suite frame** — the
 
 ## 4. Build & dependency isolation
 
-There are **four Rust build surfaces** plus the Go server, and the boundaries
+There are **five Rust build surfaces** plus the Go server, and the boundaries
 between them are load-bearing:
 
 1. **The `libsigil` workspace** (`core` + `ffi`) — native build/clippy/test. This
@@ -816,6 +885,17 @@ between them are load-bearing:
    `0`**, and `libsigil/Cargo.lock` must be unchanged by any wasm-binding work. This
    is what proves the caller-supplied-entropy invariant end to end into a JS runtime
    (see [`decisions/0019-wasm-client-bindings.md`](decisions/0019-wasm-client-bindings.md)).
+5. **The standalone `desktop` workspace** (`sigil-desktop-core` + `sigil-desktop`) —
+   the native GUI column, also **outside** the `libsigil` workspace with its **own
+   [`../desktop/Cargo.lock`](../desktop/Cargo.lock)**, path-depending on
+   `../libsigil/core` **and** `../cli` (the `sigil-cli` **library** target). Because it
+   is native-only it may pull Tauri's whole platform stack and, transitively through
+   `sigil-cli`, `getrandom` — and all of that lands **only** in `desktop/Cargo.lock`.
+   The same mechanical guard applies: `grep -c 'name = "getrandom"' libsigil/Cargo.lock`
+   **must stay `0`** and `libsigil/Cargo.lock` must be unchanged by any desktop work.
+   This is the surface that links `sigil-core` **natively** — no `wasm-bindgen`, no
+   `wasm-pack`, no `.wasm` (see
+   [`decisions/0032-native-desktop-client.md`](decisions/0032-native-desktop-client.md)).
 
 `sigild`'s **core server and its in-memory / file-backed dev backends are Go
 stdlib-only**, which keeps that surface reproducible and near-zero-dependency.
@@ -859,12 +939,18 @@ To avoid any over-claim, the honest gaps in the current architecture (the
 authoritative list, with rationale, is the **defer ledger** in
 [`sprint-72h.md`](sprint-72h.md)):
 
-- **No native clients (but the client column has started, and now reaches a real
-  browser app *and* a browser extension).** The native apps
-  (iOS/Android/macOS/Windows/Linux/watch) live in separate repos and consume
-  `libsigil` as a versioned artifact; none exist yet, and the admin console is
-  still a reserved directory. The **one**
-  client-side consumer that now exists is **`sigil-wasm`** — the first thing to
+- **One native GUI client now exists; the rest of the native platforms do not.**
+  `desktop/` is a real **Tauri v2** desktop authenticator that links `sigil-core`
+  **natively** (no wasm) and shares the CLI's sealed `SIGILcli` vault file
+  ([ADR 0032](decisions/0032-native-desktop-client.md)) — but it is **dev /
+  UNAUDITED**, **unsigned, unnotarized and undistributed** (no `.app` bundle was
+  built), its **GUI has not been visually verified** here (all behaviour is proven
+  through the headless `sigil-desktop-core` crate and its CLI-interop test), and it
+  has **no sync, no device enrollment, no QR scanning and no code verification**. The
+  **mobile** clients (iOS/Android/watch) and the other desktop platforms
+  (Windows/Linux) remain **unbuilt**; native apps outside this repo consume `libsigil`
+  as a versioned artifact, and the admin console is still a reserved directory. The
+  **browser-side** consumer is **`sigil-wasm`** — the first thing to
   actually link the wasm-pure core into a JS runtime — but it is a **demo of the
   UNAUDITED `seal_record` / `open_record` building block**, not a product client
   and not the account / key-management model

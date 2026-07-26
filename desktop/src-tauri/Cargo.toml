@@ -1,0 +1,23 @@
+[package]
+name = "sigil-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Pre-audit Sigil desktop authenticator (Tauri v2 shell). Links the real-but-unaudited libsigil core NATIVELY — no WebAssembly. Not for real secrets."
+
+[[bin]]
+name = "sigil-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ALL authenticator logic lives in the headless core crate so it is testable
+# without a window; this crate is only the shell (window + #[tauri::command] glue).
+sigil-desktop-core = { workspace = true }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

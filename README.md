@@ -311,6 +311,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   reimplementing them ([ADR 0030](docs/decisions/0030-browser-extension-client.md)).
   **Dev, UNAUDITED, loaded unpacked and published to no store**; no sync. Do not store
   real 2FA secrets.
+- `desktop/` — a **native desktop client** (Tauri v2): the same encrypted TOTP vault
+  as a real application window, with add/import (`otpauth://` + Google
+  Authenticator)/export and live codes. Unlike the webapp and the extension it links
+  the libsigil core **natively — no WebAssembly** — and it reuses the CLI's container,
+  vault schema and migration codec rather than reimplementing them, so it opens the
+  **same vault file as the CLI** (`$HOME/.sigil/totp-vault.sigil`): add an account in
+  the app and `sigil totp code` prints it, and vice versa. Only the sealed container is
+  stored; the password stays in memory. Its own cargo workspace, so the wasm-pure core
+  is untouched ([ADR 0032](docs/decisions/0032-native-desktop-client.md)). **Dev,
+  UNAUDITED, unsigned, unnotarized and not distributed** — no installer was built, and
+  there is no sync, no device enrollment and no QR scanning. Do not store real 2FA
+  secrets.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.
@@ -331,6 +343,7 @@ libsigil/        Rust crypto core (workspace: core + ffi)
 sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
 web/             Next.js marketing + webapp (in-browser wasm authenticator) + @sigil/wasm loader (admin reserved), pnpm workspace
 extension/       MV3 browser extension — popup TOTP authenticator over the wasm (dev, unpublished)
+desktop/         Tauri v2 native desktop authenticator — libsigil linked natively, shares the CLI's vault (dev, unsigned)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 sigil-wasm/      Rust wasm-bindgen binding — in-browser seal/open demo over the core (pre-audit)
 deploy/          terraform / nomad / caddy / systemd + local/ (loopback smoke) + preflight.sh
@@ -338,8 +351,10 @@ docs/            architecture, threat model, crypto spec, op-log API, sprint pla
 docs/decisions/  Architecture Decision Records (ADRs)
 ```
 
-Native platform clients (iOS/Android/macOS/Windows/Linux/watchOS/wearOS) live in
-**separate repositories** and consume `libsigil` as a versioned binary artifact.
+One native client now lives **in this repo** — `desktop/`, which links `libsigil`
+directly as a Rust dependency. The remaining native platform clients
+(iOS/Android/Windows/Linux/watchOS/wearOS) are **unbuilt**; they are intended to live
+in **separate repositories** and consume `libsigil` as a versioned binary artifact.
 
 ## Toolchains
 
@@ -364,6 +379,10 @@ cargo test  --manifest-path cli/Cargo.toml
 # sigil-wasm (separate crate; wasm-bindgen binding — getrandom-free, JS supplies entropy)
 cargo test  --manifest-path sigil-wasm/Cargo.toml   # native *_inner unit tests
 ./sigil-wasm/build-wasm.sh && node sigil-wasm/test/roundtrip.mjs   # browser/Node round-trip
+
+# Native desktop app (separate workspace; Tauri v2, no wasm toolchain needed)
+cargo test  --manifest-path desktop/Cargo.toml     # incl. the desktop <-> CLI vault interop proof
+cargo build --manifest-path desktop/Cargo.toml --release
 
 # Go sync server
 ( cd sigild && gofmt -l . && go vet ./... && go test ./... && go build ./... )

@@ -1,0 +1,132 @@
+<!doctype html>
+<!--
+  Sigil Desktop — PRE-AUDIT / UNAUDITED demonstration UI.
+
+  Framework-free on purpose: no bundler, no npm, no CDN. This page holds no key
+  material and does no cryptography — every action is a #[tauri::command] into
+  the native Rust core, which is where the vault, the password and the RFC
+  4226/6238 code generation live.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <title>Sigil Desktop — PRE-AUDIT</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- The loud pre-audit banner. Text is filled from the Rust BANNER_* consts
+         so no surface can quietly soften it. -->
+    <div class="banner" role="alert">
+      <strong id="banner-title">PRE-AUDIT · UNAUDITED · DO NOT STORE REAL 2FA SECRETS</strong>
+      <span id="banner-body"></span>
+    </div>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span>Sigil <em>desktop</em></span>
+      </div>
+      <div class="topbar-right">
+        <span class="pill" id="native-pill" title="sigil-core is linked as a native Rust dependency; no WebAssembly is involved">native core</span>
+        <button id="lock-btn" class="ghost" hidden>Lock</button>
+      </div>
+    </header>
+
+    <p class="vaultpath">Vault: <code id="vault-path">…</code></p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <!-- Lock screen                                                         -->
+    <!-- ------------------------------------------------------------------ -->
+    <section id="lock-screen" class="card" hidden>
+      <h2 id="lock-heading">Unlock vault</h2>
+      <p class="hint" id="lock-hint"></p>
+      <form id="unlock-form" autocomplete="off">
+        <label for="password">Vault password</label>
+        <input id="password" type="password" autocomplete="off" spellcheck="false" required />
+        <button type="submit" class="primary">Unlock</button>
+      </form>
+      <p class="hint">
+        The password is held only in memory by the native process for this
+        session. Only the sealed container is ever written to disk.
+      </p>
+    </section>
+
+    <!-- ------------------------------------------------------------------ -->
+    <!-- Accounts                                                            -->
+    <!-- ------------------------------------------------------------------ -->
+    <main id="app" hidden>
+      <section class="card">
+        <div class="card-head">
+          <h2>Accounts</h2>
+          <span class="count" id="count"></span>
+        </div>
+        <ul id="accounts" class="accounts"></ul>
+        <p class="empty" id="empty" hidden>No accounts yet. Add one below.</p>
+      </section>
+
+      <section class="card">
+        <h2>Add account</h2>
+        <form id="add-secret-form" autocomplete="off">
+          <label for="label">Label</label>
+          <input id="label" required placeholder="alice@example.com" />
+          <label for="issuer">Issuer <span class="opt">(optional)</span></label>
+          <input id="issuer" placeholder="Acme" />
+          <label for="secret">Secret <span class="opt">(base32)</span></label>
+          <input id="secret" required spellcheck="false" placeholder="GEZDGNBVGY3TQOJQ…" />
+          <div class="row3">
+            <span>
+              <label for="algorithm">Algorithm</label>
+              <select id="algorithm">
+                <option value="sha1" selected>sha1</option>
+                <option value="sha256">sha256</option>
+                <option value="sha512">sha512</option>
+              </select>
+            </span>
+            <span>
+              <label for="digits">Digits</label>
+              <input id="digits" type="number" min="6" max="10" value="6" />
+            </span>
+            <span>
+              <label for="period">Period (s)</label>
+              <input id="period" type="number" min="1" value="30" />
+            </span>
+          </div>
+          <button type="submit" class="primary">Add from secret</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Import</h2>
+        <p class="hint">
+          A Google Authenticator export (<code>otpauth-migration://offline?data=…</code>),
+          a single <code>otpauth://totp/…</code> URI, or one URI per line.
+        </p>
+        <form id="import-form" autocomplete="off">
+          <textarea id="import-text" rows="4" spellcheck="false" placeholder="otpauth://totp/Acme:alice?secret=…"></textarea>
+          <button type="submit" class="primary">Import</button>
+        </form>
+      </section>
+
+      <section class="card danger">
+        <h2>Export</h2>
+        <p class="warn" id="export-warning"></p>
+        <div class="row">
+          <button id="export-uris-btn" class="ghost">Reveal otpauth:// URIs</button>
+          <button id="export-migration-btn" class="ghost">Reveal migration URI</button>
+        </div>
+        <pre id="export-out" hidden></pre>
+      </section>
+    </main>
+
+    <p id="toast" class="toast" hidden role="status"></p>
+
+    <footer>
+      Apache-2.0 OR MIT · pre-audit demonstration build · not signed, not
+      notarized, not distributed.
+    </footer>
+
+    <script src="main.js"></script>
+  </body>
+</html>

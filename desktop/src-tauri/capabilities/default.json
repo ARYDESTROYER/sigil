@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The minimum the shell needs: the core IPC surface for the main window. No filesystem, shell, http, or dialog plugins are granted — every privileged action goes through an explicit #[tauri::command].",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

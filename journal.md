@@ -11,7 +11,50 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 42, `main` @ origin).** Phase 42 taught the **`sigil` CLI to
+**Where we are (through Phase 43; `main` @ origin through Phase 42 — Phase 43 is not yet
+committed).** Phase 43 opened the **NATIVE client column**: a new top-level **`desktop/`** —
+a **Tauri v2 desktop authenticator** whose Rust backend links libsigil **NATIVELY**. That is
+the whole point: `web/apps/webapp` and `extension/` both run the core as **WebAssembly**, so
+a third browser-shaped client would have proved nothing; **there is no wasm, `wasm-bindgen` or
+`wasm-pack` anywhere under `desktop/`** (grepped and confirmed). `sigil-core` still reads **no
+clock and no RNG**, so the native app supplies both — **entropy** through `sigil-cli`'s
+`getrandom` seal path, the **clock** via `std::time` passed **into** `sigil_core` as a `u64`.
+**Two crates:** **`sigil-desktop-core`** (`desktop/core`) holds **ALL** the authenticator logic
+**headless** and is `#![forbid(unsafe_code)]`; **`sigil-desktop`** (`desktop/src-tauri`) is a
+thin Tauri shell — a `Mutex`-held `VaultSession` and **ten `#[tauri::command]`s**; `desktop/ui`
+is framework-free HTML/CSS/JS (**no npm, no bundler, no CDN**). **ZERO crypto/format
+reimplementation**: the `SIGILcli` container, the `TotpVault`/`TotpEntry` schema,
+`TotpEntry::code_at`, `base32_decode`, the `otpauth://` parse/build and the Google
+Authenticator migration codec are all **re-used from `cli/` by path dependency** (no hand-rolled
+hmac/sha1 anywhere; **nothing under `cli/` was edited**). So the vault is
+**`$HOME/.sigil/totp-vault.sigil` — byte-for-byte the CLI's default: the desktop app and the CLI
+literally share ONE vault file** (dir 0700, file 0600, temp-file+rename so an interrupted save
+can't truncate a good vault); **only the sealed container is persisted**, the password is
+memory-only and **best-effort** zeroed on `Drop`. **Trust boundary:** the webview holds no key
+material and does no crypto, and the Tauri capability grants **`core:default` ONLY** (no
+fs/shell/http/dialog plugin), so the frontend reaches disk only through the explicit commands;
+export commands return the secrets-in-the-clear warning **together with** the payload. It is
+its **OWN cargo workspace with its own `desktop/Cargo.lock`, deliberately outside `libsigil`**
+(like `cli/` and `sigil-wasm/`) — **`libsigil/Cargo.lock` `getrandom` is still 0**. **VERIFIED
+FIRST-HAND:** fmt clean, clippy `-D warnings` zero, **11 unit + 1 integration test pass**,
+release build → **~8.6 MB native binary** that launches and keeps its event loop alive while
+printing the pre-audit banner; the **RFC 6238 App B KAT** (`T=59` → `94287082`/`287082`) was
+**independently reproduced with a from-scratch Python HMAC-SHA-1**; and **THE INTEROP PROOF**
+(`desktop/core/tests/cli_interop.rs`) builds the **REAL `sigil` binary** and drives it as a
+subprocess against **ONE shared vault file BOTH ways** — desktop-created vault →
+`sigil totp list`/`code`/`export` agree byte-for-byte; `sigil totp add` → the desktop reopens
+the same file and reproduces the CLI's code/issuer/algorithm/digits; and a desktop-generated
+migration URI imports via `sigil totp import` (temp dirs, never the real user vault). Honest:
+the **GUI is build-and-launch verified but NOT visually verified** (screencapture denied here →
+no screenshot proof, which is exactly why all behaviour lives in the headless lib), **`tauri
+build` / the `.app` bundler was NOT run** (the applicable build is `cargo build --release`;
+**unsigned, unnotarized, undistributed**), the interop test's exact cross-process equality uses
+**`period = u32::MAX`** to pin the counter at 0 until ~2106 — a **deliberate test artifice, not
+product behaviour** (an ordinary 30 s account is also checked with a bounded retry), the
+password zeroing is **best-effort**, it is still **pre-audit / UNAUDITED (do not store real 2FA
+secrets)**, and this is **one** native surface — the other native platforms, **mobile in
+particular, remain unbuilt**. ADR 0032; details in the Phase 43 entry below.
+Phase 42 taught the **`sigil` CLI to
 speak the server's multi-device auth contract v3** — the CLIENT half of ADR 0031, so a real
 client now exercises the device model end to end (**no new ADR**; a "client support" note was
 appended to ADR 0031 instead). Four new subcommands — **`sigil device enroll --token <t>
@@ -4580,3 +4623,148 @@ GREEN; this pass is docs-only.
 - Client gaps: **no `device grants` listing subcommand** (`GET /v1/vaults/{vaultID}/grants` is
   unused), and the CLI is still the **only** client that speaks v3 — the wasm `sync.mjs`,
   webapp, and extension all remain on the unsigned dev path.
+
+---
+
+## 2026-07-16 — Phase 43 (the NATIVE client column opens: `desktop/`, a Tauri v2 authenticator over libsigil linked natively)
+
+### What & why
+- Three client surfaces existed and **every one was a terminal or a browser**: `cli/`
+  (native, but a terminal tool), `web/apps/webapp` (core as **wasm**), `extension/` (core as
+  **wasm**). The **native GUI column was empty**, and `README.md` said native clients "live in
+  separate repositories" — none existed.
+- Phase 43 fills it with a new top-level **`desktop/`**: a **Tauri v2** desktop authenticator
+  whose Rust backend links **`sigil-core` as a plain NATIVE Rust dependency**. **There is no
+  wasm, `wasm-bindgen` or `wasm-pack` anywhere under `desktop/`** — grepped and confirmed. That
+  is what makes this a genuinely new column instead of a re-skin of the browser clients: it is a
+  **second, non-wasm consumer** of the core's caller-supplies-entropy-and-time contract
+  (ADR 0007), which is the cheapest available test of whether that contract is a real interface
+  or an accident of the wasm path. Routing a native app through wasm would have carried the
+  whole wasm-pack / `target_features`-strip apparatus for zero benefit on a platform that links
+  Rust directly.
+- **ADR 0032** records the decision.
+
+### How
+- **Own cargo workspace.** `desktop/Cargo.toml` (`members = ["core", "src-tauri"]`) with its
+  **own `desktop/Cargo.lock`**, **deliberately OUTSIDE the `libsigil` workspace** exactly like
+  `cli/` and `sigil-wasm/` (ADR 0002), so Tauri's platform stack and the transitively-pulled
+  native `getrandom` can never perturb the wasm-pure, audit-bound core lockfile.
+  `rust-version = "1.85"` (transitive `ml-dsa` 0.1.1 is edition 2024).
+- **Two crates, logic split from shell.**
+  - **`sigil-desktop-core`** (`desktop/core`) — **ALL** the authenticator logic, **headless**,
+    `#![forbid(unsafe_code)]` + `#![deny(missing_docs)]`: `VaultSession`
+    (`create`/`unlock`/`open_or_create`, `with_params`, `entries_at`/`entries_now`,
+    `add_secret_base32`, `add_uri`, `import_text`/`import_file`, `remove`, `export_uris`,
+    `export_migration_uri`, `save`), the `EntryView`/`ImportSummary` view models,
+    `DesktopError`, `now_unix`, `default_vault_path`, and the `BANNER_TITLE`/`BANNER_BODY`/
+    `EXPORT_WARNING` constants.
+  - **`sigil-desktop`** (`desktop/src-tauri`) — a **thin** shell: one window, a
+    `Mutex<Option<VaultSession>>` app state, and **ten `#[tauri::command]`s** (`status`,
+    `unlock`, `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`, `export_uris`,
+    `export_migration`) that only marshal arguments.
+  - `desktop/ui` — framework-free HTML/CSS/JS. **No npm, no bundler, no CDN.**
+  - The split is deliberate: **a GUI cannot be clicked by a test runner**, so everything that
+    could be wrong lives in `core/` where tests drive it.
+- **The two things the core refuses to do.** `sigil-core` reads **no clock and no RNG**, so the
+  native app supplies both: **entropy** (Argon2id salt, AEAD nonce) through `sigil-cli`'s
+  native `getrandom` path inside `seal_to_container`, and the **clock** via
+  `std::time::SystemTime` in `now_unix`, passed **into** the core's `totp` as a `u64`.
+- **REUSE, NOT REIMPLEMENT — zero crypto/format code in this directory.**
+  `sigil-desktop-core` path-depends on `sigil-core` **and on the `sigil-cli` LIBRARY target**,
+  taking the `SIGILcli` container (`seal_vault`/`open_vault`), the `TotpVault`/`TotpEntry`
+  schema and `TotpEntry::code_at`, `base32_decode`, `new_totp_entry`,
+  `totp_algorithm_from_str`, `parse_otpauth_uri`/`entry_to_otpauth_uri`, and the Google
+  Authenticator migration codec (`decode_migration_uri`/`encode_migration_uri`/
+  `entry_to_migration_otp`/`migration_otp_to_entry`). Grepped `desktop/core` for hand-rolled
+  hmac/sha1 — **none**. **Nothing under `cli/` was edited.** Consequence: **no fourth at-rest
+  format and NO mirrored schema to keep in sync** (unlike the deliberate Rust↔JS mirrors of
+  ADRs 0020/0026) — this column consumes the Rust definitions directly.
+- **One shared vault file.** Default path **`$HOME/.sigil/totp-vault.sigil`** (fallback
+  `./totp-vault.sigil` when `$HOME` is unset) — **byte-for-byte the CLI's default**, so the
+  desktop app and `sigil totp` drive **the same file** with no configuration. Dir `0700`, file
+  `0600`; `save()` writes a temp file and **renames** it into place so an interrupted save
+  cannot truncate a good vault. **Only the sealed container is ever persisted**; the password
+  is memory-only for the life of a `VaultSession` and **best-effort** zeroed on `Drop` (no
+  `zeroize`, no volatile guarantee — documented, not claimed).
+- **Trust boundary.** The webview holds **no** key material and does **no** crypto — the
+  password crosses the IPC once at unlock, codes arrive already computed — and
+  `desktop/src-tauri/capabilities/default.json` grants **`core:default` and nothing else** (no
+  `fs`/`shell`/`http`/`dialog` plugin), so the frontend reaches disk only through the explicit
+  commands. The export commands return `EXPORT_WARNING` **together with** the payload, so a UI
+  cannot render the secrets without the warning.
+- **Features.** Create / unlock / lock an encrypted vault; live list (issuer/label + code +
+  seconds remaining, recomputed ~1/s); add by base32 secret with algorithm/digits/period; add
+  by `otpauth://` URI; import Google Authenticator `otpauth-migration://`; remove; export
+  `otpauth://` URIs and one combined migration URI behind the loud warning. A loud **UNAUDITED**
+  banner is rendered in the window **and** printed to stderr at startup from the same Rust
+  constants, so no surface can quietly soften it.
+
+### ✅ Verified GREEN (first-hand)
+- `cargo fmt --manifest-path desktop/Cargo.toml --all -- --check` — **clean**.
+- `cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings` — **zero
+  warnings**.
+- `cargo test --manifest-path desktop/Cargo.toml` — **11 unit tests + 1 integration test, all
+  pass**.
+- `cargo build --manifest-path desktop/Cargo.toml --release` — **succeeds**, producing an
+  **~8.6 MB native binary**; **launching it keeps the process alive with the event loop
+  running** and prints the pre-audit banner.
+- **The TOTP KAT** (`totp_kat_rfc6238_t59` in `desktop/core/src/lib.rs`) asserts the **native**
+  path reproduces **RFC 6238 App B at `T=59`** — `94287082` (8 digits) and `287082` (6) — and
+  both were **independently reproduced with a from-scratch Python HMAC-SHA-1 implementation**.
+- **THE INTEROP PROOF** (`desktop/core/tests/cli_interop.rs`) builds the **REAL `sigil`
+  binary** and drives it as a **subprocess** against **ONE SHARED vault file, both directions**:
+  a desktop-created vault is read by `sigil totp list` / `totp code` / `totp export` with
+  **byte-for-byte agreement**; `sigil totp add` appends to that same file and the desktop
+  **reopens it and reproduces the CLI's code, issuer, algorithm and digits**; and a
+  desktop-generated migration URI **imports via `sigil totp import`**. Tests use **temp dirs,
+  never the real user vault**.
+- **Lockfile invariant intact:** `grep -c 'name = "getrandom"' libsigil/Cargo.lock` is still
+  **0**, and `desktop/` is **not** a `libsigil` workspace member.
+
+### ⚠️ Honest caveats (documented, not hidden)
+1. **The GUI is build-and-launch verified, NOT visually verified.** Screencapture is denied in
+   this environment, so there is **no screenshot proof** of the rendered window. This is exactly
+   why all behaviour lives in a **headless** lib that tests drive — but the pixels are unproven
+   here.
+2. **`tauri build` (the `.app` bundler) was NOT run.** The applicable build is
+   `cargo build --release`. The app is **not signed, not notarized, not distributed**.
+3. **The interop test pins the clock with a deliberate artifice.** `sigil totp code` reads the
+   host clock and has no `--at` flag, so the exact cross-process equality assertions use
+   **`period = u32::MAX`** — the TOTP counter is `floor(now/period) = 0` until ~2106, making the
+   code a constant both processes must agree on. **A test artifice, not product behaviour.** An
+   ordinary 30 s account is also checked, with a bounded retry that tolerates a step boundary
+   landing between the two processes.
+4. **Still pre-audit / UNAUDITED — do not store real 2FA secrets.**
+5. **Password zeroing is best-effort** (no `zeroize`, no volatile guarantee, the OS may have
+   paged the buffer).
+6. **This is ONE native surface.** macOS is where it was built and launched; Windows/Linux are
+   untried from here, and the other native platforms — **mobile in particular — remain
+   unbuilt**. No sync (`push`/`pull`), no device enrollment, no QR scanning, no code
+   verification, no hardened zeroization in this column.
+
+### Docs (this pass)
+- `docs/architecture.md` — `desktop` added to the component map as the **fourth client surface
+  and the first NATIVE one** (both crates, the native linkage, reuse-not-reimplement, the shared
+  vault file, sealed-only persistence + in-memory password, the `core:default`-only trust
+  boundary, its own workspace/lockfile); §4 "Build & dependency isolation" grew from **four to
+  five Rust build surfaces**; the §1 diagram legend gained a `desktop` block; and §6's "No
+  native clients" bullet was corrected to "one native GUI client now exists" with every caveat.
+- `CLAUDE.md` — a `desktop/` repository-map entry (both crates, the native linkage, the
+  reuse-not-reimplement rule, the shared vault path, its own workspace/`Cargo.lock`, the
+  `u32::MAX` test artifice, dev/UNAUDITED/unsigned) and a **desktop block in Build & test**
+  (`fmt`/`clippy`/`test`, the interop test, `cargo build --release`, and the
+  `getrandom`==0 re-check), plus the `web/apps/admin` "reserved" note updated.
+- `README.md` — a short honest `desktop/` note (native, shares the CLI's vault, dev / UNAUDITED
+  / unsigned / undistributed), a repository-layout row, a Build & test line, and the "native
+  clients live in separate repositories" sentence corrected.
+- `docs/decisions/0032-native-desktop-client.md` — **NEW ADR 0032**, plus its index row in
+  `docs/decisions/README.md`.
+- `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 43**.
+
+### ➡️ Still open (honest)
+- **No `.app`/`.msi`/`.deb` bundle, no code signing, no notarization, no distribution channel.**
+- **No visual/GUI regression proof** in this environment; the headless crate is the only gate.
+- **No sync in the desktop column** — it never talks to `sigild`, so the multi-device work of
+  Phases 41–42 (contract v3, grants, revocation) is unused here.
+- **No mobile client.** The native column is open, not finished.
+- **Not wired into CI** (like `extension/`); the gates above are local only.

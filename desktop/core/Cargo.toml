@@ -1,0 +1,19 @@
+[package]
+name = "sigil-desktop-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Headless authenticator logic for the pre-audit Sigil desktop app: an encrypted TOTP vault over the real-but-unaudited libsigil core, linked NATIVELY. Not for real secrets."
+
+[dependencies]
+# Re-used, not reimplemented: sigil-cli owns the SIGILcli container, the
+# TotpVault/TotpEntry JSON schema, base32/otpauth parsing and the Google
+# Authenticator migration codec. sigil-core owns ALL the crypto and the RFC
+# 4226/6238 OTP primitive.
+sigil-cli = { workspace = true }
+sigil-core = { workspace = true }
+
+[dev-dependencies]
+# The interop proof shells out to the REAL `sigil` binary; no extra crates needed.

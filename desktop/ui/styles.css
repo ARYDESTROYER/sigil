@@ -1,0 +1,162 @@
+/* Sigil Desktop — PRE-AUDIT demonstration UI. No frameworks, no CDN fonts. */
+
+:root {
+  --bg: #0e0f13;
+  --panel: #161821;
+  --panel-2: #1c1f2a;
+  --line: #2a2e3d;
+  --ink: #e9ebf2;
+  --ink-dim: #9aa1b4;
+  --accent: #7c9cff;
+  --danger: #ff8a5c;
+  --danger-bg: #2a1a14;
+  --warn-bg: #3a2a08;
+  --warn-line: #7a5c14;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7fb;
+    --panel: #ffffff;
+    --panel-2: #f0f2f8;
+    --line: #dcdfeb;
+    --ink: #14161c;
+    --ink-dim: #5b6377;
+    --accent: #2f5bd8;
+    --danger: #b23a10;
+    --danger-bg: #fdf0ea;
+    --warn-bg: #fff6dd;
+    --warn-line: #e0b64a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0 16px 32px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* --- The loud pre-audit banner -------------------------------------------- */
+.banner {
+  margin: 0 -16px 14px;
+  padding: 10px 16px;
+  background: repeating-linear-gradient(
+    45deg, var(--warn-bg), var(--warn-bg) 12px,
+    color-mix(in srgb, var(--warn-bg) 80%, black) 12px,
+    color-mix(in srgb, var(--warn-bg) 80%, black) 24px
+  );
+  border-bottom: 2px solid var(--warn-line);
+  color: #3a2a08;
+  font-size: 12px;
+}
+@media (prefers-color-scheme: dark) { .banner { color: #ffe9ad; } }
+.banner strong { display: block; letter-spacing: 0.04em; font-size: 12px; }
+.banner span { display: block; margin-top: 2px; opacity: 0.9; }
+
+/* --- Chrome --------------------------------------------------------------- */
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.brand em { font-style: normal; color: var(--ink-dim); font-weight: 400; }
+.mark {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--accent); display: inline-block;
+}
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+.pill {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--ink-dim); background: var(--panel-2);
+}
+.vaultpath { margin: 8px 0 14px; font-size: 11px; color: var(--ink-dim); word-break: break-all; }
+.vaultpath code { font-family: var(--mono); }
+
+/* --- Cards ---------------------------------------------------------------- */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+.card.danger { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); background: var(--danger-bg); }
+.card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-dim); }
+.card-head { display: flex; align-items: baseline; justify-content: space-between; }
+.count { font-size: 11px; color: var(--ink-dim); }
+.hint { font-size: 12px; color: var(--ink-dim); margin: 8px 0 0; }
+.opt { color: var(--ink-dim); font-weight: 400; }
+.empty { color: var(--ink-dim); font-size: 13px; margin: 4px 0 0; }
+
+/* --- Account rows --------------------------------------------------------- */
+.accounts { list-style: none; margin: 0; padding: 0; }
+.accounts li {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+.accounts li:first-child { border-top: 0; }
+.acct-name { font-weight: 600; word-break: break-all; }
+.acct-meta { font-size: 11px; color: var(--ink-dim); font-family: var(--mono); }
+.code {
+  font-family: var(--mono);
+  font-size: 22px;
+  letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+}
+.ring { display: flex; align-items: center; gap: 6px; color: var(--ink-dim); font-size: 11px; }
+.ring progress { width: 46px; height: 5px; }
+
+/* --- Forms ---------------------------------------------------------------- */
+label { display: block; margin: 10px 0 4px; font-size: 12px; color: var(--ink-dim); }
+input, select, textarea {
+  width: 100%; padding: 8px 10px;
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 7px;
+  font: inherit;
+}
+textarea { font-family: var(--mono); font-size: 12px; resize: vertical; }
+input:focus, select:focus, textarea:focus, button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+.row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+button {
+  margin-top: 12px; padding: 8px 14px;
+  border-radius: 7px; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--ink);
+  font: inherit; cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button.ghost { margin-top: 0; }
+button.link { margin: 0; padding: 2px 8px; font-size: 11px; }
+button:hover { filter: brightness(1.08); }
+
+.warn {
+  margin: 0; padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, transparent);
+  border-radius: 7px;
+  color: var(--danger); font-size: 12px; font-weight: 600;
+}
+#export-out {
+  margin-top: 12px; padding: 10px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 7px;
+  font-family: var(--mono); font-size: 11px;
+  white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto;
+}
+
+/* --- Toast + footer ------------------------------------------------------- */
+.toast {
+  position: fixed; left: 16px; right: 16px; bottom: 16px;
+  margin: 0; padding: 10px 12px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+.toast.err { border-color: var(--danger); color: var(--danger); }
+footer { margin-top: 20px; font-size: 11px; color: var(--ink-dim); text-align: center; }

@@ -23,5 +23,8 @@ independent audit completes and trademark clears (brief, GTM Phase 1).
 - [`decisions/`](decisions/README.md) — Architecture Decision Records (the
   load-bearing *why*), Nygard-style and pre-audit.
 
-Every line here is **subject to change** and describes a system that is **not yet
-built or audited**.
+Every line here is **subject to change**. Substantial parts of the scaffold now
+exist and are tested (the crypto core, the CLI, the dev op-log server, and the
+wasm/webapp clients), but the system as a whole is **pre-audit and not
+production-ready**: nothing here is **audited**, and the product-level pieces
+(accounts, enrollment, real auth, native apps) are **not yet built**.

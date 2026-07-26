@@ -503,6 +503,53 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   not been run on real GitHub Actions from here (see
   [ADR 0027](decisions/0027-webapp-and-wasm-bundling.md),
   [ADR 0029](decisions/0029-webapp-pwa-offline-a11y-and-ci.md)).
+- **`extension`** ([`../extension/`](../extension/)) — **the second real product
+  client surface** (after `web/apps/webapp`; the third client over the core if you
+  count the demo `cli/`): a **Manifest V3 browser extension** whose **popup is a
+  multi-account encrypted TOTP vault**, running the **libsigil core as WebAssembly
+  inside the extension page**. It **adds no cryptography and no vault/migration
+  logic of its own**: `extension/build.sh` runs the repo-root
+  `sigil-wasm/build-wasm.sh` (wasm-pack `--target web`) and **vendors** the wasm
+  bindings (`sigil_wasm.js` + `sigil_wasm_bg.wasm`) together with the **proven,
+  framework-free helpers** `totp-vault.mjs` and `totp-migration.mjs` — copied
+  **verbatim** from the repo-root `sigil-wasm/`, the same source the Node interop
+  tests exercise ([ADR 0024](decisions/0024-wasm-totp-vault-and-cross-client-totp.md),
+  [ADR 0026](decisions/0026-browser-totp-import-export.md)) — into a gitignored
+  `extension/vendor/`; `src/popup/popup.{html,css,js}` is UI glue only (there is no
+  bundler — the popup is plain ESM). The vault seals into the **same `SIGILcli`
+  container** the CLI and the webapp use (Argon2id → XChaCha20-Poly1305 over the
+  mirrored `TotpVault` JSON), so **a vault stays cross-client interoperable** rather
+  than becoming a third at-rest format. Persistence mirrors the webapp model
+  ([ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)):
+  `chrome.storage.local` holds **ONLY the sealed container** (base64, key
+  `sigil.extension.vault.v1`) — the plaintext vault and the password are **never
+  persisted**, the **password lives only in memory** while unlocked, and closing the
+  popup re-locks, so the popup boots setup / locked / unlocked. You **add accounts**
+  by form (label / issuer / base32 secret / algorithm / digits / period), by pasting
+  an `otpauth://` URI, or by **importing a Google Authenticator
+  `otpauth-migration://` export**, and **export** back out as `otpauth://` URIs or one
+  combined migration URI (behind a loud secrets-in-the-clear warning); **codes and
+  countdowns are computed in the wasm**, never in JS, and salt/nonce entropy comes
+  from `crypto.getRandomValues`. The attack surface is kept deliberately small:
+  `"permissions": ["storage"]` and **nothing else** (no host permissions, no `tabs`,
+  no `clipboardWrite`), **no background service worker, no content script, no options
+  page**, and the MV3 CSP is widened by exactly one keyword —
+  `script-src 'self' 'wasm-unsafe-eval'` — so the wasm can be instantiated. A pinned
+  **public** `key` in the manifest fixes the unpacked extension ID (no private half
+  exists in this repo; it is not a signing key) so a headless test can address
+  `chrome-extension://<id>/…`. Proven GREEN by `tests/extension.spec.mjs`, which
+  loads the **real unpacked extension** in Chromium (`launchPersistentContext`,
+  `channel: "chromium"`) and drives the real popup under the real MV3 CSP and real
+  `chrome.storage.local`: the wasm instantiates in-page and renders the RFC 6238
+  vector `287082` at the pinned test clock `?t=59`, storage contains **only** the
+  sealed container (no plaintext secret / label / password), a reload boots
+  **locked** and the right password restores the vault, and the `otpauth://` +
+  migration import/export paths round-trip. It is **dev / UNAUDITED / not published
+  to any store** (loaded unpacked, by hand), does **not** talk to `sigild` (no sync —
+  the vault is local to the browser profile), and generates codes without verifying
+  them (no constant-time compare, no zeroization). The reserved-stub ambitions
+  (phishing protection, passkey provider, content scripts) are **not** implemented
+  ([ADR 0030](decisions/0030-browser-extension-client.md)).
 
 ```
                          CLIENT SIDE  (all cryptography lives here)
@@ -554,6 +601,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
      installable, OFFLINE-capable (manifest + service worker: static assets cached, the
      sealed vault stays in localStorage), accessible/axe-clean;
      client-side only; dev / no-index / UNAUDITED; not deployed.
+   extension (MV3, popup): the same in-browser wasm authenticator as an extension —
+     encrypted TOTP vault (add/import/export), codes in wasm, ONLY the SIGILcli-sealed
+     container in chrome.storage.local, in-memory password; permissions: ["storage"];
+     no sync, no background worker; dev / UNAUDITED; not published to any store.
 ```
 
 ---
@@ -752,11 +803,11 @@ To avoid any over-claim, the honest gaps in the current architecture (the
 authoritative list, with rationale, is the **defer ledger** in
 [`sprint-72h.md`](sprint-72h.md)):
 
-- **No clients / extension (but the client column has started, and now reaches a
-  real browser app).** The native apps
+- **No native clients (but the client column has started, and now reaches a real
+  browser app *and* a browser extension).** The native apps
   (iOS/Android/macOS/Windows/Linux/watch) live in separate repos and consume
-  `libsigil` as a versioned artifact; none exist yet, and the admin console and
-  browser extension are still reserved directories. The **one**
+  `libsigil` as a versioned artifact; none exist yet, and the admin console is
+  still a reserved directory. The **one**
   client-side consumer that now exists is **`sigil-wasm`** — the first thing to
   actually link the wasm-pure core into a JS runtime — but it is a **demo of the
   UNAUDITED `seal_record` / `open_record` building block**, not a product client
@@ -774,7 +825,14 @@ authoritative list, with rationale, is the **defer ledger** in
   ([ADR 0027](decisions/0027-webapp-and-wasm-bundling.md),
   [ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)) — but it too is
   **dev / no-index / UNAUDITED**, **not deployed**, and **not** the product's
-  account / device / sync-auth or key-management model.
+  account / device / sync-auth or key-management model. The **`extension`**
+  directory is likewise no longer reserved: it is a real **MV3 browser extension**
+  whose popup is the same wasm authenticator over the same `SIGILcli`-sealed vault
+  (sealed-only persistence in `chrome.storage.local`, in-memory password;
+  [ADR 0030](decisions/0030-browser-extension-client.md)) — but it is **dev /
+  UNAUDITED**, **loaded unpacked and published to no store**, has **no sync** (it
+  never talks to `sigild`), and implements **none** of the originally reserved
+  extension ambitions (phishing protection, passkey provider, content scripts).
 - **No real auth or authorization.** The dev op-log is wide open by default; an
   optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
   device-key signature check (contract v2: a per-request nonce plus a

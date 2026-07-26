@@ -11,7 +11,30 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 39, `main` @ origin, clean tree).** Phase 39 hardened the
+**Where we are (through Phase 40, `main` @ origin).** Phase 40 opened a **NEW client
+surface**: `extension/` is **no longer reserved** — it is a real **Manifest V3 browser
+extension** whose **popup is a wasm-powered authenticator** (a multi-account **encrypted
+TOTP vault**), so **a SECOND real product client now exists** beside `web/apps/webapp`
+(third over the core counting the demo `cli/`). It **adds no crypto and no vault/migration
+logic of its own**: `extension/build.sh` runs the repo-root `sigil-wasm/build-wasm.sh` and
+**vendors** the wasm bindings + **verbatim copies** of the proven `totp-vault.mjs` /
+`totp-migration.mjs` into a gitignored `extension/vendor/`; `src/popup/popup.js` is UI glue
++ storage. It seals to the **SAME `SIGILcli` container** as the CLI and the webapp (vaults
+stay **cross-client interoperable** — no third at-rest format) and persists **ONLY the
+sealed container** in `chrome.storage.local` (`sigil.extension.vault.v1`) with the
+**password in memory only** (closing the popup re-locks) → setup / locked / unlocked.
+Add by form / `otpauth://` / **Google Authenticator migration import**, export back out,
+codes + countdowns **computed in the wasm**. Deliberately small surface:
+`"permissions": ["storage"]` and nothing else, **no background worker / content script /
+options page**, MV3 CSP widened by exactly one keyword (`'wasm-unsafe-eval'`). **VERIFIED
+GREEN headlessly** — `extension/tests/extension.spec.mjs` loads the **REAL unpacked
+extension** in a full Chromium and the wasm renders the RFC 6238 vector **`287082`** at the
+pinned `?t=59` in the actual popup, storage holds **only** the sealed container, and
+reload→lock→unlock restores it (3/3 pass). Honest: **dev / UNAUDITED / loaded unpacked /
+published to NO store**, **no sync** (never talks to `sigild`), generate-only, none of the
+originally reserved ambitions (phishing protection, passkey provider, content scripts), and
+**not wired into CI**. ADR 0030; details in the Phase 40 entry below.
+Phase 39 hardened the
 `web/apps/webapp` authenticator toward shippable: it is now an **installable PWA that
 works fully OFFLINE** — a web **manifest** (`app/manifest.ts`) + a hand-rolled **service
 worker** (`public/sw.js`, registered by `app/register-sw.tsx`) that precaches the app
@@ -4080,3 +4103,118 @@ GREEN; this pass is docs-only.
   mirror in this repo). It is also heavier/slower than marketing (Rust + wasm-pack + a browser).
 - **Manual cache versioning.** `sw.js` invalidates on a manual `CACHE` bump; no automatic
   asset-revision pipeline yet.
+
+---
+
+## 2026-07-26 — Phase 40 (NEW client surface: MV3 browser extension — a wasm-powered popup authenticator)
+
+### What & why
+- `extension/` had been a **reserved directory** since the sprint, and its README named the exact
+  blocker: it "depends on `libsigil-wasm`, not yet available". That blocker is **gone** — the
+  repo-root `sigil-wasm` crate builds a browser wasm package (ADR 0019), reads/writes the shared
+  `SIGILcli` container (ADR 0020), computes TOTP (ADR 0024) and does Google Authenticator
+  import/export (ADR 0026), all behind framework-free ESM helpers that already have Node interop
+  tests against the real CLI. So the directory was finally spendable.
+- **Why now, beyond "we can":** one browser client cannot prove the shared-vault architecture
+  *generalizes* — with a sample size of one, accidental coupling to Next.js, to `localStorage`, or
+  to a bundler is invisible. A **second real client on a different runtime** (an MV3 extension page:
+  different storage API, stricter CSP, **no bundler at all**) is the cheapest way to find that
+  coupling or show there is none. And a popup one click from the login form is the shape the product
+  actually takes.
+- Constraint for the whole phase: change **nothing** under `libsigil/`, `cli/`, `sigild/`, or the
+  repo-root `sigil-wasm/` — and add **no cryptography**.
+
+### How (design decisions → ADR 0030)
+- **Vendor, don't reimplement.** `extension/build.sh` is the ONLY build step (no bundler — the popup
+  is plain ESM). It runs the repo-root `sigil-wasm/build-wasm.sh` (single source of truth for the
+  wasm build: wasm-pack 0.13.1 against the `wasm-bindgen = "=0.2.100"` pin, `--target web`) and
+  copies into a **gitignored `extension/vendor/`**: `sigil_wasm.js` + `sigil_wasm_bg.wasm` (+`.d.ts`)
+  and **verbatim** copies of `totp-vault.mjs` + `totp-migration.mjs`, plus a `BUILD-INFO.txt`
+  provenance stamp so a stale `vendor/` is obvious. `src/popup/popup.js` therefore contains **no
+  crypto and no vault/migration logic** — a THIRD copy of that logic is exactly what we refused to
+  write. `.gitignore` gained `extension/{vendor,test-results,playwright-report}/`.
+- **Same `SIGILcli` vault → vaults stay cross-client.** The same mirrored `TotpVault` JSON sealed
+  into the same Argon2id → XChaCha20-Poly1305 container the CLI and webapp use. No new at-rest
+  format was invented for the extension; the container is self-describing, so a vault sealed in the
+  popup opens in `sigil` and in the webapp.
+- **Sealed-only persistence + in-memory password** (mirrors the webapp, ADR 0028).
+  `chrome.storage.local` holds **ONLY** the sealed container (base64) under
+  `sigil.extension.vault.v1`; the plaintext vault and the password are **never** written; the
+  password is a module-local that dies with the popup, so closing it re-locks and a fresh open boots
+  setup / locked / unlocked. Salt + nonce from `crypto.getRandomValues` (core still draws no entropy,
+  reads no clock — ADR 0007).
+- **Minimal MV3 surface.** `"permissions": ["storage"]` and **nothing else** — no host permissions,
+  no `tabs`, no `clipboardWrite` (copy uses the in-page clipboard API with a `document.execCommand`
+  fallback). **No background service worker, no content script, no options page** — the MVP does not
+  need them, so they are not declared. CSP widened by exactly one keyword:
+  `script-src 'self' 'wasm-unsafe-eval'; object-src 'self'` (the minimum to instantiate the core).
+  A pinned **PUBLIC** manifest `key` fixes the unpacked extension ID (no private half exists in this
+  repo; it is not a signing key) so a headless test can address `chrome-extension://<id>/…` without
+  a background worker to read the ID from.
+- **Dependency-light:** exactly one devDependency (`@playwright/test`) — no UI framework, no
+  bundler, no crypto/protobuf/PWA library. It is a **standalone pnpm project**, not part of the
+  `web/` workspace.
+- **TEST HOOK:** `popup.html?t=<unix-seconds>` pins the clock and stops the 1 s tick so an exact RFC
+  6238 vector is assertable. It changes the displayed time only — never the vault.
+
+### ✅ Verified GREEN (gated first-hand)
+- **`corepack pnpm -C extension test` → 3 passed** (`tests/extension.spec.mjs`). Nothing is stubbed:
+  the spec launches a **real Chromium with the unpacked extension loaded**
+  (`chromium.launchPersistentContext(…, { channel: "chromium", headless: true,
+  args: ["--disable-extensions-except=…","--load-extension=…"] })` — the headless *shell* cannot
+  load extensions, the full browser in the new headless mode can) and drives
+  `chrome-extension://<pinned-id>/src/popup/popup.html?t=59`, so the **real MV3 CSP**, the **real
+  `chrome.storage.local`** and the **real wasm** are exercised. It asserts:
+  1. the wasm instantiates **inside the extension page** and the UNAUDITED banner shows;
+  2. creating a vault then adding the PUBLIC RFC 6238 seed `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ` at the
+     pinned `t=59` displays exactly **`287082`** — the wasm-computed 6-digit form of the RFC's
+     `94287082` — with a `1s` countdown, **in the real popup**;
+  3. `chrome.storage.local` contains **ONLY the sealed container** — no plaintext secret, label, or
+     password (the sealed-only persistence property, checked in real storage);
+  4. a fresh popup boots **locked**, a wrong password is rejected, the right one restores the
+     persisted account and the same code;
+  5. the `otpauth://` + Google Authenticator `otpauth-migration://` import paths and the export
+     round-trip work, and removal re-seals the vault.
+- ⚠️ An intermediate run during the phase failed all three with `Could not load the WebAssembly
+  core: Failed to fetch`; the re-run after the vendored build settled is clean (3/3). Stale
+  `test-results/` from that run are gitignored artifacts, not state.
+- **Nothing else moved.** `libsigil/`, `cli/`, `sigild/`, the repo-root `sigil-wasm/`, and `web/` are
+  untouched by this phase; both `Cargo.lock`s still have `getrandom` == 0.
+
+### Docs (this pass)
+- `docs/architecture.md` — new `extension` component in §1 (MV3 popup authenticator over the
+  **vendored** wasm + proven helpers; same `SIGILcli` vault → cross-client; sealed-only
+  `chrome.storage.local` + in-memory password; `["storage"]` only, no background worker, one CSP
+  keyword; the headless proof) + a diagram-footer line; §6 reworded — the extension is no longer a
+  "reserved directory", but is honestly logged as dev / UNAUDITED / unpublished / no-sync / none of
+  the reserved ambitions.
+- `CLAUDE.md` — `extension/` promoted from "reserved" to a real repository-map entry, and its
+  build/test commands added to the Build & test section (`pnpm -C extension install`,
+  `./extension/build.sh`, `pnpm -C extension test`, plus the load-unpacked note and the "not in CI"
+  caveat).
+- `README.md` — a short `extension/` bullet (browser extension client, encrypted TOTP vault, dev /
+  UNAUDITED / unpublished) + the repository-layout line updated.
+- `docs/decisions/0030-browser-extension-client.md` — new Nygard ADR (context: the reserved
+  extension was blocked on a wasm artifact that now exists, and a second real client is the honest
+  test of the shared-vault architecture; decision: MV3 with a minimal permission/CSP surface, vendor
+  the wasm + reuse the proven helpers rather than reimplement, persist ONLY the sealed `SIGILcli`
+  container with an in-memory password, stay dependency-light and store-unpublished; consequences:
+  vault stays cross-client, a build step now stands between clone and loadable extension, MV3
+  CSP/popup-lifetime constraints, still dev/UNAUDITED, no CI job). Indexed in
+  `docs/decisions/README.md` (Accepted, 2026-07).
+- `journal.md` — this entry + RESUME ANCHOR bumped to through Phase 40.
+
+### ➡️ Still open (honest)
+- **Dev / UNAUDITED / published to NO store.** Loaded unpacked by hand, not signed, not listed. Same
+  unaudited building blocks; no security claim. **Do NOT store real 2FA secrets.**
+- **No sync.** The extension never talks to `sigild`; the vault is local to one browser profile —
+  no multi-device, enrollment, or recovery. A lost password is an unrecoverable local vault by
+  design, and `chrome.storage.local` is **not** a hardened secret store.
+- **Generate-only.** No verification, no constant-time comparison, no zeroization.
+- **A build step is now load-bearing.** `vendor/` is generated and gitignored, so the extension needs
+  the **Rust + wasm-pack toolchain** before it can be loaded or tested; a stale `vendor/` is a real
+  failure mode (hence `BUILD-INFO.txt`).
+- **Not in CI.** The Playwright proof runs locally only (needs a full Chromium + the Rust/wasm
+  toolchain); no `.github/workflows/` job exercises the extension yet.
+- **None of the reserved ambitions.** Phishing protection, passkey provider, and content scripts are
+  explicitly NOT implemented by this phase — a background service worker would be required first.

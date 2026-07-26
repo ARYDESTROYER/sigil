@@ -270,6 +270,16 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   so it stays **out of the default `web` CI job** and marketing/CI stay Rust-free — see
   [ADR 0027](docs/decisions/0027-webapp-and-wasm-bundling.md). Do not store real 2FA
   secrets (dev, UNAUDITED).
+- `extension/` — a **browser extension client** (Manifest V3) whose popup is the same
+  wasm authenticator: a multi-account **encrypted TOTP vault** with add/import
+  (`otpauth://` + Google Authenticator)/export and live codes computed by the wasm.
+  It seals to the **same `SIGILcli` container** as the CLI and the webapp (so vaults
+  stay cross-client), stores **only the sealed container** in `chrome.storage.local`
+  with the password held in memory, and asks for **one permission** (`storage`). It
+  vendors the wasm + the proven JS helpers via `extension/build.sh` rather than
+  reimplementing them ([ADR 0030](docs/decisions/0030-browser-extension-client.md)).
+  **Dev, UNAUDITED, loaded unpacked and published to no store**; no sync. Do not store
+  real 2FA secrets.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.
@@ -289,7 +299,7 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 libsigil/        Rust crypto core (workspace: core + ffi)
 sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
 web/             Next.js marketing + webapp (in-browser wasm authenticator) + @sigil/wasm loader (admin reserved), pnpm workspace
-extension/       Browser extension (reserved)
+extension/       MV3 browser extension — popup TOTP authenticator over the wasm (dev, unpublished)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 sigil-wasm/      Rust wasm-bindgen binding — in-browser seal/open demo over the core (pre-audit)
 deploy/          terraform / nomad / caddy / systemd + local/ (loopback smoke) + preflight.sh

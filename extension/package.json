@@ -1,0 +1,16 @@
+{
+  "name": "sigil-extension",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Sigil MV3 browser extension (dev, UNAUDITED). Not published to any store.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "./build.sh",
+    "test": "playwright test",
+    "pretest": "./build.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

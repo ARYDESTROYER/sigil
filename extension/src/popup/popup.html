@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Sigil (dev)</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <!-- LOUD pre-audit banner. Required by the repo's stealth posture: this is a
+         development build of UNAUDITED cryptography. -->
+    <div class="banner" role="alert" data-testid="banner">
+      <strong>UNAUDITED DEV BUILD</strong>
+      <span
+        >Pre-audit cryptography, not reviewed by anyone. Do <b>not</b> store real
+        2FA secrets.</span
+      >
+    </div>
+
+    <header class="head">
+      <h1>Sigil</h1>
+      <button id="lock" class="ghost" type="button" hidden data-testid="lock">
+        Lock
+      </button>
+    </header>
+
+    <!-- polite status line: wasm load, errors, action feedback -->
+    <p id="status" class="status" role="status" aria-live="polite" data-testid="status">
+      Loading the WebAssembly core&hellip;
+    </p>
+
+    <!-- ── setup: no vault yet ────────────────────────────────────────────── -->
+    <section id="view-setup" hidden data-testid="view-setup">
+      <h2>Create a vault</h2>
+      <p class="hint">
+        Your accounts are sealed with this password into a Sigil container. The
+        password is held in memory only &mdash; it is never stored. There is no
+        recovery if you forget it.
+      </p>
+      <form id="setup-form" autocomplete="off">
+        <label for="setup-pw">Vault password</label>
+        <input id="setup-pw" type="password" required data-testid="setup-password" />
+        <label for="setup-pw2">Confirm password</label>
+        <input id="setup-pw2" type="password" required data-testid="setup-password-2" />
+        <button type="submit" class="primary" data-testid="setup-submit">
+          Create vault
+        </button>
+      </form>
+    </section>
+
+    <!-- ── locked: a sealed vault exists ──────────────────────────────────── -->
+    <section id="view-locked" hidden data-testid="view-locked">
+      <h2>Unlock</h2>
+      <form id="unlock-form" autocomplete="off">
+        <label for="unlock-pw">Vault password</label>
+        <input id="unlock-pw" type="password" required data-testid="unlock-password" />
+        <button type="submit" class="primary" data-testid="unlock-submit">Unlock</button>
+      </form>
+      <button id="destroy" class="danger-link" type="button" data-testid="destroy">
+        Forget this vault (delete the sealed container)
+      </button>
+    </section>
+
+    <!-- ── unlocked ───────────────────────────────────────────────────────── -->
+    <section id="view-unlocked" hidden data-testid="view-unlocked">
+      <ul id="accounts" class="accounts" data-testid="accounts"></ul>
+      <p id="empty" class="hint" data-testid="empty">
+        No accounts yet. Add one below.
+      </p>
+
+      <details class="panel">
+        <summary data-testid="add-toggle">Add an account</summary>
+
+        <form id="add-form" autocomplete="off">
+          <h3>From a secret</h3>
+          <label for="add-label">Label</label>
+          <input id="add-label" required data-testid="add-label" />
+          <label for="add-issuer">Issuer <span class="dim">(optional)</span></label>
+          <input id="add-issuer" data-testid="add-issuer" />
+          <label for="add-secret">Base32 secret</label>
+          <input id="add-secret" required spellcheck="false" data-testid="add-secret" />
+          <div class="row">
+            <span>
+              <label for="add-alg">Algorithm</label>
+              <select id="add-alg" data-testid="add-alg">
+                <option value="sha1" selected>SHA-1</option>
+                <option value="sha256">SHA-256</option>
+                <option value="sha512">SHA-512</option>
+              </select>
+            </span>
+            <span>
+              <label for="add-digits">Digits</label>
+              <input id="add-digits" type="number" min="6" max="10" value="6" data-testid="add-digits" />
+            </span>
+            <span>
+              <label for="add-period">Period</label>
+              <input id="add-period" type="number" min="1" value="30" data-testid="add-period" />
+            </span>
+          </div>
+          <button type="submit" class="primary" data-testid="add-submit">Add account</button>
+        </form>
+
+        <form id="uri-form" autocomplete="off">
+          <h3>From an <code>otpauth://</code> URI</h3>
+          <label for="uri-input">Provisioning URI</label>
+          <input id="uri-input" required spellcheck="false" placeholder="otpauth://totp/…" data-testid="uri-input" />
+          <button type="submit" data-testid="uri-submit">Add from URI</button>
+        </form>
+
+        <form id="migration-form" autocomplete="off">
+          <h3>Import from Google Authenticator</h3>
+          <label for="migration-input"
+            >Bulk export URI <span class="dim">(otpauth-migration://)</span></label
+          >
+          <input
+            id="migration-input"
+            required
+            spellcheck="false"
+            placeholder="otpauth-migration://offline?data=…"
+            data-testid="migration-input"
+          />
+          <button type="submit" data-testid="migration-submit">Import accounts</button>
+        </form>
+      </details>
+
+      <details class="panel">
+        <summary data-testid="export-toggle">Export</summary>
+        <p class="warn" role="alert">
+          <strong>Export reveals your 2FA secrets in the clear.</strong> The text
+          below is unencrypted and is enough for anyone who sees it to generate
+          your codes. Do not paste it anywhere you would not paste a password.
+        </p>
+        <div class="row">
+          <button type="button" id="export-uris" data-testid="export-uris">
+            otpauth:// URIs
+          </button>
+          <button type="button" id="export-migration" data-testid="export-migration">
+            One migration URI
+          </button>
+        </div>
+        <textarea id="export-out" rows="4" readonly hidden data-testid="export-out"></textarea>
+      </details>
+    </section>
+
+    <footer class="foot">
+      Codes are computed in the Sigil WebAssembly core. Only the sealed container
+      is stored locally; the password never is.
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

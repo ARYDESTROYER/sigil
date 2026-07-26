@@ -45,12 +45,20 @@ still a plain TCP dial only (no auth handshake — that is the production build'
 job). The **active op-log backend**, however, now gets a **real** health check:
 when the durable Postgres op-log backend (`SIGILD_OPLOG_POSTGRES`) is in use,
 `/readyz` **pings its `pgxpool` connection pool** and returns `503` if that ping
-fails; the in-memory and file-backed backends have no remote dependency and
-report healthy.
+fails; the in-memory and file-backed backends have no remote dependency (they do
+not implement `store.Pinger`), so the live check is skipped for them and the
+`oplog` key is **omitted entirely** rather than reported as `unconfigured`.
 
 ```json
-{ "version": "<build version>", "checks": { "postgres": "ok|unreachable|unconfigured", "redis": "ok|unreachable|unconfigured", "oplog": "ok|unreachable|unconfigured" } }
+{ "version": "<build version>", "checks": { "postgres": "ok|unreachable|unconfigured", "redis": "ok|unreachable|unconfigured", "oplog": "ok|unreachable" } }
 ```
+
+The `postgres` / `redis` keys are always present and use the TCP-dial states
+(`unconfigured` when the corresponding address env var is unset). The `oplog`
+key appears **only** when the active backend implements `store.Pinger` (today:
+the Postgres op-log backend) and is then only ever `ok` or `unreachable` — a
+default instance therefore reports just
+`{"checks":{"postgres":"unconfigured","redis":"unconfigured"},…}`.
 
 ### `GET /version` — build identity
 

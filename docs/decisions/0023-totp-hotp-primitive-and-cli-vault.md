@@ -78,7 +78,8 @@ storage in the native CLI.**
 - **The no-clock / no-RNG core invariant is intact.** `totp` takes time as an
   argument; `hmac` + `sha1` are `getrandom`-free. The core stays `no_std`,
   wasm-pure, and RNG-free ([ADR 0007](0007-caller-supplied-entropy-in-core.md)).
-- **The vault reuses the audited-surface-minimal `SIGILcli` sealing.** No new
+- **The vault reuses the audit-surface-minimal `SIGILcli` sealing.** (Minimal
+  *surface to audit* — nothing here is audited.) No new
   at-rest format, no new crypto — the vault inherits the Argon2id +
   XChaCha20-Poly1305 container and its properties (wrong password / tamper →
   authentication failure, never plaintext). Because it is an opaque sealed

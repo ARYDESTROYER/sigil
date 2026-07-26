@@ -32,6 +32,10 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > **installable, offline-capable (manifest + service worker), accessible** PWA with a
 > separate Rust/wasm-pack CI job; dev / no-index / UNAUDITED, kept out of the default
 > web CI job),
+> the **MV3 browser extension** (`extension/` — a popup TOTP authenticator over the
+> vendored wasm + the proven JS helpers, sealing to the same `SIGILcli` vault, sealed-only
+> `chrome.storage.local` persistence with an in-memory password; dev / UNAUDITED, loaded
+> unpacked and published to no store),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -93,3 +97,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0027](0027-webapp-and-wasm-bundling.md) | Real webapp over a `@sigil/wasm` loader (Next.js `asyncWebAssembly` + the `target_features`/`externref` strip) | Accepted (2026-07) |
 | [0028](0028-webapp-vault-persistence-and-unlock.md) | Webapp vault persistence + password-unlock model (persist only the `SIGILcli`-sealed container in `localStorage`; in-memory password) | Accepted (2026-07) |
 | [0029](0029-webapp-pwa-offline-a11y-and-ci.md) | Webapp as an offline-capable, accessible PWA (hand-rolled service worker + manifest) + a Rust/wasm-pack webapp CI job | Accepted (2026-07) |
+| [0030](0030-browser-extension-client.md) | MV3 browser-extension client — popup TOTP authenticator over the vendored wasm + proven helpers (sealed-only `chrome.storage.local`, in-memory password) | Accepted (2026-07) |

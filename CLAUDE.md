@@ -453,8 +453,52 @@ public, make no security claims, until the audit completes and trademark clears.
   Authenticator vector via JS, `sigil totp export --migration` decoded in JS [RUST→JS],
   and a JS-encoded migration URI imported by the CLI [JS→RUST]). `export` reveals the
   2FA secrets IN THE CLEAR by design; UNAUDITED, dev-only. ADR 0026.
-- `extension/`, `web/apps/admin` — reserved. (`web/apps/webapp` +
-  `web/packages/sigil-wasm` are now real — see above.)
+- `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
+  whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
+  as **WebAssembly inside the extension page** — the **second real product client
+  surface** (after `web/apps/webapp`; third over the core counting the demo `cli/`).
+  It adds **NO cryptography and NO vault/migration logic of its own**:
+  **`extension/build.sh`** (the only build step — there is **no bundler**, the popup
+  is plain ESM) runs the repo-root `sigil-wasm/build-wasm.sh` (wasm-pack
+  `--target web`) and **vendors** into a **gitignored `extension/vendor/`** the
+  wasm-bindgen bindings (`sigil_wasm.js` + `sigil_wasm_bg.wasm` + `.d.ts`) plus
+  **verbatim copies** of the proven, framework-free `sigil-wasm/totp-vault.mjs` and
+  `totp-migration.mjs` (+ a `BUILD-INFO.txt` provenance stamp, so a stale `vendor/`
+  is obvious). The **source** is `manifest.json` + `src/popup/popup.{html,css,js}`
+  (UI glue + storage only; `popup.js` imports the vendored wasm via
+  `chrome.runtime.getURL("vendor/sigil_wasm_bg.wasm")`). The vault seals into the
+  **SAME `SIGILcli` container** the CLI and the webapp use (Argon2id →
+  XChaCha20-Poly1305 over the mirrored `TotpVault` JSON), so **vaults stay
+  cross-client interoperable** — no new at-rest format. Persistence mirrors the
+  webapp (ADR 0028): **`chrome.storage.local` holds ONLY the sealed container**
+  (base64, key `sigil.extension.vault.v1`); the plaintext vault and the password are
+  **never** persisted, the **password lives only in memory** (closing the popup
+  re-locks), so it boots setup / locked / unlocked. Add by form / `otpauth://` /
+  **Google Authenticator `otpauth-migration://` import**, **export** back out
+  (`otpauth://` or one migration URI, behind a loud secrets-in-the-clear warning),
+  remove / lock / forget-vault; **codes + countdowns are computed in the wasm**,
+  never in JS; salt+nonce from `crypto.getRandomValues`. **Minimal surface:**
+  `"permissions": ["storage"]` and nothing else (no host permissions, no `tabs`, no
+  `clipboardWrite`), **no background service worker / content script / options
+  page**, and the MV3 CSP widened by exactly one keyword
+  (`script-src 'self' 'wasm-unsafe-eval'`); a pinned **public** manifest `key` fixes
+  the unpacked extension ID (no private half in this repo, not a signing key) so the
+  headless test can address `chrome-extension://<id>/…`. **TEST HOOK:**
+  `popup.html?t=<unix-seconds>` pins the clock (stops the 1 s tick) for deterministic
+  vectors. Proven GREEN by **`extension/tests/extension.spec.mjs`** — a Playwright
+  suite that loads the **REAL unpacked extension** in Chromium
+  (`launchPersistentContext`, `channel: "chromium"`; the headless *shell* cannot load
+  extensions) and asserts the wasm instantiates in-page → RFC 6238 `287082` at
+  `?t=59`, storage holds **only** the sealed container (no plaintext secret / label /
+  password), reload → locked → right password restores the vault, and the
+  `otpauth://` + migration import/export paths round-trip. **Dev / UNAUDITED /
+  loaded unpacked / published to NO store**; **no sync** (it never talks to
+  `sigild`); generate-only (no verification / constant-time compare / zeroization);
+  the reserved-stub ambitions (phishing protection, passkey provider, content
+  scripts) are **NOT** implemented; **not** wired into CI. Do NOT store real 2FA
+  secrets. ADR 0030.
+- `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm` and
+  `extension/` are now real — see above.)
 
 ## Toolchains (this machine — macOS arm64)
 
@@ -527,6 +571,19 @@ corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
 corepack pnpm --filter webapp exec playwright test   # headless chromium wasm smoke (tests/wasm.spec.ts)
+
+# extension — the MV3 popup authenticator. A STANDALONE pnpm project (NOT part of
+# the web/ workspace), one devDependency (@playwright/test). It needs the Rust +
+# wasm-pack toolchain: build.sh runs sigil-wasm/build-wasm.sh and vendors the wasm
+# + the proven JS helpers into extension/vendor/ (gitignored — must exist before
+# the extension can be loaded unpacked or tested). NOT wired into CI.
+corepack pnpm -C extension install
+./extension/build.sh                          # -> extension/vendor/ (gitignored)
+corepack pnpm -C extension test               # `pretest` re-runs build.sh; 3 Playwright specs, PASS
+# The suite loads the REAL unpacked extension in a full Chromium (channel:
+# "chromium" — the headless SHELL cannot load extensions) and drives
+# chrome-extension://<pinned-id>/src/popup/popup.html?t=59.
+# Load it by hand: chrome://extensions -> Developer mode -> Load unpacked -> extension/
 ```
 
 **Always run the relevant suite after changes and record the result in

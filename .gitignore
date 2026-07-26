@@ -21,6 +21,11 @@ sigil-wasm/pkg-web/
 sigil-wasm/pkg-node/
 sigil-wasm/target/
 
+# --- browser extension build artifacts (extension/build.sh output; never commit) ---
+extension/vendor/
+extension/test-results/
+extension/playwright-report/
+
 # --- Go ---
 /sigild/bin/
 *.test

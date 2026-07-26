@@ -11,8 +11,8 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 43; `main` @ origin through Phase 42 — Phase 43 is not yet
-committed).** Phase 43 opened the **NATIVE client column**: a new top-level **`desktop/`** —
+**Where we are (through Phase 43, `main` @ origin, clean tree).** Phase 43 opened the
+**NATIVE client column**: a new top-level **`desktop/`** —
 a **Tauri v2 desktop authenticator** whose Rust backend links libsigil **NATIVELY**. That is
 the whole point: `web/apps/webapp` and `extension/` both run the core as **WebAssembly**, so
 a third browser-shaped client would have proved nothing; **there is no wasm, `wasm-bindgen` or

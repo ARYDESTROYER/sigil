@@ -247,6 +247,25 @@ at a time, so there is never an ambiguous "which model is live" state. With
 - `GET /metrics` remains always-on and unauthenticated; it exposes the new
   counters and the bumped `sigild_schema_version` and nothing secret.
 
+## Client support (added Phase 42, 2026-07-16)
+
+This ADR was recorded with the **server half** implemented and no client
+speaking the contract. The **`sigil` CLI now implements it** — enrollment with
+proof of possession, v3-signed `push`/`pull`, owner-only grants, and revocation
+(`sigil device enroll|list|revoke|grant`); it is so far the only client that
+does. No separate ADR was written: the client is the other half of *this*
+decision, not a new one, and it adds **no new design choice** — it mirrors the
+canonical messages defined above (`canonical_v3_message` /
+`canonical_enroll_message` in `cli/src/lib.rs`) and selects its contract from
+the identity file, so **no key ⇒ unsigned**, **an identity without a
+`device_id` ⇒ legacy v2**, and **an identity with one ⇒ v3**. The existing key
+file was *extended* with an optional `device_id` rather than replaced, so the
+"nothing regressed" consequence above still holds and old key files keep
+working. Every honest limitation listed above is unchanged and now also applies
+end to end: plain HTTP in dev, trust-on-first-write, single-attempt tokens,
+per-process replay cache, no account model, no session issuance, no rotation.
+See [`../api.md` → Client support](../api.md#client-support-the-sigil-cli).
+
 ## References
 
 - Code: [`../../sigild/internal/api/deviceauth.go`](../../sigild/internal/api/deviceauth.go),

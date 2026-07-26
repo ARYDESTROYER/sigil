@@ -299,7 +299,11 @@ To avoid any over-claim, the honest gaps:
   do not exist on the build machine (LibreSSL can't negotiate the group). See
   [§3](#3-pq-tls-nuance-read-this-before-claiming-a-pq-proof).
 - **Clients are stubbed, and the one browser app is dev-only / NOT deployed.** No
-  admin console / extension / native client consumes this server, and `libsigil`'s
+  admin console or extension consumes this server; the only client that does is the
+  demo **`sigil` CLI** — `push`/`pull` against the dev op-log and, as of Phase 42,
+  `sigil device enroll|list|revoke|grant` against a `SIGILD_DEVICE_AUTH` server
+  (**contract v3**, so a client now exercises the device model end to end) — all
+  **dev / localhost / plain HTTP, nothing deployed**. `libsigil`'s
   real-but-**unaudited** AEAD building block is **not wired into any product flow**.
   A **`web/apps/webapp`** Next.js app now exists — it runs the libsigil core via
   **WebAssembly, entirely client-side** (an **installable, offline-capable, accessible**

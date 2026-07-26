@@ -452,15 +452,23 @@ All failures use the standard typed envelope with `401 Unauthorized` (a distinct
 { "error": "unauthorized", "detail": "<reason>" }
 ```
 
-The matching CLI key file is JSON, written with mode `0600`:
+The matching CLI key file (`sigil keygen --out <file>`) is JSON, written with
+mode `0600`:
 
 ```json
 { "version": 1, "seed": "<std-base64 of 32 bytes>", "public_key": "<std-base64 of 32 bytes>" }
 ```
 
+The same file is also the **device identity** file for contract v3: `sigil
+device enroll` adds an **optional `"device_id"`** field to it. The field is
+absent here by construction, and a key file **without** it keeps signing v2
+exactly as before — see [Client support](#client-support-the-sigil-cli).
+
 **Honest scope:** a single configured DEV device key; the seen-nonce replay
 cache is **in-memory / per-process** (a multi-instance production deploy needs a
-shared store); multi-device enrollment / registry / JWT auth is future; and with
+shared store); multi-device enrollment and a device registry exist only in
+**contract v3** ([below](#multi-device-auth-model-contract-v3--dev)), never in
+this mode, and JWT / session issuance is still future; and with
 `SIGILD_OPLOG_PUBKEY` unset there is no auth at all.
 
 ### Audit log (structured server-side events)
@@ -836,6 +844,46 @@ Any device with **read** access to the vault may see who else can reach it.
 - **Errors:** `400 missing_vault_id`; `401 unauthorized`; `403 forbidden` (no
   grant — including on an **unowned** vault, since reads never claim); `500
   internal`; `501 not_implemented`.
+
+### Client support (the `sigil` CLI)
+
+The **`sigil` CLI implements contract v3** — it is the first (and so far only)
+client that speaks it, covering four of the five device routes above. Commands (see
+[`../cli/src/main.rs`](../cli/src/main.rs)):
+
+| Command | Route it calls |
+|---------|----------------|
+| `sigil device enroll --token <t> [--label <name>] [--key <file>] [--server <url>] [--reuse-key]` | `POST /v1/devices/enroll` — generates (or, with `--reuse-key`, reuses) the key, signs the proof of possession, and writes the returned `device_id` into the `0600` identity file. It **refuses to overwrite** an existing identity file unless `--reuse-key` is given. |
+| `sigil device list --admin-token <t> [--server <url>]` | `GET /v1/devices` |
+| `sigil device revoke <deviceID> [--admin-token <t>] [--key <file>] [--server <url>]` | `POST /v1/devices/{deviceID}/revoke` — self-revocation with `--key`, or the operator path with `--admin-token` |
+| `sigil device grant <deviceID> --vault <id> --permission read\|write [--key <file>] [--server <url>]` | `POST /v1/vaults/{vaultID}/grants` (owner-only) |
+
+`GET /v1/vaults/{vaultID}/grants` has **no CLI subcommand yet**.
+
+**Contract selection is additive and driven by the identity file**, so nothing
+existing changed:
+
+| Client state | Contract used |
+|--------------|---------------|
+| no `--key` and no `SIGIL_DEVICE_KEY` | **unsigned** (byte-identical to the legacy unauthenticated path) |
+| identity file **without** `device_id` | **v2** (legacy, unchanged) |
+| identity file **with** `device_id` (after `device enroll`) | **v3**, sending `X-Sigil-Device` |
+
+`sigil push` / `sigil pull` therefore sign v3 automatically once the key they
+were given is enrolled. `SIGIL_DEVICE_ID=<id>` forces v3 with that ID even for
+an older key file. Tokens and the server URL may also come from the environment
+— `SIGIL_ENROLL_TOKEN`, `SIGIL_ADMIN_TOKEN`, `SIGIL_DEVICE_ID`, plus the
+existing `SIGIL_SERVER` / `SIGIL_DEVICE_KEY` — with the flags taking
+precedence. The `device` subcommands default the identity path to
+`$HOME/.sigil/device.key`; `push`/`pull` keep their old rule (no key ⇒
+unsigned). The CLI never prints the seed, the enrollment token, or the admin
+token.
+
+The CLI builds the same canonical bytes as the server
+(`canonical_v3_message` / `canonical_enroll_message` in
+[`../cli/src/lib.rs`](../cli/src/lib.rs)), with a fresh CSPRNG nonce and the
+current unix seconds per request. It is the same **dev-only, plain-HTTP,
+UNAUDITED** posture as the server side: no TLS, do not point it at a remote host.
 
 ### Default posture (all five routes)
 

@@ -715,14 +715,24 @@ const OPLOG_AUTH_PREFIX: &[u8] = b"sigil-oplog-auth-v2\n";
 /// of these bytes is what is signed and sent as `X-Sigil-Nonce`.
 const OPLOG_NONCE_LEN: usize = 16;
 
-/// A LOCAL, DEV-ONLY device key file: a single Ed25519 key pair used to sign
-/// op-log requests under the `sigil-oplog-auth-v2` contract.
+/// A LOCAL, DEV-ONLY device key file — now also the DEVICE IDENTITY file.
 ///
-/// On disk this is JSON `{"version":1,"seed":"<b64>","public_key":"<b64>"}`,
+/// One Ed25519 key pair, used to sign op-log requests under either the legacy
+/// `sigil-oplog-auth-v2` contract (no `device_id`) or the multi-device
+/// `sigil-oplog-auth-v3` contract (once `device_id` has been assigned by
+/// `sigil device enroll`).
+///
+/// On disk this is JSON
+/// `{"version":1,"seed":"<b64>","public_key":"<b64>"[,"device_id":"dev_..."]}`,
 /// where `seed` is standard-base64 of the 32-byte Ed25519 secret seed and
 /// `public_key` is standard-base64 of the 32-byte Ed25519 public key. The file
 /// holds SECRET key material and is written with mode `0600`; it is per-device,
 /// DEV-ONLY, and NOT synced.
+///
+/// BACKWARD COMPATIBILITY: `device_id` is OPTIONAL on read (serde `default`) and
+/// OMITTED on write when absent, so a key file written by an older build parses
+/// unchanged and keeps signing under contract v2. The file shape was EXTENDED,
+/// not replaced — see [`DeviceIdentity`] for how the contract is selected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyFile {
     /// Key file format version. Always [`KEY_FILE_VERSION`].
@@ -730,8 +740,15 @@ pub struct KeyFile {
     /// Standard-base64 of the 32-byte Ed25519 secret seed. SECRET material.
     pub seed: String,
     /// Standard-base64 of the 32-byte Ed25519 public key. Set sigild's
-    /// `SIGILD_OPLOG_PUBKEY` to exactly this string to enable verification.
+    /// `SIGILD_OPLOG_PUBKEY` to exactly this string to enable LEGACY v2
+    /// verification (v3 resolves the key through the device registry instead).
     pub public_key: String,
+    /// The server-assigned device ID from `sigil device enroll`, when this key
+    /// has been enrolled. `None` (the field absent on disk) means this is a
+    /// pre-enrollment key file and requests are signed under LEGACY contract v2.
+    /// This is NOT secret — it is an opaque public identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 /// Generate a fresh DEV-ONLY device key: draw a 32-byte Ed25519 seed from the OS
@@ -748,6 +765,8 @@ pub fn generate_key() -> Result<KeyFile, CliError> {
         version: KEY_FILE_VERSION,
         seed: BASE64.encode(seed),
         public_key: BASE64.encode(public),
+        // Not enrolled yet: `sigil device enroll` fills this in.
+        device_id: None,
     })
 }
 
@@ -796,6 +815,19 @@ pub fn save_key(path: &std::path::Path, key: &KeyFile) -> Result<(), CliError> {
 pub fn load_key(
     path: &std::path::Path,
 ) -> Result<([u8; SIG_SEED_LEN], [u8; SIG_PUBLIC_KEY_LEN]), CliError> {
+    let id = load_identity(path)?;
+    Ok((id.seed, id.public_key))
+}
+
+/// Read a device key / identity file from `path` WITHOUT decoding its fields.
+///
+/// Validates only the JSON shape and the `version`; the base64 fields are decoded
+/// by [`load_identity`]. Useful when a caller needs the raw file (e.g. to add a
+/// `device_id` after enrollment and write it back).
+///
+/// # Errors
+/// - [`CliError::Key`] on an IO error, malformed JSON, or an unsupported version.
+pub fn load_key_file(path: &std::path::Path) -> Result<KeyFile, CliError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| CliError::Key(format!("could not read key file: {e}")))?;
     let kf: KeyFile = serde_json::from_str(&text)
@@ -806,28 +838,63 @@ pub fn load_key(
             kf.version
         )));
     }
+    Ok(kf)
+}
 
-    let seed_vec = BASE64
-        .decode(kf.seed.as_bytes())
-        .map_err(|e| CliError::Key(format!("seed is not valid base64: {e}")))?;
-    let seed: [u8; SIG_SEED_LEN] = seed_vec.try_into().map_err(|v: Vec<u8>| {
-        CliError::Key(format!(
-            "seed must decode to {SIG_SEED_LEN} bytes, got {}",
-            v.len()
-        ))
-    })?;
+/// Read and DECODE a device identity file from `path`.
+///
+/// This is the v3-aware loader: it returns the decoded seed and public key plus
+/// the OPTIONAL `device_id`. A key file written before device enrollment existed
+/// (no `device_id` field) loads fine and yields `device_id: None`, which selects
+/// the LEGACY v2 contract — see [`DeviceIdentity::auth`].
+///
+/// # Errors
+/// - [`CliError::Key`] on an IO error, malformed JSON, an unsupported version, a
+///   non-base64 field, or a seed/public key of the wrong length.
+pub fn load_identity(path: &std::path::Path) -> Result<DeviceIdentity, CliError> {
+    load_key_file(path)?.decode()
+}
 
-    let pub_vec = BASE64
-        .decode(kf.public_key.as_bytes())
-        .map_err(|e| CliError::Key(format!("public_key is not valid base64: {e}")))?;
-    let public: [u8; SIG_PUBLIC_KEY_LEN] = pub_vec.try_into().map_err(|v: Vec<u8>| {
-        CliError::Key(format!(
-            "public_key must decode to {SIG_PUBLIC_KEY_LEN} bytes, got {}",
-            v.len()
-        ))
-    })?;
+impl KeyFile {
+    /// Decode this key file's base64 fields into a [`DeviceIdentity`].
+    ///
+    /// # Errors
+    /// - [`CliError::Key`] on a non-base64 field, a seed/public key of the wrong
+    ///   length, or a `device_id` that could not sit in a URL path segment.
+    pub fn decode(&self) -> Result<DeviceIdentity, CliError> {
+        let seed_vec = BASE64
+            .decode(self.seed.as_bytes())
+            .map_err(|e| CliError::Key(format!("seed is not valid base64: {e}")))?;
+        let seed: [u8; SIG_SEED_LEN] = seed_vec.try_into().map_err(|v: Vec<u8>| {
+            CliError::Key(format!(
+                "seed must decode to {SIG_SEED_LEN} bytes, got {}",
+                v.len()
+            ))
+        })?;
 
-    Ok((seed, public))
+        let pub_vec = BASE64
+            .decode(self.public_key.as_bytes())
+            .map_err(|e| CliError::Key(format!("public_key is not valid base64: {e}")))?;
+        let public_key: [u8; SIG_PUBLIC_KEY_LEN] = pub_vec.try_into().map_err(|v: Vec<u8>| {
+            CliError::Key(format!(
+                "public_key must decode to {SIG_PUBLIC_KEY_LEN} bytes, got {}",
+                v.len()
+            ))
+        })?;
+
+        // An empty-string device_id is treated as absent rather than as a device
+        // ID the server could never resolve.
+        let device_id = self.device_id.clone().filter(|d| !d.is_empty());
+        if let Some(d) = &device_id {
+            check_device_id(d)?;
+        }
+
+        Ok(DeviceIdentity {
+            seed,
+            public_key,
+            device_id,
+        })
+    }
 }
 
 /// The current wall-clock time as decimal-ASCII Unix SECONDS, e.g. `"1717900000"`.
@@ -911,6 +978,494 @@ fn sign_oplog_request(
 
     let signature = sign(seed, &message);
     Ok((timestamp, nonce, BASE64.encode(signature)))
+}
+
+// ---------------------------------------------------------------------------
+// MULTI-DEVICE auth — the CLIENT side of sigild's contract v3 (Phase 42).
+//
+// STATUS: pre-audit, DEV-ONLY, UNAUDITED. This speaks sigild's REAL device model:
+// a device ENROLLS (proving possession of its Ed25519 private key against an
+// operator-provisioned, single-use enrollment token), the server assigns it a
+// device ID, and every later op-log request is signed under the
+// `sigil-oplog-auth-v3` message, which binds THAT device ID. The server resolves
+// the ID to the registered public key, rejects a revoked device, and then checks
+// a PER-VAULT grant (401 = not authenticated, 403 = authenticated but not
+// authorized).
+//
+// CONTRACT SELECTION IS STRICTLY ADDITIVE:
+//
+//   no key file at all      -> unsigned            (unchanged legacy behaviour)
+//   key file, no device_id  -> contract v2         (unchanged legacy behaviour)
+//   key file with device_id -> contract v3         (new)
+//
+// so an existing key file, or no key at all, behaves EXACTLY as before.
+//
+// HONEST SCOPE: dev/localhost/plain-HTTP. The enrollment token is a bearer
+// secret typed on the command line; the device seed lives in a 0600 file. There
+// is no account model, no key rotation, no recovery, and no hardware backing.
+// ---------------------------------------------------------------------------
+
+/// The fixed domain-separation prefix of the contract v3 signed message. It MUST
+/// match sigild's `opsAuthDomainV3` byte-for-byte.
+pub const OPLOG_AUTH_V3_PREFIX: &[u8] = b"sigil-oplog-auth-v3\n";
+
+/// The fixed domain-separation prefix of the device-enrollment proof-of-possession
+/// challenge. It MUST match sigild's `enrollDomain` byte-for-byte. It is a
+/// DIFFERENT domain from the request contract, so an enrollment proof can never be
+/// replayed as a request signature.
+pub const DEVICE_ENROLL_PREFIX: &[u8] = b"sigil-device-enroll-v1\n";
+
+/// Header carrying the enrolled device ID on a contract v3 request.
+const HEADER_DEVICE: &str = "X-Sigil-Device";
+/// Header carrying the unix-seconds timestamp (both contracts + enrollment).
+const HEADER_TIMESTAMP: &str = "X-Sigil-Timestamp";
+/// Header carrying the fresh per-request nonce (both contracts + enrollment).
+const HEADER_NONCE: &str = "X-Sigil-Nonce";
+/// Header carrying the base64 Ed25519 signature (both contracts + enrollment).
+const HEADER_SIGNATURE: &str = "X-Sigil-Signature";
+/// Header carrying the single-use enrollment token. SECRET — never logged.
+const HEADER_ENROLL_TOKEN: &str = "X-Sigil-Enroll-Token";
+/// Header carrying the operator admin token. SECRET — never logged.
+const HEADER_ADMIN_TOKEN: &str = "X-Sigil-Admin-Token";
+
+/// A LOCAL device identity: the decoded Ed25519 key pair plus the OPTIONAL
+/// server-assigned device ID. Produced by [`load_identity`].
+///
+/// The presence of `device_id` is what selects the request-auth contract (see
+/// [`DeviceIdentity::auth`]). The `seed` is SECRET and is never printed by this
+/// crate.
+#[derive(Debug, Clone)]
+pub struct DeviceIdentity {
+    /// The 32-byte Ed25519 secret seed. SECRET material.
+    pub seed: [u8; SIG_SEED_LEN],
+    /// The 32-byte Ed25519 public key.
+    pub public_key: [u8; SIG_PUBLIC_KEY_LEN],
+    /// The server-assigned device ID, when enrolled. `None` => legacy v2.
+    pub device_id: Option<String>,
+}
+
+impl DeviceIdentity {
+    /// Select the request-auth contract this identity signs under: contract v3
+    /// when it carries a `device_id`, else the LEGACY contract v2.
+    pub fn auth(&self) -> RequestAuth<'_> {
+        match &self.device_id {
+            Some(id) => RequestAuth::V3 {
+                device_id: id,
+                seed: &self.seed,
+            },
+            None => RequestAuth::V2 { seed: &self.seed },
+        }
+    }
+}
+
+/// How one HTTP request to sigild is authenticated.
+///
+/// [`RequestAuth::None`] sends no signature headers at all (the unauthenticated
+/// dev path, unchanged); [`RequestAuth::V2`] is the legacy single-key contract;
+/// [`RequestAuth::V3`] is the multi-device contract and additionally sends
+/// `X-Sigil-Device`.
+#[derive(Debug, Clone, Copy)]
+pub enum RequestAuth<'a> {
+    /// Send the request unsigned (sigild without request-auth configured).
+    None,
+    /// Sign under the legacy `sigil-oplog-auth-v2` contract.
+    V2 {
+        /// The 32-byte Ed25519 secret seed. SECRET material.
+        seed: &'a [u8; SIG_SEED_LEN],
+    },
+    /// Sign under the multi-device `sigil-oplog-auth-v3` contract.
+    V3 {
+        /// The server-assigned device ID, sent as `X-Sigil-Device` AND bound
+        /// into the signed message.
+        device_id: &'a str,
+        /// The 32-byte Ed25519 secret seed. SECRET material.
+        seed: &'a [u8; SIG_SEED_LEN],
+    },
+}
+
+impl RequestAuth<'_> {
+    /// The short contract name, for user-facing messages. Never includes key
+    /// material.
+    pub fn contract(&self) -> &'static str {
+        match self {
+            RequestAuth::None => "unsigned",
+            RequestAuth::V2 { .. } => "v2",
+            RequestAuth::V3 { .. } => "v3",
+        }
+    }
+}
+
+/// Build the byte-for-byte contract v3 signed message:
+///
+/// ```text
+/// sigil-oplog-auth-v3\n
+/// {DEVICE_ID}\n
+/// {METHOD}\n
+/// {PATH}\n
+/// {QUERY}\n
+/// {TIMESTAMP}\n
+/// {NONCE}\n
+/// {BODY}
+/// ```
+///
+/// i.e. `b"sigil-oplog-auth-v3\n" + DEVICE_ID + b"\n" + METHOD + b"\n" + PATH +
+/// b"\n" + QUERY + b"\n" + TIMESTAMP + b"\n" + NONCE + b"\n" + BODY`. `METHOD` is
+/// the uppercase HTTP method, `PATH` the URL path with NO query, `QUERY` the raw
+/// query string (`""` when absent), `TIMESTAMP` decimal-ASCII unix seconds, and
+/// `NONCE` the EXACT `X-Sigil-Nonce` text. This mirrors sigild's
+/// `canonicalV3Message` and MUST stay byte-identical to it.
+pub fn canonical_v3_message(
+    device_id: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    timestamp: &str,
+    nonce: &str,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(
+        OPLOG_AUTH_V3_PREFIX.len()
+            + device_id.len()
+            + method.len()
+            + path.len()
+            + query.len()
+            + timestamp.len()
+            + nonce.len()
+            + body.len()
+            + 6, // the six interior '\n' separators
+    );
+    m.extend_from_slice(OPLOG_AUTH_V3_PREFIX);
+    for part in [device_id, method, path, query, timestamp, nonce] {
+        m.extend_from_slice(part.as_bytes());
+        m.push(b'\n');
+    }
+    m.extend_from_slice(body);
+    m
+}
+
+/// Build the byte-for-byte device-enrollment proof-of-possession challenge:
+///
+/// ```text
+/// sigil-device-enroll-v1\n
+/// {TOKEN_SHA256_HEX}\n
+/// {TIMESTAMP}\n
+/// {NONCE}\n
+/// {PUBLIC_KEY_B64}\n
+/// {LABEL}
+/// ```
+///
+/// i.e. `b"sigil-device-enroll-v1\n" + TOKEN_SHA256_HEX + b"\n" + TIMESTAMP +
+/// b"\n" + NONCE + b"\n" + PUBLIC_KEY_B64 + b"\n" + LABEL` — note there is NO
+/// trailing newline after the label. `TOKEN_SHA256_HEX` is [`enroll_token_hash`]
+/// of the enrollment token; `PUBLIC_KEY_B64` and `LABEL` are the EXACT strings
+/// placed in the JSON request body. The enrolling device signs this with the
+/// private key matching the public key it submits — that is the proof of
+/// possession. This mirrors sigild's `canonicalEnrollMessage`.
+pub fn canonical_enroll_message(
+    token_hash_hex: &str,
+    timestamp: &str,
+    nonce: &str,
+    public_key_b64: &str,
+    label: &str,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(
+        DEVICE_ENROLL_PREFIX.len()
+            + token_hash_hex.len()
+            + timestamp.len()
+            + nonce.len()
+            + public_key_b64.len()
+            + label.len()
+            + 4, // the four interior '\n' separators
+    );
+    m.extend_from_slice(DEVICE_ENROLL_PREFIX);
+    for part in [token_hash_hex, timestamp, nonce, public_key_b64] {
+        m.extend_from_slice(part.as_bytes());
+        m.push(b'\n');
+    }
+    m.extend_from_slice(label.as_bytes());
+    m
+}
+
+/// Lowercase-hex SHA-256 of an enrollment token, exactly as sigild computes it.
+///
+/// The token itself is SECRET and is never logged; only this digest is bound into
+/// the signed enrollment challenge (so a captured proof cannot be re-presented
+/// with a different token).
+pub fn enroll_token_hash(token: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push(char::from_digit((b >> 4) as u32, 16).expect("nibble < 16"));
+        out.push(char::from_digit((b & 0x0f) as u32, 16).expect("nibble < 16"));
+    }
+    out
+}
+
+/// Draw a fresh per-request nonce: [`OPLOG_NONCE_LEN`] CSPRNG bytes, standard
+/// base64. The base64 TEXT is what is signed and sent, so both sides see the same
+/// bytes.
+fn fresh_nonce() -> Result<String, CliError> {
+    let mut nonce_bytes = [0u8; OPLOG_NONCE_LEN];
+    fill_random(&mut nonce_bytes)?;
+    Ok(BASE64.encode(nonce_bytes))
+}
+
+/// Sign one request under contract v3, returning the
+/// `(timestamp, nonce, signature)` header triple. A FRESH nonce is drawn per call
+/// and the CURRENT unix time is used, so each request is unique and replay of a
+/// captured one is rejected inside the server's window.
+fn sign_oplog_request_v3(
+    seed: &[u8; SIG_SEED_LEN],
+    device_id: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> Result<(String, String, String), CliError> {
+    let timestamp = unix_timestamp_secs()?;
+    let nonce = fresh_nonce()?;
+    let message = canonical_v3_message(device_id, method, path, query, &timestamp, &nonce, body);
+    let signature = sign(seed, &message);
+    Ok((timestamp, nonce, BASE64.encode(signature)))
+}
+
+/// Attach the auth headers for `auth` to `req`, signing over EXACTLY the
+/// `(method, path, query, body)` the request will send.
+///
+/// [`RequestAuth::None`] adds nothing at all — byte-for-byte the legacy
+/// unauthenticated request.
+fn apply_auth(
+    req: ureq::Request,
+    auth: &RequestAuth<'_>,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> Result<ureq::Request, CliError> {
+    match auth {
+        RequestAuth::None => Ok(req),
+        RequestAuth::V2 { seed } => {
+            let (ts, nonce, sig) = sign_oplog_request(seed, method, path, query, body)?;
+            Ok(req
+                .set(HEADER_TIMESTAMP, &ts)
+                .set(HEADER_NONCE, &nonce)
+                .set(HEADER_SIGNATURE, &sig))
+        }
+        RequestAuth::V3 { device_id, seed } => {
+            let (ts, nonce, sig) =
+                sign_oplog_request_v3(seed, device_id, method, path, query, body)?;
+            Ok(req
+                .set(HEADER_DEVICE, device_id)
+                .set(HEADER_TIMESTAMP, &ts)
+                .set(HEADER_NONCE, &nonce)
+                .set(HEADER_SIGNATURE, &sig))
+        }
+    }
+}
+
+/// Reject device IDs that cannot be placed verbatim in a URL path segment.
+///
+/// Same rule as [`check_vault`]: non-empty, no `/`, no ASCII whitespace. Server
+/// IDs are `dev_` + base64url, so a legitimate ID always passes.
+fn check_device_id(device_id: &str) -> Result<(), CliError> {
+    if device_id.is_empty()
+        || device_id.contains('/')
+        || device_id.chars().any(|c| c.is_whitespace())
+    {
+        return Err(CliError::Key(format!(
+            "invalid device id {device_id:?}: must be non-empty with no '/' or whitespace"
+        )));
+    }
+    Ok(())
+}
+
+/// Join a server base URL and an absolute path, tolerating a trailing `/` on the
+/// base so we never build `http://host//v1/...`.
+fn join_url(server: &str, path: &str) -> String {
+    let base = server.strip_suffix('/').unwrap_or(server);
+    format!("{base}{path}")
+}
+
+/// A device as reported by the server's device routes. The registry never echoes
+/// public keys back, so this carries only metadata.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceInfo {
+    /// The server-assigned device ID.
+    pub device_id: String,
+    /// The human label supplied at enrollment.
+    #[serde(default)]
+    pub label: String,
+    /// `"active"` or `"revoked"`.
+    #[serde(default)]
+    pub status: String,
+    /// RFC 3339 creation time.
+    #[serde(default)]
+    pub created_at: String,
+    /// RFC 3339 revocation time, absent while active.
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+}
+
+/// ENROLL this device's Ed25519 public key with sigild and return the assigned
+/// device record.
+///
+/// Two independent factors are sent, both mandatory server-side:
+/// 1. the operator-provisioned, SINGLE-USE enrollment token (`X-Sigil-Enroll-Token`);
+/// 2. PROOF OF POSSESSION — an Ed25519 signature by `seed` over
+///    [`canonical_enroll_message`], which binds the token digest, the timestamp,
+///    a fresh nonce, the submitted public key, and the label.
+///
+/// The token is a BEARER SECRET: it is sent in a header and is never printed or
+/// logged by this crate. It is single-use — a failed attempt burns it.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (bad/expired/spent token or bad
+///   proof), `409` (that public key is already enrolled), `501` (the device model
+///   is not enabled on that server).
+/// - [`CliError::Http`] on a transport failure, [`CliError::BadResponse`] on an
+///   unparseable `201` body.
+pub fn enroll_device(
+    server: &str,
+    token: &str,
+    label: &str,
+    public_key: &[u8; SIG_PUBLIC_KEY_LEN],
+    seed: &[u8; SIG_SEED_LEN],
+) -> Result<DeviceInfo, CliError> {
+    if token.is_empty() {
+        return Err(CliError::Key(
+            "enrollment token is empty; pass --token <token>".to_string(),
+        ));
+    }
+    let public_key_b64 = BASE64.encode(public_key);
+
+    // Serialize the body FIRST, then sign the exact strings it carries. The
+    // server signs/verifies the DECODED JSON strings, so escaping cannot diverge.
+    #[derive(Serialize)]
+    struct EnrollBody<'a> {
+        public_key: &'a str,
+        label: &'a str,
+    }
+    let body = serde_json::to_vec(&EnrollBody {
+        public_key: &public_key_b64,
+        label,
+    })
+    .map_err(|e| CliError::Key(format!("could not serialize enrollment body: {e}")))?;
+
+    let timestamp = unix_timestamp_secs()?;
+    let nonce = fresh_nonce()?;
+    let token_hash = enroll_token_hash(token);
+    let message = canonical_enroll_message(&token_hash, &timestamp, &nonce, &public_key_b64, label);
+    let signature = BASE64.encode(sign(seed, &message));
+
+    let url = join_url(server, "/v1/devices/enroll");
+    let result = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set(HEADER_ENROLL_TOKEN, token)
+        .set(HEADER_TIMESTAMP, &timestamp)
+        .set(HEADER_NONCE, &nonce)
+        .set(HEADER_SIGNATURE, &signature)
+        .send_bytes(&body);
+    let text = finish(result)?;
+    serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))
+}
+
+/// LIST every registered device. Operator-only: this requires the admin token
+/// (sigild's `SIGILD_ADMIN_TOKEN`), which is a BEARER SECRET and is never logged.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx (`401` when the admin token is wrong or
+///   the server has none configured, `501` when the device model is off).
+pub fn list_devices(server: &str, admin_token: &str) -> Result<Vec<DeviceInfo>, CliError> {
+    let url = join_url(server, "/v1/devices");
+    let result = ureq::get(&url).set(HEADER_ADMIN_TOKEN, admin_token).call();
+    let text = finish(result)?;
+
+    #[derive(Deserialize)]
+    struct ListResp {
+        #[serde(default)]
+        devices: Vec<DeviceInfo>,
+    }
+    let parsed: ListResp =
+        serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))?;
+    Ok(parsed.devices)
+}
+
+/// REVOKE a device. A revoked device is rejected on its very next request.
+///
+/// Two authorized paths, matching the server: the operator `admin_token` (may
+/// revoke ANY device), or SELF-REVOCATION — a valid contract v3 signature whose
+/// signing device IS `device_id`. When `admin_token` is `Some`, it is sent and the
+/// request is additionally signed if `auth` is a signing mode; a device may never
+/// revoke a DIFFERENT device (the server answers 403).
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (no valid credential), `403`
+///   (authenticated but revoking someone else), `404` (no such device).
+pub fn revoke_device(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+    admin_token: Option<&str>,
+) -> Result<DeviceInfo, CliError> {
+    check_device_id(device_id)?;
+    let path = format!("/v1/devices/{device_id}/revoke");
+    let url = join_url(server, &path);
+
+    // An empty body is sent and is what gets signed (the server authenticates
+    // over the bytes it read).
+    let body: &[u8] = b"";
+    let mut req = ureq::post(&url).set("Content-Type", "application/json");
+    if let Some(t) = admin_token {
+        req = req.set(HEADER_ADMIN_TOKEN, t);
+    }
+    req = apply_auth(req, auth, "POST", &path, "", body)?;
+    let text = finish(req.send_bytes(body))?;
+    serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))
+}
+
+/// GRANT another enrolled device access to a vault. OWNER-ONLY: the signing
+/// device must be the vault's owner (the device that claimed it on first write),
+/// so `auth` must be a contract v3 identity.
+///
+/// `permission` is `"read"` or `"write"`.
+///
+/// # Errors
+/// - [`CliError::Key`] if `permission` is neither `read` nor `write`.
+/// - [`CliError::Server`] on a non-2xx: `403` (the signer is not the vault
+///   owner), `404` (no such grantee device), `409` (the grantee is revoked).
+pub fn grant_vault_access(
+    server: &str,
+    vault: &str,
+    device_id: &str,
+    permission: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<(), CliError> {
+    check_vault(vault)?;
+    check_device_id(device_id)?;
+    if permission != "read" && permission != "write" {
+        return Err(CliError::Key(format!(
+            "invalid permission {permission:?}: must be \"read\" or \"write\""
+        )));
+    }
+
+    #[derive(Serialize)]
+    struct GrantBody<'a> {
+        device_id: &'a str,
+        permission: &'a str,
+    }
+    let body = serde_json::to_vec(&GrantBody {
+        device_id,
+        permission,
+    })
+    .map_err(|e| CliError::Key(format!("could not serialize grant body: {e}")))?;
+
+    let path = format!("/v1/vaults/{vault}/grants");
+    let url = join_url(server, &path);
+    let req = ureq::post(&url).set("Content-Type", "application/json");
+    let req = apply_auth(req, auth, "POST", &path, "", &body)?;
+    finish(req.send_bytes(&body))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,19 +1564,43 @@ pub fn push_op(
     container: &[u8],
     key: Option<&[u8; SIG_SEED_LEN]>,
 ) -> Result<u64, CliError> {
+    let auth = match key {
+        Some(seed) => RequestAuth::V2 { seed },
+        None => RequestAuth::None,
+    };
+    push_op_auth(server, vault, container, &auth)
+}
+
+/// POST an OPAQUE `container` to the dev op-log under an explicit [`RequestAuth`]
+/// and return its assigned `seq`.
+///
+/// This is [`push_op`] generalised over the auth contract: [`RequestAuth::None`]
+/// sends the request unsigned (byte-identical to the legacy path),
+/// [`RequestAuth::V2`] signs the legacy single-key message, and
+/// [`RequestAuth::V3`] signs the multi-device message and sends `X-Sigil-Device`.
+///
+/// The signed `(method, path, query, body)` is exactly what this request sends:
+/// `POST`, `/v1/vaults/{vault}/ops`, an EMPTY query, and `container` as the body.
+///
+/// Under v3 a WRITE to an unclaimed vault CLAIMS it for the signing device
+/// (trust-on-first-write); a write to a vault owned by another device is `403`.
+///
+/// # Errors
+/// As [`push_op`], plus `403` (authenticated but not authorized for this vault)
+/// under contract v3.
+pub fn push_op_auth(
+    server: &str,
+    vault: &str,
+    container: &[u8],
+    auth: &RequestAuth<'_>,
+) -> Result<u64, CliError> {
     check_vault(vault)?;
     let url = ops_url(server, vault);
 
-    let mut req = ureq::post(&url).set("Content-Type", "application/octet-stream");
-    if let Some(seed) = key {
-        // Sign EXACTLY what this request sends: POST, the op path, NO query,
-        // body = container. The query is "" to match the server's r.URL.RawQuery.
-        let (ts, nonce, sig) = sign_oplog_request(seed, "POST", &ops_path(vault), "", container)?;
-        req = req
-            .set("X-Sigil-Timestamp", &ts)
-            .set("X-Sigil-Nonce", &nonce)
-            .set("X-Sigil-Signature", &sig);
-    }
+    let req = ureq::post(&url).set("Content-Type", "application/octet-stream");
+    // Sign EXACTLY what this request sends: POST, the op path, NO query,
+    // body = container. The query is "" to match the server's r.URL.RawQuery.
+    let req = apply_auth(req, auth, "POST", &ops_path(vault), "", container)?;
     let result = req.send_bytes(container);
     let body = finish(result)?;
 
@@ -1065,6 +1644,33 @@ pub fn pull_ops(
     since: u64,
     key: Option<&[u8; SIG_SEED_LEN]>,
 ) -> Result<Vec<PulledOp>, CliError> {
+    let auth = match key {
+        Some(seed) => RequestAuth::V2 { seed },
+        None => RequestAuth::None,
+    };
+    pull_ops_auth(server, vault, since, &auth)
+}
+
+/// GET operations with `seq > since` from the dev op-log under an explicit
+/// [`RequestAuth`].
+///
+/// This is [`pull_ops`] generalised over the auth contract (see
+/// [`push_op_auth`]). The signed `(method, path, query, body)` is exactly what
+/// this request sends: `GET`, `/v1/vaults/{vault}/ops`, the query
+/// `since={since}`, and an EMPTY body.
+///
+/// Under contract v3 a READ never claims a vault: reading an unowned vault, or
+/// one owned by another device with no grant, is `403`.
+///
+/// # Errors
+/// As [`pull_ops`], plus `403` (authenticated but not authorized for this vault)
+/// under contract v3.
+pub fn pull_ops_auth(
+    server: &str,
+    vault: &str,
+    since: u64,
+    auth: &RequestAuth<'_>,
+) -> Result<Vec<PulledOp>, CliError> {
     check_vault(vault)?;
     let url = ops_url(server, vault);
 
@@ -1072,16 +1678,10 @@ pub fn pull_ops(
     let since_str = since.to_string();
     let query = format!("since={since_str}");
 
-    let mut req = ureq::get(&url).query("since", &since_str);
-    if let Some(seed) = key {
-        // Sign EXACTLY what this request sends: GET, the op path, query
-        // "since={since}", empty body — matching the server's r.URL.RawQuery.
-        let (ts, nonce, sig) = sign_oplog_request(seed, "GET", &ops_path(vault), &query, b"")?;
-        req = req
-            .set("X-Sigil-Timestamp", &ts)
-            .set("X-Sigil-Nonce", &nonce)
-            .set("X-Sigil-Signature", &sig);
-    }
+    let req = ureq::get(&url).query("since", &since_str);
+    // Sign EXACTLY what this request sends: GET, the op path, query
+    // "since={since}", empty body — matching the server's r.URL.RawQuery.
+    let req = apply_auth(req, auth, "GET", &ops_path(vault), &query, b"")?;
     let result = req.call();
     let body = finish(result)?;
 
@@ -2078,6 +2678,7 @@ mod tests {
             version: KEY_FILE_VERSION,
             seed: BASE64.encode([0u8; 16]),
             public_key: BASE64.encode([0u8; SIG_PUBLIC_KEY_LEN]),
+            device_id: None,
         };
         let json = serde_json::to_string(&bad).unwrap();
         std::fs::write(&path, json).unwrap();
@@ -2686,5 +3287,514 @@ mod tests {
         v2.remove("acct").expect("remove");
         assert!(v2.find("acct").is_none());
         assert!(matches!(v2.remove("acct"), Err(CliError::Totp(_))));
+    }
+
+    // --- Contract v3 + device enrollment tests --------------------------------
+    //
+    // These pin the INTEROP CONTRACT: the exact byte layout of both canonical
+    // messages is asserted against hand-built expected values, so a drift from
+    // sigild's canonicalV3Message / canonicalEnrollMessage fails here rather than
+    // silently 401-ing in production. The HTTP tests then close the loop
+    // in-process: the mock captures the real request, the test rebuilds the
+    // message from what was captured, and verifies the signature with the public
+    // key.
+
+    /// Hand-build the v3 message with explicit byte concatenation (deliberately
+    /// NOT reusing `canonical_v3_message`, so the test is an independent witness).
+    fn handbuilt_v3(
+        device_id: &str,
+        method: &str,
+        path: &str,
+        query: &str,
+        ts: &str,
+        nonce: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(b"sigil-oplog-auth-v3\n");
+        m.extend_from_slice(device_id.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(method.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(path.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(query.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(ts.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(nonce.as_bytes());
+        m.push(b'\n');
+        m.extend_from_slice(body);
+        m
+    }
+
+    #[test]
+    fn canonical_v3_message_is_byte_exact() {
+        let got = canonical_v3_message(
+            "dev_abc",
+            "POST",
+            "/v1/vaults/demo/ops",
+            "",
+            "1717900000",
+            "bm9uY2U=",
+            b"BLOB",
+        );
+        // Literal expected bytes — this IS the wire contract.
+        let want: &[u8] =
+            b"sigil-oplog-auth-v3\ndev_abc\nPOST\n/v1/vaults/demo/ops\n\n1717900000\nbm9uY2U=\nBLOB";
+        assert_eq!(got, want, "v3 canonical message must be byte-exact");
+
+        // Same bytes as an independent hand-build, including a non-empty query
+        // and an empty body (the GET shape).
+        let get = canonical_v3_message(
+            "dev_abc",
+            "GET",
+            "/v1/vaults/demo/ops",
+            "since=5",
+            "1717900000",
+            "bm9uY2U=",
+            b"",
+        );
+        assert_eq!(
+            get,
+            handbuilt_v3(
+                "dev_abc",
+                "GET",
+                "/v1/vaults/demo/ops",
+                "since=5",
+                "1717900000",
+                "bm9uY2U=",
+                b""
+            )
+        );
+        // The empty query must still contribute its own separator line.
+        assert_eq!(
+            get,
+            b"sigil-oplog-auth-v3\ndev_abc\nGET\n/v1/vaults/demo/ops\nsince=5\n1717900000\nbm9uY2U=\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn v3_domain_differs_from_v2_so_signatures_do_not_cross() {
+        let v2 = rebuild_oplog_message("POST", "/p", "", "1", "n", b"b");
+        let v3 = canonical_v3_message("dev_x", "POST", "/p", "", "1", "n", b"b");
+        assert_ne!(v2, v3);
+        assert!(v3.starts_with(b"sigil-oplog-auth-v3\n"));
+        assert!(v2.starts_with(b"sigil-oplog-auth-v2\n"));
+    }
+
+    #[test]
+    fn canonical_enroll_message_is_byte_exact() {
+        let got =
+            canonical_enroll_message("deadbeef", "1717900000", "bm9uY2U=", "cHVia2V5", "laptop");
+        // NOTE: no trailing newline after the label.
+        let want: &[u8] =
+            b"sigil-device-enroll-v1\ndeadbeef\n1717900000\nbm9uY2U=\ncHVia2V5\nlaptop";
+        assert_eq!(got, want, "enrollment challenge must be byte-exact");
+
+        // An EMPTY label still ends the message right after the key separator.
+        let empty = canonical_enroll_message("deadbeef", "1", "n", "k", "");
+        assert_eq!(
+            empty,
+            b"sigil-device-enroll-v1\ndeadbeef\n1\nn\nk\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn enroll_token_hash_matches_sha256_known_vectors() {
+        // NIST/FIPS 180-4 classic vectors; sigild computes the same lowercase hex.
+        assert_eq!(
+            enroll_token_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            enroll_token_hash(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // Lowercase hex, fixed 64 chars.
+        let h = enroll_token_hash("dev-enroll-token-0123456789");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    }
+
+    #[test]
+    fn identity_round_trips_with_device_id_and_is_0600() {
+        let dir = TempDir::new("ident");
+        let path = dir.path.join("device.key");
+
+        let mut kf = generate_key().expect("generate");
+        assert!(kf.device_id.is_none(), "a fresh key is not enrolled");
+        kf.device_id = Some("dev_ABC123".to_string());
+        save_key(&path, &kf).expect("save");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "identity file must be 0600");
+
+        let id = load_identity(&path).expect("load identity");
+        assert_eq!(id.device_id.as_deref(), Some("dev_ABC123"));
+        assert_eq!(BASE64.encode(id.seed), kf.seed);
+        assert_eq!(BASE64.encode(id.public_key), kf.public_key);
+
+        // The on-disk JSON really carries the id, and the seed is still there.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"device_id\""));
+    }
+
+    #[test]
+    fn old_key_file_without_device_id_still_loads_and_selects_v2() {
+        let dir = TempDir::new("legacy");
+        let path = dir.path.join("old.key");
+
+        // EXACTLY the JSON an older build wrote: no device_id field at all.
+        let kf = generate_key().expect("generate");
+        let legacy = format!(
+            "{{\n  \"version\": 1,\n  \"seed\": \"{}\",\n  \"public_key\": \"{}\"\n}}",
+            kf.seed, kf.public_key
+        );
+        std::fs::write(&path, legacy).expect("write legacy key file");
+
+        // The legacy loader still works, byte for byte.
+        let (seed, public) = load_key(&path).expect("legacy load_key");
+        assert_eq!(BASE64.encode(seed), kf.seed);
+        assert_eq!(BASE64.encode(public), kf.public_key);
+
+        // And the v3-aware loader reports "not enrolled" -> contract v2.
+        let id = load_identity(&path).expect("load identity");
+        assert!(id.device_id.is_none());
+        assert!(matches!(id.auth(), RequestAuth::V2 { .. }));
+        assert_eq!(id.auth().contract(), "v2");
+    }
+
+    #[test]
+    fn contract_selection_is_driven_by_device_id() {
+        let mut kf = generate_key().expect("generate");
+        let v2 = kf.decode().expect("decode");
+        assert!(matches!(v2.auth(), RequestAuth::V2 { .. }));
+
+        kf.device_id = Some("dev_z".to_string());
+        let v3 = kf.decode().expect("decode");
+        match v3.auth() {
+            RequestAuth::V3 { device_id, .. } => assert_eq!(device_id, "dev_z"),
+            other => panic!("expected V3, got {other:?}"),
+        }
+        assert_eq!(v3.auth().contract(), "v3");
+
+        // An empty device_id is treated as absent (never sent as a real ID).
+        kf.device_id = Some(String::new());
+        assert!(kf.decode().expect("decode").device_id.is_none());
+
+        // A device_id that could not sit in a URL path segment is rejected.
+        kf.device_id = Some("bad/id".to_string());
+        assert!(matches!(kf.decode(), Err(CliError::Key(_))));
+
+        // Explicitly: no identity at all -> unsigned.
+        assert_eq!(RequestAuth::None.contract(), "unsigned");
+    }
+
+    #[test]
+    fn push_v3_sets_device_header_and_signature_verifies() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_TESTDEVICE".to_string());
+        let id = kf.decode().expect("decode");
+
+        let container = b"\x00\x01\x02opaque-container-bytes";
+        let response = "HTTP/1.1 201 Created\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 23\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"seq\":7}";
+        let (base, handle) = spawn_mock(response);
+        let seq = push_op_auth(&base, "v", container, &id.auth()).expect("push ok");
+        assert_eq!(seq, 7);
+
+        let req = handle.join().expect("server thread");
+        assert_eq!(req.request_line, "POST /v1/vaults/v/ops HTTP/1.1");
+        assert_eq!(
+            req.body, container,
+            "the opaque bytes must be sent verbatim"
+        );
+        assert_eq!(req.header("x-sigil-device"), Some("dev_TESTDEVICE"));
+
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+
+        // Rebuild the v3 message the SERVER would build from this exact request.
+        let msg = handbuilt_v3(
+            "dev_TESTDEVICE",
+            "POST",
+            "/v1/vaults/v/ops",
+            "",
+            &ts,
+            &nonce,
+            container,
+        );
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(
+            verify(&id.public_key, &msg, &sig).is_ok(),
+            "the v3 signature must verify over the canonical message"
+        );
+        // A v2 reconstruction must NOT verify (domain separation holds).
+        let v2msg = rebuild_oplog_message("POST", "/v1/vaults/v/ops", "", &ts, &nonce, container);
+        assert!(verify(&id.public_key, &v2msg, &sig).is_err());
+    }
+
+    #[test]
+    fn pull_v3_signs_query_and_sends_device_header() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_R".to_string());
+        let id = kf.decode().expect("decode");
+
+        let response = "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 56\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"ops\":[{\"seq\":1,\"blob\":\"aGk=\"}],\"next\":1}";
+        let (base, handle) = spawn_mock(response);
+        let ops = pull_ops_auth(&base, "v", 5, &id.auth()).expect("pull ok");
+        assert_eq!(ops.len(), 1);
+
+        let req = handle.join().expect("server thread");
+        assert_eq!(req.request_line, "GET /v1/vaults/v/ops?since=5 HTTP/1.1");
+        assert_eq!(req.header("x-sigil-device"), Some("dev_R"));
+
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+        let msg = handbuilt_v3(
+            "dev_R",
+            "GET",
+            "/v1/vaults/v/ops",
+            "since=5",
+            &ts,
+            &nonce,
+            b"",
+        );
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(verify(&id.public_key, &msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn unsigned_and_v2_paths_never_send_the_device_header() {
+        // REGRESSION GUARD: RequestAuth::None must be byte-identical to the legacy
+        // unauthenticated request, and V2 must not leak a v3 header.
+        let response = "HTTP/1.1 201 Created\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 23\r\n\
+             \r\n\
+             {\"vaultID\":\"v\",\"seq\":1}";
+
+        let (base, handle) = spawn_mock(response);
+        push_op_auth(&base, "v", b"x", &RequestAuth::None).expect("push ok");
+        let req = handle.join().expect("thread");
+        assert!(req.header("x-sigil-device").is_none());
+        assert!(req.header("x-sigil-signature").is_none());
+        assert!(req.header("x-sigil-timestamp").is_none());
+        assert!(req.header("x-sigil-nonce").is_none());
+
+        let kf = generate_key().expect("keygen");
+        let id = kf.decode().expect("decode");
+        let (base, handle) = spawn_mock(response);
+        push_op_auth(&base, "v", b"x", &id.auth()).expect("push ok");
+        let req = handle.join().expect("thread");
+        assert!(
+            req.header("x-sigil-device").is_none(),
+            "v2 must not send X-Sigil-Device"
+        );
+        assert!(req.header("x-sigil-signature").is_some());
+    }
+
+    #[test]
+    fn enroll_posts_proof_of_possession_that_verifies() {
+        let kf = generate_key().expect("keygen");
+        let id = kf.decode().expect("decode");
+        let token = "an-operator-enrollment-token";
+
+        let response = "HTTP/1.1 201 Created\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 94\r\n\
+             \r\n\
+             {\"device_id\":\"dev_NEW\",\"label\":\"laptop\",\"status\":\"active\",\"created_at\":\"2026-01-01T00:00:00Z\"}";
+        let (base, handle) = spawn_mock(response);
+        let dev = enroll_device(&base, token, "laptop", &id.public_key, &id.seed).expect("enroll");
+        assert_eq!(dev.device_id, "dev_NEW");
+        assert_eq!(dev.status, "active");
+
+        let req = handle.join().expect("thread");
+        assert_eq!(req.request_line, "POST /v1/devices/enroll HTTP/1.1");
+        // The token goes in its own header and is NEVER part of the body.
+        assert_eq!(req.header("x-sigil-enroll-token"), Some(token));
+        let body = String::from_utf8(req.body.clone()).expect("json body");
+        assert!(!body.contains(token), "the token must not be in the body");
+        assert!(body.contains(&BASE64.encode(id.public_key)));
+        assert!(body.contains("\"label\":\"laptop\""));
+
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+
+        // Rebuild the challenge the SERVER builds: SHA-256(token) hex, the exact
+        // header texts, the submitted public key b64, and the label.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"sigil-device-enroll-v1\n");
+        msg.extend_from_slice(enroll_token_hash(token).as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(ts.as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(nonce.as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(BASE64.encode(id.public_key).as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(b"laptop");
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(
+            verify(&id.public_key, &msg, &sig).is_ok(),
+            "enrollment proof of possession must verify against the SUBMITTED key"
+        );
+    }
+
+    #[test]
+    fn grant_signs_its_json_body_under_v3() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_OWNER".to_string());
+        let id = kf.decode().expect("decode");
+
+        let response = "HTTP/1.1 201 Created\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             \r\n\
+             {}";
+        let (base, handle) = spawn_mock(response);
+        grant_vault_access(&base, "demo", "dev_B", "read", &id.auth()).expect("grant ok");
+
+        let req = handle.join().expect("thread");
+        assert_eq!(req.request_line, "POST /v1/vaults/demo/grants HTTP/1.1");
+        assert_eq!(req.header("x-sigil-device"), Some("dev_OWNER"));
+        let body = req.body.clone();
+        assert_eq!(
+            String::from_utf8(body.clone()).unwrap(),
+            "{\"device_id\":\"dev_B\",\"permission\":\"read\"}"
+        );
+
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+        // The signature must cover the EXACT body bytes that were sent.
+        let msg = handbuilt_v3(
+            "dev_OWNER",
+            "POST",
+            "/v1/vaults/demo/grants",
+            "",
+            &ts,
+            &nonce,
+            &body,
+        );
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(verify(&id.public_key, &msg, &sig).is_ok());
+
+        // A bad permission never reaches the network.
+        assert!(matches!(
+            grant_vault_access("http://127.0.0.1:1", "demo", "dev_B", "admin", &id.auth()),
+            Err(CliError::Key(_))
+        ));
+    }
+
+    #[test]
+    fn revoke_self_signs_v3_and_admin_path_sends_the_admin_header() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_SELF".to_string());
+        let id = kf.decode().expect("decode");
+
+        let response = "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 43\r\n\
+             \r\n\
+             {\"device_id\":\"dev_SELF\",\"status\":\"revoked\"}";
+
+        // Self-revocation: v3-signed, no admin header.
+        let (base, handle) = spawn_mock(response);
+        let dev = revoke_device(&base, "dev_SELF", &id.auth(), None).expect("revoke ok");
+        assert_eq!(dev.status, "revoked");
+        let req = handle.join().expect("thread");
+        assert_eq!(
+            req.request_line,
+            "POST /v1/devices/dev_SELF/revoke HTTP/1.1"
+        );
+        assert_eq!(req.header("x-sigil-device"), Some("dev_SELF"));
+        assert!(req.header("x-sigil-admin-token").is_none());
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+        let msg = handbuilt_v3(
+            "dev_SELF",
+            "POST",
+            "/v1/devices/dev_SELF/revoke",
+            "",
+            &ts,
+            &nonce,
+            b"",
+        );
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(verify(&id.public_key, &msg, &sig).is_ok());
+
+        // Operator path: the admin token header is sent, unsigned.
+        let (base, handle) = spawn_mock(response);
+        revoke_device(&base, "dev_OTHER", &RequestAuth::None, Some("admintok")).expect("revoke ok");
+        let req = handle.join().expect("thread");
+        assert_eq!(req.header("x-sigil-admin-token"), Some("admintok"));
+        assert!(req.header("x-sigil-signature").is_none());
+
+        // A device id that cannot be a path segment never reaches the network.
+        assert!(matches!(
+            revoke_device(
+                "http://127.0.0.1:1",
+                "bad id",
+                &RequestAuth::None,
+                Some("t")
+            ),
+            Err(CliError::Key(_))
+        ));
+    }
+
+    #[test]
+    fn list_devices_sends_admin_header_and_parses_the_registry() {
+        let response = "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 122\r\n\
+             \r\n\
+             {\"devices\":[{\"device_id\":\"dev_A\",\"label\":\"laptop\",\"status\":\"active\",\"created_at\":\"2026-01-01T00:00:00Z\",\"revoked_at\":\"\"}]}";
+        let (base, handle) = spawn_mock(response);
+        let devices = list_devices(&base, "admintok").expect("list ok");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "dev_A");
+        assert_eq!(devices[0].status, "active");
+
+        let req = handle.join().expect("thread");
+        assert_eq!(req.request_line, "GET /v1/devices HTTP/1.1");
+        assert_eq!(req.header("x-sigil-admin-token"), Some("admintok"));
     }
 }

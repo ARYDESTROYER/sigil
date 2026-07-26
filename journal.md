@@ -11,7 +11,36 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 41, `main` @ origin).** Phase 41 gave **`sigild` a REAL
+**Where we are (through Phase 42, `main` @ origin).** Phase 42 taught the **`sigil` CLI to
+speak the server's multi-device auth contract v3** — the CLIENT half of ADR 0031, so a real
+client now exercises the device model end to end (**no new ADR**; a "client support" note was
+appended to ADR 0031 instead). Four new subcommands — **`sigil device enroll --token <t>
+[--label <name>] [--key <file>] [--server <url>] [--reuse-key]`**, **`device list
+--admin-token <t>`**, **`device revoke <deviceID> [--admin-token <t>] [--key <file>]`**,
+**`device grant <deviceID> --vault <id> --permission read|write [--key <file>]`** — plus
+env vars **`SIGIL_ENROLL_TOKEN`/`SIGIL_ADMIN_TOKEN`/`SIGIL_DEVICE_ID`** (flags win) beside the
+unchanged `SIGIL_SERVER`/`SIGIL_DEVICE_KEY`. The **EXISTING key file was EXTENDED**, not
+replaced: an OPTIONAL `device_id` (serde `default` + `skip_serializing_if`) means an old key
+file parses unchanged and still signs v2. **Contract selection is additive and driven by the
+identity**: **no key ⇒ unsigned** (byte-identical legacy path) · **identity WITHOUT
+`device_id` ⇒ v2** · **identity WITH `device_id` ⇒ v3** (+ `X-Sigil-Device`), so `push`/`pull`
+sign v3 automatically once their key is enrolled; `SIGIL_DEVICE_ID` forces v3 on an older key
+file. **VERIFIED FIRST-HAND against a live sigild:** enroll A → 0600 identity, no seed on
+stdout; **reusing that enrollment token failed (single-use)**; `sigil push --vault demo`
+succeeded at **seq 1** and **claimed** the vault (trust-on-first-write); pull + open
+round-tripped byte-identical plaintext; device B enrolled and **B pulling A's vault before a
+grant → 403**; `device grant <B> --vault demo --permission read` → B pulled fine; **B WRITING
+with a read-only grant → 403** (the lattice is enforced); after an admin **revoke** B got
+**401** while A kept working; an **UNSIGNED push → 401**; and the server log contained
+**neither the enrollment token nor the admin token**. Static green (fmt, clippy `-D warnings`,
+64 lib + 3 integration tests) and the **legacy paths are untouched** — `sigil-wasm`
+`sync-interop.mjs` + `totp-interop.mjs` still PASS against an UNAUTHENTICATED dev sigild, all
+changes are confined to `cli/`, and `libsigil` `getrandom` is still **0**. Honest: still the
+**DEV op-log over PLAIN HTTP (no TLS)**, server model dev-gated + **UNAUDITED**, ownership is
+trust-on-first-write, enrollment tokens are single-ATTEMPT, and there is still no account
+model, no session issuance, no key rotation, and a per-process replay cache. Details in the
+Phase 42 entry below.
+Phase 41 gave **`sigild` a REAL
 multi-device auth model** — the first time the server can answer *which device is this,
 and may it touch this vault*. **Op-log auth contract v3**, opt-in via **`SIGILD_DEVICE_AUTH`**
 (requires `SIGILD_ENABLE_DEV_OPS`; **mutually exclusive** with the legacy single-key
@@ -4446,3 +4475,108 @@ GREEN; this pass is docs-only.
   NO rate limiting on enrollment attempts.** The admin token is a single static bearer secret
   with no rotation story: if it leaks, the holder can revoke any device (a DoS — it still
   cannot decrypt anything).
+
+---
+
+## 2026-07-16 — Phase 42 (the `sigil` CLI speaks contract v3: device enrollment, v3-signed push/pull, grants, revocation)
+
+### What & why
+- Phase 41 built the server half of the multi-device auth model (ADR 0031) but **no client
+  spoke it** — v3 could only be exercised by a throwaway test client. Phase 42 is the
+  **client half**: the `sigil` CLI now enrolls as a device, signs its op-log requests under
+  contract v3, grants other devices access to its vaults, and revokes devices.
+- **No new ADR.** This is the other half of ADR 0031, not a new decision — it introduces no
+  design choice of its own, only mirrors the server's canonical messages. A **"Client
+  support (added Phase 42)"** section was appended to
+  `docs/decisions/0031-multi-device-auth-model.md` instead.
+
+### How (all changes confined to `cli/`)
+- **Four subcommands** under a `device` dispatch (`cli/src/main.rs`: `cmd_device`,
+  `parse_device_flags`, `cmd_device_enroll`/`_list`/`_revoke`/`_grant`):
+  - `sigil device enroll --token <t> [--label <name>] [--key <file>] [--server <url>] [--reuse-key]`
+    → `POST /v1/devices/enroll`. Generates a fresh key (or reuses the existing one with
+    `--reuse-key`), signs the proof-of-possession challenge, and writes the server-assigned
+    device ID back into the identity file. It **refuses to overwrite** an existing identity
+    file without `--reuse-key` — overwriting would destroy a device's only credential.
+  - `sigil device list --admin-token <t> [--server <url>]` → `GET /v1/devices` (operator-only).
+  - `sigil device revoke <deviceID> [--admin-token <t>] [--key <file>] [--server <url>]` →
+    `POST /v1/devices/{deviceID}/revoke`; self-revocation via `--key` (the CLI checks locally
+    that the identity IS the target before sending), operator revocation via `--admin-token`.
+  - `sigil device grant <deviceID> --vault <id> --permission read|write [--key <file>] [--server <url>]`
+    → `POST /v1/vaults/{vaultID}/grants` (owner-only). `GET …/grants` has **no subcommand yet**.
+- **Identity model: the EXISTING key file was EXTENDED, not replaced.** `KeyFile`
+  (`cli/src/lib.rs`) gained an **optional `device_id`** (`#[serde(default,
+  skip_serializing_if = "Option::is_none")]`), so a key file written by an older build parses
+  unchanged, omits the field on write, and keeps signing v2. `DeviceIdentity` +
+  `RequestAuth::{None,V2,V3}` make **contract selection additive and driven by the identity**:
+  **no key ⇒ unsigned** (byte-identical legacy path) · **identity WITHOUT `device_id` ⇒ legacy
+  v2** · **identity WITH `device_id` ⇒ v3** (adds the `X-Sigil-Device` header). `push`/`pull`
+  therefore sign v3 automatically once their key is enrolled, with **zero flag changes**;
+  `SIGIL_DEVICE_ID` forces v3 with that ID even on an older key file.
+- **Canonical bytes are rebuilt client-side and MUST stay byte-identical to sigild's**:
+  `canonical_v3_message` (`"sigil-oplog-auth-v3\n" + DEVICE_ID + "\n" + METHOD + "\n" + PATH +
+  "\n" + QUERY + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY`) mirrors `canonicalV3Message`,
+  and `canonical_enroll_message` (`"sigil-device-enroll-v1\n" + TOKEN_SHA256_HEX + "\n" +
+  TIMESTAMP + "\n" + NONCE + "\n" + PUBLIC_KEY_B64 + "\n" + LABEL`, **no trailing newline**)
+  mirrors `canonicalEnrollMessage`. A fresh CSPRNG nonce + the current unix seconds are drawn
+  per request; signing is `sigil_core::sign`. The enrollment body is serialized FIRST and the
+  exact strings it carries are what get signed, so escaping cannot diverge from the server.
+- **New env vars** `SIGIL_ENROLL_TOKEN` / `SIGIL_ADMIN_TOKEN` / `SIGIL_DEVICE_ID` (flags win,
+  empty treated as unset) beside the unchanged `SIGIL_SERVER` / `SIGIL_DEVICE_KEY` /
+  `SIGIL_PASSWORD`. The default identity path `$HOME/.sigil/device.key` applies **only** to the
+  `device` subcommands; `push`/`pull` keep their old rule (no key ⇒ unsigned).
+- **Secret hygiene:** identity files are written `0600` (parent dir `0700`), and the seed, the
+  enrollment token and the admin token are **never printed** — only device IDs, labels and
+  statuses. `explain_device_error` / `explain_sync_error` translate `401` vs `403` into
+  actionable operator text (including the exact `sigil device grant …` line to ask an owner
+  for) **without echoing any credential**.
+- **Dependencies:** one new dependency **EDGE** only — `sha2` (`default-features = false`) for
+  the enrollment-token digest. The crate was already in `cli/Cargo.lock` transitively via
+  `sigil-core`, so **no new package** entered the lockfile.
+
+### ✅ Verified GREEN (first-hand, against a live `sigild`)
+- **Enroll A** succeeded and wrote a `0600` identity — **no seed on stdout**.
+- **Reusing the same enrollment token failed** — tokens really are single-use.
+- `sigil push --vault demo --in <file> --key A.key` succeeded at **seq 1** and **claimed** the
+  vault (trust-on-first-write); `sigil pull` + `sigil open` round-tripped **byte-identical**
+  plaintext.
+- **Device B enrolled**, and **B pulling A's vault BEFORE a grant → `403`**.
+- `sigil device grant <B> --vault demo --permission read` succeeded → **B then pulled fine**.
+- **B WRITING with a read-only grant → `403`** — the permission lattice is enforced.
+- After an **admin revoke**, **B → `401`** while **A kept working**.
+- An **UNSIGNED push** against a device-auth server → **`401`**.
+- The **server log contained neither the enrollment token nor the admin token**.
+- Static: `cargo fmt --check` clean, `cargo clippy --all-targets -D warnings` clean,
+  **64 lib + 3 integration tests pass**.
+- **Regression green:** `sigil-wasm/test/sync-interop.mjs` and `totp-interop.mjs` both still
+  **PASS** (they drive the real CLI against an **UNAUTHENTICATED** dev sigild), proving the
+  legacy unsigned/v2 paths are untouched. All changes are confined to `cli/`, and
+  **`libsigil/Cargo.lock` `getrandom` is still 0**.
+
+### Docs (this pass)
+- `docs/api.md` — a new **"Client support (the `sigil` CLI)"** subsection in the v3 section
+  (command→route table, the contract-selection table, the env vars, the note that
+  `GET …/grants` has no subcommand yet); the legacy-v2 key-file paragraph now mentions the
+  optional `device_id`, and its "multi-device enrollment / registry … is future" clause was
+  corrected to point at contract v3 (JWT/session issuance is what is still future).
+- `CLAUDE.md` — the `cli/` bullet gained the four subcommands, the extended-key-file /
+  backward-compatibility note, the unsigned/v2/v3 selection rule, the new env vars, the
+  canonical-message sync requirement, and the `sha2` dep-edge note, with the honest scope kept.
+- `README.md` — a brief honest note that the CLI can enroll as a device and sync under
+  per-vault authorization against the dev server (dev / plain HTTP / UNAUDITED).
+- `docs/deployment.md` — the stale "no … native client consumes this server" clause corrected:
+  the `sigil` CLI does, now including the device model, still dev/localhost/plain HTTP.
+- `docs/decisions/0031-multi-device-auth-model.md` — a **"Client support (added Phase 42)"**
+  section (no new ADR).
+- `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 42**.
+
+### ➡️ Still open (honest)
+- **Dev op-log over PLAIN HTTP — no TLS.** Do not point it at a remote host.
+- **The server-side model is dev-gated and UNAUDITED**; this is not a security claim.
+- **Ownership is trust-on-first-write** — a dev heuristic, not an account model.
+- **Enrollment tokens are single-ATTEMPT** (a failed attempt burns one).
+- **No account model, no session issuance (no JWT), no key rotation / re-enrollment**, and the
+  server's **replay cache is per-process**.
+- Client gaps: **no `device grants` listing subcommand** (`GET /v1/vaults/{vaultID}/grants` is
+  unused), and the CLI is still the **only** client that speaks v3 — the wasm `sync.mjs`,
+  webapp, and extension all remain on the unsigned dev path.

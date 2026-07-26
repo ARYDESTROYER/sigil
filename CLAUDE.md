@@ -401,6 +401,38 @@ public, make no security claims, until the audit completes and trademark clears.
   Authenticator export) + round-trip verified. The vault's `TotpVault` JSON schema is
   **UNCHANGED** (browser mirror intact); HOTP entries are warned-and-skipped since the
   vault is TOTP-only. Dev/UNAUDITED. ADR 0025.
+  Also **`sigil device enroll|list|revoke|grant`** — the CLIENT half of sigild's
+  multi-device auth model (**contract v3**, ADR 0031; Phase 42), so the CLI is the
+  FIRST client that speaks v3: `device enroll --token <t> [--label <name>] [--key
+  <file>] [--server <url>] [--reuse-key]` (POST `/v1/devices/enroll`: generates —
+  or with `--reuse-key` reuses — the key, signs the proof-of-possession challenge,
+  and writes the server-assigned device ID into the 0600 identity file; it REFUSES
+  to overwrite an existing identity file without `--reuse-key`), `device list
+  --admin-token <t>` (GET `/v1/devices`, operator-only), `device revoke <deviceID>
+  [--admin-token <t>] [--key <file>]` (POST `/v1/devices/{deviceID}/revoke` — self
+  via `--key`, or operator via `--admin-token`), and `device grant <deviceID>
+  --vault <id> --permission read|write [--key <file>]` (POST
+  `/v1/vaults/{vaultID}/grants`, owner-only). `GET …/grants` has no subcommand yet.
+  The **identity file is the EXISTING `sigil keygen` key file EXTENDED** with an
+  OPTIONAL `device_id` (serde `default` + `skip_serializing_if`), so an old key file
+  parses unchanged. **Contract selection is additive and driven by the identity**
+  (`DeviceIdentity::auth` → `RequestAuth`): **no key ⇒ unsigned** (byte-identical
+  legacy path) · **identity WITHOUT `device_id` ⇒ legacy v2** · **identity WITH
+  `device_id` ⇒ v3** (adds `X-Sigil-Device`), so `push`/`pull` sign v3 automatically
+  once their key is enrolled; **`SIGIL_DEVICE_ID`** forces v3 on an older key file.
+  New env vars **`SIGIL_ENROLL_TOKEN`** / **`SIGIL_ADMIN_TOKEN`** / **`SIGIL_DEVICE_ID`**
+  (flags win) beside the unchanged `SIGIL_SERVER`/`SIGIL_DEVICE_KEY`/`SIGIL_PASSWORD`;
+  the default identity path `$HOME/.sigil/device.key` applies ONLY to the `device`
+  subcommands (push/pull keep "no key means unsigned"). The CLI rebuilds the server's
+  canonical bytes itself (`canonical_v3_message`/`canonical_enroll_message` in
+  `cli/src/lib.rs`, fresh CSPRNG nonce + current unix seconds per request, signing via
+  `sigil_core::sign`) — these **MUST stay byte-identical to sigild's `canonicalV3Message`
+  /`canonicalEnrollMessage`**. Identity files are 0600 and the seed / enrollment token /
+  admin token are NEVER printed. One new dependency EDGE only (`sha2`, for the
+  enrollment-token digest — already in `cli/Cargo.lock` transitively, so no new package).
+  Same honest scope as the server side: **dev op-log over PLAIN HTTP, no TLS,
+  dev-gated + UNAUDITED**, trust-on-first-write ownership, single-ATTEMPT enrollment
+  tokens, no account model / session issuance / key rotation, per-process replay cache.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.

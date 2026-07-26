@@ -11,13 +11,15 @@
 use std::process::ExitCode;
 
 use sigil_cli::{
-    base32_decode, cursor_key, decode_migration_uri, encode_migration_uri, entry_to_migration_otp,
-    entry_to_otpauth_uri, generate_hybrid_identity, generate_key, hybrid_open_container,
-    hybrid_seal_to_container, load_hybrid_public, load_hybrid_secret, load_key,
-    migration_otp_to_entry, new_totp_entry, open_container, open_vault, parse_otpauth_uri,
-    pull_ops, push_op, read_cursor, save_hybrid_public, save_hybrid_secret, save_key,
-    seal_to_container, seal_vault, totp_algorithm_from_str, write_cursor, ImportedOtp, TotpEntry,
-    TotpVault, PULL_STATE_FILE, TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD,
+    base32_decode, cursor_key, decode_migration_uri, encode_migration_uri, enroll_device,
+    entry_to_migration_otp, entry_to_otpauth_uri, generate_hybrid_identity, generate_key,
+    grant_vault_access, hybrid_open_container, hybrid_seal_to_container, list_devices,
+    load_hybrid_public, load_hybrid_secret, load_identity, load_key_file, migration_otp_to_entry,
+    new_totp_entry, open_container, open_vault, parse_otpauth_uri, pull_ops_auth, push_op_auth,
+    read_cursor, revoke_device, save_hybrid_public, save_hybrid_secret, save_key,
+    seal_to_container, seal_vault, totp_algorithm_from_str, write_cursor, CliError, DeviceIdentity,
+    ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE, TOTP_DEFAULT_DIGITS,
+    TOTP_DEFAULT_PERIOD,
 };
 use sigil_core::Argon2Params;
 
@@ -30,9 +32,23 @@ const SERVER_ENV: &str = "SIGIL_SERVER";
 /// Default dev sigild base URL when neither --server nor SIGIL_SERVER is set.
 const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
-/// Environment variable giving the path to the device key file used to SIGN
-/// op-log requests (overridden by `--key`).
+/// Environment variable giving the path to the device key / identity file used to
+/// SIGN op-log requests (overridden by `--key`).
 const DEVICE_KEY_ENV: &str = "SIGIL_DEVICE_KEY";
+
+/// Environment variable that supplies (or overrides) the enrolled DEVICE ID.
+/// Setting it forces contract v3 signing even for an identity file that has no
+/// `device_id` yet. Unset/empty means "use whatever the identity file says".
+const DEVICE_ID_ENV: &str = "SIGIL_DEVICE_ID";
+
+/// Environment variable for the operator ADMIN token used by
+/// `sigil device list` / `sigil device revoke` (overridden by `--admin-token`).
+/// It is a BEARER SECRET and is never printed.
+const ADMIN_TOKEN_ENV: &str = "SIGIL_ADMIN_TOKEN";
+
+/// Environment variable for the single-use device ENROLLMENT token (overridden by
+/// `--token`). It is a BEARER SECRET and is never printed.
+const ENROLL_TOKEN_ENV: &str = "SIGIL_ENROLL_TOKEN";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -66,6 +82,14 @@ USAGE:
                                          Export entries as otpauth:// URIs (or ONE
                                          otpauth-migration:// URI with --migration). PRINTS SECRETS.
   sigil keygen --out <file>              Generate a DEV device key (0600) and print its public key
+  sigil device enroll --token <t> [--label <name>] [--key <file>] [--server <url>] [--reuse-key]
+                                         Enroll this device with sigild; writes the identity (0600)
+  sigil device list --admin-token <t> [--server <url>]
+                                         List enrolled devices (operator admin token)
+  sigil device revoke <deviceID> [--admin-token <t>] [--key <file>] [--server <url>]
+                                         Revoke a device (self, v3-signed, or operator admin token)
+  sigil device grant <deviceID> --vault <id> --permission read|write [--key <file>] [--server <url>]
+                                         Grant another device access to YOUR vault (owner only)
   sigil hybrid-keygen --out <file>       Generate a hybrid identity: secret <file> (0600) + shareable <file>.pub
   sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>
                                          Encrypt <in> TO a recipient's hybrid public identity (no password)
@@ -184,9 +208,48 @@ DEVICE-KEY SIGNING (push/pull) — DEV-ONLY, single device key:
   timestamps skewed more than 300s AND, when it tracks seen nonces, rejects a
   replayed nonce within that window — so a captured request is replay-resistant.
   That replay cache is per-process/in-memory on the server (a multi-instance deploy
-  would need a shared store). Device enrollment, a multi-device registry, and JWT
-  bearer tokens are all FUTURE work. The signing primitive (Ed25519) is REAL but
-  UNAUDITED.
+  would need a shared store). The signing primitive (Ed25519) is REAL but UNAUDITED.
+
+MULTI-DEVICE AUTH (sigil device ...) — CONTRACT v3, DEV-ONLY:
+  A sigild started with SIGILD_DEVICE_AUTH=1 (plus SIGILD_ENABLE_DEV_OPS=1 and
+  SIGILD_ENROLL_TOKENS=<...>) runs a real device registry instead of the single
+  v2 key: each device ENROLLS, gets a device ID, signs every request under the
+  CONTRACT v3 message (which additionally binds that device ID and is sent with
+  X-Sigil-Device), and is authorized PER VAULT. The first device to WRITE an
+  unclaimed vault becomes its owner; any other device gets 403 until granted.
+
+  CONTRACT SELECTION is automatic and additive:
+    no --key/SIGIL_DEVICE_KEY        -> unsigned      (unchanged legacy behaviour)
+    identity file WITHOUT device_id  -> contract v2   (unchanged legacy behaviour)
+    identity file WITH device_id     -> contract v3   (after `device enroll`)
+  Setting SIGIL_DEVICE_ID=<id> forces v3 with that ID even for an older key file.
+
+  The identity file is the SAME 0600 JSON as `sigil keygen` writes, EXTENDED with
+  an optional \"device_id\" that `device enroll` fills in — an old key file still
+  works untouched. The default identity path is $HOME/.sigil/device.key. The seed
+  is never printed; enrollment/admin tokens are never printed or logged.
+
+    # operator: sigild with SIGILD_DEVICE_AUTH=1 SIGILD_ENROLL_TOKENS=tokA,tokB
+    sigil device enroll --token tokA --label laptop --key ./a.key
+    # -> enrolled device dev_XXXX (identity written to ./a.key, mode 0600)
+
+    sigil push --vault demo --in secret.sigil --key ./a.key   # A claims 'demo'
+    sigil pull --vault demo --out-dir ./inbox --key ./a.key
+
+    # a second device is 403 on A's vault until A grants it:
+    sigil device enroll --token tokB --label phone --key ./b.key
+    sigil device grant <B_ID> --vault demo --permission read --key ./a.key
+    sigil pull --vault demo --out-dir ./inbox-b --key ./b.key
+
+    # revoke: the device itself (v3-signed) or the operator admin token
+    sigil device revoke <B_ID> --key ./b.key
+    sigil device revoke <B_ID> --admin-token \"$SIGIL_ADMIN_TOKEN\"
+    sigil device list --admin-token \"$SIGIL_ADMIN_TOKEN\"
+
+  Enrollment tokens are SINGLE-USE (a failed attempt burns one) and are bound into
+  the signed enrollment challenge only as their SHA-256 digest. Enrollment proves
+  possession of the device private key. HONEST SCOPE: dev/localhost/plain HTTP,
+  UNAUDITED; no account model, no key rotation, no recovery.
 
 INCREMENTAL PULL (pull only):
   Pulled ops are written to <out-dir>/<vault>/op-<seq>.sigil — a PER-VAULT subdir,
@@ -280,6 +343,7 @@ fn run() -> Result<(), String> {
             cmd_hybrid_open(&a)
         }
         "totp" => cmd_totp(args),
+        "device" => cmd_device(args),
         "push" => {
             let p = parse_push(args)?;
             cmd_push(&p)
@@ -620,16 +684,47 @@ fn cmd_hybrid_open(a: &HybridOpenArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the device-key seed from an optional key-file path. `None` -> `None`
-/// (send unsigned); `Some(path)` -> decode the seed, mapping errors to a string.
-fn load_seed(key: &Option<String>) -> Result<Option<[u8; sigil_core::SIG_SEED_LEN]>, String> {
-    match key {
-        None => Ok(None),
-        Some(path) => {
-            let (seed, _public) =
-                load_key(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-            Ok(Some(seed))
-        }
+/// Load the device IDENTITY from an optional key-file path.
+///
+/// `None` -> `Ok(None)` (send unsigned — the EXACT legacy behaviour when neither
+/// `--key` nor `SIGIL_DEVICE_KEY` is set). `Some(path)` -> decode the identity;
+/// its `device_id` (or `SIGIL_DEVICE_ID`, which overrides it) is what later
+/// selects contract v3 over the legacy v2.
+fn load_identity_opt(key: &Option<String>) -> Result<Option<DeviceIdentity>, String> {
+    let Some(path) = key else { return Ok(None) };
+    let mut id = load_identity(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    if let Some(env_id) = std::env::var(DEVICE_ID_ENV).ok().filter(|s| !s.is_empty()) {
+        id.device_id = Some(env_id);
+    }
+    Ok(Some(id))
+}
+
+/// The [`RequestAuth`] for an optional identity: no identity -> unsigned;
+/// identity without a device ID -> legacy v2; with one -> contract v3.
+fn auth_for(identity: &Option<DeviceIdentity>) -> RequestAuth<'_> {
+    match identity {
+        Some(id) => id.auth(),
+        None => RequestAuth::None,
+    }
+}
+
+/// Turn a sync error into an actionable message, distinguishing the two auth
+/// verdicts sigild can return: `401` = the request was not authenticated at all
+/// (missing/invalid/replayed signature, unknown or revoked device), `403` = it WAS
+/// authenticated but this device holds no sufficient grant on that vault.
+fn explain_sync_error(e: CliError, vault: &str, contract: &str) -> String {
+    match &e {
+        CliError::Server { status: 401, .. } => format!(
+            "{e}\n  -> HTTP 401: sigild did not accept this request's credentials (contract {contract}).\n     \
+             Check that the device is enrolled and not revoked, that --key/SIGIL_DEVICE_KEY points at the\n     \
+             enrolled identity, and that the clock is within 300s of the server."
+        ),
+        CliError::Server { status: 403, .. } => format!(
+            "{e}\n  -> HTTP 403: this device IS authenticated but is NOT authorized for vault {vault:?}.\n     \
+             The vault is owned by another device. Ask its owner to run:\n       \
+             sigil device grant <THIS_DEVICE_ID> --vault {vault} --permission read|write"
+        ),
+        _ => e.to_string(),
     }
 }
 
@@ -637,10 +732,14 @@ fn cmd_push(p: &PushArgs) -> Result<(), String> {
     let container =
         std::fs::read(&p.input).map_err(|e| format!("could not read input {:?}: {e}", p.input))?;
 
-    // When a device key is configured, SIGN the request (required if sigild has
-    // SIGILD_OPLOG_PUBKEY set). push_op still moves OPAQUE bytes; no password.
-    let seed = load_seed(&p.key)?;
-    let seq = push_op(&p.server, &p.vault, &container, seed.as_ref()).map_err(|e| e.to_string())?;
+    // When a device identity is configured, SIGN the request: contract v3 if the
+    // identity is enrolled (has a device ID), else the LEGACY v2 contract. With no
+    // identity the request is unsigned, exactly as before. Either way push moves
+    // OPAQUE bytes; no password, no plaintext.
+    let identity = load_identity_opt(&p.key)?;
+    let auth = auth_for(&identity);
+    let seq = push_op_auth(&p.server, &p.vault, &container, &auth)
+        .map_err(|e| explain_sync_error(e, &p.vault, auth.contract()))?;
     println!("pushed vault {} seq {}", p.vault, seq);
     Ok(())
 }
@@ -659,10 +758,12 @@ fn cmd_pull(p: &PullArgs) -> Result<(), String> {
     // resume from the saved cursor.
     let start = p.since.unwrap_or(saved);
 
-    // When a device key is configured, SIGN the request (required if sigild has
-    // SIGILD_OPLOG_PUBKEY set).
-    let seed = load_seed(&p.key)?;
-    let ops = pull_ops(&p.server, &p.vault, start, seed.as_ref()).map_err(|e| e.to_string())?;
+    // When a device identity is configured, SIGN the request: contract v3 if the
+    // identity is enrolled, else the LEGACY v2 contract; unsigned with no identity.
+    let identity = load_identity_opt(&p.key)?;
+    let auth = auth_for(&identity);
+    let ops = pull_ops_auth(&p.server, &p.vault, start, &auth)
+        .map_err(|e| explain_sync_error(e, &p.vault, auth.contract()))?;
 
     if ops.is_empty() {
         println!("no new ops since {start}");
@@ -692,6 +793,302 @@ fn cmd_pull(p: &PullArgs) -> Result<(), String> {
     let new_cursor = saved.max(max_seq);
     write_cursor(&state_path, &key, new_cursor).map_err(|e| e.to_string())?;
     println!("cursor for {} now at {}", p.vault, new_cursor);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `sigil device` — the CLIENT side of sigild's MULTI-DEVICE auth model
+// (contract v3): enroll / list / revoke / grant.
+//
+// DEV-ONLY, UNAUDITED, plain HTTP. Every secret here (the device seed, the
+// enrollment token, the admin token) is kept out of stdout/stderr: we print
+// device IDs, labels and statuses only.
+// ---------------------------------------------------------------------------
+
+/// Resolve the device identity path: `--key <file>`, else `SIGIL_DEVICE_KEY`,
+/// else the default `$HOME/.sigil/device.key` (falling back to the CWD if `$HOME`
+/// is unset).
+///
+/// NOTE: this default applies ONLY to the `device` subcommands. push/pull keep
+/// their existing rule (no `--key` and no `SIGIL_DEVICE_KEY` => send UNSIGNED),
+/// so their legacy behaviour is untouched.
+fn resolve_identity_path(flag: Option<String>) -> std::path::PathBuf {
+    if let Some(p) = resolve_key(flag) {
+        return std::path::PathBuf::from(p);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home)
+            .join(".sigil")
+            .join("device.key"),
+        _ => std::path::PathBuf::from("device.key"),
+    }
+}
+
+/// Read a token from an explicit flag, else the given environment variable.
+/// Tokens are BEARER SECRETS: this never echoes the value.
+fn resolve_token(flag: Option<String>, env: &str) -> Option<String> {
+    flag.or_else(|| std::env::var(env).ok())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parsed flags shared by the `device` subcommands. Unknown flags are rejected by
+/// the caller, so each subcommand validates the combination it needs.
+#[derive(Default)]
+struct DeviceFlags {
+    server: Option<String>,
+    key: Option<String>,
+    token: Option<String>,
+    admin_token: Option<String>,
+    label: Option<String>,
+    vault: Option<String>,
+    permission: Option<String>,
+    reuse_key: bool,
+}
+
+/// Parse the `device` subcommand flags (order-independent), rejecting anything
+/// unknown or repeated.
+fn parse_device_flags(args: Vec<String>) -> Result<DeviceFlags, String> {
+    let mut f = DeviceFlags::default();
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--server" => set_once(&mut f.server, &mut it, "--server")?,
+            "--key" => set_once(&mut f.key, &mut it, "--key")?,
+            "--token" => set_once(&mut f.token, &mut it, "--token")?,
+            "--admin-token" => set_once(&mut f.admin_token, &mut it, "--admin-token")?,
+            "--label" => set_once(&mut f.label, &mut it, "--label")?,
+            "--vault" => set_once(&mut f.vault, &mut it, "--vault")?,
+            "--permission" => set_once(&mut f.permission, &mut it, "--permission")?,
+            "--reuse-key" => f.reuse_key = true,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    Ok(f)
+}
+
+/// Dispatch `sigil device <sub> ...`.
+fn cmd_device(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let Some(sub) = args.next() else {
+        return Err("missing device subcommand: enroll | list | revoke | grant".to_string());
+    };
+    let rest: Vec<String> = args.collect();
+    let (positional, flags) = take_positional(&rest);
+    let f = parse_device_flags(flags.to_vec())?;
+
+    match sub.as_str() {
+        "enroll" => cmd_device_enroll(&f),
+        "list" => cmd_device_list(&f),
+        "revoke" => cmd_device_revoke(positional, &f),
+        "grant" => cmd_device_grant(positional, &f),
+        other => Err(format!(
+            "unknown device subcommand {other:?}; try enroll | list | revoke | grant"
+        )),
+    }
+}
+
+/// Explain a device-route HTTP failure in terms of what the operator can do.
+/// Never echoes a token.
+fn explain_device_error(e: CliError, what: &str) -> String {
+    match &e {
+        CliError::Server { status: 401, .. } => format!(
+            "{e}\n  -> HTTP 401: sigild rejected the credentials for {what}. Enrollment tokens are\n     \
+             SINGLE-USE and time-limited, the admin token must match SIGILD_ADMIN_TOKEN exactly, and the\n     \
+             clock must be within 300s of the server."
+        ),
+        CliError::Server { status: 403, .. } => format!(
+            "{e}\n  -> HTTP 403: authenticated, but not permitted to {what}. A device may only revoke\n     \
+             ITSELF, and only a vault's OWNER may grant access to it."
+        ),
+        CliError::Server { status: 409, .. } => format!(
+            "{e}\n  -> HTTP 409: that public key is already enrolled. Use the existing identity file, or\n     \
+             enroll a FRESH key (drop --reuse-key / choose a new --key path)."
+        ),
+        CliError::Server { status: 501, .. } => format!(
+            "{e}\n  -> HTTP 501: this sigild does not have the device model enabled. Start it with\n     \
+             SIGILD_ENABLE_DEV_OPS=1 SIGILD_DEVICE_AUTH=1 SIGILD_ENROLL_TOKENS=<token,...>."
+        ),
+        _ => e.to_string(),
+    }
+}
+
+/// `sigil device enroll --token <t> [--label <name>] [--key <file>] [--reuse-key]`
+///
+/// Generates a FRESH Ed25519 key pair (or reuses the existing identity file with
+/// `--reuse-key`), proves possession of it against the enrollment challenge, and
+/// on success writes the identity file (mode 0600) INCLUDING the server-assigned
+/// device ID. Prints the device ID; never the seed and never the token.
+fn cmd_device_enroll(f: &DeviceFlags) -> Result<(), String> {
+    if f.vault.is_some() || f.permission.is_some() || f.admin_token.is_some() {
+        return Err("device enroll takes --token/--label/--key/--server/--reuse-key only".into());
+    }
+    let token = resolve_token(f.token.clone(), ENROLL_TOKEN_ENV).ok_or_else(|| {
+        format!("missing required --token <enrollment-token> (or set {ENROLL_TOKEN_ENV})")
+    })?;
+    let server = resolve_server(f.server.clone());
+    let path = resolve_identity_path(f.key.clone());
+    let label = f.label.clone().unwrap_or_default();
+
+    // Choose the key: reuse the existing identity file on request, else generate a
+    // fresh pair. We NEVER silently overwrite an existing identity — that would
+    // destroy a device's only credential.
+    let key_file = if f.reuse_key {
+        load_key_file(&path).map_err(|e| e.to_string())?
+    } else {
+        if path.exists() {
+            return Err(format!(
+                "identity file {} already exists; pass --reuse-key to enroll that key, \
+                 or --key <other-file> to enroll a fresh one",
+                path.display()
+            ));
+        }
+        generate_key().map_err(|e| e.to_string())?
+    };
+
+    let identity = key_file.decode().map_err(|e| e.to_string())?;
+
+    let dev = enroll_device(
+        &server,
+        &token,
+        &label,
+        &identity.public_key,
+        &identity.seed,
+    )
+    .map_err(|e| explain_device_error(e, "device enrollment"))?;
+
+    // Persist the assigned device ID alongside the key (mode 0600). Creating the
+    // parent dir 0700 mirrors the TOTP vault's handling of $HOME/.sigil.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|e| format!("could not create identity dir {:?}: {e}", parent))?;
+        }
+    }
+    let mut stored = key_file;
+    stored.device_id = Some(dev.device_id.clone());
+    save_key(&path, &stored).map_err(|e| e.to_string())?;
+
+    println!(
+        "enrolled device {id} (label {label:?}, status {status})\n\
+         identity written to {path} (mode 0600) — push/pull with this --key now sign under contract v3",
+        id = dev.device_id,
+        status = dev.status,
+        path = path.display(),
+    );
+    Ok(())
+}
+
+/// `sigil device list --admin-token <t>` — operator-only listing.
+fn cmd_device_list(f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.vault.is_some() || f.permission.is_some() {
+        return Err("device list takes --admin-token/--server only".into());
+    }
+    let admin = resolve_token(f.admin_token.clone(), ADMIN_TOKEN_ENV).ok_or_else(|| {
+        format!("missing required --admin-token <token> (or set {ADMIN_TOKEN_ENV}); listing devices is operator-only")
+    })?;
+    let server = resolve_server(f.server.clone());
+
+    let devices =
+        list_devices(&server, &admin).map_err(|e| explain_device_error(e, "listing devices"))?;
+    if devices.is_empty() {
+        println!("no devices enrolled");
+        return Ok(());
+    }
+    println!("{} device(s):", devices.len());
+    for d in &devices {
+        let revoked = d.revoked_at.as_deref().unwrap_or("-");
+        println!(
+            "  {id}  status={status}  label={label:?}  created={created}  revoked={revoked}",
+            id = d.device_id,
+            status = d.status,
+            label = d.label,
+            created = d.created_at,
+        );
+    }
+    Ok(())
+}
+
+/// `sigil device revoke <deviceID> [--admin-token <t>] [--key <file>]`
+///
+/// Authorized EITHER by the operator admin token (may revoke any device) OR by the
+/// device itself (a contract v3 signature whose device ID IS `<deviceID>`).
+fn cmd_device_revoke(target: Option<String>, f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.vault.is_some() || f.permission.is_some() {
+        return Err("device revoke takes <deviceID> plus --admin-token/--key/--server only".into());
+    }
+    let target = target.ok_or_else(|| "missing <deviceID> to revoke".to_string())?;
+    let server = resolve_server(f.server.clone());
+    let admin = resolve_token(f.admin_token.clone(), ADMIN_TOKEN_ENV);
+
+    // Self-revocation needs the device's own identity; with an admin token the
+    // identity is optional.
+    let identity = match (&admin, resolve_key(f.key.clone())) {
+        (_, Some(path)) => {
+            Some(load_identity(std::path::Path::new(&path)).map_err(|e| e.to_string())?)
+        }
+        (Some(_), None) => None,
+        (None, None) => {
+            return Err(format!(
+                "revoking needs a credential: either --admin-token <t> (or {ADMIN_TOKEN_ENV}) \
+                 or --key <identity-file> for SELF-revocation"
+            ))
+        }
+    };
+    if let (None, Some(id)) = (&admin, &identity) {
+        if id.device_id.as_deref() != Some(target.as_str()) {
+            return Err(format!(
+                "that identity is device {:?}, not {target:?}; a device may only revoke ITSELF \
+                 (use --admin-token to revoke another device)",
+                id.device_id.as_deref().unwrap_or("<not enrolled>")
+            ));
+        }
+    }
+    let auth = auth_for(&identity);
+
+    let dev = revoke_device(&server, &target, &auth, admin.as_deref())
+        .map_err(|e| explain_device_error(e, "revoking a device"))?;
+    println!("revoked device {} (status {})", dev.device_id, dev.status);
+    Ok(())
+}
+
+/// `sigil device grant <deviceID> --vault <id> --permission read|write`
+///
+/// OWNER-ONLY: signed under contract v3 by the identity that owns `--vault`.
+fn cmd_device_grant(target: Option<String>, f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.admin_token.is_some() {
+        return Err(
+            "device grant takes <deviceID> plus --vault/--permission/--key/--server only".into(),
+        );
+    }
+    let target = target.ok_or_else(|| "missing <deviceID> to grant access to".to_string())?;
+    let vault = f
+        .vault
+        .clone()
+        .ok_or_else(|| "missing required --vault <id>".to_string())?;
+    let permission = f
+        .permission
+        .clone()
+        .ok_or_else(|| "missing required --permission read|write".to_string())?;
+    let server = resolve_server(f.server.clone());
+
+    let path = resolve_identity_path(f.key.clone());
+    let identity = load_identity(&path).map_err(|e| e.to_string())?;
+    if identity.device_id.is_none() {
+        return Err(format!(
+            "identity {} has no device_id: run `sigil device enroll` first (granting is a \
+             contract v3, owner-only operation)",
+            path.display()
+        ));
+    }
+    let identity = Some(identity);
+    let auth = auth_for(&identity);
+
+    grant_vault_access(&server, &vault, &target, &permission, &auth)
+        .map_err(|e| explain_device_error(e, "granting vault access"))?;
+    println!("granted {target} {permission} access to vault {vault}");
     Ok(())
 }
 

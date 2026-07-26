@@ -218,7 +218,18 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   protobuf codec), a single `otpauth://` URI, or a file of URIs; `export` is the
   inverse — it prints each entry as an `otpauth://` URI, or (with `--migration`) one
   combined `otpauth-migration://` URI. **`export` prints your secrets IN THE CLEAR**
-  (that is what a 2FA export is) — by design, guarded by a loud warning. Standalone
+  (that is what a 2FA export is) — by design, guarded by a loud warning.
+  The CLI can also **enroll as a device** and sync under **per-vault authorization**
+  against a `SIGILD_DEVICE_AUTH` dev server: `sigil device enroll --token <t>` proves
+  possession of a fresh key and stores the server-assigned device ID in the 0600
+  identity file, after which `push`/`pull` sign under **contract v3** automatically
+  (an un-enrolled key still signs the legacy contract, and no key is still unsigned —
+  nothing existing changed). `sigil device grant <deviceID> --vault <id> --permission
+  read|write` shares one of your vaults with another device, `sigil device list` and
+  `sigil device revoke` (self, or operator with `--admin-token`) manage the registry.
+  **Dev / localhost / plain HTTP, no TLS, UNAUDITED** — trust-on-first-write ownership,
+  no account model, no session issuance, no key rotation.
+  Standalone
   crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build is not
   audited; **do not store real 2FA secrets yet**. Public copy obeys
   `web/apps/marketing/MARKETING-CLAIMS.md`.

@@ -780,6 +780,18 @@ cargo build --manifest-path desktop/Cargo.toml --release   # -> ~8.6 MB native b
 `workflow_dispatch`-only (no `push`/`pull_request` trigger) so nothing builds or
 publishes automatically while in stealth.
 
+**Every surface now has a CI job**: `libsigil.yml`, `cli.yml`, `sigild.yml`,
+`web.yml` (a Rust-free `build` job for marketing **plus** a `webapp` job carrying
+the Rust + wasm-pack toolchain), **`extension.yml`** (Rust + wasm toolchain →
+`extension/build.sh`, then the real-extension Playwright run in chromium), and
+**`desktop.yml`** (Rust + Tauri's Linux WebKitGTK system libs → fmt/clippy/test
+incl. the desktop↔CLI vault interop test, a release build, and a re-check that
+`libsigil/Cargo.lock` stays `getrandom`-free). ⚠️ Like the repo's other CI
+mirrors, the `webapp`/`extension`/`desktop` jobs are **validated locally only**
+(YAML-parsed; each step mirrors a known-green local command) — they have **not**
+been run on real GitHub Actions from this machine, and the Tauri Linux
+system-dependency list in `desktop.yml` is by-eye because the dev machine is macOS.
+
 ## Conventions & guardrails
 
 - **License split:** clients/core/web/CLI = Apache-2.0 (incl. `sigil-wasm`, the

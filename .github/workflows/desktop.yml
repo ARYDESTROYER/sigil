@@ -1,0 +1,93 @@
+name: desktop
+
+# The native desktop client (Tauri v2). Unlike the webapp and the extension, it
+# links `sigil-core` NATIVELY — there is no wasm in this build — so it only needs
+# the Rust toolchain plus Tauri's Linux system libraries (webkit2gtk et al).
+#
+# `desktop/` is its own cargo workspace with its own Cargo.lock, deliberately
+# outside the libsigil workspace, which is what keeps the wasm-pure core's
+# `getrandom`-free lockfile invariant safe. This job re-checks that invariant.
+#
+# The integration test builds the REAL `sigil` binary and drives it against one
+# shared vault file to prove desktop <-> CLI vault interoperability, so the CLI
+# crate is compiled here too (that is expected, not accidental).
+#
+# HONESTY NOTE: like the repo's other CI mirrors, this workflow has been
+# validated locally (YAML-parsed, and every step mirrors a known-green local
+# command) but has NOT been run on real GitHub Actions from the build machine.
+# In particular the Tauri Linux system-dependency list is by-eye: the local
+# machine is macOS, where those packages do not apply.
+
+on:
+  push:
+    paths:
+      - "desktop/**"
+      - "cli/**"
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "cli/**"
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 on Linux needs the WebKitGTK stack. macOS (the dev machine)
+      # uses the system WebKit, so this step has no local counterpart.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            file
+        working-directory: .
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Unit tests plus the desktop <-> CLI vault interop test, which builds and
+      # drives the real `sigil` binary.
+      - name: test (incl. CLI vault interop)
+        run: cargo test
+
+      - name: build (release binary)
+        run: cargo build --release
+
+      # The desktop workspace must never perturb the wasm-pure core lockfile.
+      - name: Assert the libsigil core stays getrandom-free
+        working-directory: .
+        run: |
+          count=$(grep -c 'name = "getrandom"' libsigil/Cargo.lock || true)
+          echo "libsigil/Cargo.lock getrandom entries: $count"
+          test "$count" -eq 0

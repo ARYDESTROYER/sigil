@@ -1,0 +1,85 @@
+name: extension
+
+# The MV3 browser-extension client. Its popup runs libsigil compiled to
+# WebAssembly, so this job needs the Rust + wasm toolchain (unlike the Rust-free
+# marketing job in web.yml): `extension/build.sh` shells out to the repo-root
+# `sigil-wasm/build-wasm.sh` and vendors the generated bindings plus the proven
+# helper modules into `extension/vendor/` (a gitignored build artifact).
+#
+# The test loads the REAL built extension into headless chromium and drives the
+# popup, so it needs a browser as well as the toolchain.
+#
+# HONESTY NOTE: like the repo's other CI mirrors, this workflow has been
+# validated locally (YAML-parsed, and every step mirrors a known-green local
+# command) but has NOT been run on real GitHub Actions from the build machine.
+
+on:
+  push:
+    paths:
+      - "extension/**"
+      - "sigil-wasm/**"
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/extension.yml"
+  pull_request:
+    paths:
+      - "extension/**"
+      - "sigil-wasm/**"
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/extension.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Prebuilt binaries so build-wasm.sh finds `wasm-pack` / `wasm-bindgen`
+      # on PATH under Linux (the local script also probes the macOS cache path).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.100,wasm-pack
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sigil-wasm
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: extension/pnpm-lock.yaml
+
+      - name: Install test deps
+        working-directory: extension
+        run: pnpm install --frozen-lockfile
+
+      # Compiles the wasm and vendors it (plus the proven .mjs helpers) into
+      # extension/vendor/. `pnpm test` also runs this via its pretest hook, but
+      # running it explicitly makes a build failure obvious in its own step.
+      - name: Build the extension package (wasm + vendored helpers)
+        working-directory: extension
+        run: ./build.sh
+
+      - name: Install chromium for the extension test
+        working-directory: extension
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Loads the REAL extension into chromium and drives the popup: asserts the
+      # wasm-computed RFC 6238 code, that storage holds only the sealed vault,
+      # and the lock/unlock persistence round-trip.
+      - name: Test (real extension in headless chromium)
+        working-directory: extension
+        run: pnpm test

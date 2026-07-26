@@ -33,8 +33,11 @@ and 5 above). The only stateful surface today is the **dev-only vault op-log**
 default, and **unauthenticated unless one of two opt-in contracts is
 configured** — legacy single-static-key **v2** (`SIGILD_OPLOG_PUBKEY`, no
 authorization at all) or the **multi-device model v3** (`SIGILD_DEVICE_AUTH`;
-see the next section). It is a local-wiring scaffold only and **must never be
-exposed publicly or hold real secrets**.
+see the next section). The same dev gate also opens the **vault-key relay**
+(device hybrid **public** keys + opaque wrapped-vault-key envelopes) — which does
+not weaken the property above, because the server holds no decapsulation key and
+relays the envelope verbatim. It is a local-wiring scaffold only and **must never
+be exposed publicly or hold real secrets**.
 
 ## Dev op-log request-auth surface (contract v3, opt-in — see [ADR 0031](decisions/0031-multi-device-auth-model.md))
 
@@ -133,14 +136,16 @@ not buy:
   vault password destroys the device identity along with the vault; the only recovery
   is an operator revoke plus a fresh enrollment token.
 
-**Zero-knowledge is unaffected by the auth model.** The registry stores **auth
-metadata only** — Ed25519 **public** keys, server-assigned IDs, labels,
-permissions, timestamps, and a bearer token's SHA-256 digest. Migration
-`0002_devices.sql` touches **nothing** in the op-log table, so the opaque blob
-and its tamper-evidence hash chain are byte-for-byte unchanged, and the server
-still performs **no cryptography on vault contents**. Adding authentication did
-**not** give the server any ability to decrypt: adversary classes 4 and 5 above
-are unchanged. Correspondingly, the audit and metrics surfaces never record a
+**Zero-knowledge is unaffected by the auth model — or by sharing.** The registry
+stores **auth metadata only** — Ed25519 **public** keys, server-assigned IDs,
+labels, permissions, timestamps, and a bearer token's SHA-256 digest. Migrations
+`0002_devices.sql` and `0004_key_sharing.sql` touch **nothing** in the op-log
+table, so the opaque blob and its tamper-evidence hash chain are byte-for-byte
+unchanged, and the server still performs **no cryptography on vault contents**.
+Adding authentication did **not** give the server any ability to decrypt, and
+neither did adding the key relay: what `0004` stores is **public** key material and
+**ciphertext the server has no decapsulation key for** (see the vault-sharing
+section below). Adversary classes 4 and 5 above are unchanged. Correspondingly, the audit and metrics surfaces never record a
 public key, an enrollment or admin token (or its digest), a signature, a nonce, a
 timestamp value, or blob content.
 
@@ -182,6 +187,74 @@ that actually resists a hostile server is **client-side**: a client re-derives
 the chain from the per-op hashes it receives and compares against its own
 remembered tip. Server-side verification only catches accidental corruption and a
 non-adversarial operator's storage faults.
+
+## Device-to-device vault sharing (opt-in, dev-gated — see [ADR 0035](decisions/0035-device-to-device-vault-sharing.md))
+
+Sharing puts **key material in motion** for the first time. A shared vault is
+sealed under a random 32-byte **vault key**; that key is wrapped to each recipient
+device with the PQ-hybrid `hybrid_seal` path (X25519 + ML-KEM-768 → XChaCha20-
+Poly1305) and relayed through `sigild` as an **opaque envelope**. The human
+password is **never shared and never wrapped**. The key hierarchy is specified in
+[`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use).
+
+Everything here is **dev-gated (`501` by default), opt-in, plain HTTP in dev, and
+UNAUDITED** — and the cryptography it now leans on (the hybrid combiner and the
+custom KEM-then-AEAD seal) is **the same unaudited code**, only now load-bearing.
+
+| # | Adversary | Capability | Defense as implemented | Layer |
+| --- | --- | --- | --- | --- |
+| R | **Malicious server / rogue operator reading a relayed envelope** | Owns `sigild` and its database; wants the vault key in transit | The envelope is **ciphertext the server has no key for**: it is a `SIGILhyb` container holding the vault key sealed under a shared secret that only the recipient's hybrid **secret** identity can decapsulate, and that identity **never leaves the device**. The server stores and returns the bytes **verbatim**, decodes nothing, and its *only* inspection of key material is a **length check** (32 / 1184 bytes) on a *published public* key. Proven, not asserted: the e2e script byte-compares uploaded vs. returned bytes and greps the envelope for the 2FA seed | Architecture + crypto |
+| S | **Unauthorized device requesting an envelope** | Enrolled and authenticated, but has no business with this vault | **Two** independent conditions on `GET …/keys/{deviceID}`: the caller must **be the addressee** *and* hold a **read** grant on the vault. Failing either is **`403`** (`forbidden_device` / `unauthorized_vault`) — never `401` (which would be a lie) and never `404` (which would leak whether an envelope exists). Depositing needs **write**, so a read-only grantee cannot inject one. Verified: a third enrolled device is refused fetching another device's envelope, fetching its own on someone else's vault, reading the op-log, and depositing on a vault it does not own | `sigild` authorization |
+| T | **Revoked device** | Was authorized; still holds its Ed25519 key and its hybrid secret identity | Revocation is checked **before** signature verification, so on its very next request the device gets **`401`** on *every* sharing route — collecting an envelope, publishing a hybrid key, and reading the op-log. Depositing an envelope **for** a revoked recipient is refused with `409 device_revoked` rather than silently stored. **This only stops FUTURE access** — see the limits below | `sigild` request auth |
+| U | **Device publishing a hybrid key it does not own** | Wants a vault key wrapped to *its* key by impersonating another device in the registry | A device may publish **only into its own slot**: the path `deviceID` must equal the authenticated device's ID, else **`403`** (`forbidden_device`). The registry FK means only an **enrolled** device can have a key on file at all. The `sigild` test `TestHybridKeyCannotPublishForAnotherDevice` pins this by forging the mismatch that the CLI cannot produce | `sigild` authorization |
+| V | **Envelope replayer / substituter** | Re-sends a captured envelope deposit, or swaps one envelope for another | The transport is the **v3 signed request contract** (see table above): the body is *inside* the signed message, so a mutated envelope invalidates the signature, and the ±300 s window plus the single-use nonce bound replay. Depositing requires **write** on the vault, so a passive observer cannot deposit anything. A substituted envelope also **fails to open**: `hybrid_open` authenticates, so a wrong or tampered container yields an authentication failure, never plaintext, and `unwrap_vault_key` additionally rejects any recovered plaintext that is not exactly 32 bytes rather than using it as a key | `sigild` request auth + crypto |
+| W | **Log / metrics scraper hunting for key material** | Reads `sigild`'s audit log or scrapes `/metrics` | The three sharing audit events carry **metadata plus a SHA-256 fingerprint** only (`vault.key_envelope_put` / `_get`: vault ID, device IDs, size, `blob_sha256`; `device.hybrid_key_published`: a device ID). **No envelope byte, no vault key, and no hybrid public key is ever logged** — the "no key material in logs" rule is kept absolute even for *public* keys, so there is no judgement call to get wrong later. The three `/metrics` counters are counts with **no vault or device label**. Asserted by a test and by the e2e script, which fails if `SIGILhyb` appears in the server log | `sigild` observability |
+
+**What vault sharing does NOT defend (be explicit):**
+
+- **No out-of-band verification of a recipient's hybrid public key.** A sender
+  wraps to whatever the registry serves. A **malicious server that substitutes its
+  own hybrid public key** for the recipient's would receive a vault key wrapped to
+  itself — and the recipient would simply see "no envelope"/a failure to unwrap.
+  There are **no safety numbers, no key-transparency log, and no cross-signature**
+  binding a hybrid key to the device's already-enrolled Ed25519 identity. Comparing
+  the `vault list` key fingerprints out of band detects the *result* after the
+  fact; it does not prevent the substitution. **This is the largest gap in the
+  design**, and it is why adversary R above is scoped to *reading a relayed
+  envelope* rather than to *the server being harmless*.
+- **A compromised device keeps its copy of the vault key.** Revocation stops
+  **future** server access; it cannot make a device forget a key it already
+  unwrapped, and the sealed container it already pulled stays openable offline. The
+  e2e script asserts this explicitly rather than hiding it: after revocation,
+  device B still generates correct codes locally. The only remediation is a manual
+  `vault rekey` + re-share.
+- **No re-wrap on revoke, no key rotation, no forward secrecy for the vault key.**
+  Nothing re-keys a vault when a grant is dropped, nothing expires an envelope, and
+  an envelope already delivered cannot be recalled. Republishing a hybrid key does
+  **not** re-wrap envelopes already deposited for that device.
+- **Sharing inherits trust-on-first-write.** A first envelope deposit **claims** an
+  unowned vault exactly like a first append, so the ownership caveats above apply
+  unchanged.
+- **A `write` grantee can overwrite another writer's envelope.** There is one
+  mailbox per `(vault, recipient)` and a deposit is an upsert — the property that
+  makes a re-key distributable also makes it clobberable by any writer.
+- **No rate limiting on the sharing routes.** The per-vault op-log limiter covers
+  appends only.
+- **The wrap is PQ-hybrid; the authentication is not.** Every sharing request is
+  signed with **classical Ed25519** (contract v3). The hybrid signature
+  (`hybrid_sign` / `hybrid_verify`) exists in `sigil-core` and is used by nothing.
+- **The primitives are UNAUDITED and the composition is bespoke.** It is a
+  **custom KEM-then-AEAD, NOT RFC 9180 HPKE** — no standardized analysis, no HPKE
+  interoperability. The hybrid property (secure if **either** X25519 or ML-KEM-768
+  holds) is design intent of unaudited code, and the **SYSTEM is not "post-quantum
+  secure."**
+- **Local key storage is filesystem permissions, nothing more.** The hybrid secret
+  identity (`$HOME/.sigil/device.hybrid`) and the vault keyring
+  (`$HOME/.sigil/vault-keys.json`) are mode `0600` plaintext files — **not** sealed
+  under the password, not zeroized, not in an enclave. Anything that can read the
+  user's home directory as that user has the vault keys (adversary class 9 above).
+- **Plain HTTP in dev.** Signing proves who sent a request; it is not transport
+  security.
 
 ## Billing / payment surface (opt-in, dev-gated — see [ADR 0034](decisions/0034-billing-provider-seam.md))
 
@@ -240,13 +313,20 @@ security claim, and none of it is a PCI attestation.
   only over TLS. The dev server speaks plain HTTP, and Juspay's `basic` scheme in
   particular is a bearer credential with no body binding.
 
-**Status note for this repo:** none of the defenses in the **first** table
-(adversary classes 1–12, the *intended product* design) is implemented yet. The
-current `sigild` skeleton performs no crypto on vault contents and stores only
-the opaque blobs described above; `libsigil` has real-but-**unaudited** crypto
-building blocks not wired into any product flow. The **second** table (the dev
-op-log request-auth surface, A–I) *is* implemented — that code really runs — but
-it is **dev-gated, off by default, opt-in, and UNAUDITED**, and it is a
-request-auth model for a dev op-log, **not** the product's account, session, or
-key-management model. Do not represent any of this as live or as a security
+**Status note for this repo:** almost none of the defenses in the **first** table
+(adversary classes 1–12, the *intended product* design) is implemented yet — the
+one partial exception is class 8 (*insider with vault export*), where the
+**mechanism** for re-keying and re-wrapping a vault to remaining members' KEM
+public keys now exists in the sharing flow, but the **workflow** does not: nothing
+re-keys automatically on revoke, and revocation cannot recall a key already
+unwrapped. The current `sigild` skeleton performs no crypto on vault contents and
+stores only the opaque blobs and opaque envelopes described above. `libsigil`'s
+crypto is still **UNAUDITED**, and it is **no longer all unused**: the hybrid KEM
+and the `hybrid_seal` / `hybrid_open` composition are now **load-bearing** (they
+wrap vault keys), while the hybrid **signature** and the suite-frame `kem_ct` path
+remain wired into nothing. The **second** and **third** tables (the dev op-log
+request-auth surface, A–I, and the vault-sharing surface, R–W) *are* implemented —
+that code really runs — but they are **dev-gated, off by default, opt-in, and
+UNAUDITED**, and they are a request-auth and key-distribution model for a dev
+op-log, **not** the product's account, session, or key-management model. Do not represent any of this as live or as a security
 guarantee.

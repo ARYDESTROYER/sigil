@@ -11,7 +11,38 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 45, `main` @ origin, clean tree).** Phase 45 gave `sigild` a **billing /
+**Where we are (through Phase 46, `main` @ origin, clean tree).** Phase 46 delivered **device-to-device VAULT SHARING** — the answer to "a grant says who the
+server will talk to, but the server holds no key, so how does a SECOND device actually decrypt?".
+⭐ **The key hierarchy:** the **human password seals a PERSONAL vault and is NEVER shared, never
+wrapped, never sent**; a SHARED vault is sealed under a **random 32-byte VAULT KEY**; that key is
+**wrapped per recipient** with the PQ-hybrid `hybrid_seal` path (X25519 + ML-KEM-768 → AEAD) into an
+**opaque `SIGILhyb` envelope** (~1.2 KiB) that `sigild` **relays and cannot read**. ⭐ **NO CONTAINER
+FORMAT CHANGE** — the `SIGILcli` container takes arbitrary password BYTES, so a random key drops in
+and all four client surfaces keep reading it unchanged. **`sigild` gained four routes** behind the
+SAME dev gate and the SAME v3 choke points (**no new auth path**): `PUT|GET
+/v1/devices/{deviceID}/hybrid-key` (publish is **self-only** ⇒ 403 otherwise) and `PUT|GET
+/v1/vaults/{vaultID}/keys/{deviceID}` (PUT needs **write** and CLAIMS an unowned vault; GET requires
+the caller to **BE the addressee AND hold read** ⇒ otherwise **403, never 401/404**, returning the
+**exact bytes** as octet-stream); caps 8 KiB / 16 KiB; migration **`0004_key_sharing.sql`** ⇒
+**`sigild_schema_version` now 4**. The server's ONLY look at key material is a **LENGTH CHECK** (32 /
+1184) — never a curve-point parse. **CLI:** `sigil device hybrid-publish` + `sigil vault
+rekey|share|accept|list`, keys in a 0600 keyring, **never printed** (only a 16-hex SHA-256
+fingerprint); `sigil totp … --vault-id <id>` is purely additive so existing invocations are
+unchanged. ✅ **VERIFIED FIRST-HAND:** `go test ./...` green; `cargo test` (cli) green;
+**`./cli/tests/e2e-sharing.sh` PASS** — two devices generate **94287082 at T=59 (the RFC 6238
+vector)** from the same shared vault; the server's returned bytes are **byte-identical** to the
+uploaded envelope, which contains **no seed** and never appears in the logs; device C is **403**
+everywhere and a revoked B is **401** everywhere. ⚠️ **THE FRAMING THAT CHANGED: the hybrid KEM /
+`hybrid_seal` are NO LONGER "standalone, not wired into any flow" — they are LOAD-BEARING and IN
+SCOPE for the audit.** The hybrid **SIGNATURE is still used by nothing** (all request auth is
+classical Ed25519). ⚠️ **HONEST LIMITS:** UNAUDITED; custom KEM-then-AEAD, **NOT RFC 9180 HPKE**;
+the **SYSTEM is NOT "post-quantum secure"**; ⭐ **NO out-of-band verification of a published hybrid
+key** (a hostile registry could substitute its own — the biggest gap); a revoked/compromised device
+**keeps a key it already unwrapped**; **no rotation, no re-wrap-on-revoke, no forward secrecy, no
+recovery**; one mailbox per (vault, recipient) so any writer can overwrite; no rate limiting; local
+keys are 0600 plaintext files; only the CLI implements sharing. ADR 0035; details in the Phase 46
+entry below.
+Phase 45 gave `sigild` a **billing /
 subscription layer**, because Sigil is a **paid** product and the payment story was an unwritten
 assumption. A **provider-agnostic seam** (`sigild/internal/billing/`): one `billing.Provider`
 interface (`Name`/`CreateCheckout`/`VerifyWebhook`) with **three adapters** — **Stripe**
@@ -5214,3 +5245,194 @@ GREEN; this pass is docs-only.
   needs the account model first.
 - **Decide whether billing stays in `sigild`** — the ADR deliberately leaves it open.
 - Nothing was committed in this phase; the working tree carries Phase 45 code + these docs.
+
+---
+
+## 2026-07-26 — Phase 46 (device-to-device VAULT SHARING: a random per-vault key, wrapped with the PQ-hybrid seal, relayed as an opaque envelope)
+
+### Why this phase, and what it fixes
+Two facts had been sitting next to each other, unresolved.
+
+1. **Phase 41/42 gave us authorization, not key distribution.** A grant decides *who the
+   server will talk to*. It says nothing about *who can decrypt*, because the server holds
+   no key. So a second device could be perfectly authorized to `pull` a vault's containers
+   and still open **none** of them — every vault was sealed under **one human's password**.
+   The only way in was to tell the other device the password, which is not a design, it is
+   a confession.
+2. **Every hybrid primitive we built was unused.** X25519, ML-KEM-768, the hybrid KEM
+   combiner (ADR 0011), Ed25519, ML-DSA-65, the hybrid signature (ADR 0012), and the
+   KEM-then-AEAD `hybrid_seal`/`hybrid_open` (ADR 0013) — each ADR closed with the same
+   caveat: **standalone, not wired into any flow**. The CLI and wasm client only *demoed*
+   the seal by encrypting a file.
+
+Phase 46 joins them: a feature that needs public-key encryption, meet the public-key
+encryption path with no feature.
+
+### The key hierarchy (the whole design in five lines)
+```
+human password ─Argon2id─▶ seals a PERSONAL vault.  NEVER shared, NEVER wrapped, never sent.
+vault key = 32 CSPRNG bytes ─▶ seals a SHARED vault, through the SAME SIGILcli container
+     └─ hybrid_seal to each recipient device's hybrid PUBLIC key (X25519 + ML-KEM-768)
+        ─▶ an OPAQUE SIGILhyb envelope that sigild relays and cannot read.
+```
+⭐ **The trick that made this cheap: NO CONTAINER FORMAT CHANGE.** The `SIGILcli` container
+takes arbitrary password **BYTES** — it runs Argon2id over whatever it is handed — so a
+random 32-byte key drops straight in. A shared vault is byte-for-byte the same shape as a
+personal one, and the CLI, the wasm client, the desktop core and the extension all keep
+reading it **unchanged**. (The Argon2id pass over an already-uniform key is redundant work,
+kept deliberately: it is what buys the zero-format-change property. Replacing it with a
+direct KDF is a future, format-breaking change.) That mattered because `SIGILcli` is
+hand-mirrored across four client surfaces — changing it means changing all of them at once.
+
+### What was built
+**`sigild` — a key relay, deliberately the dullest component in the repo** (`internal/api/sharing.go`,
+`internal/store/keysharing.go`, `internal/store/postgreskeysharing.go`). Four routes, all
+behind the **same** dev gate and the **same** v3 choke points (`authenticateDevice` /
+`authorizeVault` / `authorizeOpsRequest`) — ⚠️ **there is NO new auth path**:
+- `PUT|GET /v1/devices/{deviceID}/hybrid-key` — publish/fetch a device's hybrid **PUBLIC**
+  key. Publish is **self-only** (path ID ≠ authenticated ID ⇒ **403**); body ≤ 8 KiB; fetch
+  is open to any authenticated active device (they are public keys — auth only stops the
+  registry being world-enumerable) and 404s `hybrid_key_not_found`.
+- `PUT|GET /v1/vaults/{vaultID}/keys/{deviceID}` — deposit/collect the **opaque wrapped
+  vault key**. PUT needs **write** (a first deposit CLAIMS an unowned vault, trust-on-first-
+  write, same rule and same code path as a first append) → **201**; `404 device_not_found`
+  / `409 device_revoked` / `413` over `MaxKeyEnvelopeBytes` = 16 KiB. GET requires the
+  caller to **BE the addressee AND hold read** — otherwise **403, never 401 and never 404**
+  (a 401 would be a lie; a 404 would leak whether an envelope exists) — and returns the
+  **exact stored bytes** as `application/octet-stream`.
+
+⭐ **The server's ONLY inspection of key material is a LENGTH CHECK** (`ValidateHybridPublicKey`:
+32 / 1184 bytes). No curve-point parse, no low-order screen, no "do these two halves belong
+together" — doing any of that would be the server performing cryptography on user key
+material. Correctness of a published key is the **client's** business.
+
+Migration **`0004_key_sharing.sql`** (`sigil_device_hybrid_keys`, `sigil_vault_key_envelopes`,
++ a by-recipient index) is purely additive — `sigil_vault_ops`, its hash chain, the registry,
+the grants table and the billing tables are byte-for-byte untouched ⇒ **`sigild_schema_version`
+now 4**. Both are UPSERTs, so re-sharing after a re-key replaces the envelope. Audit events
+`device.hybrid_key_published` / `vault.key_envelope_put` / `vault.key_envelope_get` carry
+metadata + a **`blob_sha256` fingerprint** and never the bytes; three count-only metrics with
+no vault/device label.
+
+**`sigil` CLI — the client half.** `device hybrid-publish` (creates the hybrid identity if
+absent, publishes only the public half; refuses to silently overwrite a secret whose `.pub`
+is missing, because that would orphan every envelope already addressed to it), and
+`vault rekey | share | accept | list`. `share` deliberately does **both halves in one
+command** — wrap + deposit, **then grant through the EXISTING grant route** — so
+authorization and key distribution cannot drift apart. `wrap_vault_key` /
+`unwrap_vault_key` are thin, explicit wrappers over `hybrid_seal_to_container` with **fresh
+ephemeral entropy per call**, and unwrap **rejects any recovered plaintext that is not
+exactly 32 bytes** rather than using it as a key. Local state (never uploaded): the hybrid
+secret at `$HOME/.sigil/device.hybrid` (0600) + `.pub`, and the keyring
+`$HOME/.sigil/vault-keys.json` (0600). ⭐ **A vault key is NEVER printed** — only
+`vault_key_fingerprint`, the first 16 hex chars of its SHA-256, so two devices can prove
+they hold the same key without revealing it. `sigil totp …` gained **`--vault-id <id>`**
+(open with the vault key instead of `SIGIL_PASSWORD`) — purely additive, `--vault <file>`
+keeps its meaning, so **every existing invocation behaves exactly as before**; `totp code`
+gained `--at <unix>` so a code is reproducible across two machines in a proof.
+
+### ✅ VERIFIED FIRST-HAND (this session, no mocks anywhere)
+- `go test ./...` across `sigild` — **green** (`api`, `store`, `billing`, `cmd/server`),
+  including the new `sharing_test.go` (18 cases: verbatim+addressed relay, third-device
+  403, read-only grantee cannot deposit, revoked refused, publish-for-another-device 403,
+  malformed key rejected, oversized 413, dev-gated 501, **and a no-envelope-bytes-in-logs
+  test**) and the backend-agnostic `keysharing_test.go` conformance suite.
+- `cargo test --manifest-path cli/Cargo.toml` — **green**, incl. the new unit tests: a vault
+  key is 32 bytes and differs per call; the keyring round-trips and is **0600**; **a vault
+  key seals a vault exactly like a password** (still a `SIGILcli` container); wrap/unwrap
+  round-trips, the envelope does **not** contain the key in the clear, a different device
+  cannot open it, and two wraps of the same key differ; a non-32-byte payload is rejected;
+  the fingerprint is stable, short, hex, and is not the key.
+- ⭐ **`./cli/tests/e2e-sharing.sh` — PASS.** Builds the REAL `sigild` + the REAL `sigil`,
+  boots sigild on a free loopback port (`SIGILD_ENABLE_DEV_OPS=1`, `SIGILD_DEVICE_AUTH=1`),
+  enrolls **three** devices with **separate `HOME`s** (so separate identities, hybrid
+  identities and keyrings — three machines in effect), and asserts:
+  - **THE HEADLINE — two devices, the same code.** A puts the public RFC 6238 seed in a
+    vault, re-keys it, pushes, shares to B; B accepts, pulls, and generates
+    **`A=94287082  B=94287082  RFC 6238 vector=94287082` at T=59 — all equal.**
+    Fingerprints matched (`4c1a3e03b354a7a7` on both), so B recovered *the same key*.
+    The uploaded envelope was **1226 bytes**.
+  - **THE ZERO-KNOWLEDGE CHECK.** `cmp` of uploaded vs. server-returned bytes:
+    **byte-identical**. The envelope starts `SIGILhyb`. It contains **neither** the base32
+    seed **nor** the raw `12345678901234567890` secret. And the server's own log contains
+    **no** `SIGILhyb` — only `vault.key_envelope_put` / `_get` lines with `blob_sha256`.
+  - **THE AUTHORIZATION RESULTS.** Device C (enrolled, unauthorized) is **403** fetching
+    B's envelope, **403** fetching one for itself, **403** reading the op-log, and **403**
+    depositing on a vault it does not own — and after fabricating its own key for the same
+    vault ID, C's fingerprint (`b9134efac5db48d7`) ≠ A's, and C **cannot open** the shared
+    container at all. A **revoked** device B is **401** on accept, on hybrid-publish and on
+    pull. ⚠️ And the script asserts the honest limit as a *test*: B still generates correct
+    codes **locally** after revocation.
+- Also re-confirmed: `SIGIL_PASSWORD` **no longer opens** the re-keyed vault — the password
+  was never shared, wrapped, or sent.
+
+### ⚠️ HONEST LIMITS — do not paper over
+- ⭐ **The hybrid primitives are now LOAD-BEARING, so they are squarely IN SCOPE for the
+  audit.** "Standalone building block" is no longer an available excuse for `hybrid.rs`,
+  `hybrid_seal.rs`, `kx.rs` or `mlkem.rs`. A flaw there is a flaw in a user-facing path.
+- **Still a CUSTOM KEM-then-AEAD, NOT RFC 9180 HPKE**; still **UNAUDITED**; the **SYSTEM is
+  still NOT "post-quantum secure"**.
+- **The hybrid SIGNATURE remains unused.** All request auth — including every sharing route
+  — is **classical Ed25519** (contract v3). The wrap is hybrid; the authentication is not.
+- ⭐ **THE BIGGEST GAP: no out-of-band verification of a published hybrid public key.** A
+  sender wraps to whatever the registry serves. A malicious server that substitutes its own
+  hybrid key would receive a vault key wrapped **to itself**. No safety numbers, no key
+  transparency, no cross-signature binding the hybrid key to the device's enrolled Ed25519
+  identity. Comparing `vault list` fingerprints out of band detects the result *after the
+  fact*; it does not prevent the substitution.
+- **A compromised or revoked device KEEPS any vault key it already unwrapped.** Revocation
+  stops FUTURE server access only; the container it already pulled stays openable offline.
+  Remediation is a **manual** `vault rekey` + re-share.
+- **NOT implemented: key rotation schedule, automatic re-wrap on revoke, forward secrecy for
+  a delivered vault key, envelope expiry, recovery.** Republishing a hybrid key does **not**
+  re-wrap envelopes already deposited for that device.
+- **One mailbox per (vault, recipient)** and a deposit is an upsert, so any device with
+  `write` can overwrite another writer's envelope. Sharing also inherits **trust-on-first-write**.
+- **No rate limiting** on the sharing routes (the per-vault limiter covers appends only).
+- **Local key storage is filesystem permissions, nothing more** — the hybrid secret and the
+  keyring are 0600 plaintext files: not sealed under the password, not zeroized, no enclave.
+- **Only the CLI implements sharing.** The webapp, extension and desktop clients do not.
+- Dev-gated (`501` by default), localhost, plain HTTP. **Do not store real 2FA secrets.**
+
+### Docs updated in the same change
+- `docs/crypto-spec.md` — ⭐ **the load-bearing correction**: every "standalone / not wired
+  into any flow" statement about the hybrid **KEM** and `hybrid_seal`/`hybrid_open` was
+  corrected to say they now carry **vault-key wrapping**, while the caveats were *sharpened*
+  rather than deleted (custom KEM-then-AEAD ≠ HPKE, UNAUDITED, system not PQ-secure) and the
+  hybrid **signature** was explicitly re-stated as **still unused**. Plus a new
+  **Key hierarchy and vault sharing** section: the three layers, exactly what the server sees
+  vs. cannot do (as a table), and the honest limits.
+- `docs/api.md` — a full **Device-to-device vault sharing** section: all four routes with
+  auth/request/response/status codes, the 401-vs-403 rules, every size cap, the storage and
+  migration `0004`, the audit events, CLI client support, and honest limits; plus the three
+  new metric rows, `sigild_schema_version` → **4**, the route/permission table, and the
+  `501` default posture (now nine routes, with the new detail string).
+- `docs/architecture.md` — the same standalone/not-wired corrections in the component map
+  and §3/§6, the sharing relay in the `sigild` bullet, the sharing commands in the `cli`
+  bullet, and a new **§2b data-flow diagram** for sharing + the zero-knowledge boundary.
+- `docs/threat-model.md` — a new **vault-sharing** adversary table (R–W: malicious server
+  reading a relayed envelope, unauthorized device, revoked device, device publishing a key
+  it does not own, envelope replay/substitution, log/metrics scraper) with an explicit
+  "what this does NOT defend" list; the closing status note corrected (the crypto is no
+  longer all unused).
+- `CLAUDE.md` — the sharing routes/migration/caps in a new `sigild/` bullet, the CLI
+  commands and key hierarchy in the `cli/` bullet, the e2e script added to the known-green
+  commands, and the hybrid-primitive framing corrected to match reality.
+- `README.md` — an honest note that vaults can be shared between enrolled devices with
+  post-quantum-hybrid key wrapping, still dev-gated and unaudited; the top banner's
+  "not wired into any product flow" corrected.
+- `docs/decisions/0035-device-to-device-vault-sharing.md` — **NEW ADR 0035**, plus its index
+  row (Accepted, 2026-07) and a banner line in `docs/decisions/README.md`.
+- `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 46**.
+
+### ➡️ Still open (honest)
+- ⭐ **Bind a hybrid public key to the device's enrolled Ed25519 identity** (self-sign the
+  hybrid key with the device key at publish time, and verify it at wrap time). That closes
+  the registry-substitution gap and is the single highest-value follow-up.
+- **Rotation + re-wrap on revoke**: make `vault rekey` re-share automatically to every
+  remaining grantee, so revocation has a real remediation path.
+- **Teach the other clients to share** — the browser/extension/desktop surfaces have the
+  wasm `hybrid_*` exports already; they need the keyring + the four routes.
+- **Wire the hybrid SIGNATURE into something** — it is now the only hybrid construction
+  still used by nothing.
+- Nothing was committed in this phase; the working tree carries Phase 46 code + these docs.

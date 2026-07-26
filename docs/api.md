@@ -8,8 +8,12 @@
 > file-backed or durable Postgres backends), **unauthenticated unless one of two
 > opt-in auth contracts is configured** (legacy single-key **v2**, or the
 > **multi-device v3** model with a device registry, per-vault authorization and
-> revocation — itself dev-gated and unaudited). A **dev-gated, opt-in billing
-> layer** (hosted checkout + provider webhooks, [below](#billing--subscriptions-dev-gated-opt-in--phase-45))
+> revocation — itself dev-gated and unaudited). The same dev gate also opens a
+> **vault-sharing relay** ([below](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)):
+> the server parks a device's **public** hybrid key and an **opaque wrapped vault
+> key** for a recipient device, returning both verbatim — it holds no
+> decapsulation key and cannot read the envelope it relays. A **dev-gated, opt-in
+> billing layer** (hosted checkout + provider webhooks, [below](#billing--subscriptions-dev-gated-opt-in--phase-45))
 > stores subscription state but **no card data**, and has **never been run
 > against a live payment provider**. Nothing
 > here is audited or production-ready. See [`deployment.md`](deployment.md) for
@@ -110,11 +114,14 @@ the source of truth for the exact strings):
 | `sigild_device_revocations_total` | counter | device revocations performed |
 | `sigild_vault_grants_total` | counter | per-vault access grants created |
 | `sigild_vault_claims_total` | counter | vault ownership claims (trust-on-first-write) |
+| `sigild_device_hybrid_keys_published_total` | counter | device hybrid **public** key publishes, including re-publishes (`PUT /v1/devices/{deviceID}/hybrid-key`) |
+| `sigild_vault_key_envelopes_total` | counter | opaque wrapped-vault-key envelopes deposited (`PUT /v1/vaults/{vaultID}/keys/{deviceID}`) |
+| `sigild_vault_key_envelope_fetches_total` | counter | envelopes collected by their recipient (`GET /v1/vaults/{vaultID}/keys/{deviceID}`) |
 | `sigild_billing_checkouts_total{provider="…"}` | counter | hosted checkout sessions created, by provider (`stripe`/`razorpay`/`juspay`) |
 | `sigild_billing_webhooks_total{provider="…",outcome="…"}` | counter | **authenticated** webhooks handled, by provider and outcome (`accepted`, `ignored`, `duplicate`, `stale`, `illegal`, `unresolved`) |
 | `sigild_billing_webhook_rejected_total{reason="…"}` | counter | webhooks rejected **before** application, by reason (`bad_signature`, `malformed`, `unknown_provider`, `payload_too_large`, `store_error`) |
 | `sigild_billing_subscription_transitions_total{status="…"}` | counter | **applied** subscription status transitions, by target status (`none`, `trialing`, `active`, `past_due`, `canceled`) |
-| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`3`** once `0003_billing.sql` is applied) |
+| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`4`** once `0004_key_sharing.sql` is applied) |
 | `sigild_build_info{version="…"}` | gauge (`1`) | build identity; the version label carries the injected build SHA |
 
 Counters are **process-lifetime and unlabelled by vault or device** (no per-vault
@@ -122,7 +129,9 @@ cardinality blow-up, and no vault ID or device ID — a device-ID label would le
 scrape enumerate the registry — is exported). The endpoint performs **no
 cryptography** and reads no stored bytes; it only reports aggregate counts, and
 it never exposes a public key, an enrollment token or its digest, an admin
-token, a signature, or a nonce.
+token, a signature, or a nonce. The three **vault-sharing** counters follow the
+same rule: they are counts only, carrying no envelope byte, no hybrid public key,
+no vault key, and no vault or device ID as a label.
 
 Every **billing** label above comes from a **closed set materialized at startup**
 (the three provider names, the six outcomes, the five rejection reasons, the five
@@ -576,8 +585,10 @@ The migration is **pure DDL over auth metadata**: Ed25519 **public** keys,
 server-assigned IDs, labels, permissions, timestamps. It touches **nothing** in
 `sigil_vault_ops` — the opaque blob, its per-op hash chain, and the
 zero-knowledge boundary are **unaffected**. `sigild_schema_version` reports **2**
-once applied (and **3** once `0003_billing.sql` is applied — see
-[Billing](#billing--subscriptions-dev-gated-opt-in--phase-45)).
+once applied (**3** once `0003_billing.sql` is applied — see
+[Billing](#billing--subscriptions-dev-gated-opt-in--phase-45) — and **4** once
+`0004_key_sharing.sql` is applied, see
+[Vault sharing](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)).
 
 ### Signed request contract (v3)
 
@@ -648,6 +659,8 @@ or `write` and **`write` implies `read`**. Each route declares what it needs:
 | `GET /v1/vaults/{vaultID}/ops/verify` | read |
 | `POST /v1/vaults/{vaultID}/grants` | **owner** |
 | `GET /v1/vaults/{vaultID}/grants` | read |
+| `PUT /v1/vaults/{vaultID}/keys/{deviceID}` | **write** (a first deposit **claims** an unowned vault, exactly like a first append) |
+| `GET /v1/vaults/{vaultID}/keys/{deviceID}` | read **and** being the addressee |
 
 **Ownership is TRUST ON FIRST WRITE (TOFU).** A vault with no owner is claimed
 by the **first device that successfully authenticates a WRITE** to it; that
@@ -943,19 +956,285 @@ boots a **real** sigild with `SIGILD_DEVICE_AUTH=1` and drives the JS client
 against it (enroll, claim, grant, revoke, tamper, stale, token reuse). Same
 **dev-only, plain-HTTP, UNAUDITED** posture as the CLI: no TLS, loopback only.
 
-### Default posture (all five routes)
+### Default posture (all nine routes)
 
 With **`SIGILD_ENABLE_DEV_OPS` unset** — the default and the only
-production-safe setting — **every** device route returns:
+production-safe setting — **every** device route **and every vault-sharing route**
+(the four in the [next section](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46))
+returns:
 
 ```json
-{ "error": "not_implemented", "detail": "device enrollment and per-vault authorization are not enabled on this server" }
+{ "error": "not_implemented", "detail": "device enrollment, per-vault authorization and vault sharing are not enabled on this server" }
 ```
 
 `501`, never `404`, and never a partial or faked auth behaviour. The same `501`
 applies when dev-ops is on but no registry is configured
-(`SIGILD_DEVICE_AUTH` unset). `GET /metrics` stays `200` throughout — it is never
-dev-gated.
+(`SIGILD_DEVICE_AUTH` unset). The bodies of `PUT`/`POST` requests are drained and
+discarded, and the envelope route keeps its size cap even while stubbed.
+`GET /metrics` stays `200` throughout — it is never dev-gated.
+
+---
+
+## Device-to-device vault sharing (DEV-GATED, opt-in) — Phase 46
+
+> **DEV-GATED, OPT-IN, and UNAUDITED.** These four routes let one enrolled device
+> hand a vault's encryption key to another **without the server ever being able to
+> read it**. The relay is real and the authorization is real (it is the *same* v3
+> code path as the op-log, not a parallel one), but it is **gated off by default**
+> (`501`), **plain HTTP in dev**, and the cryptography it carries is **unaudited**.
+> The key hierarchy — a random per-vault key wrapped with the PQ-hybrid
+> `hybrid_seal` path, the human password never shared — is specified in
+> [`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use).
+> See [ADR 0035](decisions/0035-device-to-device-vault-sharing.md).
+
+### The shape of the flow
+
+`sigild` is a **mailbox**, not a key manager. The sending client wraps a vault key
+to the recipient's hybrid **public** key and uploads the resulting ciphertext; the
+recipient collects those exact bytes and unwraps them locally.
+
+```
+device A                          sigild                          device B
+   │  PUT /v1/devices/{A}/hybrid-key  ─▶ registry (public keys only)
+   │  GET /v1/devices/{B}/hybrid-key  ◀─ B's X25519 + ML-KEM-768 public key
+   │  ── wrap the 32-byte vault key with hybrid_seal (client-side) ──
+   │  PUT /v1/vaults/{V}/keys/{B}     ─▶ stores OPAQUE envelope bytes verbatim
+   │  POST /v1/vaults/{V}/grants      ─▶ authorize B on vault V (existing route)
+                                          GET /v1/vaults/{V}/keys/{B}  ◀─ │
+                                          (exact same bytes back)         │
+                                     ── unwrap with B's hybrid secret ──  │
+```
+
+**Zero-knowledge.** The server holds no decapsulation key, decodes nothing, and
+returns the envelope byte-for-byte. Its **only** inspection of key material is a
+**length check** on a published hybrid public key (32 / 1184 bytes) — it never
+parses a curve point or validates a KEM key, because that would be the server
+performing cryptography on user key material.
+
+### Configuration and storage
+
+No new environment variable. The routes are live exactly when the multi-device
+model is (`SIGILD_ENABLE_DEV_OPS` **and** a configured registry — see
+[Configuration](#configuration) above), and they use that registry's backend.
+
+Migration [`0004_key_sharing.sql`](../sigild/internal/store/migrations/0004_key_sharing.sql)
+adds two tables on top of the untouched `0001`–`0003` (`sigild_schema_version` →
+**4**):
+
+| Table | Holds |
+|-------|-------|
+| `sigil_device_hybrid_keys` | `device_id` (PK, FK → `sigil_devices`, `ON DELETE CASCADE`), `x25519_public_key` (`bytea`), `mlkem_encaps_key` (`bytea`), `updated_at`. **Public** key material, stored verbatim |
+| `sigil_vault_key_envelopes` | `(vault_id, recipient_device_id)` (PK; the FK is on the recipient), `sender_device_id`, `blob` (`bytea`, **ciphertext**), `created_at`; plus the index `sigil_vault_key_envelopes_by_recipient` |
+
+Both are pure DDL over opaque bytes; `sigil_vault_ops`, its hash chain, the device
+registry, the grants table and the billing tables are byte-for-byte unchanged.
+`sender_device_id` is **audit metadata** — the device the server *authenticated* on
+upload, never a claim read out of the blob. Both stores (in-memory and Postgres)
+implement the one `store.KeySharing` seam and are held to one conformance suite.
+
+**Upsert semantics, and what they do not do.** `PUT …/hybrid-key` is an upsert on
+`device_id`, and `PUT …/keys/{deviceID}` is an upsert on
+`(vault_id, recipient_device_id)` — re-sharing after a re-key replaces the
+envelope. **Republishing a hybrid key does NOT re-wrap envelopes already deposited
+for that device**: those were sealed to the old key and must be re-shared.
+
+### Size caps
+
+| Limit | Value | Enforced |
+|-------|-------|----------|
+| hybrid-key publish body | **8 KiB** (`maxHybridKeyBodyBytes`) | in the handler → `413 payload_too_large` |
+| key envelope | **16 KiB** (`store.MaxKeyEnvelopeBytes`) | at the router (`limitBody`) **and** again in the store → `413 payload_too_large` |
+| X25519 public key | exactly **32** bytes after base64 decode | `store.ValidateHybridPublicKey` → `400 invalid_request` |
+| ML-KEM-768 encapsulation key | exactly **1184** bytes after base64 decode | as above |
+| envelope may not be empty | ≥ 1 byte | → `400 empty_envelope` |
+
+A real wrapped vault key is a `SIGILhyb` container of about **1.2 KiB** (observed
+1226 bytes: 8-byte magic + version + 32-byte ephemeral X25519 public key +
+1088-byte ML-KEM ciphertext + a small AEAD envelope), so 16 KiB is generous
+headroom that still stops the relay being used as a blob store.
+
+### `401` vs `403` on these routes
+
+The [general rule](#401-vs-403-and-the-absence-of-an-auth-oracle) applies
+unchanged, and two sharing-specific cases are worth stating because they are easy
+to get backwards:
+
+- Publishing into **another device's** hybrid-key slot is **`403`**
+  (`forbidden_device`) — the request authenticated fine; it is simply not permitted.
+- Requesting **another device's** envelope is **`403`** (`forbidden_device`), *not*
+  `404` and *not* `401`. A `401` would be a lie (the caller did authenticate) and a
+  `404` would leak whether an envelope exists for that device.
+- A **revoked** device gets **`401`** everywhere, on its very next request —
+  revocation is checked before the signature is even verified.
+
+The response bodies stay coarse (`{"error":"forbidden", …}`); the precise reason
+goes only to the audit log and the per-reason metric.
+
+### `PUT /v1/devices/{deviceID}/hybrid-key` — publish my hybrid public key
+
+Stores the **public** half of this device's X25519 + ML-KEM-768 identity so other
+devices can wrap a vault key to it. The secret half never leaves the device.
+
+- **Auth:** the four v3 headers. The path `deviceID` **must be the authenticated
+  device's own ID**.
+- **Request body** (JSON, ≤ 8 KiB); both fields are standard-base64 of **raw**
+  public key bytes:
+
+  ```json
+  { "x25519_public_key": "<b64 32 bytes>", "mlkem_encaps_key": "<b64 1184 bytes>" }
+  ```
+
+- **Success — `200 OK`** (an upsert, so re-publishing is not an error):
+
+  ```json
+  { "device_id": "dev_…", "x25519_public_key": "<b64>", "mlkem_encaps_key": "<b64>", "updated_at": "<RFC3339>" }
+  ```
+
+  Unlike the device routes — which deliberately never echo an Ed25519 signing key —
+  this route **does** return key material, because publishing it for others to
+  fetch is the entire point and it is a **public** key.
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `missing_device_id` / `invalid_request` | empty path device ID; body is not a JSON object; a field is not standard-base64; a decoded half is not exactly 32 / 1184 bytes |
+  | `401 Unauthorized` | `unauthorized` | v3 signature check failed — including a **revoked** device |
+  | `403 Forbidden` | `forbidden` | authenticated, but publishing into **another** device's slot |
+  | `404 Not Found` | `device_not_found` | the device is not (or no longer) in the registry |
+  | `413 Payload Too Large` | `payload_too_large` | body over 8 KiB |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+### `GET /v1/devices/{deviceID}/hybrid-key` — fetch a device's hybrid public key
+
+- **Auth:** the four v3 headers (`BODY` is empty for GET). **Any** authenticated,
+  active device may fetch **any** device's key — they are public keys; requiring
+  authentication only stops the registry being world-enumerable.
+- **Success — `200 OK`:** the same `hybridKeyJSON` object as above.
+- **Errors:** `400 missing_device_id`; `401 unauthorized` (including revoked);
+  `404 hybrid_key_not_found` (**that device exists but has published no hybrid
+  key** — distinct from `device_not_found`); `500 internal`; `501 not_implemented`.
+
+### `PUT /v1/vaults/{vaultID}/keys/{deviceID}` — deposit a wrapped vault key
+
+Uploads an **opaque** envelope addressed to one device. The body is the **raw
+envelope bytes**, the same "opaque bytes in, opaque bytes out" shape as an op-log
+append — the server never decodes it.
+
+- **Auth:** the four v3 headers. Requires **`write`** on the vault, through the
+  same `authorizeOpsRequest` choke point the op-log uses — so depositing the first
+  envelope for an **unowned** vault **claims** it (trust-on-first-write), exactly as
+  a first append would. A read-only grantee cannot deposit.
+- **Request body:** `application/octet-stream`, 1 byte … 16 KiB. The v3 signature
+  covers the body, so the body is read **before** authorization runs.
+- **Success — `201 Created`:**
+
+  ```json
+  { "vaultID": "<vaultID>", "device_id": "dev_<recipient>", "size_bytes": 1226, "created_at": "<RFC3339>" }
+  ```
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `invalid_request` / `empty_envelope` | missing vault or device ID; unreadable body; empty envelope |
+  | `401 Unauthorized` | `unauthorized` | v3 signature check failed — including a **revoked** sender |
+  | `403 Forbidden` | `forbidden` | authenticated but holding no **write** grant on the vault (including an unowned vault claimed by someone else) |
+  | `404 Not Found` | `device_not_found` | the **recipient** is not enrolled |
+  | `409 Conflict` | `device_revoked` | the recipient is revoked — refused, not silently stored |
+  | `413 Payload Too Large` | `payload_too_large` | body over 16 KiB |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+### `GET /v1/vaults/{vaultID}/keys/{deviceID}` — collect my envelope
+
+Returns the envelope **byte-for-byte as it was uploaded**.
+
+- **Auth:** the four v3 headers. **Two** conditions, both required: the caller must
+  **be the addressee** (`deviceID` == the authenticated device) **and** hold
+  **`read`** on the vault — so an envelope cannot outlive a revoked grant.
+- **Success — `200 OK`**, `Content-Type: application/octet-stream`, the exact
+  stored bytes. No JSON, no base64, no re-framing.
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `invalid_request` | missing vault or device ID |
+  | `401 Unauthorized` | `unauthorized` | v3 signature check failed — including a **revoked** device |
+  | `403 Forbidden` | `forbidden` | authenticated but **not the addressee**, or holding no read grant |
+  | `404 Not Found` | `envelope_not_found` | nothing has been shared to this device for that vault |
+  | `500 Internal Server Error` | `internal` | the store could not be read |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+### Audit log
+
+Three events, all **metadata plus a fingerprint** — the envelope bytes, the vault
+key, the hybrid public keys, signatures and nonces are **never** logged:
+
+| Event | Fields |
+|-------|--------|
+| `device.hybrid_key_published` | `request_id`, `device_id`. The key bytes are public, but are still not logged: an audit line is not a key-distribution channel |
+| `vault.key_envelope_put` | `request_id`, `vault_id`, `recipient_device_id`, `sender_device_id`, `size_bytes`, `blob_sha256` (hex SHA-256 of the opaque envelope) |
+| `vault.key_envelope_get` | `request_id`, `vault_id`, `recipient_device_id`, `size_bytes`, `blob_sha256` |
+
+The shared `blob_sha256` lets an operator correlate "the sender uploaded X" with
+"the recipient collected X" **without the server retaining the ciphertext**.
+Denials are audited by the existing `oplog.auth_denied` path with the fixed reason
+enum.
+
+### Client support (the `sigil` CLI)
+
+The CLI implements the whole flow (see [`../cli/src/main.rs`](../cli/src/main.rs)
+and [`../cli/src/lib.rs`](../cli/src/lib.rs)):
+
+| Command | Routes it calls |
+|---------|-----------------|
+| `sigil device hybrid-publish [--key <f>] [--hybrid-key <f>] [--regenerate] [--server <url>]` | `PUT /v1/devices/{deviceID}/hybrid-key` — generates the hybrid identity if absent (secret `0600`, never uploaded), publishes only the public half |
+| `sigil vault rekey --vault <id> [--file <vaultfile>] [--publish] [--keyring <f>]` | none, unless `--publish` → `PUT /v1/vaults/{vaultID}/keys/{deviceID}` (wraps the new key to **this** device) |
+| `sigil vault share --vault <id> --to <deviceID> [--permission read\|write] [--envelope-out <f>]` | `GET /v1/devices/{to}/hybrid-key`, then `PUT /v1/vaults/{vaultID}/keys/{to}`, then `POST /v1/vaults/{vaultID}/grants` |
+| `sigil vault accept --vault <id> [--hybrid-key <f>] [--envelope-out <f>] [--for <deviceID>]` | `GET /v1/vaults/{vaultID}/keys/{deviceID}` — collect, unwrap, store the key locally |
+| `sigil vault list [--keyring <f>]` | none — prints which vaults this device holds a key for, as **fingerprints only** |
+
+Supporting client state, none of which is ever uploaded:
+
+- the **hybrid secret identity** at `<identity>.hybrid` (default
+  `$HOME/.sigil/device.hybrid`), mode `0600`, with the shareable public half at
+  `<identity>.hybrid.pub`;
+- the **vault keyring** at `$HOME/.sigil/vault-keys.json` (override with
+  `--keyring`), mode `0600`, JSON `{"version":1,"keys":{"<vaultID>":"<b64 32 bytes>"}}`.
+
+`sigil totp add|list|code|remove|import|export` gained **`--vault-id <id>`**, which
+opens a file with the **vault key** for `<id>` instead of `SIGIL_PASSWORD`
+(`--vault <file>` keeps its existing meaning, so every existing invocation behaves
+exactly as before), plus `--keyring <file>`; `sigil totp code` gained `--at <unix>`
+to pin the instant for reproducible testing. `--for <deviceID>` on `vault accept`
+is a **diagnostic** that asks for someone else's envelope so the `403` rule is
+testable from the outside — it never attempts to unwrap.
+
+The CLI **never prints a vault key**: `rekey` / `share` / `accept` / `list` show
+only `key_sha256=<16 hex chars>`, the first 8 bytes of the key's SHA-256, so two
+devices can confirm they hold the same key without revealing it. The browser,
+extension and desktop clients **do not implement sharing yet**.
+
+### Honest limits (read before believing any of the above)
+
+- **Dev-gated (`501` by default), plain HTTP, localhost, UNAUDITED.** Do not
+  expose it and do not store real 2FA secrets.
+- **No out-of-band verification of a published hybrid public key.** A sender trusts
+  what the registry serves; a malicious server could substitute its own key and
+  receive a vault key wrapped to itself. There are no safety numbers, no key
+  transparency, and no cross-signature.
+- **Revocation does not un-share.** It stops **future** access; a device that
+  already collected and unwrapped an envelope keeps the vault key. Remediation is a
+  manual `vault rekey` + re-share — there is **no automatic re-wrap on revoke and
+  no rotation schedule**.
+- **No forward secrecy for a delivered vault key**, and republishing a hybrid key
+  does not re-wrap already-deposited envelopes.
+- **One mailbox per (vault, recipient).** A deposit is an upsert, so any device with
+  `write` access can overwrite an envelope another writer deposited.
+- **No rate limiting** on these routes — the per-vault limiter covers appends only.
+- **Request authentication is classical Ed25519** (contract v3). The wrap is
+  PQ-hybrid; the signature over the request is not, and **the system is not
+  "post-quantum secure"**.
 
 ---
 

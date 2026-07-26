@@ -6,8 +6,11 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
 > foundation scaffold from the 72-hour deployment sprint — _not_ a shipping
 > product. The sync server and every client are intentionally stubbed.
 > `libsigil` now has **real but UNAUDITED** crypto building blocks — an
-> Argon2id KDF, an XChaCha20-Poly1305 + HKDF AEAD, and a C-ABI `seal`/`open`
-> over them — that are **not wired into any product flow**.
+> Argon2id KDF, an XChaCha20-Poly1305 + HKDF AEAD, a C-ABI `seal`/`open`
+> over them, and a hybrid (X25519 + ML-KEM-768) public-key seal. Most are still
+> **not wired into any product flow**; the exception is that hybrid seal, which
+> now wraps vault keys for the dev-gated device-to-device **vault sharing** below
+> — real, load-bearing, and **still unaudited**.
 > Everything is pre-audit; **do not store real secrets.** See
 > [`docs/sprint-72h.md`](docs/sprint-72h.md) for the
 > exact definition of done and the defer ledger.
@@ -209,6 +212,25 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   [`docs/api.md`](docs/api.md#billing--subscriptions-dev-gated-opt-in--phase-45),
   [`docs/deployment.md`](docs/deployment.md) §13 and
   [ADR 0034](docs/decisions/0034-billing-provider-seam.md).
+  **Vaults can now be shared between enrolled devices, with post-quantum-hybrid
+  key wrapping.** A shared vault is sealed under a random 32-byte *vault key*; that
+  key is encrypted **to the recipient device's hybrid public key** (X25519 +
+  ML-KEM-768) and the result is relayed through `sigild` as an **opaque envelope
+  the server cannot read** — it holds no decapsulation key and returns the bytes
+  byte-for-byte. Your **password is never shared and never wrapped**, and a vault
+  key is never printed (only a short SHA-256 fingerprint, so two devices can check
+  they match). Authorization reuses the existing per-vault grants, so a device that
+  is not the addressee gets a `403`, and a revoked device a `401`. Honest limits:
+  it is **dev-gated (`501` by default), localhost/plain HTTP, and UNAUDITED**; the
+  wrapping is a **custom KEM-then-AEAD composition, not RFC 9180 HPKE**, so the
+  **system is not "post-quantum secure"**; there is **no out-of-band verification**
+  of a recipient's published hybrid key; and **revoking a device cannot make it
+  forget a key it already accepted** — there is no key rotation, no automatic
+  re-wrap on revoke, and no forward secrecy for a delivered vault key. Only the
+  `sigil` CLI implements it so far. See
+  [`docs/api.md`](docs/api.md#device-to-device-vault-sharing-dev-gated-opt-in--phase-46),
+  [`docs/crypto-spec.md`](docs/crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use)
+  and [ADR 0035](docs/decisions/0035-device-to-device-vault-sharing.md).
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from
@@ -249,6 +271,15 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `sigil device revoke` (self, or operator with `--admin-token`) manage the registry.
   **Dev / localhost / plain HTTP, no TLS, UNAUDITED** — trust-on-first-write ownership,
   no account model, no session issuance, no key rotation.
+  The CLI is also the **only client that can share a vault between devices** —
+  `sigil device hybrid-publish` publishes this device's hybrid public key, `sigil
+  vault rekey` re-seals a vault under a random vault key (your password is never
+  shared), `sigil vault share --to <deviceID>` wraps that key to the recipient's
+  hybrid public key and uploads the opaque envelope, and `sigil vault accept`
+  unwraps it on the other side; `sigil totp … --vault-id <id>` then opens the shared
+  vault. Keys are never printed — only a short fingerprint. **Dev-gated and
+  UNAUDITED**, and revoking a device cannot make it forget a key it already
+  accepted (see the sharing note above).
   Standalone
   crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build is not
   audited; **do not store real 2FA secrets yet**. Public copy obeys

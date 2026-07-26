@@ -42,6 +42,11 @@ func newTestDeviceStore(t *testing.T) *PostgresDeviceStore {
 		cctx, ccancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer ccancel()
 		for _, q := range []string{
+			// Sharing rows first: they FK-reference sigil_devices (ON DELETE
+			// CASCADE would handle it, but deleting explicitly keeps the
+			// cleanup readable and order-independent).
+			`DELETE FROM sigil_vault_key_envelopes WHERE created_at >= $1`,
+			`DELETE FROM sigil_device_hybrid_keys WHERE updated_at >= $1`,
 			`DELETE FROM sigil_device_grants WHERE created_at >= $1`,
 			`DELETE FROM sigil_enrollment_tokens WHERE issued_at >= $1`,
 			`DELETE FROM sigil_devices WHERE created_at >= $1`,

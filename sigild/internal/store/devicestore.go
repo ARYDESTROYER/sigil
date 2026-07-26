@@ -197,6 +197,13 @@ type DeviceStore interface {
 	// this call performed the claim, false when the vault was already owned (by
 	// this or any other device). This is the trust-on-first-write rule.
 	ClaimVaultOwner(ctx context.Context, vaultID, deviceID string, at time.Time) (bool, error)
+
+	// KeySharing adds device hybrid PUBLIC keys and the opaque key-envelope
+	// relay that back device-to-device vault sharing (Phase 46, see
+	// keysharing.go). It is embedded here rather than kept as a separate seam
+	// because both live in the same auth-metadata store and share its backends;
+	// it holds PUBLIC key bytes and CIPHERTEXT the server cannot read.
+	KeySharing
 }
 
 // MemDeviceStore is a concurrency-safe, in-memory DeviceStore for local dev and
@@ -210,6 +217,12 @@ type MemDeviceStore struct {
 	tokens    map[string]*enrollTokenState // token SHA-256 hex -> state
 	grants    map[string]map[string]Grant  // vault ID -> device ID -> grant
 	vaultOwnr map[string]string            // vault ID -> owning device ID
+	// hybridKeys holds each device's PUBLISHED hybrid public key (opaque public
+	// bytes; see keysharing.go), keyed by device ID.
+	hybridKeys map[string]HybridPublicKey
+	// envelopes is the opaque key-envelope mailbox, keyed by (vault ID,
+	// recipient device ID). The values are CIPHERTEXT this server cannot read.
+	envelopes map[envelopeKey]KeyEnvelope
 }
 
 // enrollTokenState is one registered enrollment token's ledger entry. The token
@@ -224,11 +237,13 @@ type enrollTokenState struct {
 // NewMemDeviceStore returns an empty, ready-to-use in-memory device store.
 func NewMemDeviceStore() *MemDeviceStore {
 	return &MemDeviceStore{
-		devices:   make(map[string]Device),
-		byKey:     make(map[string]string),
-		tokens:    make(map[string]*enrollTokenState),
-		grants:    make(map[string]map[string]Grant),
-		vaultOwnr: make(map[string]string),
+		devices:    make(map[string]Device),
+		byKey:      make(map[string]string),
+		tokens:     make(map[string]*enrollTokenState),
+		grants:     make(map[string]map[string]Grant),
+		vaultOwnr:  make(map[string]string),
+		hybridKeys: make(map[string]HybridPublicKey),
+		envelopes:  make(map[envelopeKey]KeyEnvelope),
 	}
 }
 

@@ -14,12 +14,17 @@
 > signature** (Ed25519 then ML-DSA-65; verification requires **both**) is now
 > **assembled as a standalone primitive** too, in `sigil-core` (`hybrid_sig.rs`),
 > composing the Ed25519 half (`sig.rs`) and the ML-DSA-65 half (`mldsa.rs`). So
-> **both hybrid constructions (KEM and signature) now exist as standalone
-> primitives**; neither is wired into a product flow. The hybrid **KEM** is now
-> further composed with the AEAD into **hybrid public-key authenticated
-> encryption** — `hybrid_seal` / `hybrid_open` (`hybrid_seal.rs`) — the **first
-> wiring of a hybrid primitive into an encryption flow**, though still a
-> crypto-level building block, **not** the product account/vault flow. Condensed
+> **both hybrid constructions (KEM and signature) now exist**. The hybrid **KEM** is
+> further composed with the AEAD into **hybrid public-key authenticated encryption**
+> — `hybrid_seal` / `hybrid_open` (`hybrid_seal.rs`) — and **that flow is no longer
+> standalone: it now carries device-to-device VAULT-KEY WRAPPING** (see
+> [Key hierarchy and vault sharing](#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use)
+> and [ADR 0035](decisions/0035-device-to-device-vault-sharing.md)), which makes it
+> **load-bearing and squarely in scope for the audit**. It remains a **custom
+> KEM-then-AEAD composition — NOT RFC 9180 HPKE** — it remains **UNAUDITED**, and it
+> does **not** make the SYSTEM "post-quantum secure". The hybrid **signature**
+> (`hybrid_sign` / `hybrid_verify`) is **still unused by every flow** — all request
+> authentication is classical Ed25519 only. Condensed
 > from the product brief §11/§20/§21. Subject to change. A Cure53 audit of the
 > hybrid construction is to be commissioned before public beta.
 
@@ -96,7 +101,9 @@ breaking both X25519 and ML-KEM.
 **both** to validate.
 
 **KEM implementation status (pre-audit, UNAUDITED).** **Both halves of the hybrid
-KEM now exist as standalone primitives in `sigil-core`.** The **classical X25519
+KEM exist as separate primitives in `sigil-core`, and the combiner over them is now
+in productive use** (it wraps vault keys — see the combiner note below and
+[ADR 0035](decisions/0035-device-to-device-vault-sharing.md)). The **classical X25519
 key-agreement half** (`ss_x` above) is **implemented** in
 [`libsigil/core/src/kx.rs`](../libsigil/core/src/kx.rs): a raw-bytes
 `x25519_public_key` / `x25519_shared_secret` Diffie–Hellman over a
@@ -132,14 +139,22 @@ recomputes the same transcript from the received ciphertexts and reproduces the
 identical secret. It is **secure if EITHER component remains secure** — the
 standard hybrid-combiner property, so breaking it requires breaking **both** X25519
 and ML-KEM-768 — and the transcript binding stops an attacker splicing a
-ciphertext from one exchange onto material from another. This is **real but
-UNAUDITED and standalone**: it is **not wired into the record / vault / account
-flow**, the envelope's `kem_ct` field stays *reserved* but unused, and the
-**SYSTEM is still not "post-quantum secure"** (see
+ciphertext from one exchange onto material from another. It is **real but
+UNAUDITED**.
+
+**It is no longer standalone.** Through `hybrid_seal` (below) this combiner now
+carries **device-to-device vault-key wrapping** — the vault key of a shared vault
+is encapsulated to a recipient device's hybrid public key
+([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)) — so a flaw in the
+combiner is a flaw in a real user-facing path. Two things this does **not** change:
+the envelope's `kem_ct` field is still *reserved* but unused (the ML-KEM ciphertext
+travels alongside the envelope in the `SIGILhyb` container, not inside the
+envelope frame), and the **SYSTEM is still not "post-quantum secure"** — the
+combiner's property is that `ss_combined` stays secret if **either** half holds,
+which is a statement about the construction, not about the product (see
 [ADR 0011](decisions/0011-hybrid-kem-combiner.md)). The **hybrid signature**
-(Ed25519 & ML-DSA-65) is now assembled as a standalone primitive too — see the
-signature-implementation-status note below — so **both** hybrid constructions now
-exist; the remaining hybrid-crypto work is **wiring** them into an actual flow.
+(Ed25519 & ML-DSA-65) is assembled too — see the signature-implementation-status
+note below — but **unlike the KEM it is still wired into nothing**.
 
 **Signature implementation status (pre-audit, UNAUDITED).** **The combined hybrid
 signature — and both halves it composes — now exist as standalone primitives in
@@ -180,13 +195,17 @@ verification fails. The honest property, asserted as design intent of an
 **UNAUDITED** primitive: **a forgery requires breaking BOTH Ed25519 AND
 ML-DSA-65** — the concatenate-and-require-both hybrid pattern — which is **not** a
 claim that the SYSTEM is "post-quantum secure". It is **real but UNAUDITED and
-standalone**: it is **not wired into a record / vault / account / session flow**
-(e.g. the `sigild` op-log request auth still uses classical Ed25519 only). With
-this and the hybrid **KEM** (`hybrid.rs`; see above and
-[ADR 0011](decisions/0011-hybrid-kem-combiner.md)), **both hybrid constructions now
-exist as standalone primitives**; the only remaining large crypto work is **wiring
-the hybrid primitives into an actual account/session/record flow** (nothing uses
-them yet), and the **SYSTEM is still not "post-quantum secure"**. See
+STILL STANDALONE**: it is **not wired into a record / vault / account / session /
+sharing flow**. Every signature `sigild` verifies — the op-log request contract
+(v2 and v3), device enrollment proofs, and **every device-to-device sharing
+route** — is **classical Ed25519 only**. So the two hybrid constructions are now in
+**different states**, and the distinction matters: the hybrid **KEM** is
+load-bearing (it wraps vault keys, via `hybrid_seal` — see above and
+[ADR 0035](decisions/0035-device-to-device-vault-sharing.md)), while the hybrid
+**signature** is not used anywhere. The remaining hybrid-crypto work is therefore
+**authentication**: wiring `hybrid_sign` / `hybrid_verify` into the request/identity
+model, and wiring either construction into the suite frame. The **SYSTEM is still
+not "post-quantum secure"**. See
 [ADR 0012](decisions/0012-hybrid-signature-combiner.md).
 
 ## Hybrid public-key authenticated encryption (`hybrid_seal` / `hybrid_open`)
@@ -242,17 +261,115 @@ Honest framing:
   **either** X25519 or ML-KEM-768 remains secure, and the transcript binding stops
   mix-and-match — asserted as design intent of an **UNAUDITED** primitive, **not** a
   claim that the SYSTEM is "post-quantum secure".
-- It is **real but UNAUDITED and standalone**: a **crypto-level flow**, **not** the
-  product's account / key-management / vault-storage model, and **not used by
-  `sigild` or the CLI**. The envelope's `kem_ct` field still stays *reserved* but
-  unused — the ML-KEM ciphertext travels alongside the envelope here, not inside it.
-  See [ADR 0013](decisions/0013-hybrid-public-key-seal.md).
+- It is **real but UNAUDITED**, and it is **no longer standalone**: `hybrid_seal` /
+  `hybrid_open` now carry **device-to-device vault-key wrapping** (next section;
+  [ADR 0035](decisions/0035-device-to-device-vault-sharing.md)). That is the first
+  time a hybrid primitive does load-bearing work in a user-facing feature, and it
+  is why this composition must be treated as **in-scope product code** by the
+  audit rather than as a lab primitive. It is still **not** the product's *account*
+  model, and there is still **no key-transparency / out-of-band verification** of a
+  recipient's hybrid public key. The envelope's `kem_ct` field still stays
+  *reserved* but unused — the ML-KEM ciphertext travels alongside the envelope here,
+  not inside it. See [ADR 0013](decisions/0013-hybrid-public-key-seal.md).
 - These hybrid primitives are also reachable over the **C-ABI** —
   `sigil_x25519_public_key`, `sigil_ml_kem768_keygen`, and `sigil_hybrid_*`
   (`encapsulate` / `decapsulate` / `seal` / `open`) in
   [`libsigil/ffi/`](../libsigil/ffi/) (`sigil.h`) — so native clients can generate a
   hybrid identity and encrypt to a recipient's hybrid public key. Still the same
-  custom KEM-then-AEAD, **UNAUDITED**, and not wired into a product flow.
+  custom KEM-then-AEAD and still **UNAUDITED**; the **C-ABI itself** has no
+  product consumer (the sharing flow reaches `hybrid_seal` through the Rust CLI
+  crate, not through the FFI).
+
+## Key hierarchy and vault sharing (`hybrid_seal` / `hybrid_open` in use)
+
+**Status (pre-audit, UNAUDITED, dev-gated).** This is where the hybrid public-key
+seal above stops being a demo. Device-to-device **vault sharing**
+([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)) uses it to
+distribute a vault's encryption key to another enrolled device, so a second device
+can open the same vault **without ever learning the owner's password**.
+
+### The three layers
+
+```
+human password ──Argon2id(m,t,p; per-vault salt)──▶ seals a PERSONAL vault
+                  (the SIGILcli container)
+                  NEVER shared. NEVER wrapped. NEVER sent anywhere.
+
+vault key = 32 bytes from the OS CSPRNG
+                 ──▶ seals a SHARED vault, through the SAME SIGILcli container
+                     (the container takes arbitrary password BYTES, so a random
+                      key drops in with NO format change)
+     │
+     └── per recipient device:
+         hybrid_seal( recipient_x25519_pub, recipient_mlkem_encaps_key,
+                      eph_x25519_secret, mlkem_coin, nonce,
+                      plaintext = the 32-byte vault key )
+                 ──▶ (eph_x25519_pub, mlkem_ct, envelope)
+                     packaged as a SIGILhyb container ≈ 1.2 KiB  ("the envelope")
+```
+
+The recipient reverses it with `hybrid_open` under its hybrid **secret** identity
+(an X25519 secret scalar + an ML-KEM-768 keygen seed), recovering exactly 32 bytes;
+anything other than 32 bytes is rejected rather than used as a key.
+
+- **The human password is never shared and never wrapped.** Sharing it would hand a
+  recipient every *other* vault sealed under it and would make revocation mean
+  "change your password everywhere". A per-vault random key is rotatable in
+  principle (re-key + re-share) and reveals nothing about the user.
+- **Fresh ephemeral entropy per wrap.** The ephemeral X25519 secret, the ML-KEM coin
+  and the AEAD nonce are drawn from the OS CSPRNG on **every** call, so two shares
+  of the same key never reuse randomness. Consistent with
+  [ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md), all of it is
+  supplied by the caller (the CLI); `sigil-core` still generates nothing.
+- **Keys are never printed.** A vault key is shown only as
+  `vault_key_fingerprint` — the first 16 hex characters of its SHA-256 — so two
+  devices can confirm they hold the same key without revealing it.
+
+### What the server sees, and what it cannot do
+
+`sigild` **relays** the envelope: `PUT`/`GET /v1/vaults/{vaultID}/keys/{deviceID}`
+store and return the bytes **verbatim** (see [`api.md`](api.md)). Concretely the
+server holds:
+
+| The server has | The server does **not** have |
+|----------------|------------------------------|
+| device hybrid **public** keys (32-byte X25519 + 1184-byte ML-KEM-768 encaps key) | any hybrid **secret** identity — decapsulation keys never leave a device |
+| the opaque envelope (`SIGILhyb` ciphertext) | the vault key inside it, or any plaintext |
+| device IDs, a vault ID, a size, a timestamp | the user's password, or anything derived from it |
+| a SHA-256 **fingerprint** of the envelope in the audit log | the envelope's contents in any log or metric |
+
+So the server **cannot decapsulate** (no secret key), **cannot decrypt** the vault
+that key protects, and **cannot mint** a valid envelope for a device without that
+device's public key producing ciphertext only that device can open. Its **only**
+inspection of key material is a **length check** (32 / 1184 bytes) — it does not
+decode a curve point, screen for low-order elements, or verify that the two halves
+of a hybrid public key belong together. That is deliberate: validating key material
+would be the server performing cryptography on it. Correctness of a published key
+is the **client's** business.
+
+### Honest limits (read these with the section above)
+
+- **UNAUDITED**, dev-gated (`501` by default), plain HTTP on localhost. Do not
+  store real 2FA secrets.
+- **Custom KEM-then-AEAD, NOT RFC 9180 HPKE** — no HPKE interoperability, no
+  standardized analysis.
+- **The system is NOT "post-quantum secure."** The wrap is designed to stay secret
+  if **either** X25519 or ML-KEM-768 holds; that is a property of the construction.
+- **No out-of-band verification of a recipient's hybrid public key.** A device
+  trusts what the registry serves. A malicious server that substitutes its own
+  hybrid public key would receive a vault key wrapped to itself. There is no
+  safety-number, key-transparency, or cross-signature mechanism.
+- **No forward secrecy for a delivered vault key, no rotation schedule, and no
+  re-wrap on revoke.** Revocation stops **future** server access; it cannot make a
+  device forget a key it already unwrapped. Remediation is a manual `vault rekey`
+  + re-share. Republishing a hybrid key does not re-wrap already-deposited
+  envelopes.
+- **Authentication of the sharing routes is classical Ed25519 only** (contract v3).
+  The wrap is hybrid; the request signature is not.
+- **The Argon2id pass over an already-uniform 32-byte vault key is redundant work**,
+  kept deliberately so the shared vault is byte-identical in shape to a personal
+  one and no client's container parser changes. Replacing it with a direct KDF is a
+  future, format-breaking change.
 
 ## HOTP / TOTP one-time-password primitive (`hotp` / `totp`)
 

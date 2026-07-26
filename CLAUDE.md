@@ -73,6 +73,13 @@ public, make no security claims, until the audit completes and trademark clears.
   MSRV `rust-version` 1.74→1.85, still below the machine's rustc 1.96; the PQ
   signature half of the Ed25519&ML-DSA-65 hybrid). **Both signature halves are now
   ASSEMBLED into a hybrid signature (`hybrid_sign`/`hybrid_verify`, `hybrid_sig.rs`):
+  **NOTE (Phase 46): the "standalone / not wired into any flow" framing below is now
+  TRUE ONLY OF THE SIGNATURE.** The hybrid KEM — through `hybrid_seal`/`hybrid_open` —
+  is **LOAD-BEARING**: it wraps the per-vault key for device-to-device vault sharing
+  (ADR 0035), so it is real product code and in scope for the audit. The hybrid
+  SIGNATURE is still used by nothing (all request auth is classical Ed25519). Still
+  UNAUDITED, still a custom KEM-then-AEAD (NOT RFC 9180 HPKE), and the SYSTEM is
+  still NOT "post-quantum secure".
   `ed25519_sig(64) ‖ ml_dsa65_sig(3309)` = 3373 bytes — a plain concatenation (no KDF,
   a signature already commits to the message) whose verify requires BOTH halves to
   validate, so a forgery needs breaking BOTH schemes; two caller-supplied seeds,
@@ -87,9 +94,12 @@ public, make no security claims, until the audit completes and trademark clears.
   envelope)`; `hybrid_open` decapsulates with the recipient's hybrid secret and
   `open`s. Caller-supplied ephemeral X25519 secret + ML-KEM coin + AEAD nonce
   (ADR 0007), composes hybrid.rs + aead.rs + envelope.rs (no new deps). A CUSTOM
-  composition — NOT RFC 9180 HPKE — and the FIRST wiring of a hybrid primitive into
-  an encryption flow; still real but UNAUDITED and STANDALONE (not the product's
-  account / key-management / vault-storage model, not used by sigild/CLI). ADR 0013.**
+  composition — NOT RFC 9180 HPKE. **Phase 46: this flow is NO LONGER STANDALONE —
+  it WRAPS THE PER-VAULT KEY for device-to-device vault sharing (`sigil vault share`
+  → `wrap_vault_key` → `hybrid_seal_to_container`; sigild relays the OPAQUE envelope
+  and cannot read it, ADR 0035), making the hybrid KEM real product code and IN
+  SCOPE for the audit.** Still UNAUDITED, still NOT the product's ACCOUNT model, and
+  there is NO out-of-band verification of a recipient's hybrid public key. ADR 0013.**
   **The core now also has the FIRST primitive that implements an actual product
   FEATURE (not a building block): an **HOTP/TOTP** one-time-password primitive
   (`hotp`/`totp`/`format_code` over an `OtpAlgorithm` enum — SHA-1 (default)/
@@ -353,6 +363,40 @@ public, make no security claims, until the audit completes and trademark clears.
   webhook route; and **billing living inside `sigild` is PROVISIONAL** — a scaffold placement,
   not a final topology. Contract in [`docs/api.md`](docs/api.md), operator guide in
   [`docs/deployment.md`](docs/deployment.md) §13; ADR 0034.
+- `sigild/` **DEVICE-TO-DEVICE VAULT SHARING (Phase 46, ADR 0035)** — a **key relay**,
+  behind the SAME dev gate + the SAME v3 auth choke points (`authenticateDevice` /
+  `authorizeVault` / `authorizeOpsRequest`; there is **no new auth path**), in
+  `internal/api/sharing.go` + `internal/store/keysharing.go` +
+  `internal/store/postgreskeysharing.go`. **Four routes** (`501` when dev-ops off, exactly
+  like the device routes): **`PUT|GET /v1/devices/{deviceID}/hybrid-key`** (publish/fetch a
+  device's hybrid PUBLIC key — publish is **self-only**, mismatched path ID ⇒ **403**;
+  body ≤ **8 KiB** = `maxHybridKeyBodyBytes`; fetch 404s `hybrid_key_not_found`) and
+  **`PUT|GET /v1/vaults/{vaultID}/keys/{deviceID}`** (deposit/collect an **opaque wrapped
+  vault key** — PUT needs **write** and a first deposit CLAIMS an unowned vault
+  (trust-on-first-write), returns **201** `{vaultID, device_id, size_bytes, created_at}`,
+  `404 device_not_found` / `409 device_revoked` / `413` over `store.MaxKeyEnvelopeBytes` =
+  **16 KiB**; GET requires the caller to **BE the addressee AND hold read** ⇒ otherwise
+  **403, never 401/404**, and returns the **exact stored bytes** as
+  `application/octet-stream`). **ZERO-KNOWLEDGE:** the server has no decapsulation key,
+  decodes nothing, returns the envelope VERBATIM, and its ONLY look at key material is a
+  **length check** (`ValidateHybridPublicKey`: `X25519PublicKeyLen` 32 /
+  `MLKEM768EncapsKeyLen` 1184) — never a curve-point parse. Storage seam is
+  `store.KeySharing` (embedded in `DeviceStore`, one conformance suite, Mem + Postgres);
+  migration **`0004_key_sharing.sql`** adds `sigil_device_hybrid_keys` +
+  `sigil_vault_key_envelopes` (+ index `sigil_vault_key_envelopes_by_recipient`), both
+  UPSERTs, purely additive ⇒ **`sigild_schema_version` now 4**. Audit events
+  `device.hybrid_key_published` / `vault.key_envelope_put` / `vault.key_envelope_get` carry
+  metadata + a **`blob_sha256` fingerprint**, NEVER the bytes or any key; metrics
+  `sigild_device_hybrid_keys_published_total` / `sigild_vault_key_envelopes_total` /
+  `sigild_vault_key_envelope_fetches_total` (counts only, no vault/device label).
+  ⚠️ **HONEST SCOPE:** dev-gated/`501`, plain HTTP, UNAUDITED; **no out-of-band
+  verification** of a published hybrid key (a hostile registry could substitute its own);
+  revocation stops FUTURE access but **cannot un-learn** a key a device already unwrapped
+  (remediation = manual `vault rekey` + re-share); **no re-wrap on revoke, no rotation, no
+  forward secrecy**; one mailbox per (vault, recipient) so any writer can overwrite; **no
+  rate limiting**; request signatures are **classical Ed25519** (the wrap is hybrid, the
+  auth is not). Contract in [`docs/api.md`](docs/api.md); key hierarchy in
+  [`docs/crypto-spec.md`](docs/crypto-spec.md).
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
@@ -514,6 +558,39 @@ public, make no security claims, until the audit completes and trademark clears.
   Same honest scope as the server side: **dev op-log over PLAIN HTTP, no TLS,
   dev-gated + UNAUDITED**, trust-on-first-write ownership, single-ATTEMPT enrollment
   tokens, no account model / session issuance / key rotation, per-process replay cache.
+  Also **`sigil device hybrid-publish`** and **`sigil vault rekey|share|accept|list`** —
+  **DEVICE-TO-DEVICE VAULT SHARING** (Phase 46, ADR 0035), the FIRST load-bearing use of
+  the PQ-hybrid primitives. ⚠️ **THE KEY HIERARCHY:** the human password seals a
+  PERSONAL vault and is **NEVER shared, never wrapped, never sent**; a SHARED vault is
+  sealed under a random 32-byte **VAULT KEY** (`generate_vault_key`, `VAULT_KEY_LEN` =
+  32) that goes into the **SAME `SIGILcli` container with NO format change** (the
+  container takes arbitrary password BYTES); that key is **WRAPPED per recipient** with
+  `wrap_vault_key` → `hybrid_seal_to_container` (X25519 + ML-KEM-768 → AEAD, fresh
+  ephemeral entropy per call) into an opaque **`SIGILhyb` envelope** (~1.2 KiB; observed
+  1226 B) that sigild relays and cannot read; `unwrap_vault_key` reverses it and
+  **rejects any recovered plaintext that is not exactly 32 bytes**. Commands: `device
+  hybrid-publish [--key <f>] [--hybrid-key <f>] [--regenerate] [--server <url>]` (creates
+  the hybrid identity if absent and PUTs only the PUBLIC half; refuses to silently
+  overwrite a secret whose `.pub` is missing), `vault rekey --vault <id> [--file <f>]
+  [--publish] [--keyring <f>]` (the one-way password→vault-key door; `--publish` also
+  wraps to THIS device and uploads), `vault share --vault <id> --to <deviceID>
+  [--permission read|write] [--envelope-out <f>]` (fetch recipient key → wrap → PUT
+  envelope → **grant via the EXISTING grant route**, so authz and keys cannot drift),
+  `vault accept --vault <id> [--hybrid-key <f>] [--envelope-out <f>] [--for <deviceID>]`
+  (`--for` is a DIAGNOSTIC that asks for someone else's envelope so the server's 403 is
+  externally testable; it never unwraps), `vault list [--keyring <f>]`. **Local state,
+  never uploaded:** the hybrid SECRET identity at `<identity>.hybrid` (default
+  `$HOME/.sigil/device.hybrid`, 0600) + `<identity>.hybrid.pub`, and the vault keyring
+  `$HOME/.sigil/vault-keys.json` (`VAULT_KEYRING_FILE`, 0600,
+  `{"version":1,"keys":{"<vaultID>":"<b64 32B>"}}`). **A vault key is NEVER printed** —
+  only `vault_key_fingerprint` (first 16 hex chars of its SHA-256). `sigil totp
+  add|list|code|remove|import|export` gained **`--vault-id <id>`** (open with the VAULT
+  KEY for `<id>` instead of `SIGIL_PASSWORD`; `--vault <file>` keeps its old meaning, so
+  every existing invocation is unchanged) + `--keyring <f>`, and `totp code` gained
+  `--at <unix>`. New `CliError::Sharing` carries **no secret bytes**. Proof:
+  **`cli/tests/e2e-sharing.sh`** (real sigild + real CLI, three devices, no mocks).
+  Dev/localhost/plain-HTTP/UNAUDITED; custom KEM-then-AEAD (NOT RFC 9180 HPKE); the
+  SYSTEM is NOT "post-quantum secure"; revocation cannot un-learn an accepted key.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.
@@ -827,6 +904,17 @@ cargo fmt   --manifest-path cli/Cargo.toml --all -- --check
 cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path cli/Cargo.toml
 grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
+
+# Device-to-device vault sharing — the Phase 46 end-to-end proof (ADR 0035). Builds
+# the REAL sigild + the REAL sigil CLI, boots sigild on a free loopback port with
+# dev-ops + device auth v3, enrolls THREE devices with separate HOMEs, and asserts
+# the positive path (two devices, same RFC 6238 code), the zero-knowledge check
+# (returned bytes == uploaded bytes, no seed in the envelope, no envelope in the
+# logs) and the negative paths (403 for an unauthorized device, 401 for a revoked
+# one). Torn down on exit; nothing is exposed.
+./cli/tests/e2e-sharing.sh                        # prints PASS
+# Optional: run the identical proof against the durable Postgres backend (also
+# exercises migration 0004): SIGILD_OPLOG_POSTGRES=<dsn> ./cli/tests/e2e-sharing.sh
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (26 tests); build-wasm.sh emits

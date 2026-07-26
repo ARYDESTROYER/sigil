@@ -141,6 +141,11 @@ pub enum CliError {
     /// parse. Never carries a secret key or a generated code. Carries a short
     /// message.
     Totp(String),
+    /// A device-to-device VAULT SHARING operation failed at the CLI layer: a
+    /// malformed local vault keyring, a missing vault key, a recipient that has
+    /// not published a hybrid public key, or a recovered vault key of the wrong
+    /// length. NEVER carries a vault key, a password, or any secret bytes.
+    Sharing(String),
 }
 
 impl From<RecordError> for CliError {
@@ -192,6 +197,7 @@ impl core::fmt::Display for CliError {
             // know. Never includes plaintext.
             CliError::HybridSeal(e) => write!(f, "could not hybrid-open record: {e:?}"),
             CliError::Totp(e) => write!(f, "totp vault error: {e}"),
+            CliError::Sharing(e) => write!(f, "vault sharing error: {e}"),
         }
     }
 }
@@ -2273,6 +2279,424 @@ pub fn open_vault(password: &[u8], container: &[u8]) -> Result<TotpVault, CliErr
     Ok(vault)
 }
 
+// ---------------------------------------------------------------------------
+// DEVICE-TO-DEVICE VAULT SHARING (Phase 46) — the first LOAD-BEARING use of the
+// post-quantum hybrid primitives.
+//
+// THE KEY HIERARCHY, and why it is shaped this way:
+//
+//   human password ──Argon2id──> (seals a PERSONAL vault; NEVER shared, never
+//                                 wrapped, never leaves this machine)
+//
+//   vault key = 32 CSPRNG bytes ──> seals a SHARED vault (same `SIGILcli`
+//                                    container; the container takes arbitrary
+//                                    password BYTES, so a random key drops in
+//                                    with NO format change)
+//        │
+//        └── wrapped per recipient device with `hybrid_seal_to_container`
+//            (X25519 + ML-KEM-768 -> XChaCha20-Poly1305) -> an OPAQUE envelope
+//            the server relays and cannot read.
+//
+// The human password is NEVER shared and NEVER wrapped. Sharing a password
+// would hand every recipient the ability to open every OTHER vault sealed under
+// it, and would make revocation mean "change your password everywhere". A
+// per-vault random key is revocable in principle (re-key + re-share) and leaks
+// nothing about the user.
+//
+// WHAT THE SERVER SEES: a device's PUBLIC hybrid key, device IDs, a vault ID,
+// and ciphertext. It cannot derive the vault key — that needs the recipient's
+// hybrid SECRET identity, which never leaves the device.
+//
+// HONEST SCOPE: pre-audit, UNAUDITED, DEV/localhost/plain-HTTP. The hybrid
+// construction is a CUSTOM KEM-then-AEAD, NOT RFC 9180 HPKE; the system is NOT
+// "post-quantum secure". Revoking a device stops FUTURE access — it cannot make
+// a device forget a vault key it already accepted (that needs a re-key and a
+// re-share). There is no key rotation schedule, no recovery, and no forward
+// secrecy for an envelope already delivered.
+// ---------------------------------------------------------------------------
+
+/// Byte length of a vault key: 32 bytes of OS CSPRNG output. It is used as the
+/// "password" bytes of a [`SIGILcli` container](seal_to_container) — the
+/// container takes arbitrary bytes, so a random key needs NO format change.
+pub const VAULT_KEY_LEN: usize = 32;
+
+/// The version byte written into every local vault keyring file.
+pub const VAULT_KEYRING_VERSION: u8 = 1;
+
+/// Default file name of the LOCAL vault keyring (inside `$HOME/.sigil`).
+pub const VAULT_KEYRING_FILE: &str = "vault-keys.json";
+
+/// The LOCAL vault keyring: this device's map of `vault id -> vault key`.
+///
+/// On disk it is JSON `{"version":1,"keys":{"<vaultID>":"<b64 32 bytes>"}}`,
+/// written with mode `0600`. It holds SECRET key material: every key in it can
+/// open the corresponding shared vault. It is per-device, DEV-ONLY, and is NEVER
+/// synced or uploaded — only individually WRAPPED keys ever leave the device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultKeyring {
+    /// Keyring format version. Always [`VAULT_KEYRING_VERSION`].
+    pub version: u8,
+    /// `vault id -> standard-base64 of the 32-byte vault key`. SECRET material.
+    #[serde(default)]
+    pub keys: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for VaultKeyring {
+    fn default() -> Self {
+        VaultKeyring {
+            version: VAULT_KEYRING_VERSION,
+            keys: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Draw a fresh 32-byte vault key from the OS CSPRNG.
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails.
+pub fn generate_vault_key() -> Result<[u8; VAULT_KEY_LEN], CliError> {
+    let mut key = [0u8; VAULT_KEY_LEN];
+    fill_random(&mut key)?;
+    Ok(key)
+}
+
+/// A short, NON-REVERSIBLE fingerprint of a vault key: the first 16 hex
+/// characters of its SHA-256.
+///
+/// This exists so two devices can prove they hold the SAME key without either
+/// of them ever printing it. Printing the key itself is never done anywhere in
+/// this crate.
+pub fn vault_key_fingerprint(key: &[u8; VAULT_KEY_LEN]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(key);
+    let mut out = String::with_capacity(16);
+    for b in digest.iter().take(8) {
+        out.push(char::from_digit((b >> 4) as u32, 16).expect("nibble < 16"));
+        out.push(char::from_digit((b & 0x0f) as u32, 16).expect("nibble < 16"));
+    }
+    out
+}
+
+/// Read the local vault keyring at `path`. A MISSING file is not an error — it
+/// yields an empty keyring, so the first `vault rekey`/`vault accept` creates it.
+///
+/// # Errors
+/// - [`CliError::Sharing`] on an IO error, malformed JSON, or an unsupported
+///   version.
+pub fn load_keyring(path: &std::path::Path) -> Result<VaultKeyring, CliError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(VaultKeyring::default()),
+        Err(e) => return Err(CliError::Sharing(format!("could not read keyring: {e}"))),
+    };
+    let kr: VaultKeyring = serde_json::from_str(&text)
+        .map_err(|e| CliError::Sharing(format!("keyring is not valid JSON: {e}")))?;
+    if kr.version != VAULT_KEYRING_VERSION {
+        return Err(CliError::Sharing(format!(
+            "unsupported keyring version {}: expected {VAULT_KEYRING_VERSION}",
+            kr.version
+        )));
+    }
+    Ok(kr)
+}
+
+/// Write the vault keyring to `path` with mode `0600`, creating the parent
+/// directory `0700` if needed. It holds secret key material, so it is created
+/// `0600` up front (never briefly world-readable) and re-chmod'd afterwards in
+/// case the file pre-existed with looser permissions.
+///
+/// # Errors
+/// - [`CliError::Sharing`] on a serialize, directory, write, or chmod failure.
+pub fn save_keyring(path: &std::path::Path, keyring: &VaultKeyring) -> Result<(), CliError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|e| CliError::Sharing(format!("could not create keyring dir: {e}")))?;
+        }
+    }
+    let json = serde_json::to_string_pretty(keyring)
+        .map_err(|e| CliError::Sharing(format!("could not serialize keyring: {e}")))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| CliError::Sharing(format!("could not create keyring: {e}")))?;
+    f.write_all(json.as_bytes())
+        .map_err(|e| CliError::Sharing(format!("could not write keyring: {e}")))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| CliError::Sharing(format!("could not set keyring permissions: {e}")))
+}
+
+/// Look up one vault key in the keyring at `path`. `Ok(None)` means this device
+/// holds no key for that vault (it is a password vault, or has not accepted a
+/// share yet).
+///
+/// # Errors
+/// - [`CliError::Sharing`] on a keyring read failure, or a stored key that is not
+///   base64 of exactly [`VAULT_KEY_LEN`] bytes.
+pub fn keyring_get(
+    path: &std::path::Path,
+    vault: &str,
+) -> Result<Option<[u8; VAULT_KEY_LEN]>, CliError> {
+    let kr = load_keyring(path)?;
+    let Some(encoded) = kr.keys.get(vault) else {
+        return Ok(None);
+    };
+    let raw = BASE64
+        .decode(encoded.as_bytes())
+        .map_err(|e| CliError::Sharing(format!("vault key for {vault:?} is not base64: {e}")))?;
+    let key: [u8; VAULT_KEY_LEN] = raw.try_into().map_err(|v: Vec<u8>| {
+        CliError::Sharing(format!(
+            "vault key for {vault:?} must be {VAULT_KEY_LEN} bytes, got {}",
+            v.len()
+        ))
+    })?;
+    Ok(Some(key))
+}
+
+/// Record (or replace) one vault key in the keyring at `path`, rewriting the
+/// file `0600`.
+///
+/// # Errors
+/// - [`CliError::Sharing`] on a keyring read/write failure.
+pub fn keyring_put(
+    path: &std::path::Path,
+    vault: &str,
+    key: &[u8; VAULT_KEY_LEN],
+) -> Result<(), CliError> {
+    let mut kr = load_keyring(path)?;
+    kr.version = VAULT_KEYRING_VERSION;
+    kr.keys.insert(vault.to_string(), BASE64.encode(key));
+    save_keyring(path, &kr)
+}
+
+// --- Sharing transport: hybrid public keys + the opaque key-envelope relay ---
+
+/// Maximum response size this client will read from a sharing endpoint (1 MiB).
+/// A wrapped vault key is ~1.2 KiB; the cap just stops a hostile/broken server
+/// from making the client allocate without bound.
+const MAX_SHARING_RESPONSE_BYTES: u64 = 1 << 20;
+
+/// Map a `ureq` result into the raw 2xx response BYTES (used by the envelope
+/// GET, which returns `application/octet-stream`, not JSON).
+///
+/// Non-2xx becomes [`CliError::Server`] exactly as [`finish`] does, so callers
+/// can distinguish `401` / `403` / `404` / `501` identically.
+fn finish_bytes(result: Result<ureq::Response, ureq::Error>) -> Result<Vec<u8>, CliError> {
+    use std::io::Read as _;
+    match result {
+        Ok(resp) => {
+            let mut buf = Vec::new();
+            resp.into_reader()
+                .take(MAX_SHARING_RESPONSE_BYTES)
+                .read_to_end(&mut buf)
+                .map_err(|e| CliError::Http(e.to_string()))?;
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Err(CliError::Server { status, body })
+        }
+        Err(ureq::Error::Transport(t)) => Err(CliError::Http(t.to_string())),
+    }
+}
+
+/// The wire shape of a device's hybrid public key on the sharing endpoints. It
+/// carries no `version` field (that is a LOCAL identity-file concern), so
+/// [`fetch_hybrid_key`] re-attaches [`HYBRID_IDENTITY_VERSION`].
+#[derive(Debug, Clone, Deserialize)]
+struct HybridKeyWire {
+    #[serde(default)]
+    x25519_public_key: String,
+    #[serde(default)]
+    mlkem_encaps_key: String,
+}
+
+/// The URL PATH of a device's hybrid-key endpoint. This is exactly the `{PATH}`
+/// the server parses from `r.URL.Path`, so it is also what gets signed.
+fn hybrid_key_path(device_id: &str) -> String {
+    format!("/v1/devices/{device_id}/hybrid-key")
+}
+
+/// The URL PATH of a (vault, device) key-envelope mailbox.
+fn key_envelope_path(vault: &str, device_id: &str) -> String {
+    format!("/v1/vaults/{vault}/keys/{device_id}")
+}
+
+/// PUBLISH this device's hybrid PUBLIC identity so other devices can wrap a
+/// vault key to it.
+///
+/// A device may publish only its OWN key: `auth` must be a contract v3 identity
+/// whose device ID is `device_id`, or the server answers `403`. Publishing is an
+/// UPSERT — re-publishing after regenerating the local hybrid identity is
+/// allowed and simply replaces the stored key (it does NOT re-wrap envelopes
+/// already deposited for this device).
+///
+/// Only the PUBLIC half is ever sent. The secret identity never leaves the
+/// device.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (unauthenticated / revoked), `403`
+///   (publishing into another device's slot), `400` (malformed key), `501` (the
+///   device model is off on that server).
+pub fn publish_hybrid_key(
+    server: &str,
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+    auth: &RequestAuth<'_>,
+) -> Result<(), CliError> {
+    check_device_id(device_id)?;
+
+    #[derive(Serialize)]
+    struct PublishBody<'a> {
+        x25519_public_key: &'a str,
+        mlkem_encaps_key: &'a str,
+    }
+    let body = serde_json::to_vec(&PublishBody {
+        x25519_public_key: &identity.x25519_public_key,
+        mlkem_encaps_key: &identity.mlkem_encaps_key,
+    })
+    .map_err(|e| CliError::Sharing(format!("could not serialize hybrid key body: {e}")))?;
+
+    let path = hybrid_key_path(device_id);
+    let req = ureq::put(&join_url(server, &path)).set("Content-Type", "application/json");
+    let req = apply_auth(req, auth, "PUT", &path, "", &body)?;
+    finish(req.send_bytes(&body))?;
+    Ok(())
+}
+
+/// FETCH another device's published hybrid PUBLIC identity, so this device can
+/// wrap a vault key to it. Requires an authenticated device (`auth` must sign);
+/// the keys themselves are public.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (unauthenticated / revoked), `404`
+///   (that device has published no hybrid key), `501` (device model off).
+/// - [`CliError::BadResponse`] if the `200` body is not the expected JSON.
+pub fn fetch_hybrid_key(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<HybridPublicIdentity, CliError> {
+    check_device_id(device_id)?;
+    let path = hybrid_key_path(device_id);
+    let req = ureq::get(&join_url(server, &path));
+    let req = apply_auth(req, auth, "GET", &path, "", b"")?;
+    let text = finish(req.call())?;
+
+    let wire: HybridKeyWire =
+        serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))?;
+    Ok(HybridPublicIdentity {
+        version: HYBRID_IDENTITY_VERSION,
+        x25519_public_key: wire.x25519_public_key,
+        mlkem_encaps_key: wire.mlkem_encaps_key,
+    })
+}
+
+/// DEPOSIT an OPAQUE wrapped vault key addressed to `device_id` for `vault`.
+///
+/// `envelope` is already-sealed ciphertext (a `SIGILhyb` container from
+/// [`hybrid_seal_to_container`]); this function performs NO cryptography — it
+/// only moves bytes, exactly like [`push_op_auth`]. The signing device must hold
+/// WRITE access to the vault; depositing into an UNCLAIMED vault claims it
+/// (trust-on-first-write, the same rule as the first op append).
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401`, `403` (no write access), `404`
+///   (unknown recipient), `409` (revoked recipient), `413` (oversized).
+pub fn put_key_envelope(
+    server: &str,
+    vault: &str,
+    device_id: &str,
+    envelope: &[u8],
+    auth: &RequestAuth<'_>,
+) -> Result<(), CliError> {
+    check_vault(vault)?;
+    check_device_id(device_id)?;
+    let path = key_envelope_path(vault, device_id);
+    let req = ureq::put(&join_url(server, &path)).set("Content-Type", "application/octet-stream");
+    let req = apply_auth(req, auth, "PUT", &path, "", envelope)?;
+    finish(req.send_bytes(envelope))?;
+    Ok(())
+}
+
+/// COLLECT the opaque envelope addressed to `device_id` for `vault`, returning
+/// the bytes EXACTLY as the sender uploaded them.
+///
+/// Only the addressee may collect: asking for another device's envelope is a
+/// `403`, not a `401` (the request authenticated fine — it is simply not
+/// permitted). This function performs no cryptography; the caller unwraps.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (unauthenticated / revoked), `403`
+///   (not the addressee, or no read access to the vault), `404` (nothing waiting).
+pub fn get_key_envelope(
+    server: &str,
+    vault: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<Vec<u8>, CliError> {
+    check_vault(vault)?;
+    check_device_id(device_id)?;
+    let path = key_envelope_path(vault, device_id);
+    let req = ureq::get(&join_url(server, &path));
+    let req = apply_auth(req, auth, "GET", &path, "", b"")?;
+    finish_bytes(req.call())
+}
+
+/// WRAP a vault key to a recipient's hybrid public identity, producing the
+/// OPAQUE envelope the server relays.
+///
+/// This is a thin, deliberately explicit wrapper over
+/// [`hybrid_seal_to_container`]: fresh ephemeral entropy (an X25519 secret, an
+/// ML-KEM-768 coin, and an AEAD nonce) is drawn from the OS CSPRNG on EVERY
+/// call, so no two shares of the same key reuse randomness.
+///
+/// # Errors
+/// - [`CliError::Identity`] if the recipient's public identity does not decode.
+/// - [`CliError::Rng`] / [`CliError::HybridSeal`] from the underlying seal.
+pub fn wrap_vault_key(
+    recipient: &HybridPublicIdentity,
+    key: &[u8; VAULT_KEY_LEN],
+) -> Result<Vec<u8>, CliError> {
+    let decoded = recipient.decode()?;
+    hybrid_seal_to_container(&decoded, key)
+}
+
+/// UNWRAP an envelope with this device's hybrid SECRET identity, recovering the
+/// 32-byte vault key.
+///
+/// The recovered plaintext must be exactly [`VAULT_KEY_LEN`] bytes — anything
+/// else is rejected rather than silently used as a key.
+///
+/// # Errors
+/// - [`CliError::Identity`] if the secret identity does not decode.
+/// - [`CliError::HybridSeal`] on a wrong identity or tampered envelope (no
+///   plaintext is leaked).
+/// - [`CliError::Sharing`] if the envelope opened but did not hold a
+///   [`VAULT_KEY_LEN`]-byte key.
+pub fn unwrap_vault_key(
+    identity: &HybridSecretIdentity,
+    envelope: &[u8],
+) -> Result<[u8; VAULT_KEY_LEN], CliError> {
+    let decoded = identity.decode()?;
+    let plaintext = hybrid_open_container(&decoded, envelope)?;
+    plaintext.try_into().map_err(|v: Vec<u8>| {
+        CliError::Sharing(format!(
+            "envelope opened but held {} bytes, expected a {VAULT_KEY_LEN}-byte vault key",
+            v.len()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3796,5 +4220,149 @@ mod tests {
         let req = handle.join().expect("thread");
         assert_eq!(req.request_line, "GET /v1/devices HTTP/1.1");
         assert_eq!(req.header("x-sigil-admin-token"), Some("admintok"));
+    }
+
+    // --- Vault sharing: keyring + wrap/unwrap (Phase 46) --------------------
+
+    /// A unique temp path for one test, cleaned up by the caller.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sigil-share-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn vault_key_is_32_random_bytes_and_differs_per_call() {
+        let a = generate_vault_key().expect("key a");
+        let b = generate_vault_key().expect("key b");
+        assert_eq!(a.len(), VAULT_KEY_LEN);
+        assert_ne!(a, b, "two vault keys must not be identical");
+    }
+
+    #[test]
+    fn keyring_round_trips_and_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_path("keyring");
+        let path = dir.join("vault-keys.json");
+
+        assert!(keyring_get(&path, "demo")
+            .expect("missing keyring is empty")
+            .is_none());
+
+        let key = generate_vault_key().expect("key");
+        keyring_put(&path, "demo", &key).expect("put");
+        let got = keyring_get(&path, "demo").expect("get").expect("present");
+        assert_eq!(got, key);
+
+        // A second vault does not disturb the first.
+        let key2 = generate_vault_key().expect("key2");
+        keyring_put(&path, "other", &key2).expect("put 2");
+        assert_eq!(
+            keyring_get(&path, "demo").expect("get").expect("present"),
+            key
+        );
+        assert_eq!(
+            keyring_get(&path, "other").expect("get").expect("present"),
+            key2
+        );
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the keyring holds vault keys and must be 0600");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_vault_key_seals_a_vault_exactly_like_a_password() {
+        // The point of the whole design: the SIGILcli container takes arbitrary
+        // password BYTES, so a random 32-byte vault key works with NO format
+        // change and produces a container the existing opener reads.
+        let key = generate_vault_key().expect("key");
+        let mut vault = TotpVault::default();
+        vault
+            .add(
+                new_totp_entry("work", None, b"0123456789", OtpAlgorithm::Sha1, 6, 30)
+                    .expect("entry"),
+            )
+            .expect("add");
+
+        let sealed = seal_vault(&key, &vault, FAST).expect("seal under vault key");
+        assert_eq!(&sealed[..8], MAGIC.as_slice(), "still a SIGILcli container");
+
+        let opened = open_vault(&key, &sealed).expect("open under vault key");
+        assert_eq!(opened.entries.len(), 1);
+        assert_eq!(opened.entries[0].label, "work");
+
+        // A different key does not open it, and leaks no plaintext.
+        let other = generate_vault_key().expect("other");
+        assert!(open_vault(&other, &sealed).is_err());
+    }
+
+    #[test]
+    fn wrap_unwrap_vault_key_round_trips_and_rejects_the_wrong_device() {
+        let (b_secret, b_public) = generate_hybrid_identity().expect("B identity");
+        let (c_secret, _c_public) = generate_hybrid_identity().expect("C identity");
+        let key = generate_vault_key().expect("key");
+
+        let envelope = wrap_vault_key(&b_public, &key).expect("wrap to B");
+        // The envelope is an opaque SIGILhyb container that does NOT contain the
+        // key in the clear.
+        assert_eq!(&envelope[..8], HYBRID_MAGIC.as_slice());
+        assert!(
+            !envelope.windows(VAULT_KEY_LEN).any(|w| w == key),
+            "the wrapped envelope must not contain the vault key in the clear"
+        );
+
+        let recovered = unwrap_vault_key(&b_secret, &envelope).expect("B unwraps");
+        assert_eq!(recovered, key);
+
+        // A different device cannot open it.
+        assert!(unwrap_vault_key(&c_secret, &envelope).is_err());
+
+        // Two wraps of the SAME key differ (fresh ephemeral entropy per call).
+        let envelope2 = wrap_vault_key(&b_public, &key).expect("wrap again");
+        assert_ne!(
+            envelope, envelope2,
+            "each wrap must use fresh ephemeral entropy"
+        );
+        assert_eq!(
+            unwrap_vault_key(&b_secret, &envelope2).expect("unwrap 2"),
+            key
+        );
+    }
+
+    #[test]
+    fn unwrap_rejects_a_payload_that_is_not_a_vault_key() {
+        let (secret, public) = generate_hybrid_identity().expect("identity");
+        let decoded = public.decode().expect("decode");
+        let not_a_key = hybrid_seal_to_container(&decoded, b"only nine").expect("seal");
+        assert!(matches!(
+            unwrap_vault_key(&secret, &not_a_key),
+            Err(CliError::Sharing(_))
+        ));
+    }
+
+    #[test]
+    fn vault_key_fingerprint_is_stable_short_and_not_the_key() {
+        let key = generate_vault_key().expect("key");
+        let fp = vault_key_fingerprint(&key);
+        assert_eq!(fp.len(), 16);
+        assert_eq!(
+            fp,
+            vault_key_fingerprint(&key),
+            "fingerprint must be stable"
+        );
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            fp,
+            BASE64.encode(key),
+            "the fingerprint must not be the key"
+        );
+        assert_ne!(
+            vault_key_fingerprint(&generate_vault_key().expect("k2")),
+            fp
+        );
     }
 }

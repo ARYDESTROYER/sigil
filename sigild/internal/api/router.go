@@ -187,6 +187,15 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("POST /v1/devices/{deviceID}/revoke", http.HandlerFunc(h.devicesRevoke))
 		mux.Handle("POST /v1/vaults/{vaultID}/grants", http.HandlerFunc(h.vaultGrantCreate))
 		mux.Handle("GET /v1/vaults/{vaultID}/grants", http.HandlerFunc(h.vaultGrantList))
+		// Vault sharing (Phase 46): device hybrid PUBLIC keys and the opaque
+		// key-envelope relay. Same dev-gate and same auth choke points as the
+		// routes above — see sharing.go for the authorization rules. The
+		// envelope PUT is body-capped (oversized -> 413) before the handler runs.
+		mux.Handle("PUT /v1/devices/{deviceID}/hybrid-key", http.HandlerFunc(h.deviceHybridKeyPublish))
+		mux.Handle("GET /v1/devices/{deviceID}/hybrid-key", http.HandlerFunc(h.deviceHybridKeyFetch))
+		mux.Handle("PUT /v1/vaults/{vaultID}/keys/{deviceID}",
+			limitBody(store.MaxKeyEnvelopeBytes, http.HandlerFunc(h.keyEnvelopePut)))
+		mux.Handle("GET /v1/vaults/{vaultID}/keys/{deviceID}", http.HandlerFunc(h.keyEnvelopeGet))
 	} else {
 		stub := http.HandlerFunc(h.deviceNotImplemented)
 		mux.Handle("POST /v1/devices/enroll", stub)
@@ -194,6 +203,11 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("POST /v1/devices/{deviceID}/revoke", stub)
 		mux.Handle("POST /v1/vaults/{vaultID}/grants", stub)
 		mux.Handle("GET /v1/vaults/{vaultID}/grants", stub)
+		mux.Handle("PUT /v1/devices/{deviceID}/hybrid-key", stub)
+		mux.Handle("GET /v1/devices/{deviceID}/hybrid-key", stub)
+		mux.Handle("PUT /v1/vaults/{vaultID}/keys/{deviceID}",
+			limitBody(store.MaxKeyEnvelopeBytes, stub))
+		mux.Handle("GET /v1/vaults/{vaultID}/keys/{deviceID}", stub)
 	}
 
 	// Billing routes (hosted checkout, provider webhooks, subscription status).

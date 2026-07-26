@@ -40,12 +40,12 @@ const maxDeviceLabelLen = 128
 // return 501 rather than 404 so the surface is discoverable and unambiguous, and
 // rather than any partial/faked auth behaviour.
 func (h *handlers) deviceNotImplemented(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
 		_, _ = io.Copy(io.Discard, r.Body)
 	}
 	writeJSON(w, http.StatusNotImplemented, apiError{
 		Error:  "not_implemented",
-		Detail: "device enrollment and per-vault authorization are not enabled on this server",
+		Detail: "device enrollment, per-vault authorization and vault sharing are not enabled on this server",
 	})
 }
 

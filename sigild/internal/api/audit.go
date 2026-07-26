@@ -36,6 +36,13 @@ const (
 	auditEventDeviceRevoked      = "device.revoked"
 	auditEventVaultClaimed       = "vault.claimed"
 	auditEventVaultGranted       = "vault.granted"
+	// Vault-sharing events (Phase 46). METADATA ONLY: device IDs, a vault ID, a
+	// size, and a hex SHA-256 FINGERPRINT of the opaque envelope. They NEVER
+	// carry the envelope bytes (which are ciphertext the server cannot read),
+	// a vault key, a hybrid public key, a signature, or a nonce.
+	auditEventHybridKeyPublished = "device.hybrid_key_published"
+	auditEventKeyEnvelopePut     = "vault.key_envelope_put"
+	auditEventKeyEnvelopeGet     = "vault.key_envelope_get"
 	// Billing events (Phase 45). METADATA ONLY: a provider name, a normalized
 	// event type, an opaque provider event/session reference, our own subject
 	// reference, and a fixed reason enum.
@@ -235,6 +242,51 @@ func (h *handlers) auditSubscriptionTransition(r *http.Request, provider, subjec
 		"subject", subject,
 		"from", from,
 		"to", to,
+	)
+}
+
+// auditHybridKeyPublished logs a device publishing (or re-publishing) its
+// hybrid PUBLIC key. It records the device ID only. The key bytes are public,
+// but they are still not logged: an audit line is not a key-distribution
+// channel, and keeping the rule "no key material in logs" absolute means there
+// is no judgement call to get wrong later.
+func (h *handlers) auditHybridKeyPublished(r *http.Request, deviceID string) {
+	h.cfg.Logger.Info(auditEventHybridKeyPublished,
+		"event", auditEventHybridKeyPublished,
+		"request_id", RequestIDFromContext(r.Context()),
+		"device_id", deviceID,
+	)
+}
+
+// auditKeyEnvelopePut logs an opaque wrapped-vault-key deposit. Exactly like
+// auditAppend it records a hex SHA-256 FINGERPRINT of the blob and its size —
+// never the bytes. The blob is ciphertext the server cannot read, and the
+// fingerprint lets an operator correlate "the sender uploaded X" with "the
+// recipient collected X" without the server ever retaining the ciphertext.
+func (h *handlers) auditKeyEnvelopePut(r *http.Request, vaultID, recipientID, senderID string, blob []byte) {
+	sum := sha256.Sum256(blob)
+	h.cfg.Logger.Info(auditEventKeyEnvelopePut,
+		"event", auditEventKeyEnvelopePut,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"recipient_device_id", recipientID,
+		"sender_device_id", senderID,
+		"size_bytes", len(blob),
+		"blob_sha256", hex.EncodeToString(sum[:]),
+	)
+}
+
+// auditKeyEnvelopeGet logs a recipient collecting its envelope, with the same
+// fingerprint-not-content rule as auditKeyEnvelopePut.
+func (h *handlers) auditKeyEnvelopeGet(r *http.Request, vaultID, recipientID string, blob []byte) {
+	sum := sha256.Sum256(blob)
+	h.cfg.Logger.Info(auditEventKeyEnvelopeGet,
+		"event", auditEventKeyEnvelopeGet,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"recipient_device_id", recipientID,
+		"size_bytes", len(blob),
+		"blob_sha256", hex.EncodeToString(sum[:]),
 	)
 }
 

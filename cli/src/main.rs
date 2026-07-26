@@ -12,14 +12,16 @@ use std::process::ExitCode;
 
 use sigil_cli::{
     base32_decode, cursor_key, decode_migration_uri, encode_migration_uri, enroll_device,
-    entry_to_migration_otp, entry_to_otpauth_uri, generate_hybrid_identity, generate_key,
-    grant_vault_access, hybrid_open_container, hybrid_seal_to_container, list_devices,
-    load_hybrid_public, load_hybrid_secret, load_identity, load_key_file, migration_otp_to_entry,
-    new_totp_entry, open_container, open_vault, parse_otpauth_uri, pull_ops_auth, push_op_auth,
-    read_cursor, revoke_device, save_hybrid_public, save_hybrid_secret, save_key,
-    seal_to_container, seal_vault, totp_algorithm_from_str, write_cursor, CliError, DeviceIdentity,
-    ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE, TOTP_DEFAULT_DIGITS,
-    TOTP_DEFAULT_PERIOD,
+    entry_to_migration_otp, entry_to_otpauth_uri, fetch_hybrid_key, generate_hybrid_identity,
+    generate_key, generate_vault_key, get_key_envelope, grant_vault_access, hybrid_open_container,
+    hybrid_seal_to_container, keyring_get, keyring_put, list_devices, load_hybrid_public,
+    load_hybrid_secret, load_identity, load_key_file, load_keyring, migration_otp_to_entry,
+    new_totp_entry, open_container, open_vault, parse_otpauth_uri, publish_hybrid_key,
+    pull_ops_auth, push_op_auth, put_key_envelope, read_cursor, revoke_device, save_hybrid_public,
+    save_hybrid_secret, save_key, seal_to_container, seal_vault, totp_algorithm_from_str,
+    unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, write_cursor, CliError,
+    DeviceIdentity, ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE,
+    TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD, VAULT_KEYRING_FILE,
 };
 use sigil_core::Argon2Params;
 
@@ -70,8 +72,8 @@ USAGE:
   sigil totp add --uri \"otpauth://totp/...\" [--vault <file>]
                                          Import a TOTP secret from an otpauth:// URI
   sigil totp list [--vault <file>]       List vault entries (label/issuer/algorithm/digits/period)
-  sigil totp code <label> [--vault <file>]
-                                         Print the CURRENT code for <label> (uses the system clock)
+  sigil totp code <label> [--vault <file>] [--at <unix>]
+                                         Print the CURRENT code for <label> (system clock, or --at)
   sigil totp remove <label> [--vault <file>]
                                          Delete an entry from the vault
   sigil totp import <ARG> [--vault <file>]
@@ -90,6 +92,21 @@ USAGE:
                                          Revoke a device (self, v3-signed, or operator admin token)
   sigil device grant <deviceID> --vault <id> --permission read|write [--key <file>] [--server <url>]
                                          Grant another device access to YOUR vault (owner only)
+  sigil device hybrid-publish [--key <file>] [--hybrid-key <file>] [--regenerate] [--server <url>]
+                                         Generate (if absent) this device's HYBRID identity and
+                                         publish only its PUBLIC half, so others can share to it
+  sigil vault rekey --vault <id> [--file <vaultfile>] [--publish] [--keyring <f>] [--key <f>]
+                                         Re-seal a PASSWORD vault under a fresh random VAULT KEY
+                                         (--publish also wraps it to THIS device and uploads it)
+  sigil vault share --vault <id> --to <deviceID> [--permission read|write] [--keyring <f>]
+                    [--key <f>] [--server <url>] [--envelope-out <f>]
+                                         Wrap the vault key to that device's hybrid public key,
+                                         upload the opaque envelope, and grant it access
+  sigil vault accept --vault <id> [--keyring <f>] [--key <f>] [--hybrid-key <f>]
+                     [--server <url>] [--envelope-out <f>]
+                                         Collect the envelope addressed to THIS device, unwrap it,
+                                         and store the recovered vault key locally (0600)
+  sigil vault list [--keyring <file>]    List vaults this device holds a key for (fingerprints only)
   sigil hybrid-keygen --out <file>       Generate a hybrid identity: secret <file> (0600) + shareable <file>.pub
   sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>
                                          Encrypt <in> TO a recipient's hybrid public identity (no password)
@@ -251,6 +268,56 @@ MULTI-DEVICE AUTH (sigil device ...) — CONTRACT v3, DEV-ONLY:
   possession of the device private key. HONEST SCOPE: dev/localhost/plain HTTP,
   UNAUDITED; no account model, no key rotation, no recovery.
 
+DEVICE-TO-DEVICE VAULT SHARING (sigil vault ...) — DEV-ONLY, UNAUDITED:
+  This is how a SECOND device gets into the SAME vault. The key hierarchy:
+
+    human password  -> seals your PERSONAL vault. It is NEVER shared, NEVER
+                       wrapped, and never leaves your machine.
+    vault key       -> 32 random bytes that seal a SHARED vault (the same
+                       SIGILcli container: it takes arbitrary password BYTES, so
+                       a random key needs no format change).
+    wrapped key     -> the vault key encrypted TO one device's HYBRID public key
+                       (X25519 + ML-KEM-768). sigild RELAYS that opaque envelope
+                       and cannot read it: it has no decapsulation key, sees only
+                       ciphertext, device ids, and a vault id.
+
+  Flow (device A owns the vault; device B joins). Both devices must already be
+  enrolled (`sigil device enroll`), and sigild must run with device auth on:
+
+    # Both devices, once: create + publish a hybrid identity. The SECRET half is
+    # written 0600 next to the device identity and is never uploaded.
+    sigil device hybrid-publish --key ./a.key
+    sigil device hybrid-publish --key ./b.key
+
+    # A: turn its password vault into a SHARED vault (fresh random vault key),
+    # wrap that key to itself, and push the sealed vault to the op-log.
+    SIGIL_PASSWORD=... sigil vault rekey --vault demo --file ./a-vault.sigil --publish --key ./a.key
+    sigil push --vault demo --in ./a-vault.sigil --key ./a.key
+
+    # A: share to B — fetches B's hybrid PUBLIC key, wraps the vault key to it
+    # with fresh ephemeral entropy, uploads the envelope, and grants B access.
+    sigil vault share --vault demo --to <B_ID> --permission read --key ./a.key
+
+    # B: accept — collects the envelope addressed to B, unwraps it with B's
+    # hybrid SECRET identity, stores the vault key 0600.
+    sigil vault accept --vault demo --key ./b.key
+    sigil pull --vault demo --out-dir ./inbox --key ./b.key
+    sigil totp code work --vault ./inbox/demo/op-1.sigil --vault-id demo
+
+  --vault-id <id> is what tells the totp commands to open a file with the VAULT
+  KEY for <id> instead of SIGIL_PASSWORD. Without it, nothing changes: existing
+  password vaults keep working exactly as before.
+
+  The vault key is NEVER printed — commands show only a SHA-256 fingerprint, so
+  two devices can confirm they hold the same key without revealing it. The local
+  keyring is $HOME/.sigil/vault-keys.json (mode 0600, never synced).
+
+  !! HONEST SCOPE: dev/localhost/plain HTTP, UNAUDITED. The hybrid construction
+  is a CUSTOM KEM-then-AEAD, NOT RFC 9180 HPKE; the SYSTEM is NOT post-quantum
+  secure. Revoking a device stops FUTURE access — it cannot make a device forget
+  a vault key it already accepted (that needs a re-key and a re-share). No key
+  rotation schedule, no recovery. Do NOT store real 2FA secrets. !!
+
 INCREMENTAL PULL (pull only):
   Pulled ops are written to <out-dir>/<vault>/op-<seq>.sigil — a PER-VAULT subdir,
   so multiple vaults can safely share one --out-dir without their op-<seq>.sigil
@@ -344,6 +411,7 @@ fn run() -> Result<(), String> {
         }
         "totp" => cmd_totp(args),
         "device" => cmd_device(args),
+        "vault" => cmd_vault(args),
         "push" => {
             let p = parse_push(args)?;
             cmd_push(&p)
@@ -831,6 +899,28 @@ fn resolve_token(flag: Option<String>, env: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Resolve this device's HYBRID identity path (the secret half). Explicit
+/// `--hybrid-key <file>` wins; otherwise it sits ALONGSIDE the device identity
+/// with a `.hybrid` extension (so `$HOME/.sigil/device.key` pairs with
+/// `$HOME/.sigil/device.hybrid`). The shareable PUBLIC half is always that path
+/// plus `.pub`.
+fn resolve_hybrid_path(
+    flag: Option<String>,
+    identity_path: &std::path::Path,
+) -> std::path::PathBuf {
+    match flag {
+        Some(f) => std::path::PathBuf::from(f),
+        None => identity_path.with_extension("hybrid"),
+    }
+}
+
+/// The shareable PUBLIC half that sits next to a secret hybrid identity file.
+fn hybrid_public_path(secret_path: &std::path::Path) -> std::path::PathBuf {
+    let mut s = secret_path.as_os_str().to_os_string();
+    s.push(".pub");
+    std::path::PathBuf::from(s)
+}
+
 /// Parsed flags shared by the `device` subcommands. Unknown flags are rejected by
 /// the caller, so each subcommand validates the combination it needs.
 #[derive(Default)]
@@ -843,6 +933,10 @@ struct DeviceFlags {
     vault: Option<String>,
     permission: Option<String>,
     reuse_key: bool,
+    /// Path to this device's SECRET hybrid identity (`device hybrid-publish`).
+    hybrid_key: Option<String>,
+    /// Force a NEW hybrid identity even if one already exists on disk.
+    regenerate: bool,
 }
 
 /// Parse the `device` subcommand flags (order-independent), rejecting anything
@@ -859,7 +953,9 @@ fn parse_device_flags(args: Vec<String>) -> Result<DeviceFlags, String> {
             "--label" => set_once(&mut f.label, &mut it, "--label")?,
             "--vault" => set_once(&mut f.vault, &mut it, "--vault")?,
             "--permission" => set_once(&mut f.permission, &mut it, "--permission")?,
+            "--hybrid-key" => set_once(&mut f.hybrid_key, &mut it, "--hybrid-key")?,
             "--reuse-key" => f.reuse_key = true,
+            "--regenerate" => f.regenerate = true,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
     }
@@ -869,7 +965,10 @@ fn parse_device_flags(args: Vec<String>) -> Result<DeviceFlags, String> {
 /// Dispatch `sigil device <sub> ...`.
 fn cmd_device(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let Some(sub) = args.next() else {
-        return Err("missing device subcommand: enroll | list | revoke | grant".to_string());
+        return Err(
+            "missing device subcommand: enroll | list | revoke | grant | hybrid-publish"
+                .to_string(),
+        );
     };
     let rest: Vec<String> = args.collect();
     let (positional, flags) = take_positional(&rest);
@@ -880,8 +979,9 @@ fn cmd_device(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         "list" => cmd_device_list(&f),
         "revoke" => cmd_device_revoke(positional, &f),
         "grant" => cmd_device_grant(positional, &f),
+        "hybrid-publish" => cmd_device_hybrid_publish(&f),
         other => Err(format!(
-            "unknown device subcommand {other:?}; try enroll | list | revoke | grant"
+            "unknown device subcommand {other:?}; try enroll | list | revoke | grant | hybrid-publish"
         )),
     }
 }
@@ -1092,6 +1192,448 @@ fn cmd_device_grant(target: Option<String>, f: &DeviceFlags) -> Result<(), Strin
     Ok(())
 }
 
+/// `sigil device hybrid-publish [--hybrid-key <file>] [--regenerate]`
+///
+/// Generate (if absent) this device's HYBRID identity and publish only its
+/// PUBLIC half to sigild, so other devices can wrap a vault key to it.
+///
+/// The SECRET half is written 0600 alongside the device identity and NEVER
+/// leaves this machine; the shareable public half is written next to it as
+/// `<file>.pub` and is what is uploaded. Publishing is an upsert: re-running it
+/// (or `--regenerate`) replaces the server's copy. Re-generating does NOT
+/// re-wrap envelopes already deposited for this device — those were sealed to
+/// the OLD key and must be re-shared.
+fn cmd_device_hybrid_publish(f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.admin_token.is_some() || f.vault.is_some() || f.permission.is_some() {
+        return Err(
+            "device hybrid-publish takes --key/--hybrid-key/--server/--regenerate only".to_string(),
+        );
+    }
+    let server = resolve_server(f.server.clone());
+    let identity_path = resolve_identity_path(f.key.clone());
+    let identity = load_identity(&identity_path).map_err(|e| e.to_string())?;
+    let Some(device_id) = identity.device_id.clone() else {
+        return Err(format!(
+            "identity {} has no device_id: run `sigil device enroll` first (publishing a hybrid \
+             key is a contract v3, self-only operation)",
+            identity_path.display()
+        ));
+    };
+
+    let secret_path = resolve_hybrid_path(f.hybrid_key.clone(), &identity_path);
+    let public_path = hybrid_public_path(&secret_path);
+
+    // Reuse the existing identity unless asked to regenerate. We never silently
+    // overwrite a hybrid secret: it is the ONLY thing that can open envelopes
+    // already addressed to this device.
+    let public = if secret_path.exists() && !f.regenerate {
+        if public_path.exists() {
+            load_hybrid_public(&public_path).map_err(|e| e.to_string())?
+        } else {
+            // The secret is present but the public half was lost: re-derive it
+            // by regenerating is NOT acceptable (it would orphan envelopes), so
+            // ask for it explicitly.
+            return Err(format!(
+                "hybrid secret {} exists but its public half {} is missing; restore it, or pass \
+                 --regenerate to create a NEW hybrid identity (which orphans any envelope already \
+                 addressed to this device)",
+                secret_path.display(),
+                public_path.display()
+            ));
+        }
+    } else {
+        let (secret, public) = generate_hybrid_identity().map_err(|e| e.to_string())?;
+        if let Some(parent) = secret_path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .map_err(|e| format!("could not create identity dir {:?}: {e}", parent))?;
+            }
+        }
+        save_hybrid_secret(&secret_path, &secret).map_err(|e| e.to_string())?;
+        save_hybrid_public(&public_path, &public).map_err(|e| e.to_string())?;
+        public
+    };
+
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+    publish_hybrid_key(&server, &device_id, &public, &auth)
+        .map_err(|e| explain_device_error(e, "publishing this device's hybrid public key"))?;
+
+    println!(
+        "published hybrid public key for device {device_id}\n  \
+         secret identity: {secret} (mode 0600, never uploaded)\n  \
+         public identity: {public_file}",
+        secret = secret_path.display(),
+        public_file = public_path.display(),
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `sigil vault` — DEVICE-TO-DEVICE VAULT SHARING (Phase 46).
+//
+// The key hierarchy, stated once more where the user meets it:
+//
+//   * A PERSONAL vault stays sealed under the human password (SIGIL_PASSWORD).
+//     Nothing here changes that, and the password is NEVER shared or wrapped.
+//   * A SHARED vault is sealed under a random 32-byte VAULT KEY. `vault rekey`
+//     is the one-way door from the first to the second.
+//   * The vault key is WRAPPED to each recipient device with the hybrid
+//     (X25519 + ML-KEM-768) public-key path. The server relays that opaque
+//     envelope and cannot read it.
+//
+// DEV-ONLY, UNAUDITED, plain HTTP. The vault key is never printed — only its
+// SHA-256 fingerprint, so two devices can prove they hold the same key.
+// ---------------------------------------------------------------------------
+
+/// Parsed flags for the `vault` subcommands.
+#[derive(Default)]
+struct VaultFlags {
+    /// The shared VAULT ID (the op-log vault, not a local file).
+    vault: Option<String>,
+    /// Recipient device ID for `share`.
+    to: Option<String>,
+    /// Diagnostic addressee for `accept` (see cmd_vault_accept).
+    addressee: Option<String>,
+    /// The local sealed vault FILE for `rekey`.
+    file: Option<String>,
+    keyring: Option<String>,
+    key: Option<String>,
+    hybrid_key: Option<String>,
+    server: Option<String>,
+    permission: Option<String>,
+    /// Write the opaque envelope bytes to this file (0600) as well as
+    /// uploading/consuming them. Diagnostic: it is what makes "the server
+    /// relayed exactly these bytes" checkable.
+    envelope_out: Option<String>,
+    /// `rekey` only: also wrap the new vault key to THIS device and upload it,
+    /// so the owner's own key is recoverable from the server.
+    publish: bool,
+}
+
+fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
+    let mut f = VaultFlags::default();
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--vault" => set_once(&mut f.vault, &mut it, "--vault")?,
+            "--to" => set_once(&mut f.to, &mut it, "--to")?,
+            "--for" => set_once(&mut f.addressee, &mut it, "--for")?,
+            "--file" => set_once(&mut f.file, &mut it, "--file")?,
+            "--keyring" => set_once(&mut f.keyring, &mut it, "--keyring")?,
+            "--key" => set_once(&mut f.key, &mut it, "--key")?,
+            "--hybrid-key" => set_once(&mut f.hybrid_key, &mut it, "--hybrid-key")?,
+            "--server" => set_once(&mut f.server, &mut it, "--server")?,
+            "--permission" => set_once(&mut f.permission, &mut it, "--permission")?,
+            "--envelope-out" => set_once(&mut f.envelope_out, &mut it, "--envelope-out")?,
+            "--publish" => f.publish = true,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    Ok(f)
+}
+
+/// Dispatch `sigil vault <sub> ...`.
+fn cmd_vault(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let Some(sub) = args.next() else {
+        return Err("missing vault subcommand: rekey | share | accept | list".to_string());
+    };
+    let rest: Vec<String> = args.collect();
+    let f = parse_vault_flags(rest)?;
+    match sub.as_str() {
+        "rekey" => cmd_vault_rekey(&f),
+        "share" => cmd_vault_share(&f),
+        "accept" => cmd_vault_accept(&f),
+        "list" => cmd_vault_list(&f),
+        other => Err(format!(
+            "unknown vault subcommand {other:?}; try rekey | share | accept | list"
+        )),
+    }
+}
+
+/// Load the enrolled device identity for a sharing command, requiring contract
+/// v3 (every sharing route is device-authenticated).
+fn sharing_identity(key: Option<String>) -> Result<(std::path::PathBuf, DeviceIdentity), String> {
+    let path = resolve_identity_path(key);
+    let identity = load_identity(&path).map_err(|e| e.to_string())?;
+    if identity.device_id.is_none() {
+        return Err(format!(
+            "identity {} has no device_id: run `sigil device enroll` first (vault sharing is a \
+             contract v3, device-authenticated operation)",
+            path.display()
+        ));
+    }
+    Ok((path, identity))
+}
+
+/// Write opaque envelope bytes to a 0600 file. They are ciphertext, but they are
+/// still key-shaped material, so the file is owner-only.
+fn write_envelope_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let p = std::path::Path::new(path);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(p)
+        .map_err(|e| format!("could not create envelope file {path:?}: {e}"))?;
+    f.write_all(bytes)
+        .map_err(|e| format!("could not write envelope file {path:?}: {e}"))?;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("could not set envelope permissions {path:?}: {e}"))
+}
+
+/// Explain a sharing HTTP failure in terms of what the user can do. Never
+/// echoes a key, an envelope, or a token.
+fn explain_sharing_error(e: CliError, what: &str) -> String {
+    match &e {
+        CliError::Server { status: 401, .. } => format!(
+            "{e}\n  -> HTTP 401: sigild did not accept this request's credentials while {what}.\n     \
+             Check the device is enrolled and NOT REVOKED, that --key points at its identity, and\n     \
+             that the clock is within 300s of the server."
+        ),
+        CliError::Server { status: 403, .. } => format!(
+            "{e}\n  -> HTTP 403: authenticated, but not permitted while {what}. Only a device with\n     \
+             WRITE access may deposit a key envelope, and only the ADDRESSEE may collect one."
+        ),
+        CliError::Server { status: 404, .. } => format!(
+            "{e}\n  -> HTTP 404: nothing there while {what}. The recipient may not have run\n     \
+             `sigil device hybrid-publish`, or no envelope has been shared to this device yet."
+        ),
+        _ => e.to_string(),
+    }
+}
+
+/// `sigil vault rekey --vault <id> [--file <vaultfile>] [--publish]`
+///
+/// Convert a PASSWORD-sealed vault into a SHARED vault: open it with
+/// `SIGIL_PASSWORD`, draw a fresh random 32-byte VAULT KEY, re-seal the SAME
+/// file under that key, and record the key in the local 0600 keyring.
+///
+/// This is the ONLY thing that changes how a vault is sealed, and it is
+/// explicit: existing password vaults keep working untouched until you run it.
+/// After a rekey, that file is opened with `--vault-id <id>`, not the password.
+///
+/// With `--publish` it ALSO wraps the new key to THIS device's own hybrid public
+/// key and uploads the envelope, so the owner can recover its own vault key from
+/// the server (and, as a side effect, claims the vault ID for this device).
+fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
+    if f.to.is_some() || f.addressee.is_some() {
+        return Err("vault rekey takes --vault/--file/--keyring/--publish (plus --key/--hybrid-key/--server) only".to_string());
+    }
+    let vault_id = f
+        .vault
+        .clone()
+        .ok_or_else(|| "missing required --vault <id>".to_string())?;
+    let file = resolve_vault_path(f.file.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+
+    // Open the EXISTING password-sealed vault. This fails loudly if the file is
+    // already key-sealed (wrong secret), which is the right outcome: rekey is
+    // for the password -> vault-key transition.
+    let password = password_from_env()?;
+    let vault = load_vault_required(&file, &password)?;
+
+    let key = generate_vault_key().map_err(|e| e.to_string())?;
+    save_vault(&file, &key, &vault)?;
+    keyring_put(&keyring, &vault_id, &key).map_err(|e| e.to_string())?;
+
+    println!(
+        "vault {vault_id} re-sealed under a fresh random vault key\n  \
+         file:        {file} (mode 0600, now opened with --vault-id {vault_id})\n  \
+         keyring:     {keyring} (mode 0600)\n  \
+         key sha256:  {fp} (fingerprint only — the key is never printed)",
+        file = file.display(),
+        keyring = keyring.display(),
+        fp = vault_key_fingerprint(&key),
+    );
+
+    if f.publish {
+        let server = resolve_server(f.server.clone());
+        let (identity_path, identity) = sharing_identity(f.key.clone())?;
+        let device_id = identity.device_id.clone().expect("checked above");
+        let secret_path = resolve_hybrid_path(f.hybrid_key.clone(), &identity_path);
+        let public_path = hybrid_public_path(&secret_path);
+        let public = load_hybrid_public(&public_path).map_err(|e| {
+            format!("{e}\n  -> run `sigil device hybrid-publish` first so this device has a hybrid identity")
+        })?;
+
+        let envelope = wrap_vault_key(&public, &key).map_err(|e| e.to_string())?;
+        let identity_opt = Some(identity);
+        let auth = auth_for(&identity_opt);
+        put_key_envelope(&server, &vault_id, &device_id, &envelope, &auth)
+            .map_err(|e| explain_sharing_error(e, "depositing this vault's key for this device"))?;
+        println!("  wrapped the vault key to this device ({device_id}) and uploaded the envelope ({} bytes)", envelope.len());
+    }
+    Ok(())
+}
+
+/// `sigil vault share --vault <id> --to <deviceID> [--permission read|write]`
+///
+/// Share a vault with another device: fetch that device's published hybrid
+/// PUBLIC key, WRAP this vault's key to it with fresh ephemeral entropy, upload
+/// the opaque envelope, and grant the device access through the EXISTING grant
+/// API — so authorization and key distribution never drift apart.
+///
+/// The vault key itself is never printed and never leaves this machine
+/// unwrapped.
+fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
+    if f.file.is_some() || f.addressee.is_some() || f.publish {
+        return Err(
+            "vault share takes --vault/--to/--permission/--keyring/--key/--server/--envelope-out only"
+                .to_string(),
+        );
+    }
+    let vault_id = f
+        .vault
+        .clone()
+        .ok_or_else(|| "missing required --vault <id>".to_string())?;
+    let to =
+        f.to.clone()
+            .ok_or_else(|| "missing required --to <deviceID>".to_string())?;
+    let permission = f.permission.clone().unwrap_or_else(|| "read".to_string());
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+
+    let (_identity_path, identity) = sharing_identity(f.key.clone())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    let key = keyring_get(&keyring, &vault_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "no vault key for {vault_id:?} in {}; run `sigil vault rekey --vault {vault_id}` \
+                 first (a shared vault is sealed under a random vault key, never your password)",
+                keyring.display()
+            )
+        })?;
+
+    // 1) The recipient's PUBLIC hybrid key, straight from the registry.
+    let recipient = fetch_hybrid_key(&server, &to, &auth)
+        .map_err(|e| explain_sharing_error(e, "fetching the recipient's hybrid public key"))?;
+
+    // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
+    let envelope = wrap_vault_key(&recipient, &key).map_err(|e| e.to_string())?;
+
+    // 3) Deposit the OPAQUE envelope; the server cannot read it.
+    put_key_envelope(&server, &vault_id, &to, &envelope, &auth)
+        .map_err(|e| explain_sharing_error(e, "depositing the key envelope"))?;
+
+    // 4) Authorize through the EXISTING grant API, so access and keys agree.
+    grant_vault_access(&server, &vault_id, &to, &permission, &auth)
+        .map_err(|e| explain_device_error(e, "granting vault access"))?;
+
+    if let Some(path) = &f.envelope_out {
+        write_envelope_file(path, &envelope)?;
+    }
+    println!(
+        "shared vault {vault_id} with device {to}\n  \
+         wrapped the vault key to that device's hybrid public key (X25519 + ML-KEM-768)\n  \
+         envelope:    {} bytes, opaque to the server\n  \
+         permission:  {permission}\n  \
+         key sha256:  {fp} (fingerprint only)",
+        envelope.len(),
+        fp = vault_key_fingerprint(&key),
+    );
+    Ok(())
+}
+
+/// `sigil vault accept --vault <id>`
+///
+/// Collect the envelope addressed to THIS device, unwrap it with this device's
+/// hybrid SECRET identity, and record the recovered vault key in the local 0600
+/// keyring. Afterwards `sigil totp ... --vault-id <id>` opens the shared vault.
+///
+/// `--for <deviceID>` is a DIAGNOSTIC that asks for the envelope addressed to
+/// ANOTHER device. The server must refuse it with 403 — the flag exists so that
+/// rule is testable from the outside. It never attempts to unwrap.
+fn cmd_vault_accept(f: &VaultFlags) -> Result<(), String> {
+    if f.file.is_some() || f.to.is_some() || f.publish || f.permission.is_some() {
+        return Err(
+            "vault accept takes --vault/--keyring/--key/--hybrid-key/--server/--envelope-out/--for only"
+                .to_string(),
+        );
+    }
+    let vault_id = f
+        .vault
+        .clone()
+        .ok_or_else(|| "missing required --vault <id>".to_string())?;
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+
+    let (identity_path, identity) = sharing_identity(f.key.clone())?;
+    let device_id = identity.device_id.clone().expect("checked above");
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    let addressee = f.addressee.clone().unwrap_or_else(|| device_id.clone());
+    let envelope = get_key_envelope(&server, &vault_id, &addressee, &auth)
+        .map_err(|e| explain_sharing_error(e, "collecting the key envelope"))?;
+
+    if let Some(path) = &f.envelope_out {
+        write_envelope_file(path, &envelope)?;
+    }
+
+    if addressee != device_id {
+        // Diagnostic path only: this device is not the addressee, so it holds no
+        // key that could open the envelope. Reaching here at all means the
+        // server failed to enforce the addressee rule.
+        return Err(format!(
+            "fetched {} bytes addressed to {addressee} — but this device is {device_id}, so the \
+             server should have refused with 403",
+            envelope.len()
+        ));
+    }
+
+    let secret_path = resolve_hybrid_path(f.hybrid_key.clone(), &identity_path);
+    let secret = load_hybrid_secret(&secret_path).map_err(|e| {
+        format!("{e}\n  -> run `sigil device hybrid-publish` first so this device has a hybrid identity")
+    })?;
+    let key = unwrap_vault_key(&secret, &envelope).map_err(|e| e.to_string())?;
+    keyring_put(&keyring, &vault_id, &key).map_err(|e| e.to_string())?;
+
+    println!(
+        "accepted vault {vault_id}\n  \
+         unwrapped the vault key with this device's hybrid secret identity\n  \
+         keyring:     {keyring} (mode 0600)\n  \
+         key sha256:  {fp} (fingerprint only — the key is never printed)\n  \
+         open it with: sigil totp list --vault <file> --vault-id {vault_id}",
+        keyring = keyring.display(),
+        fp = vault_key_fingerprint(&key),
+    );
+    Ok(())
+}
+
+/// `sigil vault list [--keyring <file>]` — which shared vaults this device holds
+/// a key for. Prints the vault ID and a SHA-256 FINGERPRINT of the key, never
+/// the key.
+fn cmd_vault_list(f: &VaultFlags) -> Result<(), String> {
+    let keyring = resolve_keyring_path(f.keyring.clone());
+    let kr = load_keyring(&keyring).map_err(|e| e.to_string())?;
+    if kr.keys.is_empty() {
+        println!("no vault keys in {}", keyring.display());
+        return Ok(());
+    }
+    println!("{} vault key(s) in {}:", kr.keys.len(), keyring.display());
+    for id in kr.keys.keys() {
+        // Re-read through keyring_get so a malformed entry is reported, not
+        // silently rendered.
+        let fp = match keyring_get(&keyring, id).map_err(|e| e.to_string())? {
+            Some(key) => vault_key_fingerprint(&key),
+            None => "<unreadable>".to_string(),
+        };
+        println!("  {id}  key_sha256={fp}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // `sigil totp` — the encrypted TOTP-secret vault (the first product feature).
 // ---------------------------------------------------------------------------
@@ -1207,30 +1749,98 @@ fn take_positional(args: &[String]) -> (Option<String>, &[String]) {
     }
 }
 
-/// Pull `--vault <file>` (if present) from a flag list, returning the resolved
-/// vault path and the remaining flags.
-fn extract_vault_flag(mut flags: Vec<String>) -> Result<(std::path::PathBuf, Vec<String>), String> {
+/// Resolve the LOCAL vault-keyring path: `--keyring <file>` if given, else the
+/// default `$HOME/.sigil/vault-keys.json` (falling back to the CWD if `$HOME` is
+/// unset). The keyring holds SECRET vault keys and is always written 0600.
+fn resolve_keyring_path(flag: Option<String>) -> std::path::PathBuf {
+    if let Some(f) = flag {
+        return std::path::PathBuf::from(f);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home)
+            .join(".sigil")
+            .join(VAULT_KEYRING_FILE),
+        _ => std::path::PathBuf::from(VAULT_KEYRING_FILE),
+    }
+}
+
+/// How a local vault FILE is sealed/opened: which file, and which SECRET.
+///
+/// This is the one place the key hierarchy shows up in the totp commands:
+///
+///   * no `--vault-id`  -> the vault is a PERSONAL, password-sealed vault and
+///     the secret is `SIGIL_PASSWORD`. This is the EXISTING behaviour, byte for
+///     byte — nothing about an existing password vault changes.
+///   * `--vault-id <id>` -> the vault is a SHARED vault sealed under the random
+///     32-byte VAULT KEY held for `<id>` in the local keyring. The human
+///     password is not involved and is never shared.
+struct VaultAccess {
+    /// The local sealed-container file.
+    path: std::path::PathBuf,
+    /// The shared-vault id, when this vault is key-sealed rather than
+    /// password-sealed.
+    vault_id: Option<String>,
+    /// Where to look the vault key up.
+    keyring: std::path::PathBuf,
+}
+
+impl VaultAccess {
+    /// The bytes that seal/open this vault: the vault key for `--vault-id`, else
+    /// the `SIGIL_PASSWORD` password. Never printed, never logged.
+    fn secret(&self) -> Result<Vec<u8>, String> {
+        match &self.vault_id {
+            Some(id) => {
+                let key = keyring_get(&self.keyring, id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "no vault key for {id:?} in {}; run `sigil vault rekey --vault {id}` \
+                             (owner) or `sigil vault accept --vault {id}` (recipient) first",
+                            self.keyring.display()
+                        )
+                    })?;
+                Ok(key.to_vec())
+            }
+            None => password_from_env(),
+        }
+    }
+}
+
+/// Pull the vault-selection flags (`--vault <file>`, `--vault-id <id>`,
+/// `--keyring <file>`) out of a flag list, returning the resolved access and the
+/// remaining flags.
+///
+/// `--vault` keeps its existing meaning (the local FILE), so every existing
+/// invocation behaves exactly as before; `--vault-id`/`--keyring` are new and
+/// purely additive.
+fn extract_vault_access(mut flags: Vec<String>) -> Result<(VaultAccess, Vec<String>), String> {
     let mut vault: Option<String> = None;
+    let mut vault_id: Option<String> = None;
+    let mut keyring: Option<String> = None;
     let mut rest = Vec::new();
     let mut it = flags.drain(..);
     while let Some(f) = it.next() {
-        if f == "--vault" {
-            let v = it
-                .next()
-                .ok_or_else(|| "--vault requires a value".to_string())?;
-            if vault.replace(v).is_some() {
-                return Err("--vault given more than once".to_string());
-            }
-        } else {
-            rest.push(f);
+        match f.as_str() {
+            "--vault" => set_once(&mut vault, &mut it, "--vault")?,
+            "--vault-id" => set_once(&mut vault_id, &mut it, "--vault-id")?,
+            "--keyring" => set_once(&mut keyring, &mut it, "--keyring")?,
+            _ => rest.push(f),
         }
     }
-    Ok((resolve_vault_path(vault), rest))
+    Ok((
+        VaultAccess {
+            path: resolve_vault_path(vault),
+            vault_id,
+            keyring: resolve_keyring_path(keyring),
+        },
+        rest,
+    ))
 }
 
 fn cmd_totp_add(args: Vec<String>) -> Result<(), String> {
     let (label, flags) = take_positional(&args);
-    let (vault_path, flags) = extract_vault_flag(flags.to_vec())?;
+    let (access, flags) = extract_vault_access(flags.to_vec())?;
+    let vault_path = access.path.clone();
 
     // Parse the add flags.
     let mut uri: Option<String> = None;
@@ -1266,7 +1876,7 @@ fn cmd_totp_add(args: Vec<String>) -> Result<(), String> {
         }
     }
 
-    let password = password_from_env()?;
+    let password = access.secret()?;
     let mut vault = load_vault_or_empty(&vault_path, &password)?;
 
     let entry = if let Some(uri) = uri {
@@ -1304,11 +1914,12 @@ fn cmd_totp_add(args: Vec<String>) -> Result<(), String> {
 }
 
 fn cmd_totp_list(args: Vec<String>) -> Result<(), String> {
-    let (vault_path, rest) = extract_vault_flag(args)?;
+    let (access, rest) = extract_vault_access(args)?;
+    let vault_path = access.path.clone();
     if let Some(x) = rest.first() {
         return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
     }
-    let password = password_from_env()?;
+    let password = access.secret()?;
     let vault = load_vault_required(&vault_path, &password)?;
 
     if vault.entries.is_empty() {
@@ -1336,19 +1947,41 @@ fn cmd_totp_list(args: Vec<String>) -> Result<(), String> {
 
 fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
     let (label, flags) = take_positional(&args);
-    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
-    if let Some(x) = rest.first() {
-        return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
+    let (access, rest) = extract_vault_access(flags.to_vec())?;
+    let vault_path = access.path.clone();
+
+    // `--at <unix-seconds>` pins the instant instead of reading the system
+    // clock. It is a TEST/DEBUG hook (the wasm client has the same `?t=`), which
+    // is what makes a code reproducible across two machines in a proof; it
+    // changes nothing about how the code is computed.
+    let mut at: Option<u64> = None;
+    let mut it = rest.into_iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--at" => {
+                let raw = it
+                    .next()
+                    .ok_or_else(|| "--at requires a value".to_string())?;
+                at =
+                    Some(raw.parse::<u64>().map_err(|_| {
+                        format!("--at must be non-negative unix seconds, got {raw:?}")
+                    })?);
+            }
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
     }
     let label = label.ok_or_else(|| "missing <label>".to_string())?;
 
-    let password = password_from_env()?;
+    let password = access.secret()?;
     let vault = load_vault_required(&vault_path, &password)?;
     let entry = vault
         .find(&label)
         .ok_or_else(|| format!("no entry labelled {label:?} in the vault"))?;
 
-    let now = now_unix_secs()?;
+    let now = match at {
+        Some(t) => t,
+        None => now_unix_secs()?,
+    };
     let (code, remaining) = entry.code_at(now).map_err(|e| e.to_string())?;
     println!("{code}  (valid for {remaining}s)");
     Ok(())
@@ -1356,13 +1989,14 @@ fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
 
 fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
     let (label, flags) = take_positional(&args);
-    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+    let (access, rest) = extract_vault_access(flags.to_vec())?;
+    let vault_path = access.path.clone();
     if let Some(x) = rest.first() {
         return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
     }
     let label = label.ok_or_else(|| "missing <label>".to_string())?;
 
-    let password = password_from_env()?;
+    let password = access.secret()?;
     let mut vault = load_vault_required(&vault_path, &password)?;
     vault.remove(&label).map_err(|e| e.to_string())?;
     save_vault(&vault_path, &password, &vault)?;
@@ -1434,12 +2068,13 @@ fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
     let arg = arg.ok_or_else(|| {
         "missing <ARG>: an otpauth-migration:// URI, an otpauth:// URI, or a file path".to_string()
     })?;
-    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+    let (access, rest) = extract_vault_access(flags.to_vec())?;
+    let vault_path = access.path.clone();
     if let Some(x) = rest.first() {
         return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
     }
 
-    let password = password_from_env()?;
+    let password = access.secret()?;
     let mut vault = load_vault_or_empty(&vault_path, &password)?;
 
     // Resolve the arg to a list of URI strings: a URI is used directly; anything
@@ -1501,7 +2136,8 @@ fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
 /// unless `--out <file>` is given (written mode 0600).
 fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
     let (label, flags) = take_positional(&args);
-    let (vault_path, rest) = extract_vault_flag(flags.to_vec())?;
+    let (access, rest) = extract_vault_access(flags.to_vec())?;
+    let vault_path = access.path.clone();
 
     let mut migration = false;
     let mut out: Option<String> = None;
@@ -1519,7 +2155,7 @@ fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
         }
     }
 
-    let password = password_from_env()?;
+    let password = access.secret()?;
     let vault = load_vault_required(&vault_path, &password)?;
 
     let selected: Vec<&TotpEntry> = match &label {

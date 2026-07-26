@@ -55,6 +55,12 @@ type Metrics struct {
 	vaultClaimsTotal       atomic.Int64
 	authzDeniedTotal       atomic.Int64
 
+	// Vault-sharing counters (Phase 46). Counts ONLY — never an envelope byte,
+	// a hybrid public key, a vault key, or a vault/device ID as a label.
+	hybridKeyPublishesTotal atomic.Int64
+	keyEnvelopePutsTotal    atomic.Int64
+	keyEnvelopeGetsTotal    atomic.Int64
+
 	// authDenied counts request auth/authz denials, keyed by the fixed
 	// authReason enum so /metrics can label each by reason. Built once
 	// (immutable key set); only the atomic values mutate.
@@ -255,6 +261,15 @@ func (m *Metrics) incGrant() { m.vaultGrantsTotal.Add(1) }
 // incVaultClaim records one trust-on-first-write vault ownership claim.
 func (m *Metrics) incVaultClaim() { m.vaultClaimsTotal.Add(1) }
 
+// incHybridKeyPublish records one device hybrid public key publish/republish.
+func (m *Metrics) incHybridKeyPublish() { m.hybridKeyPublishesTotal.Add(1) }
+
+// incKeyEnvelopePut records one opaque wrapped-vault-key deposit.
+func (m *Metrics) incKeyEnvelopePut() { m.keyEnvelopePutsTotal.Add(1) }
+
+// incKeyEnvelopeGet records one envelope collected by its recipient.
+func (m *Metrics) incKeyEnvelopeGet() { m.keyEnvelopeGetsTotal.Add(1) }
+
 // incAuthzDenied records one AUTHORIZATION denial (a 403), i.e. an
 // authenticated device that was not permitted. It is counted separately from the
 // per-reason breakdown so an operator can alert on 403s alone.
@@ -302,6 +317,12 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 		"Total per-vault access grants created.", m.vaultGrantsTotal.Load())
 	writeCounter(&b, "sigild_vault_claims_total",
 		"Total vault ownership claims (trust on first write).", m.vaultClaimsTotal.Load())
+	writeCounter(&b, "sigild_device_hybrid_keys_published_total",
+		"Total device hybrid public key publishes (including re-publishes).", m.hybridKeyPublishesTotal.Load())
+	writeCounter(&b, "sigild_vault_key_envelopes_total",
+		"Total opaque wrapped-vault-key envelopes deposited.", m.keyEnvelopePutsTotal.Load())
+	writeCounter(&b, "sigild_vault_key_envelope_fetches_total",
+		"Total opaque wrapped-vault-key envelopes collected by their recipient.", m.keyEnvelopeGetsTotal.Load())
 	writeCounter(&b, "sigild_oplog_authz_denied_total",
 		"Total requests denied by per-vault authorization (HTTP 403).", m.authzDeniedTotal.Load())
 

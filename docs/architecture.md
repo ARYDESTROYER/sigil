@@ -85,9 +85,12 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     `ss_x || ss_kem || transcript_hash` through `HKDF-SHA-256` under the
     `"sigil-hybrid-v1"` label. Secure if **either** component stays secure (the
     standard hybrid-combiner property); the transcript binding prevents
-    mix-and-match. Real but UNAUDITED and **standalone** — not wired into suite
-    `0x12` or any record/vault/account flow (the envelope's `kem_ct` field stays
-    reserved), and the system is still not "post-quantum secure". See
+    mix-and-match. Real but UNAUDITED. It is **no longer standalone**: through
+    `hybrid_seal` (below) this combiner now carries **device-to-device vault-key
+    wrapping** ([`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)),
+    so it is load-bearing product code. It is still **not wired into suite `0x12`**
+    (the envelope's `kem_ct` field stays reserved — the ML-KEM ciphertext travels
+    alongside the envelope), and the system is still not "post-quantum secure". See
     [`decisions/0011-hybrid-kem-combiner.md`](decisions/0011-hybrid-kem-combiner.md).
   - the **combined hybrid signature**
     ([`../libsigil/core/src/hybrid_sig.rs`](../libsigil/core/src/hybrid_sig.rs):
@@ -100,9 +103,12 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     `hybrid_verify` splits the signature and requires **BOTH** halves to validate —
     so a forgery requires breaking **both** Ed25519 and ML-DSA-65 (the
     concatenate-and-require-both property; not a claim the system is "post-quantum
-    secure"). Real but UNAUDITED and **standalone** — not wired into suite `0x12` or
-    any record/vault/account/session flow (the `sigild` op-log request auth still
-    uses classical Ed25519 only), and the system is still not "post-quantum secure".
+    secure"). Real but UNAUDITED and — **unlike its KEM sibling above — STILL
+    STANDALONE**: it is not wired into suite `0x12` or into any
+    record/vault/account/session/sharing flow. Every signature `sigild` verifies
+    (op-log contracts v2 and v3, enrollment proofs, and **every vault-sharing
+    route**) is **classical Ed25519 only**, and the system is still not
+    "post-quantum secure".
     See [`decisions/0012-hybrid-signature-combiner.md`](decisions/0012-hybrid-signature-combiner.md).
   - the **hybrid public-key authenticated encryption** flow
     ([`../libsigil/core/src/hybrid_seal.rs`](../libsigil/core/src/hybrid_seal.rs):
@@ -115,11 +121,15 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     decapsulates with the recipient's hybrid secret keys to recover the same secret,
     then authenticates and decrypts the envelope. Caller-supplied ephemeral X25519
     secret + ML-KEM coin + AEAD nonce (the core generates no randomness). This is a
-    **bespoke composition — NOT RFC 9180 HPKE** — and the **first wiring of a hybrid
-    primitive into an encryption flow**. Real but UNAUDITED and **standalone**: a
-    crypto-level flow, **not** the product's account / key-management /
-    vault-storage model; `sigild` never uses it and the CLI exercises it only as a
-    demo (its `hybrid-keygen` / `hybrid-seal` / `hybrid-open` commands, above). The
+    **bespoke composition — NOT RFC 9180 HPKE**. Real but UNAUDITED, and **no longer
+    standalone: it is now the mechanism that distributes vault keys between
+    devices.** `sigil vault share` wraps a shared vault's random 32-byte vault key to
+    a recipient device's hybrid public key with exactly this call, and `sigild`
+    relays the result as an opaque envelope it cannot read
+    ([`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
+    That makes it **load-bearing product code and squarely in scope for the audit**.
+    It is still **not** the product's *account* model, there is still **no
+    out-of-band verification** of a recipient's hybrid public key, and the
     envelope's `kem_ct` field stays reserved — the ML-KEM ciphertext travels
     alongside the envelope. See
     [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
@@ -159,8 +169,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   `sigil_hybrid_open` — so a native client can generate a hybrid identity and
   encrypt a record **to a recipient's hybrid public key** through the FFI. That is
   the same **custom KEM-then-AEAD** composition as the core's `hybrid_seal`
-  (**NOT** RFC 9180 HPKE), still **real but UNAUDITED** and not wired into a product
-  flow. (Plus `sigil_current_suite` as a link/smoke check.) All with a
+  (**NOT** RFC 9180 HPKE) and still **real but UNAUDITED**; note that the **C-ABI
+  itself has no product consumer** — the vault-sharing flow reaches `hybrid_seal`
+  through the Rust `cli` crate, not through the FFI. (Plus `sigil_current_suite` as
+  a link/smoke check.) All with a
   hand-maintained [`sigil.h`](../libsigil/ffi/include/sigil.h). This is the seam the
   native clients (in separate repos) will link against. It is the only crate with
   `unsafe` (the FFI boundary); `core` forbids it.
@@ -196,6 +208,23 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   clear **by design** (an export is plaintext provisioning material) behind a loud
   warning (see
   [`decisions/0025-totp-import-export.md`](decisions/0025-totp-import-export.md)).
+  The CLI is also **the first (and so far only) client that can SHARE a vault
+  between devices** — `sigil device hybrid-publish` plus `sigil vault rekey` /
+  `share` / `accept` / `list`. `rekey` re-seals a password vault under a fresh
+  random 32-byte **vault key** (same `SIGILcli` container, no format change);
+  `share` fetches the recipient's hybrid **public** key, wraps that vault key to it
+  with the core's `hybrid_seal` path, uploads the **opaque** envelope, and grants
+  access through the existing grant route; `accept` collects the envelope and
+  unwraps it with the local hybrid **secret** identity. Vault keys live in a `0600`
+  keyring (`$HOME/.sigil/vault-keys.json`) that is **never synced**, are **never
+  printed** (only a 16-hex-character SHA-256 fingerprint), and the human password
+  is **never shared or wrapped**. `sigil totp …` gained `--vault-id <id>` to open a
+  key-sealed vault instead of a password-sealed one — purely additive, so existing
+  invocations are unchanged. This is the **first load-bearing use of the hybrid
+  primitives**; it is still **dev / localhost / plain-HTTP / UNAUDITED**, a
+  **custom KEM-then-AEAD (NOT RFC 9180 HPKE)**, and revocation cannot make a device
+  forget a key it already accepted (see
+  [`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
   A **standalone crate** with its own lockfile (see
   [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
   not-for-real-secrets banner.
@@ -503,7 +532,8 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   existing `pgxpool`** (no second pool, no new dependency) over migration
   **`0002_devices.sql`** (`sigil_devices`, `sigil_enrollment_tokens`,
   `sigil_device_grants`) — so `sigild_schema_version` reports **2** at that point
-  (**3** once the billing migration below is applied). That
+  (**3** once the billing migration below is applied, **4** once the vault-sharing
+  migration is). That
   migration adds **AUTH METADATA ONLY** (public keys, IDs, labels, permissions,
   timestamps, a token digest) and touches **nothing** in `sigil_vault_ops`: the
   **opaque blob, its tamper-evidence hash chain, and the zero-knowledge boundary
@@ -518,6 +548,29 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   extended**, and there is still no account/session model, no key rotation and no
   enrollment rate limiting (see
   [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md)).
+  **Vault-sharing relay (same dev gate, same auth choke points):** on top of that
+  model `sigild` acts as a **mailbox** for device-to-device key distribution —
+  `PUT`/`GET /v1/devices/{deviceID}/hybrid-key` (a device's **public** X25519 +
+  ML-KEM-768 key) and `PUT`/`GET /v1/vaults/{vaultID}/keys/{deviceID}` (an
+  **opaque wrapped vault key**). It is deliberately the dullest possible component:
+  it stores and returns the envelope **byte-for-byte**, holds **no decapsulation
+  key**, decodes nothing, and its **only** inspection of key material is a length
+  check (32 / 1184 bytes) — validating a curve point would be the server performing
+  cryptography on user key material. Authorization is **not a new path**: publishing
+  is self-only (`403` otherwise), a deposit needs **write** on the vault (and a
+  first deposit *claims* an unowned vault exactly like a first append), and
+  collection requires the caller to **be the addressee** *and* hold **read** — so
+  `403` means "authenticated but not permitted", never `401`. Migration
+  **`0004_key_sharing.sql`** (`sigil_device_hybrid_keys`,
+  `sigil_vault_key_envelopes`; `sigild_schema_version` → **4**) is purely additive
+  and again touches **nothing** in `sigil_vault_ops`. Audit lines
+  (`device.hybrid_key_published`, `vault.key_envelope_put`,
+  `vault.key_envelope_get`) carry metadata plus a **SHA-256 fingerprint** of the
+  envelope — never its bytes, never a key. Honest scope: **dev-gated (`501` by
+  default), plain HTTP, UNAUDITED**; there is no out-of-band verification of a
+  published hybrid key, revocation stops future access but cannot un-share a key a
+  device already unwrapped, and there is no re-wrap-on-revoke or rotation schedule
+  (see [`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
   **Billing / subscriptions (opt-in, dev-gated):** because Sigil is a **paid**
   product, `sigild` also carries a **provider-agnostic billing seam** —
   one `billing.Provider` interface with three **stdlib-only** adapters
@@ -910,24 +963,90 @@ dev-gated-off, still **UNAUDITED**, and must never be exposed or hold real
 secrets. Neither contract changes the blob: device auth adds **auth metadata
 only**, so the server remains zero-knowledge either way.
 
-**A second, public-key data path exists at the crypto level (not yet wired into
-the product).** The flow above is the *symmetric*, password-derived path
-(`seal_record` / `open_record`), and it is the only one the CLI packages.
-`sigil-core` now also provides an *encrypt-to-a-recipient's-hybrid-public-key*
-path — `hybrid_seal` / `hybrid_open`
+**A second, public-key data path — and it now does real work.** The flow above is
+the *symmetric*, password-derived path (`seal_record` / `open_record`).
+`sigil-core` also provides an *encrypt-to-a-recipient's-hybrid-public-key* path —
+`hybrid_seal` / `hybrid_open`
 ([`../libsigil/core/src/hybrid_seal.rs`](../libsigil/core/src/hybrid_seal.rs)) — a
 **KEM-then-AEAD** composition: `hybrid_seal` hybrid-encapsulates a fresh 32-byte
 shared secret to the recipient's `(X25519 public key, ML-KEM-768 encapsulation
 key)`, seals the plaintext under that secret with the same XChaCha20-Poly1305 AEAD,
 and emits `(ephemeral X25519 public key, ML-KEM-768 ciphertext, envelope)`; the
 recipient's `hybrid_open` decapsulates with its hybrid secret keys and opens the
-envelope. This is the **first wiring of a hybrid primitive into an encryption
-flow**, but it is a **crypto-level building block only** — bespoke (**NOT** RFC
-9180 HPKE), UNAUDITED, and **not** the product's account / key-management /
-vault-storage model; `sigild` never uses it, and the CLI exercises it only as a
-demo (its `hybrid-keygen` / `hybrid-seal` / `hybrid-open` commands). See
-[`crypto-spec.md`](crypto-spec.md) and
+envelope. **As of Phase 46 this is no longer a demo:** it is the mechanism that
+carries **vault keys between devices** (next subsection;
+[`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
+It remains bespoke (**NOT** RFC 9180 HPKE) and **UNAUDITED**, and it is still not
+the product's *account* model — but it is now load-bearing, so a flaw in it is a
+flaw in a user-facing path. See [`crypto-spec.md`](crypto-spec.md) and
 [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
+
+### 2b. Data flow — sharing one vault with a second device
+
+Adding a device to a vault is a **key-distribution** problem, not an authorization
+problem: a grant decides who the server will talk to, but the server holds no key,
+so a merely-authorized device could pull every container and open none of them. The
+answer is a third layer in the key hierarchy — a random **vault key** — wrapped per
+recipient with the public-key path above.
+
+```
+  DEVICE A (owner)                    sigild                    DEVICE B (recipient)
+  ────────────────                    ──────                    ────────────────────
+  password ─Argon2id─▶ personal vault
+        │  (NEVER shared, never wrapped, never sent)
+        │
+        │  sigil vault rekey
+        ▼
+  vault key = 32 CSPRNG bytes ──▶ re-seals the SAME SIGILcli container
+        │                          (the container takes arbitrary password BYTES,
+        │                           so a random key needs NO format change)
+        │
+        │  sigil vault share --to B
+        │     1. GET /v1/devices/{B}/hybrid-key   ◀── B's PUBLIC X25519 + ML-KEM-768 key
+        │     2. hybrid_seal(vault key → B's hybrid public key)   [client-side]
+        ▼
+  SIGILhyb envelope (~1.2 KiB)
+        │  3. PUT /v1/vaults/{V}/keys/{B}
+  ══════╪═════════════════════════ TRUST BOUNDARY ═══════════════════════════════
+        ▼
+             sigild stores the envelope bytes VERBATIM
+             (no decapsulation key · decodes nothing · length-checks public keys only)
+        │  4. POST /v1/vaults/{V}/grants   → B authorized (EXISTING route)
+        │
+        │                                   GET /v1/vaults/{V}/keys/{B}
+  ══════╪═════════════════════════ TRUST BOUNDARY ═══════════════════════════════
+        │                                            ▼
+        │                              exact same bytes back ─▶ hybrid_open with B's
+        │                              hybrid SECRET identity ─▶ the 32-byte vault key
+        │                                            │
+        │                              sigil pull ─▶ the sealed vault container
+        │                                            ▼
+        └──────────▶  A and B now generate the SAME code from the SAME vault.
+```
+
+**The zero-knowledge boundary is unchanged — and this is the sharpest test of it.**
+The server relays *key* material and still cannot use it: it has no decapsulation
+key, so the envelope is ciphertext to it exactly as an op-log blob is; it never sees
+the vault key, the password, or a plaintext; and its only look at key material is a
+**length check** (32 / 1184 bytes) on a *published public* key, because parsing it
+would be the server doing cryptography on user key material. Migration
+`0004_key_sharing.sql` is additive and leaves `sigil_vault_ops` and its hash chain
+byte-for-byte unchanged, and the audit log records a **SHA-256 fingerprint** of an
+envelope, never its bytes. Verified end-to-end with no mocks by
+[`../cli/tests/e2e-sharing.sh`](../cli/tests/e2e-sharing.sh): two devices produce
+the same RFC 6238 code from the same shared vault, the bytes the server returned
+are byte-identical to the bytes uploaded, and the envelope contains neither the
+vault key nor the 2FA seed.
+
+**Honest limits.** Dev-gated (`501` by default), plain HTTP, **UNAUDITED**; a
+**custom KEM-then-AEAD, NOT RFC 9180 HPKE**; the **system is not "post-quantum
+secure"**; there is **no out-of-band verification** of a published hybrid public
+key (a hostile registry could substitute its own); revocation stops **future**
+access but cannot make a device forget a key it already unwrapped (remediation is a
+manual re-key + re-share); and there is **no rotation schedule, no re-wrap on
+revoke, and no forward secrecy** for a delivered vault key. Request signatures on
+these routes are **classical Ed25519** — the wrap is hybrid, the authentication is
+not.
 
 ---
 
@@ -955,9 +1074,11 @@ opened by deriving a key for another. **The full suite table, the intended
 hybrid X25519 & ML-KEM-768 / Ed25519 & ML-DSA-65 construction, and the migration
 timeline live in [`crypto-spec.md`](crypto-spec.md)** — not duplicated here. (The
 combined hybrid KEM (`hybrid.rs`) and combined hybrid signature (`hybrid_sig.rs`)
-now exist as **standalone** primitives, but they and the individual
-KEM/signature primitives are **not yet wired into the suite frame** — the
-`kem_ct` envelope field stays *reserved* but unused; see
+both exist. The **KEM is in use** — it wraps vault keys for device-to-device
+sharing via `hybrid_seal` — while the **signature is still used by nothing**.
+Neither, however, is wired into the **suite frame** itself: the `kem_ct` envelope
+field stays *reserved* but unused, and the ML-KEM ciphertext travels alongside the
+envelope inside the `SIGILhyb` container; see
 [§6](#6-what-is-deliberately-not-here-yet).)
 
 ---
@@ -1107,7 +1228,10 @@ authoritative list, with rationale, is the **defer ledger** in
   [ADR 0010](decisions/0010-op-log-auth-v2-nonce-replay.md)), and the **v3
   multi-device model** (`SIGILD_DEVICE_AUTH`) — a real device registry, enrollment
   with proof of possession, per-vault grants and revocation
-  ([ADR 0031](decisions/0031-multi-device-auth-model.md)). What is still missing
+  ([ADR 0031](decisions/0031-multi-device-auth-model.md)), now extended with a
+  **vault-sharing relay** that distributes wrapped vault keys between authorized
+  devices without the server being able to read them
+  ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)). What is still missing
   is the **product** layer: no user/account model, no session or JWT token
   issuance ([`../sigild/internal/auth/`](../sigild/internal/auth/) is still a
   placeholder), no key rotation or re-enrollment, no recovery, no rate limiting on
@@ -1147,9 +1271,9 @@ authoritative list, with rationale, is the **defer ledger** in
   authorization *do* now exist as an opt-in dev model,
   [ADR 0031](decisions/0031-multi-device-auth-model.md) — but they are dev-gated,
   unaudited, and not an account model.)
-- **Both hybrid constructions are assembled; the hybrid KEM now drives a
-  crypto-level seal/open flow, but neither is in the product flow.** For key
-  agreement, the **combined hybrid KEM exists as a standalone primitive**
+- **Both hybrid constructions are assembled; the KEM is now load-bearing, the
+  signature is still used by nothing, and neither is in the suite frame.** For key
+  agreement, the **combined hybrid KEM exists**
   (`hybrid.rs`: `hybrid_encapsulate` / `hybrid_decapsulate`;
   [ADR 0011](decisions/0011-hybrid-kem-combiner.md)): the combiner assembles the
   classical X25519 half (`x25519_public_key` / `x25519_shared_secret`;
@@ -1159,7 +1283,7 @@ authoritative list, with rationale, is the **defer ledger** in
   `m` coin; total implicit-rejection decaps) into
   `ss_combined = HKDF-SHA-256(ss_x || ss_kem || transcript_hash, "sigil-hybrid-v1")`
   with `transcript_hash = SHA-256(ephemeral_x25519_pub || mlkem_ct)`. For
-  signatures, the **combined hybrid signature now exists as a standalone primitive**
+  signatures, the **combined hybrid signature exists**
   too (`hybrid_sig.rs`: `hybrid_sign` / `hybrid_verify`;
   [ADR 0012](decisions/0012-hybrid-signature-combiner.md)): the combiner assembles
   the classical Ed25519 half (`sig.rs`; caller-supplied 32-byte seed; UNAUDITED) and
@@ -1168,21 +1292,22 @@ authoritative list, with rationale, is the **defer ledger** in
   signing; UNAUDITED) into the fixed **3373-byte** `Ed25519.Sign(m) ||
   ML-DSA-65.Sign(m)` (64 + 3309 bytes), where `hybrid_verify` requires **BOTH**
   halves to validate — a forgery requires breaking **both** Ed25519 and ML-DSA-65.
-  Both combiners are real but **UNAUDITED**. The hybrid **KEM** is now further
-  composed with the AEAD into a standalone **hybrid public-key seal/open flow**
+  Both combiners are real but **UNAUDITED**. The hybrid **KEM** is further
+  composed with the AEAD into a **hybrid public-key seal/open flow**
   (`hybrid_seal.rs`: `hybrid_seal` / `hybrid_open` — a KEM-then-AEAD encryption to a
-  recipient's hybrid public key, the **first wiring of a hybrid primitive into an
-  encryption flow**; bespoke, **NOT** RFC 9180 HPKE;
-  [ADR 0013](decisions/0013-hybrid-public-key-seal.md)). But that remains a
-  **crypto-level** flow only: neither hybrid construction is wired into the
-  **product's account / session / vault-storage flow** (the envelope's `kem_ct`
-  field stays *reserved* but unused, and the `sigild` op-log request auth still uses
-  classical Ed25519 only), and the **system is still not "post-quantum secure"**.
-  The remaining crypto gap is therefore **wiring the hybrid primitives into the
-  product account/session/record model** — `sigild` is unchanged and the CLI only
-  **demos** the hybrid seal/open flow (its `hybrid-keygen` / `hybrid-seal` /
-  `hybrid-open` commands), not the product model, and the hybrid signature is not
-  yet composed into any flow.
+  recipient's hybrid public key; bespoke, **NOT** RFC 9180 HPKE;
+  [ADR 0013](decisions/0013-hybrid-public-key-seal.md)), and **that flow is now
+  load-bearing**: it wraps the vault key for **device-to-device vault sharing**
+  ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)), so the hybrid KEM
+  is real product code and in scope for the audit. What is still missing is
+  everything else: the **hybrid signature is used by nothing** (all request auth,
+  including every sharing route, is classical Ed25519 only); neither construction is
+  wired into the **suite frame** (the envelope's `kem_ct` field stays *reserved* but
+  unused); sharing is **not** an account/session model; and the **system is still
+  not "post-quantum secure"**. The sharing flow itself has named gaps — no
+  out-of-band verification of a published hybrid public key, no key rotation
+  schedule, no re-wrap on revoke, and no forward secrecy for a delivered vault key
+  — and it is **dev-gated and UNAUDITED**.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number and a per-op SHA-256 **hash
   chain** for **tamper-evidence** (detects modify/insert/delete/reorder of stored
@@ -1190,8 +1315,12 @@ authoritative list, with rationale, is the **defer ledger** in
   but still **no signed ops**, no Lamport/Merkle ordering, no conflict-free
   merge, and the chain is **tamper-evident, not tamper-proof** (a hostile server
   can lie about `/ops/verify`; the real check is client-side).
-- **No payments / accounts / sync protocol / key rotation / recovery.** None of
-  the product workflows exist.
+- **No accounts / sync protocol / key rotation / recovery.** Device-to-device
+  **vault sharing** now exists ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md))
+  and billing exists in code (above), but the rest of the product workflows do
+  not — and sharing itself has **no key-rotation schedule, no re-wrap on revoke, no
+  recovery path, and no key-transparency / out-of-band verification** of a
+  recipient's hybrid public key.
 - **No live PQ-TLS proof.** `sigild` serves plain HTTP in the skeleton; the hybrid
   `X25519MLKEM768` handshake is unproven on this machine (see
   [`deployment.md`](deployment.md) §3).

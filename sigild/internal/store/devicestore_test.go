@@ -441,6 +441,11 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		}
 		wg.Wait()
 	})
+
+	// Device hybrid public keys + the opaque key-envelope relay (Phase 46) are
+	// part of the SAME conformance suite, so mem and Postgres are held to
+	// identical behaviour here too.
+	runKeySharingSuite(t, newStore)
 }
 
 // TestPermissionAllows pins the permission lattice: write implies read, read

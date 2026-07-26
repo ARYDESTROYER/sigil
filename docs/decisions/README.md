@@ -50,6 +50,13 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > webhook verification with constant-time comparison, and idempotency keyed on the
 > provider event id; opt-in, `501` by default, UNAUDITED, and **never run against a
 > live provider account**),
+> **device-to-device vault sharing** (a shared vault sealed under a random 32-byte
+> **vault key** — the same `SIGILcli` container, no format change — that key **wrapped
+> per recipient device** with the PQ-hybrid `hybrid_seal` path (X25519 + ML-KEM-768) and
+> relayed through `sigild` as an **opaque envelope the server cannot read**, authorized
+> by the existing v3 grant/ownership/revocation model; the **first load-bearing use of
+> the hybrid primitives**, still dev-gated and UNAUDITED, and the human password is
+> never shared),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -116,3 +123,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0032](0032-native-desktop-client.md) | Native desktop client — Tauri v2 shell over a headless core crate, `sigil-core` linked natively (no wasm), re-using `cli/`'s container/vault/migration logic and sharing the CLI's vault file | Accepted (2026-07) |
 | [0033](0033-browser-device-identity-storage.md) | Browser device-identity storage — seal the Ed25519 device seed in a second `SIGILcli` container under the vault password (never plaintext web storage, never a `TotpVault` field) | Accepted (2026-07) |
 | [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07) |
+| [0035](0035-device-to-device-vault-sharing.md) | Device-to-device vault sharing — random per-vault key sealed into the unchanged `SIGILcli` container, wrapped per device with `hybrid_seal` (X25519 + ML-KEM-768), relayed as an opaque envelope, authorized by the existing v3 grants | Accepted (2026-07) |

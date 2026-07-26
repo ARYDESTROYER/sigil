@@ -183,6 +183,63 @@ the chain from the per-op hashes it receives and compares against its own
 remembered tip. Server-side verification only catches accidental corruption and a
 non-adversarial operator's storage faults.
 
+## Billing / payment surface (opt-in, dev-gated — see [ADR 0034](decisions/0034-billing-provider-seam.md))
+
+The billing layer adds an endpoint that is, by necessity, **authenticated by
+something other than a device key**: a payment provider has no enrolled Ed25519
+identity, so `POST /v1/billing/webhook/{provider}` is authenticated **only** by
+the provider's own signature over the raw request body. That makes it the single
+most attacker-interesting route in `sigild`, and the table below is about it.
+
+Everything here is **dev-gated (`501` by default), opt-in, UNAUDITED, and has
+never been run against a live provider account.** None of it is a production
+security claim, and none of it is a PCI attestation.
+
+| # | Adversary | Capability | Defense as implemented | Layer |
+| --- | --- | --- | --- | --- |
+| J | **Webhook forger** | Sends a plausible provider-shaped event (e.g. "subscription activated") with no valid signature | **Real HMAC verification over the exact raw body bytes**, computed *before* the JSON is parsed: Stripe `HMAC-SHA256("<t>.<raw body>")` keyed by the endpoint signing secret, Razorpay `HMAC-SHA256(raw body)` keyed by the dashboard webhook secret, Juspay `hmac` scheme likewise (or a constant-time Basic-credential check for the `basic` scheme). Comparison is **constant time** (`hmac.Equal` / `subtle.ConstantTimeCompare`); an undecodable hex signature is simply "not equal", not a distinct error. An **unconfigured** verifier **fails closed** — it accepts nothing. Verdict: `401` with a coarse body | `sigild` webhook auth |
+| K | **Replayer** | Captures a genuine, validly-signed webhook and re-sends it | Two independent bounds. **In-scheme (Stripe only):** the signed message includes the timestamp `t` and the delivery is rejected when `abs(now − t) > 5 min`, checked in **both** directions (a far-future timestamp is as suspect as a stale one). **Cross-provider:** the **idempotency ledger** keyed on `(provider, event_id)` makes a replay a **no-op that still answers `200`** — the state change and the ledger claim are one atomic operation (one mutex in memory; one transaction with `INSERT … ON CONFLICT DO NOTHING` + `SELECT … FOR UPDATE` in Postgres), so a replay cannot double-apply even under concurrency. Razorpay and Juspay carry **no timestamp element**, so for them the ledger is the *only* replay bound — and it is why a redelivery *inside* a restart of the **non-durable in-memory** store could still be applied twice | `sigild` webhook auth + store |
+| L | **Body tamperer** | Man-in-the-middle mutates the JSON (amount, subject, status) of an otherwise genuine delivery | The MAC is computed over the **exact bytes read off the wire**, never over re-serialized JSON — a re-encode changes key order and whitespace and would either break verification or, if "fixed" by re-signing, let an attacker mutate the body freely. Any mutation therefore fails verification → `401`. Tests assert this explicitly (a semantically-equal re-encode is rejected). **Exception, stated plainly:** Juspay's `basic` scheme authenticates the **connection**, not the body — it does **not** defend against this adversary; use `hmac` where available and require TLS unconditionally | `sigild` webhook auth |
+| M | **Unknown-provider prober** | POSTs provider-shaped payloads to `/v1/billing/webhook/anything`, or to a provider path that exists in code but is not enabled here | Only providers named in `SIGILD_BILLING_PROVIDERS` get a live route; anything else is `404 unknown_provider` with the body **drained and discarded**, audited as `unknown_provider` and counted in `sigild_billing_webhook_rejected_total{reason="unknown_provider"}`. The adapter map is fixed at boot, so a request cannot cause an adapter to be constructed, a credential to be read, or an outbound call to be made. With billing off entirely, the route is `501` — never `404`-vs-`501` leakage about *which* providers exist | `sigild` API surface |
+| N | **Webhook-secret thief** | Obtains a webhook signing secret (`whsec_…`, the Razorpay webhook secret, the Juspay credentials) | **Not defended beyond the secret itself** — the holder can mint authentic-looking events. What *bounds* the damage: the webhook can only drive the **state machine** (it can make a subject look subscribed; it cannot read a vault, mint a session, enroll a device, or move money), the state machine **rejects illegal transitions**, the staleness guard rejects out-of-order events, and every applied transition is audit-logged with `from`/`to`. What is missing: **no rotation runbook beyond replacing the env var and restarting**, and (Stripe aside) **no timestamp bound**. The webhook secret is a **different secret from the API key**, so leaking one does not leak the other | Operational |
+| O | **API-key thief** | Obtains `SIGILD_STRIPE_SECRET_KEY` / `SIGILD_RAZORPAY_KEY_SECRET` / `SIGILD_JUSPAY_API_KEY` | **Not defended.** A live API key is a provider-side credential: the holder can act against the merchant account directly, outside `sigild` entirely, and no server-side control here can stop that — response is provider-side revocation. `sigild` limits only its *own* exposure: keys arrive from the environment (never the repo), live only inside an adapter struct, travel in an `Authorization` header rather than a URL, and are **never logged, never returned in an error, and never exported on `/metrics`** — provider failures surface as a `ProviderError` carrying **only** provider + operation + HTTP status, deliberately never the response body (which can echo customer data) | Operational |
+| P | **Subscription-state manipulator** | An authenticated device (or a forged/leaked-secret event) tries to grant itself entitlement, or to regress someone else's | **The subject is server-derived**: a checkout's subject is the **authenticated device ID** taken from the verified v3 signature, never a body field, and `GET /v1/billing/subscription` reports only the caller's own record with no subject parameter — so neither route can act on, or enumerate, another subject. Transitions are checked against an **explicit transition table** (illegal moves are recorded as processed and rejected with no state change), and a **staleness guard** independently drops any event older than the last applied one, so an out-of-order `payment_failed` cannot regress a live subscription. `canceled` can only be left by an event targeting an active state, so a late failure cannot revive a dead subscription into `past_due` | `sigild` billing layer |
+| Q | **Log / metrics scraper** | Reads `sigild`'s audit log or scrapes `/metrics` hoping for payment data | The billing audit events (`billing.checkout_created`, `billing.checkout_failed`, `billing.webhook`, `billing.webhook_rejected`, `billing.subscription_transition`) carry **metadata only**: provider name, normalized event type, opaque provider handles, our own subject, and a fixed reason enum — **never** an API key, a webhook secret, a signature header, **one byte of the raw webhook body**, an email/name/phone, or an amount. `/metrics` exposes four counters over **closed label sets materialized at boot** (three provider names, six outcomes, five reject reasons, five statuses) — no event ID, no subject, no amount, so a scrape can neither leak nor enumerate. Both are asserted by tests that plant a marker string in a webhook body and fail if it appears in the logs | `sigild` observability |
+
+**What the billing surface does NOT defend (be explicit):**
+
+- **A compromised provider account or dashboard.** Anyone with the merchant
+  account can create, cancel or refund subscriptions and emit real events that we
+  will faithfully apply. There is no second opinion, no reconciliation job, and
+  no out-of-band verification of a webhook against the provider's API.
+- **A stolen API key** (adversary O) — provider-side revocation is the only
+  answer, and there is **no key-rotation automation**.
+- **Fraud, chargebacks, refunds, disputes, proration, tax, dunning.** None of it
+  is modelled. A refund or a chargeback arrives as an event we classify as
+  `ignored`, so entitlement does not change.
+- **No PCI attestation.** Hosted checkout means **no card data ever reaches this
+  process** — there is no field, struct, log line, metric or column that could
+  hold a PAN, CVV, expiry, cardholder name or billing address, which keeps scope
+  at SAQ-A. That is a scope-minimization property, **not** a certification, and
+  nobody has assessed it.
+- **Provider scheme correctness has not been confirmed against a live account.**
+  No request in this repository has ever reached `api.stripe.com`,
+  `api.razorpay.com` or `api.juspay.in`. The **Juspay** adapter in particular is
+  explicitly *UNVERIFIED-AGAINST-LIVE-DASHBOARD* — header names, signed message,
+  endpoint path and event vocabulary are a best-supported reading. A wrong guess
+  fails **closed** (`401`, or an `ignored` event) rather than open, but "fails
+  closed" is not "correct".
+- **Denial of service against the webhook endpoint.** There is no rate limiting
+  on `/v1/billing/webhook/{provider}` (the per-vault op-log limiter does not
+  cover it); the only bounds are the 64 KiB body cap and the cost of one HMAC.
+- **The in-memory subscription store is non-durable.** Subscriptions *and* the
+  processed-event ledger are lost on restart, so a webhook redelivered across a
+  restart **can be applied twice**. Only the Postgres backend gives the
+  idempotency guarantee across processes and restarts.
+- **Transport.** In any real deployment the webhook endpoint **must** be reachable
+  only over TLS. The dev server speaks plain HTTP, and Juspay's `basic` scheme in
+  particular is a bearer credential with no body binding.
+
 **Status note for this repo:** none of the defenses in the **first** table
 (adversary classes 1–12, the *intended product* design) is implemented yet. The
 current `sigild` skeleton performs no crypto on vault contents and stores only

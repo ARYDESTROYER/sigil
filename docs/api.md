@@ -8,7 +8,10 @@
 > file-backed or durable Postgres backends), **unauthenticated unless one of two
 > opt-in auth contracts is configured** (legacy single-key **v2**, or the
 > **multi-device v3** model with a device registry, per-vault authorization and
-> revocation — itself dev-gated and unaudited). Nothing
+> revocation — itself dev-gated and unaudited). A **dev-gated, opt-in billing
+> layer** (hosted checkout + provider webhooks, [below](#billing--subscriptions-dev-gated-opt-in--phase-45))
+> stores subscription state but **no card data**, and has **never been run
+> against a live payment provider**. Nothing
 > here is audited or production-ready. See [`deployment.md`](deployment.md) for
 > the (not-yet-applied) deploy story and [`sprint-72h.md`](sprint-72h.md) for
 > scope. This reference describes the surface as wired in
@@ -107,7 +110,11 @@ the source of truth for the exact strings):
 | `sigild_device_revocations_total` | counter | device revocations performed |
 | `sigild_vault_grants_total` | counter | per-vault access grants created |
 | `sigild_vault_claims_total` | counter | vault ownership claims (trust-on-first-write) |
-| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`2`** once `0002_devices.sql` is applied) |
+| `sigild_billing_checkouts_total{provider="…"}` | counter | hosted checkout sessions created, by provider (`stripe`/`razorpay`/`juspay`) |
+| `sigild_billing_webhooks_total{provider="…",outcome="…"}` | counter | **authenticated** webhooks handled, by provider and outcome (`accepted`, `ignored`, `duplicate`, `stale`, `illegal`, `unresolved`) |
+| `sigild_billing_webhook_rejected_total{reason="…"}` | counter | webhooks rejected **before** application, by reason (`bad_signature`, `malformed`, `unknown_provider`, `payload_too_large`, `store_error`) |
+| `sigild_billing_subscription_transitions_total{status="…"}` | counter | **applied** subscription status transitions, by target status (`none`, `trialing`, `active`, `past_due`, `canceled`) |
+| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`3`** once `0003_billing.sql` is applied) |
 | `sigild_build_info{version="…"}` | gauge (`1`) | build identity; the version label carries the injected build SHA |
 
 Counters are **process-lifetime and unlabelled by vault or device** (no per-vault
@@ -116,6 +123,12 @@ scrape enumerate the registry — is exported). The endpoint performs **no
 cryptography** and reads no stored bytes; it only reports aggregate counts, and
 it never exposes a public key, an enrollment token or its digest, an admin
 token, a signature, or a nonce.
+
+Every **billing** label above comes from a **closed set materialized at startup**
+(the three provider names, the six outcomes, the five rejection reasons, the five
+statuses), so a scrape can neither enumerate what is configured nor be made to
+create a new series. The billing counters carry **no API key, webhook secret,
+signature, event ID, subject/device ID, customer reference, or amount**.
 
 `sigild_schema_version` reflects the applied op-log database migration version for
 the **Postgres backend**; migrations are managed with an **operator CLI**, not an
@@ -563,7 +576,8 @@ The migration is **pure DDL over auth metadata**: Ed25519 **public** keys,
 server-assigned IDs, labels, permissions, timestamps. It touches **nothing** in
 `sigil_vault_ops` — the opaque blob, its per-op hash chain, and the
 zero-knowledge boundary are **unaffected**. `sigild_schema_version` reports **2**
-once applied.
+once applied (and **3** once `0003_billing.sql` is applied — see
+[Billing](#billing--subscriptions-dev-gated-opt-in--phase-45)).
 
 ### Signed request contract (v3)
 
@@ -942,6 +956,416 @@ production-safe setting — **every** device route returns:
 applies when dev-ops is on but no registry is configured
 (`SIGILD_DEVICE_AUTH` unset). `GET /metrics` stays `200` throughout — it is never
 dev-gated.
+
+---
+
+## Billing / subscriptions (DEV-GATED, opt-in) — Phase 45
+
+> **DEV-GATED, OPT-IN, UNAUDITED, and NEVER RUN AGAINST A LIVE PROVIDER
+> ACCOUNT.** The signature verification, the state machine, the idempotency
+> ledger and the storage are **real** — real `crypto/hmac` over the raw request
+> body, real constant-time comparison, real transactional dedupe — but **no
+> request in this repository has ever been sent to, or received from,
+> `api.stripe.com`, `api.razorpay.com` or `api.juspay.in`.** Every test drives a
+> local `httptest` server with fake credentials. Provider webhook schemes must be
+> **confirmed against each merchant's live dashboard** before any real money
+> moves; the **Juspay** scheme in particular is explicitly
+> *UNVERIFIED-AGAINST-LIVE-DASHBOARD* (see below). This is not a payment
+> integration you should point at production. See
+> [`decisions/0034-billing-provider-seam.md`](decisions/0034-billing-provider-seam.md).
+
+Sigil is a **paid** product, so `sigild` grew a **provider-agnostic billing
+seam**: one `billing.Provider` interface, three adapters — **Stripe**
+(international), **Razorpay** and **Juspay** (India) — a **normalized event
+vocabulary**, a **subscription state machine**, and an **idempotent** apply path
+backed by in-memory or Postgres storage.
+
+Two properties frame everything below:
+
+- **No card data ever reaches this server.** Every adapter uses the provider's
+  **hosted checkout / payment-link** flow: `sigild` asks the provider for a URL
+  and hands that URL to the client. There is deliberately **no field on any
+  request, response, struct, log line, metric or database column** that could
+  carry a PAN, CVV, expiry, cardholder name or billing address — and none that
+  carries an email or phone number either. PCI scope stays at SAQ-A.
+- **Zero-knowledge is untouched.** No billing handler reads, writes or derives
+  anything about a vault blob, and migration `0003_billing.sql` touches nothing
+  in `sigil_vault_ops`.
+
+### Routes at a glance — and which auth applies to which
+
+| Route | Auth | Body cap | Success |
+|-------|------|----------|---------|
+| `POST /v1/billing/checkout` | **device auth v3** (`authenticateDevice`, the *same* choke point as the ops routes) | 8 KiB | `201` + hosted checkout URL |
+| `POST /v1/billing/webhook/{provider}` | **the provider's own signature over the raw body** — *no* device auth | 64 KiB | `200` + outcome |
+| `GET /v1/billing/subscription` | **device auth v3** | — (no body) | `200` + the caller's status |
+
+The split is deliberate and is the whole reason the webhook route exists outside
+the device model: **checkout and subscription come from a device**, which holds
+an enrolled Ed25519 key and can sign the v3 contract; **a webhook comes from the
+payment provider**, which has no device key and cannot. So the webhook is
+authenticated by the provider's HMAC (or, for Juspay's basic scheme, its
+endpoint credentials) and by nothing else — and correspondingly it can **create
+no session, read no vault, and name no subject of its own choosing**.
+
+**The subject is server-derived.** A checkout's subject is the **authenticated
+device ID** (`dev_…`), taken from the verified signature and **never** from the
+request body; `GET /v1/billing/subscription` likewise reports only the caller's
+own record and takes no subject parameter. A client therefore cannot buy — or
+query — a subscription on another subject's behalf. There is **no account model
+yet**: "subject" means "enrolled device", which is an honest scaffold, not the
+product's billing identity (see the limits at the end of this section).
+
+### Default posture — the deliberate `501`
+
+Billing is **doubly off by default**. It requires *both*:
+
+1. `SIGILD_ENABLE_DEV_OPS` (the whole stateful surface is dev-gated), **and**
+2. `SIGILD_BILLING_PROVIDERS` naming at least one provider, **and** a
+   subscription store, **and** a device registry (`SIGILD_DEVICE_AUTH`).
+
+With any of those missing, **all three routes** return `501` — never `404`, and
+never partial or faked behaviour:
+
+```json
+{ "error": "not_implemented", "detail": "billing is not enabled on this server" }
+```
+
+Body caps still apply before the stub runs, so an oversized request gets `413`
+rather than `501`. `GET /metrics` stays `200` throughout (it is never dev-gated);
+the billing counters simply read `0`.
+
+### `POST /v1/billing/checkout` — create a hosted checkout session
+
+**Auth: device auth v3.** Identical to the ops routes: `X-Sigil-Device`,
+`X-Sigil-Timestamp`, `X-Sigil-Nonce`, `X-Sigil-Signature` over the canonical v3
+message (`"sigil-oplog-auth-v3\n" + DEVICE_ID + …+ BODY`, see
+[above](#signed-request-contract-v3)). The body is read **first** so it can be
+covered by the signature, and only then authenticated — the same order the
+op-log append uses. No billing-specific token, no API key, no second auth path.
+
+Request body (optional; `{}` or an empty body is valid):
+
+```json
+{ "provider": "stripe", "plan": "price_1234" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `provider` | which enabled provider to use. Omitted ⇒ `SIGILD_BILLING_DEFAULT_PROVIDER`. |
+| `plan` | optional per-request plan override — a Stripe **price ID**, or a Juspay **payment-page client ID**. Omitted ⇒ the adapter's configured default. |
+
+Note what is **absent**: no subject (server-derived), no amount override, and no
+payment-instrument field of any kind.
+
+`201 Created`:
+
+```json
+{
+  "provider": "stripe",
+  "session_id": "cs_test_…",
+  "url": "https://checkout.stripe.com/c/pay/cs_test_…",
+  "expires_at": "2026-07-26T18:30:00Z"
+}
+```
+
+`session_id` and `expires_at` are omitted when the provider does not return
+them. The client redirects the customer to `url`; the card details are entered
+**there**, at the provider.
+
+| Status | `error` | When |
+|--------|---------|------|
+| `201` | — | session created |
+| `400` | `invalid_request` | body unreadable, over 8 KiB, or not a JSON object |
+| `400` | `unknown_provider` | `provider` names something not enabled on this server |
+| `401` | `unauthorized` | device auth failed (missing/invalid/stale signature, unknown or revoked device, replayed nonce) — coarse body, exact reason only in the audit log |
+| `413` | `payload_too_large` | `Content-Length` exceeds the 8 KiB cap |
+| `500` | `internal` | reference generation, the subscription store, or an adapter reporting `ErrNotConfigured` (a **server** misconfiguration, deliberately not surfaced as a client error) |
+| `502` | `provider_error` | the provider API call failed — `{"error":"provider_error","detail":"the payment provider could not create a checkout session"}` |
+| `501` | `not_implemented` | billing off |
+
+**Before** calling out to the provider, the server records `StartCheckout`
+(subject → provider) so a webhook that races the HTTP response still has a row to
+resolve against. The per-attempt reference is **server-generated**
+(`"sigil-" + hex(12 random bytes)`) and used as the provider's idempotency key /
+`reference_id` / `order_id`, so a client can neither collide with nor overwrite
+another attempt. The outbound call is bounded twice: a 12 s request-scoped
+context (`billingProviderTimeout`) on top of the adapter client's own 10 s
+timeout, and at most 1 MiB of provider response is read.
+
+### `POST /v1/billing/webhook/{provider}` — provider callback
+
+**Auth: the provider's signature over the RAW request body. No device auth, no
+session, no bearer token.** `{provider}` must be one of `stripe`, `razorpay`,
+`juspay` **and** must be enabled on this server.
+
+The body is read **once** and the exact bytes are kept: the signature is verified
+over **those bytes first**, and only then is the JSON parsed. Verifying a
+re-encoded payload would be a bug — a JSON round-trip reorders keys and drops
+whitespace, so the MAC would never match (or, if "fixed" by re-signing, an
+attacker could mutate the body freely).
+
+#### Per-provider webhook contract
+
+| Provider | Header carrying the signature | What is signed (the MAC message) | MAC / encoding | Timestamp bound |
+|----------|-------------------------------|----------------------------------|----------------|-----------------|
+| **Stripe** | `Stripe-Signature: t=<unix>,v1=<hex>[,v1=<hex>][,v0=…]` | `"<t>" + "." + RAW_BODY_BYTES` | HMAC-SHA256 keyed by the **endpoint signing secret** (`whsec_…`), lowercase hex | **yes** — `abs(now − t) ≤ 5 min` (`stripeDefaultTolerance`), checked in **both** directions |
+| **Razorpay** | `X-Razorpay-Signature: <hex>` | `RAW_BODY_BYTES` — no timestamp, no prefix, no separator | HMAC-SHA256 keyed by the dashboard **webhook secret**, lowercase hex | **none in the scheme** — replay is bounded only by our idempotency ledger |
+| **Juspay**, `scheme=basic` (default) | `Authorization: Basic base64(user:pass)` | *nothing* — this authenticates the **connection**, not the body | constant-time compare of both halves | none |
+| **Juspay**, `scheme=hmac` | `X-Juspay-Signature` (**name configurable** via `SIGILD_JUSPAY_WEBHOOK_SIG_HEADER`) | `RAW_BODY_BYTES` | HMAC-SHA256 keyed by `SIGILD_JUSPAY_WEBHOOK_SECRET`, lowercase hex | none |
+
+Details that matter:
+
+- **Stripe**: **every** `v1` element is compared (Stripe sends more than one
+  while an endpoint secret is being rotated — accepting any one is what makes
+  rotation zero-downtime), with **no early exit**, so neither the number of
+  candidates nor which matched is observable in timing. Legacy **`v0` elements
+  are ignored**, never accepted — accepting them would be a downgrade path.
+- **Razorpay**: the event ID comes from the **`X-Razorpay-Event-Id`** header.
+  When it is absent, the adapter derives a **deterministic** ID
+  (`"body-" + hex(SHA-256(raw body))`) so a byte-identical redelivery still
+  deduplicates. *The header name is part of the unverified surface.*
+- **Juspay, basic scheme — stated plainly**: HTTP Basic auth proves the caller
+  knows a shared password; it does **not** prove the payload was not modified in
+  transit. Prefer `scheme=hmac` where the dashboard offers it; where only basic
+  is available the endpoint **must** be TLS-only and the credential treated as a
+  bearer secret.
+- All comparisons use `hmac.Equal` / `subtle.ConstantTimeCompare`; a hex string
+  that fails to decode is simply "not equal", so a malformed and a wrong
+  signature are indistinguishable.
+
+#### Normalized event types
+
+Each adapter maps its provider's vocabulary onto exactly one normalized type, so
+the state machine and the HTTP layer never learn a provider dialect:
+
+| Normalized type | Stripe | Razorpay | Juspay |
+|-----------------|--------|----------|--------|
+| `checkout_completed` | `checkout.session.completed` | `payment_link.paid` | `ORDER_SUCCEEDED` |
+| `subscription_activated` | `customer.subscription.created` / `.updated` with object status `trialing`/`active` | `subscription.activated`, `subscription.authenticated`, `subscription.resumed` | `MANDATE_CREATED`, `MANDATE_ACTIVATED` |
+| `subscription_renewed` | `invoice.paid`, `invoice.payment_succeeded` | `subscription.charged` | `TXN_CHARGED`, `MANDATE_NOTIFICATION_SUCCEEDED` |
+| `subscription_canceled` | `customer.subscription.deleted`; `.created`/`.updated` with status `canceled`/`incomplete_expired` | `subscription.cancelled`, `subscription.completed`, `subscription.expired` | `MANDATE_REVOKED`, `MANDATE_EXPIRED`, `MANDATE_PAUSED` |
+| `payment_failed` | `invoice.payment_failed`; `.created`/`.updated` with status `past_due`/`unpaid` | `subscription.halted`, `subscription.pending`, `payment.failed` | `ORDER_FAILED`, `TXN_FAILED`, `MANDATE_NOTIFICATION_FAILED` |
+| `ignored` | anything else | anything else | anything else |
+
+For Stripe the **status on the object** decides, not the event name alone: an
+`updated` event is how Stripe reports a trial ending, a card failing, and a
+cancellation scheduled at period end.
+
+`ignored` is an explicit verdict, not a fallthrough bug: providers send events we
+do not model (refund notices, mandate reminders, test pings), and those **must**
+be a `200` with no state change so the provider does not enter a retry/backoff
+loop against us.
+
+**Subject attribution.** Each adapter writes our subject into the provider's
+pass-through field at checkout and reads it back on the webhook: Stripe
+`client_reference_id` **plus** `subscription_data[metadata][sigil_subject]`,
+Razorpay `notes.sigil_subject`, Juspay `udf1` (with
+`metadata.sigil_subject` as a fallback). The namespaced key is
+**`sigil_subject`**. When an event carries no such marker, the store resolves the
+subject from `(provider, subscription_ref)` instead.
+
+#### Subscription state machine
+
+States: `none` → *(implicit, no record)*, `trialing`, `active`, `past_due`,
+`canceled`. Legal transitions (**everything else is rejected**):
+
+```
+none      -> trialing | active
+trialing  -> active | past_due | canceled
+active    -> active (renewal) | past_due | canceled
+past_due  -> active | canceled
+canceled  -> trialing | active          (a NEW purchase after cancellation)
+```
+
+`active -> active` is legal and is how a **renewal** is recorded (it carries a
+new `current_period_end`). `canceled` is not a dead end — a customer who cancels
+and buys again must be able to become active — but it can only be left by an
+event targeting an active state, so a late `payment_failed` cannot revive a dead
+subscription into `past_due`. There is **no transition into `none`**.
+
+**Entitlement** (`entitled: true`) covers `trialing`, `active` **and
+`past_due`** — a failed renewal opens a provider-side retry window, and cutting a
+paying customer off the instant a card declines is both hostile and usually
+wrong. Cancellation is where entitlement ends.
+
+Separately from legality, an event whose `OccurredAt` **precedes the last event
+applied** is dropped as **stale**, so an out-of-order `payment_failed` cannot
+regress a subscription that has since gone active. Legality and ordering are two
+independent guards; both must pass.
+
+#### The idempotency guarantee
+
+**A duplicate delivery is a no-op that still answers `200`.** Providers redeliver
+— on their own retry schedule, and again whenever an operator replays an event
+from a dashboard — so this is a documented behaviour to design for, not an edge
+case.
+
+The key is **`(provider, event_id)`**. Recording "we handled it" and applying the
+state change are **fused into one atomic operation**
+(`SubscriptionStore.ApplyWebhookEvent`): one mutex in the in-memory backend, one
+**transaction** in Postgres, where the ledger insert is
+`INSERT … ON CONFLICT (provider, event_id) DO NOTHING` and zero rows affected
+*means* duplicate, with the subscription row taken `FOR UPDATE` so two events for
+one subject serialize. A rollback leaves **both** the ledger and the record
+untouched, so a retry is clean. Split across two calls, a crash in between would
+either double-apply or lose an event; as one operation it cannot.
+
+The response `status` reports the verdict:
+
+```json
+{ "provider": "stripe", "status": "accepted" }
+```
+
+| `status` | Meaning | State changed? |
+|----------|---------|----------------|
+| `accepted` | fresh, legal, in order — applied | **yes** |
+| `ignored` | authentic but not a modeled event type | no |
+| `duplicate` | `(provider, event_id)` already processed — **the idempotency guarantee** | no |
+| `stale` | predates the last applied event | no |
+| `illegal` | not a legal transition from the current status | no |
+| `unresolved` | no subject on the event and none resolvable from its subscription reference. **Deliberately not recorded as processed**, so a later event can establish the binding and this one can then be redelivered | no |
+
+#### Webhook status codes, and why
+
+| Status | `error` | When |
+|--------|---------|------|
+| `200` | — | **every** handled outcome above (`accepted`/`ignored`/`duplicate`/`stale`/`illegal`/`unresolved`) — all of them mean "we handled it, stop retrying" |
+| `400` | `invalid_request` | the signature was valid but the body is unparsable, or the body could not be read |
+| `401` | `unauthorized` | signature verification failed — **for any reason** |
+| `404` | `unknown_provider` | `{provider}` is not a configured webhook endpoint on this server |
+| `413` | `payload_too_large` | body exceeds the 64 KiB cap |
+| `500` | `internal` | **our store failed.** Deliberately the *only* error class a healthy provider should ever see, because it is the only one that *should* be retried |
+| `501` | `not_implemented` | billing off |
+
+The `401` body is **coarse on purpose**: a missing header, a malformed header, an
+unparsable signature, a wrong secret, a tampered body, and a stale timestamp all
+produce the identical response, so a prober cannot learn which check tripped. The
+precise reason goes only to the server-side audit log and the per-reason metric.
+
+### `GET /v1/billing/subscription` — the caller's own status
+
+**Auth: device auth v3** (signed with an empty body). The subject is taken from
+the verified signature, so this endpoint **cannot be used to enumerate other
+subjects** — there is no query parameter and no subject field to supply.
+
+`200 OK`:
+
+```json
+{
+  "subject": "dev_AbCdEf…",
+  "provider": "stripe",
+  "status": "active",
+  "entitled": true,
+  "current_period_end": "2026-08-26T00:00:00Z",
+  "updated_at": "2026-07-26T18:22:41Z"
+}
+```
+
+"Never subscribed" is a valid answer, not a fault — it returns `200` with
+`{"subject":"…","status":"none","entitled":false}`. `provider`,
+`current_period_end` and `updated_at` are omitted when unset. `401` on failed
+device auth, `500` on a store fault, `501` when billing is off.
+
+### Configuration (environment)
+
+| Variable | Required? | Meaning |
+|----------|-----------|---------|
+| `SIGILD_BILLING_PROVIDERS` | opt-in | Comma-separated: `stripe`, `razorpay`, `juspay`. **Unset ⇒ billing OFF.** Unknown or duplicate names are a **boot error**. Requires `SIGILD_ENABLE_DEV_OPS` **and** `SIGILD_DEVICE_AUTH`. |
+| `SIGILD_BILLING_DEFAULT_PROVIDER` | optional | Which provider a checkout uses when the body names none. Must be one of the enabled providers. Unset ⇒ the first listed. |
+| `SIGILD_BILLING_SUCCESS_URL` | **required when billing is on** | Absolute `http(s)` URL the provider returns a paying customer to. |
+| `SIGILD_BILLING_CANCEL_URL` | **required when billing is on** | Absolute `http(s)` URL for an abandoned checkout. |
+| `SIGILD_STRIPE_SECRET_KEY` | **required for `stripe`** | `sk_…`, sent as a bearer token. |
+| `SIGILD_STRIPE_WEBHOOK_SECRET` | **required for `stripe`** | `whsec_…`, the **endpoint signing secret** — a *different* secret from the API key, used only as the HMAC key. |
+| `SIGILD_STRIPE_PRICE_ID` | optional | Default `price_…` for the subscription line item. |
+| `SIGILD_STRIPE_API_BASE_URL` | optional | API host override (default `https://api.stripe.com`). |
+| `SIGILD_RAZORPAY_KEY_ID` / `SIGILD_RAZORPAY_KEY_SECRET` | **required for `razorpay`** | API credentials, sent as HTTP Basic auth. |
+| `SIGILD_RAZORPAY_WEBHOOK_SECRET` | **required for `razorpay`** | Dashboard webhook secret; a *different* secret from the key secret. |
+| `SIGILD_RAZORPAY_AMOUNT_MINOR` | optional | Default payment-link amount in **minor units** (paise). Must be a positive integer. |
+| `SIGILD_RAZORPAY_CURRENCY` | optional | Default currency (adapter default `INR`). |
+| `SIGILD_RAZORPAY_DESCRIPTION` | optional | Payment-link description. |
+| `SIGILD_RAZORPAY_API_BASE_URL` | optional | API host override (default `https://api.razorpay.com`). |
+| `SIGILD_JUSPAY_MERCHANT_ID` / `SIGILD_JUSPAY_API_KEY` | **required for `juspay`** | Merchant ID (sent as `x-merchantid`) and API key (Basic-auth username, empty password). |
+| `SIGILD_JUSPAY_CLIENT_ID` | optional | Payment-page client ID. |
+| `SIGILD_JUSPAY_WEBHOOK_SCHEME` | optional | `basic` (default) or `hmac`. Any other value is a **boot error**. |
+| `SIGILD_JUSPAY_WEBHOOK_USERNAME` / `SIGILD_JUSPAY_WEBHOOK_PASSWORD` | **required for `scheme=basic`** | Endpoint Basic-auth credentials. |
+| `SIGILD_JUSPAY_WEBHOOK_SECRET` | **required for `scheme=hmac`** | HMAC key. |
+| `SIGILD_JUSPAY_WEBHOOK_SIG_HEADER` | optional | Signature header name for `scheme=hmac` (default `X-Juspay-Signature`) — configurable **because the real name is unconfirmed**. |
+| `SIGILD_JUSPAY_AMOUNT_MINOR` | optional | Default amount in minor units (paise); rendered to the decimal major-unit string Juspay expects, by integer arithmetic only. |
+| `SIGILD_JUSPAY_CURRENCY` | optional | Default currency. |
+| `SIGILD_JUSPAY_API_BASE_URL` | optional | API host override (default `https://api.juspay.in`). |
+
+All of it is **parsed and validated before the listener binds**. Enabling a
+provider without its credentials is a **boot error**, never a runtime surprise: a
+server that started half-configured would either reject real webhooks it could
+not authenticate, or offer checkouts it could not create. Validation performs
+**no network I/O**, so boot cannot contact a payment provider.
+
+### Storage (migration `0003_billing.sql`)
+
+Two tables on top of the untouched `0001_init` / `0002_devices`:
+
+| Table | Holds |
+|-------|-------|
+| `sigil_subscriptions` | `subject` (PK), `provider`, `customer_ref`, `subscription_ref`, `status`, `current_period_end`, `last_event_at` (the ordering guard), `created_at`, `updated_at`; partial index `sigil_subscriptions_by_provider_ref (provider, subscription_ref) WHERE subscription_ref <> ''` for subject resolution |
+| `sigil_billing_processed_events` | `(provider, event_id)` **PRIMARY KEY** — the idempotency key, enforced by the **database**, not by application timing — plus the **normalized** `event_type`, `subject`, `processed_at`; index `sigil_billing_processed_events_by_time (processed_at)` |
+
+The migration is **pure DDL** and adds **no column that can hold a card number,
+CVV, expiry, cardholder name, billing address, email or phone**. What is stored
+is a set of **opaque provider handles** — useful for reconciling a record against
+a provider dashboard, useless for charging anyone. The **raw webhook payload is
+never persisted**. `sigild_schema_version` reports **3** once applied.
+
+The Postgres backend **reuses the op-log's existing `pgxpool`** (no second pool,
+no new dependency). With Postgres unconfigured, billing falls back to the
+**in-memory** subscription store, which is **non-durable**: subscriptions *and*
+the processed-event ledger are lost on restart, so a webhook redelivered across a
+restart **would be applied twice**. `sigild` warns loudly about this at boot.
+
+### Audit log
+
+Five structured events, **metadata only** — never an API key, a webhook secret, a
+signature header, one byte of the raw webhook body, an email/name/phone, or an
+amount:
+
+| Event | Fields |
+|-------|--------|
+| `billing.checkout_created` | `request_id`, `provider`, `subject`, `session_id` |
+| `billing.checkout_failed` | `request_id`, `provider`, `subject`, `err` (a `ProviderError` carrying **only** provider + operation + HTTP status, or a transport error — never the provider's response body, which can echo customer data) |
+| `billing.webhook` | `request_id`, `provider`, `event_type` (normalized), `event_id` (so a `duplicate` is explainable), `outcome` |
+| `billing.webhook_rejected` | `request_id`, `provider`, `reason` — the fixed enum `unknown_provider` / `unreadable_body` / `payload_too_large` / `bad_signature` / `malformed` / `store_unavailable`, surfaced **only** here and in the metric, never to the caller |
+| `billing.subscription_transition` | `request_id`, `provider`, `subject`, `from`, `to` — fires **once per applied transition**, never for a duplicate/stale/illegal delivery, so the trail is a faithful history of entitlement |
+
+### Honest limits (read before believing any of the above)
+
+- **Nothing has been run against a live provider account.** No live API call, no
+  real webhook, no real payment. The Stripe scheme is implemented with **high**
+  confidence, the Razorpay **webhook** scheme with high confidence and its
+  surrounding details (notably the `X-Razorpay-Event-Id` header name and the
+  exact subscription event names) with **medium**; the **Juspay** adapter is
+  explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD** — its header names, signed
+  message, endpoint path, response envelope and event vocabulary are a
+  best-supported reading and **must** be confirmed before use. That uncertainty
+  is quarantined behind a small internal `juspayWebhookVerifier` seam so a
+  correction touches one type in one file.
+- **Checkout creates a one-time hosted payment page for the India adapters.**
+  Razorpay's `/v1/payment_links` and Juspay's `/session` are one-time flows;
+  **recurring subscription/mandate creation is not implemented**. Both adapters'
+  *webhook* sides already map subscription/mandate events, so a subscription
+  created out-of-band drives the state machine correctly. This is a deliberate
+  omission, not an oversight.
+- **No account model.** Subscriptions key off the **authenticated device**, so a
+  user with two devices has two subjects. There is no user, no household, no
+  organization, no seat model, and no transfer.
+- **No invoicing, proration, tax, refunds, chargebacks, dunning or reconciliation
+  job**, and no admin surface for billing.
+- **No entitlement enforcement.** `entitled` is reported; nothing in the op-log
+  or device routes consults it yet.
+- **The in-memory store is non-durable** (see above), and there is **no PCI
+  attestation** — hosted checkout keeps scope minimal, it does not certify
+  anything.
+- **In any real deployment webhooks must arrive over TLS.** The dev server speaks
+  plain HTTP.
 
 ---
 

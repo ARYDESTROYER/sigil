@@ -89,6 +89,49 @@ func main() {
 		logger.Error("invalid device-auth configuration", "err", err)
 		os.Exit(1)
 	}
+
+	// Billing config, validated BEFORE binding too. Entirely OPT-IN: with
+	// SIGILD_BILLING_PROVIDERS unset billing is OFF and the /v1/billing routes
+	// stay at their 501 stub. Enabling a provider without its credentials is a
+	// BOOT ERROR, never a runtime surprise — a server that accepted webhooks it
+	// could not authenticate would silently reject real payment events.
+	// validateBillingConfig performs NO network I/O, so this cannot contact a
+	// payment provider at startup.
+	billingCfg, err := validateBillingConfig(billingEnv{
+		Providers:             os.Getenv("SIGILD_BILLING_PROVIDERS"),
+		DefaultProvider:       os.Getenv("SIGILD_BILLING_DEFAULT_PROVIDER"),
+		DevOps:                os.Getenv("SIGILD_ENABLE_DEV_OPS"),
+		DeviceAuth:            os.Getenv("SIGILD_DEVICE_AUTH"),
+		SuccessURL:            os.Getenv("SIGILD_BILLING_SUCCESS_URL"),
+		CancelURL:             os.Getenv("SIGILD_BILLING_CANCEL_URL"),
+		StripeSecretKey:       os.Getenv("SIGILD_STRIPE_SECRET_KEY"),
+		StripeWebhookSecret:   os.Getenv("SIGILD_STRIPE_WEBHOOK_SECRET"),
+		StripePriceID:         os.Getenv("SIGILD_STRIPE_PRICE_ID"),
+		StripeBaseURL:         os.Getenv("SIGILD_STRIPE_API_BASE_URL"),
+		RazorpayKeyID:         os.Getenv("SIGILD_RAZORPAY_KEY_ID"),
+		RazorpayKeySecret:     os.Getenv("SIGILD_RAZORPAY_KEY_SECRET"),
+		RazorpayWebhookSecret: os.Getenv("SIGILD_RAZORPAY_WEBHOOK_SECRET"),
+		RazorpayAmountMinor:   os.Getenv("SIGILD_RAZORPAY_AMOUNT_MINOR"),
+		RazorpayCurrency:      os.Getenv("SIGILD_RAZORPAY_CURRENCY"),
+		RazorpayDescription:   os.Getenv("SIGILD_RAZORPAY_DESCRIPTION"),
+		RazorpayBaseURL:       os.Getenv("SIGILD_RAZORPAY_API_BASE_URL"),
+		JuspayMerchantID:      os.Getenv("SIGILD_JUSPAY_MERCHANT_ID"),
+		JuspayAPIKey:          os.Getenv("SIGILD_JUSPAY_API_KEY"),
+		JuspayClientID:        os.Getenv("SIGILD_JUSPAY_CLIENT_ID"),
+		JuspayWebhookScheme:   os.Getenv("SIGILD_JUSPAY_WEBHOOK_SCHEME"),
+		JuspayWebhookUsername: os.Getenv("SIGILD_JUSPAY_WEBHOOK_USERNAME"),
+		JuspayWebhookPassword: os.Getenv("SIGILD_JUSPAY_WEBHOOK_PASSWORD"),
+		JuspayWebhookSecret:   os.Getenv("SIGILD_JUSPAY_WEBHOOK_SECRET"),
+		JuspayWebhookSigHdr:   os.Getenv("SIGILD_JUSPAY_WEBHOOK_SIG_HEADER"),
+		JuspayAmountMinor:     os.Getenv("SIGILD_JUSPAY_AMOUNT_MINOR"),
+		JuspayCurrency:        os.Getenv("SIGILD_JUSPAY_CURRENCY"),
+		JuspayBaseURL:         os.Getenv("SIGILD_JUSPAY_API_BASE_URL"),
+	})
+	if err != nil {
+		logger.Error("invalid billing configuration", "err", err)
+		os.Exit(1)
+	}
+
 	cfg := api.Config{
 		Version: buildinfo.Version,
 		// host:port reachability targets; empty => reported "unconfigured".
@@ -221,6 +264,41 @@ func main() {
 				"admin_token_configured", cfg.AdminToken != "",
 				"registry", map[bool]string{true: "postgres", false: "memory"}[pgPool != nil])
 		}
+
+		// Billing. validateBillingConfig has already required dev-ops AND device
+		// auth, so reaching here means both are on. The subscription store is
+		// durable when the Postgres op-log backend is active (sharing its pool,
+		// tables from migration 0003), otherwise in-memory and non-durable —
+		// which for the processed-event ledger means a webhook redelivered across
+		// a restart would be applied twice.
+		if billingCfg.Enabled {
+			if pgPool != nil {
+				cfg.Billing.Subscriptions = store.NewPostgresSubscriptionStore(pgPool)
+			} else {
+				cfg.Billing.Subscriptions = store.NewMemSubscriptionStore()
+				logger.Warn("BILLING: subscription store is IN-MEMORY and NON-DURABLE — subscriptions and the processed-webhook ledger are lost on restart, so a redelivered webhook could be applied twice; use the Postgres op-log backend for durability")
+			}
+			cfg.Billing.Providers = billingCfg.Providers
+			cfg.Billing.DefaultProvider = billingCfg.DefaultProvider
+			cfg.Billing.SuccessURL = billingCfg.SuccessURL
+			cfg.Billing.CancelURL = billingCfg.CancelURL
+
+			// Logs WHICH providers are enabled and which Juspay webhook scheme is
+			// active. NEVER a key, secret, username or password.
+			logger.Warn("BILLING ENABLED — hosted checkout only (no card data ever reaches this server); UNAUDITED, dev-gated, do NOT take real payments before verifying each provider's webhook scheme against its live dashboard",
+				"providers", strings.Join(billingCfg.ProviderNames(), ","),
+				"default_provider", billingCfg.DefaultProvider,
+				"store", map[bool]string{true: "postgres", false: "memory"}[pgPool != nil])
+			if billingCfg.JuspayScheme != "" {
+				logger.Warn("BILLING: the Juspay webhook scheme is UNVERIFIED-AGAINST-LIVE-DASHBOARD — confirm it before accepting real payments",
+					"juspay_webhook_scheme", billingCfg.JuspayScheme)
+			}
+		}
+	} else if billingCfg.Enabled {
+		// Unreachable in practice (validateBillingConfig requires dev-ops), but
+		// stated explicitly: billing never runs outside the dev gate.
+		logger.Error("billing was configured without the dev-ops gate")
+		os.Exit(1)
 	}
 
 	// Server-wide timeouts bound how long a single connection may tie up

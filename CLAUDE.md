@@ -285,6 +285,74 @@ public, make no security claims, until the audit completes and trademark clears.
   in-memory registry, warned at boot); and it is still **dev-gated, pre-audit, UNAUDITED** —
   no user/account model, no session/token issuance, **no rate limiting on enrollment
   attempts**, no key rotation. Contract in [`docs/api.md`](docs/api.md); ADR 0031.
+  **A BILLING / SUBSCRIPTION LAYER (Phase 45, ADR 0034) — opt-in + dev-gated, UNAUDITED,
+  NEVER RUN AGAINST A LIVE PROVIDER ACCOUNT:** Sigil is a PAID product, so `sigild` now has
+  a **provider-agnostic billing seam** (`internal/billing/`): ONE `billing.Provider`
+  interface (`Name`/`CreateCheckout`/`VerifyWebhook`) with **three adapters** —
+  **`stripe.go`** (international), **`razorpay.go`** and **`juspay.go`** (India) — a
+  **normalized event vocabulary** (`checkout_completed`/`subscription_activated`/
+  `subscription_renewed`/`subscription_canceled`/`payment_failed`/`ignored`) and an explicit
+  **state machine** (`state.go`: `none`/`trialing`/`active`/`past_due`/`canceled` as a
+  transition TABLE; `past_due` is still `Entitled`). **THE RULE THAT SHAPED IT: NO VENDOR
+  SDKs.** Every adapter is `net/http` + `crypto/hmac` + `crypto/subtle` + `encoding/json` +
+  `net/url` only, so **`sigild/go.mod` still has EXACTLY ONE direct require (`pgx`)** and the
+  security-critical verification is ~30 readable lines per provider instead of an opaque
+  library call. **HOSTED CHECKOUT ONLY** (Stripe `POST /v1/checkout/sessions` form-encoded,
+  Razorpay `POST /v1/payment_links`, Juspay `POST /session`): we ask for a URL and hand it to
+  the client, so **NO CARD DATA EVER ENTERS THIS PROCESS** — no struct field, log line, metric
+  or column could hold a PAN/CVV/expiry (PCI scope SAQ-A; **not** an attestation).
+  **THREE ROUTES, TWO AUTHS:** `POST /v1/billing/checkout` + `GET /v1/billing/subscription`
+  reuse the **device-auth v3** choke point (`authenticateDevice`) and the **subject is the
+  AUTHENTICATED DEVICE ID, never a body field**; `POST /v1/billing/webhook/{provider}` is
+  authenticated **ONLY by the provider's own signature over the RAW body** (a provider has no
+  device key). Verification is **real**: Stripe `HMAC-SHA256("<t>.<raw body>")` from
+  `Stripe-Signature` (5-minute tolerance both directions, EVERY `v1` element compared, legacy
+  `v0` ignored), Razorpay `HMAC-SHA256(raw body)` from `X-Razorpay-Signature` (+
+  `X-Razorpay-Event-Id`, else a deterministic body-hash id), Juspay either `basic`
+  (constant-time `Authorization: Basic`) or `hmac` (configurable header, default
+  `X-Juspay-Signature`) behind a swappable `juspayWebhookVerifier` seam — all constant-time
+  (`hmac.Equal`/`subtle.ConstantTimeCompare`), verified over the RAW bytes BEFORE the JSON is
+  parsed, every failure a coarse 401. **IDEMPOTENCY** is keyed on `(provider, event_id)` and
+  **fused with the state change into ONE atomic op** (`SubscriptionStore.ApplyWebhookEvent`:
+  one mutex in mem, one tx with `ON CONFLICT DO NOTHING` + `SELECT … FOR UPDATE` in Postgres),
+  so a **duplicate delivery is a no-op that still answers 200** (outcomes
+  `accepted`/`ignored`/`duplicate`/`stale`/`illegal`/`unresolved` are ALL 200 — a non-2xx
+  would put the provider into retry/backoff; 400 malformed, 401 bad signature, 404 unknown
+  provider, 413 oversize, **500 store fault = the only retryable class**). **NEW ENV** (all
+  validated fail-fast BEFORE the listener binds, NO network I/O at boot):
+  **`SIGILD_BILLING_PROVIDERS`** (`stripe,razorpay,juspay`; unset ⇒ OFF; **requires
+  `SIGILD_ENABLE_DEV_OPS` AND `SIGILD_DEVICE_AUTH`**), `SIGILD_BILLING_DEFAULT_PROVIDER`,
+  `SIGILD_BILLING_SUCCESS_URL`/`_CANCEL_URL` (required, absolute http(s)),
+  `SIGILD_STRIPE_SECRET_KEY`/`_WEBHOOK_SECRET`/`_PRICE_ID`/`_API_BASE_URL`,
+  `SIGILD_RAZORPAY_KEY_ID`/`_KEY_SECRET`/`_WEBHOOK_SECRET`/`_AMOUNT_MINOR`/`_CURRENCY`/
+  `_DESCRIPTION`/`_API_BASE_URL`, `SIGILD_JUSPAY_MERCHANT_ID`/`_API_KEY`/`_CLIENT_ID`/
+  `_WEBHOOK_SCHEME`/`_WEBHOOK_USERNAME`/`_WEBHOOK_PASSWORD`/`_WEBHOOK_SECRET`/
+  `_WEBHOOK_SIG_HEADER`/`_AMOUNT_MINOR`/`_CURRENCY`/`_API_BASE_URL` (enabling a provider
+  WITHOUT its secrets is a BOOT ERROR). **STORAGE:** migration **`0003_billing.sql`**
+  (0001/0002 untouched) creates **`sigil_subscriptions`** + **`sigil_billing_processed_events`**
+  (PK `(provider, event_id)`) → **`sigild_schema_version` now reports 3**;
+  `store.SubscriptionStore` is the seam (`MemSubscriptionStore`, non-durable, or
+  `PostgresSubscriptionStore` **sharing the op-log's existing `pgxpool`** — no second pool, no
+  new dep). **NO CARD DATA / NO PII COLUMN EXISTS**, the raw payload is never persisted, and
+  `sigil_vault_ops` is untouched ⇒ zero-knowledge intact. New metrics
+  `sigild_billing_checkouts_total{provider}`, `sigild_billing_webhooks_total{provider,outcome}`,
+  `sigild_billing_webhook_rejected_total{reason}`,
+  `sigild_billing_subscription_transitions_total{status}` (CLOSED label sets materialized at
+  boot); new audit events `billing.checkout_created`/`checkout_failed`/`webhook`/
+  `webhook_rejected`/`subscription_transition` carrying metadata only — **never a key, secret,
+  signature header, or one byte of the raw body**. **DEFAULT = 501** on all three routes
+  (never 404). **HONEST LIMITS:** **nothing has ever been run against a live provider
+  account** (all tests drive a local `httptest` server); the **Juspay** adapter is explicitly
+  **UNVERIFIED-AGAINST-LIVE-DASHBOARD** (header names / signed message / endpoint / event
+  vocabulary must be confirmed first) and Razorpay's surrounding details are MEDIUM
+  confidence; **no account model** (a subscription keys off the enrolled DEVICE); recurring
+  subscription CREATION is unimplemented for the India adapters (one-time hosted page; their
+  webhook sides do map subscription/mandate events); no entitlement enforcement, no
+  fraud/chargeback/refund/proration/tax/dunning; **no PCI attestation**; the in-memory store
+  is non-durable (a redelivery across a restart could double-apply); no rate limit on the
+  webhook route; and **billing living inside `sigild` is PROVISIONAL** — a scaffold placement,
+  not a final topology. Contract in [`docs/api.md`](docs/api.md), operator guide in
+  [`docs/deployment.md`](docs/deployment.md) §13; ADR 0034.
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,

@@ -200,7 +200,9 @@ Backstops:
   purge history → log) lives in [`sprint-72h.md`](sprint-72h.md#secret-rotation-runbook-gitleaks-fired--suspected-leak).
 
 The team password manager is the single source of truth / registry-of-record for
-all credentials.
+all credentials. **Payment-provider credentials** (Stripe / Razorpay / Juspay API
+keys and webhook signing secrets) are governed by exactly this posture — see
+[§13.3](#133-secrets) for the payment-specific notes.
 
 ---
 
@@ -275,6 +277,18 @@ To avoid any over-claim, the honest gaps:
   may be stored in it. This honours the "stub with `501` rather than poison the
   audit" guardrail (brief §14): the production default stays `501`. See
   [`api.md`](api.md) for the full contract.
+- **Billing is in the codebase but is not a payment integration you can deploy.**
+  The Stripe / Razorpay / Juspay adapters, their webhook signature verification,
+  the subscription state machine and the idempotency ledger are **real code that
+  really runs** — but they are **opt-in, dev-gated (`501` by default),
+  UNAUDITED**, and **have never been run against a live provider account**; the
+  Juspay scheme is explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD**. There is no
+  account model (a subscription keys off the enrolled device), no entitlement
+  enforcement, no recurring-subscription creation for the India adapters, no
+  fraud/chargeback/refund/proration/tax handling, and **no PCI attestation**
+  (hosted checkout keeps card data out of the process entirely, which minimizes
+  scope but certifies nothing). Operator guide and the mandatory-TLS requirement:
+  [§13](#13-billing--payment-providers-operator-guide--opt-in-dev-gated).
 - **No production data store is wired.** The dev op-log can now be pointed at a
   real Postgres via **`SIGILD_OPLOG_POSTGRES`** (a libpq DSN, on the `pgx`
   driver — `sigild`'s first third-party dependency, so the module now carries a
@@ -533,3 +547,192 @@ real backup/restore round-trip.
 > restore-drills — none of which exist yet
 > ([§7](#7-what-is-not-yet-deployable)). The hash-chain check is
 > tamper-**evident**, not a cryptographic backup-authentication scheme.
+
+---
+
+## 13. Billing / payment providers (operator guide — opt-in, dev-gated)
+
+> **READ FIRST: nothing in this section has ever been run against a live payment
+> provider account.** No request in this repository has been sent to, or received
+> from, `api.stripe.com`, `api.razorpay.com` or `api.juspay.in`; every test drives
+> a local `httptest` server with fake credentials. The **Juspay** adapter is
+> explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD** (its header names, signed
+> message, endpoint path and event vocabulary are a best-supported reading).
+> Treat this as a scaffold you must **verify against each merchant dashboard**
+> before any real money moves. It is **UNAUDITED**, and it is **not** a PCI
+> attestation. See [`api.md`](api.md#billing--subscriptions-dev-gated-opt-in--phase-45)
+> for the wire contract and
+> [`decisions/0034-billing-provider-seam.md`](decisions/0034-billing-provider-seam.md)
+> for the decision.
+
+`sigild` carries a provider-agnostic billing seam with three **stdlib-only**
+adapters — **Stripe** (international), **Razorpay** and **Juspay** (India). It
+uses each provider's **hosted checkout** flow only: the server asks for a URL and
+hands it to the client, so **no card data ever reaches this process** and there is
+no field, log line, metric or database column that could hold one. That keeps PCI
+scope at SAQ-A; it does not certify anything.
+
+### 13.1 Enabling it (all off by default)
+
+Billing is **doubly gated**. It requires the dev-ops gate **and** the device-auth
+model **and** an explicit provider list; with any of them missing all three
+`/v1/billing/*` routes serve a deliberate `501`.
+
+```bash
+SIGILD_ENABLE_DEV_OPS=1                 # the whole stateful surface is dev-gated
+SIGILD_DEVICE_AUTH=1                    # checkout is authenticated as an ENROLLED DEVICE
+SIGILD_BILLING_PROVIDERS=stripe,razorpay,juspay
+SIGILD_BILLING_DEFAULT_PROVIDER=stripe  # optional; unset => the first listed
+SIGILD_BILLING_SUCCESS_URL=https://app.example/billing/ok      # REQUIRED
+SIGILD_BILLING_CANCEL_URL=https://app.example/billing/cancel   # REQUIRED
+```
+
+Per-provider credentials (each **required when that provider is listed** — see
+[`api.md`](api.md#configuration-environment) for the full table):
+
+```bash
+# Stripe
+SIGILD_STRIPE_SECRET_KEY=sk_live_...          # API key   (bearer token)
+SIGILD_STRIPE_WEBHOOK_SECRET=whsec_...        # ENDPOINT SIGNING SECRET — a DIFFERENT secret
+SIGILD_STRIPE_PRICE_ID=price_...              # optional default plan
+SIGILD_STRIPE_API_BASE_URL=                   # optional host override
+
+# Razorpay
+SIGILD_RAZORPAY_KEY_ID=rzp_live_...
+SIGILD_RAZORPAY_KEY_SECRET=...
+SIGILD_RAZORPAY_WEBHOOK_SECRET=...            # dashboard webhook secret — DIFFERENT from the key secret
+SIGILD_RAZORPAY_AMOUNT_MINOR=49900            # optional default, in paise (positive integer)
+SIGILD_RAZORPAY_CURRENCY=INR                  # optional
+SIGILD_RAZORPAY_DESCRIPTION="Sigil annual"    # optional
+SIGILD_RAZORPAY_API_BASE_URL=                 # optional host override
+
+# Juspay
+SIGILD_JUSPAY_MERCHANT_ID=...
+SIGILD_JUSPAY_API_KEY=...
+SIGILD_JUSPAY_CLIENT_ID=...                   # payment-page client id
+SIGILD_JUSPAY_WEBHOOK_SCHEME=basic            # basic (default) | hmac
+SIGILD_JUSPAY_WEBHOOK_USERNAME=...            # REQUIRED for scheme=basic
+SIGILD_JUSPAY_WEBHOOK_PASSWORD=...            # REQUIRED for scheme=basic
+SIGILD_JUSPAY_WEBHOOK_SECRET=...              # REQUIRED for scheme=hmac
+SIGILD_JUSPAY_WEBHOOK_SIG_HEADER=             # optional; default X-Juspay-Signature (name UNVERIFIED)
+SIGILD_JUSPAY_AMOUNT_MINOR=49900              # optional default, in paise
+SIGILD_JUSPAY_CURRENCY=INR                    # optional
+SIGILD_JUSPAY_API_BASE_URL=                   # optional host override
+```
+
+**Fail-fast, before the listener binds.** All of the above is parsed and
+validated at startup: an unknown or duplicate provider name, a missing credential
+for an enabled provider, a `SIGILD_BILLING_DEFAULT_PROVIDER` that is not enabled,
+a non-absolute success/cancel URL, a non-positive amount, or an unknown Juspay
+scheme makes `sigild` **exit non-zero with a clear message**. Validation performs
+**no network I/O**, so boot never contacts a payment provider. Under systemd
+(Shape 1) a bad `EnvironmentFile` therefore surfaces immediately as a failed unit
+start — which is the point: a server that started half-configured would reject
+real webhooks it could not authenticate, or offer checkouts it could not create.
+
+The boot log records **which** providers are enabled and **which** Juspay scheme
+is active — a mechanism name, never a credential — plus two loud warnings: that
+billing is unaudited and must be verified against live dashboards, and (when
+Postgres is not configured) that the subscription store is in-memory.
+
+### 13.2 Configuring the provider webhook endpoints
+
+Each provider must be pointed at **its own** path:
+
+| Provider | Endpoint to register in the dashboard | Signature header the dashboard configures |
+|----------|----------------------------------------|-------------------------------------------|
+| Stripe | `https://<host>/v1/billing/webhook/stripe` | `Stripe-Signature` (`t=…,v1=…`), keyed by the **endpoint signing secret** shown when the endpoint is created — copy it into `SIGILD_STRIPE_WEBHOOK_SECRET` |
+| Razorpay | `https://<host>/v1/billing/webhook/razorpay` | `X-Razorpay-Signature`, keyed by the **webhook secret** you type into the dashboard — copy the same value into `SIGILD_RAZORPAY_WEBHOOK_SECRET` |
+| Juspay | `https://<host>/v1/billing/webhook/juspay` | `Authorization: Basic …` for `scheme=basic`, or the signature header for `scheme=hmac` (**default `X-Juspay-Signature`; the real name is unconfirmed** — override with `SIGILD_JUSPAY_WEBHOOK_SIG_HEADER`) |
+
+A path that names a provider **not** enabled on this instance returns `404`
+(body drained, nothing constructed, no credential read); with billing off
+entirely every billing path returns `501`.
+
+**Verification checklist before enabling a provider for real money:**
+
+1. Replay a **real** event from the provider's tooling (e.g. `stripe listen
+   --forward-to …`, or a dashboard "send test webhook") and confirm a `200` with
+   the expected `status` in the JSON body.
+2. Confirm the **exact** signature header name and signed message against the
+   dashboard's own documentation for that account — especially for **Juspay**,
+   and for Razorpay's **`X-Razorpay-Event-Id`** header (absent, the adapter falls
+   back to a deterministic body hash as the event ID).
+3. Deliver the **same** event twice and confirm the second answers `200` with
+   `"status":"duplicate"` and changes nothing.
+4. Confirm the plan/price/amount parameters against the account's real product
+   catalogue — the adapters send what you configure and invent nothing.
+5. Confirm `sigild_billing_*` counters move as expected on `GET /metrics`.
+
+**Durability matters here.** Without `SIGILD_OPLOG_POSTGRES` the subscription
+store is **in-memory and non-durable**: subscriptions *and* the processed-event
+ledger are lost on restart, so a webhook redelivered across a restart **would be
+applied twice**. Only the Postgres backend enforces the `(provider, event_id)`
+idempotency key in the database, across processes and restarts. Configure
+Postgres before pointing any real provider at the endpoint. Billing adds **no
+second connection pool and no new dependency** — it reuses the op-log's existing
+`pgxpool` and adds migration **`0003_billing.sql`** (`sigil_subscriptions`,
+`sigil_billing_processed_events`), so `sigild_schema_version` reports **3**
+([§11](#11-schema-migrations-postgres-backend) covers how migrations are applied;
+[§12](#12-backup--restore-postgres-backend)'s `pg_dump`/`pg_restore` runbook
+covers the new tables too, since they are dumped with the rest of the database).
+
+### 13.3 Secrets
+
+**No payment credential ever lives in the repository.** API keys, key secrets,
+webhook signing secrets and Juspay's Basic-auth credentials are exactly the
+class of secret [§5](#5-secrets-posture) already governs: they live in the **team
+password manager** (the single registry-of-record), reach the process only at
+runtime through the systemd `EnvironmentFile` or Nomad template/Vault
+integration, and are **never baked into the image, the jobspec, or a committed
+file**. [`../.gitleaks.toml`](../.gitleaks.toml) scans for leaks and the
+[secret-rotation runbook](sprint-72h.md#secret-rotation-runbook-gitleaks-fired--suspected-leak)
+applies unchanged — with the payment-specific note that **the API key and the
+webhook secret are different secrets** and can be rotated independently, and that
+a leaked **API key** must be revoked **at the provider**, because no server-side
+control here can contain it.
+
+`sigild` limits its own exposure by construction: credentials are held only
+inside an adapter struct, travel in an `Authorization` (or `x-merchantid`) header
+rather than a URL, and are **never logged, never returned in an error, and never
+exported on `/metrics`** — a failed provider call surfaces as a `ProviderError`
+carrying **only** the provider, the operation and the HTTP status, deliberately
+never the response body (which can echo customer data).
+
+### 13.4 TLS is mandatory for webhooks in any real deployment
+
+A webhook is an **unauthenticated-by-transport POST from the public internet**
+that carries a signature in a header. In any real deployment it **must** reach
+`sigild` over **TLS**, terminated at Caddy ([§1](#1-topology--progression)) with
+`sigild` bound to loopback behind it:
+
+- Stripe and Razorpay bind the body with an HMAC, so TLS is about
+  **confidentiality and endpoint authenticity**, not integrity of the payload.
+- **Juspay's `basic` scheme does NOT bind the body** — it is a shared credential
+  in an `Authorization` header. Over plain HTTP it is both interceptable and
+  replayable with an arbitrary body. If you must use `basic`, the endpoint has to
+  be TLS-only; prefer `hmac` when the merchant dashboard offers it.
+- The dev server speaks **plain HTTP**, and the local compose topology
+  ([§9](#9-local-topology-check)) has **no real TLS** — so the dev configuration
+  is for loopback experimentation only. Do not register a provider webhook
+  against it.
+
+Keep `GET /metrics` on the internal side of Caddy as before; the billing counters
+carry no secret, but the endpoint is still not meant for the public internet.
+
+### 13.5 What an operator does NOT get
+
+- **No live-account verification** of any provider scheme (above), and **no
+  Juspay confirmation** at all.
+- **No recurring-subscription creation** for the India adapters — Razorpay's
+  `/v1/payment_links` and Juspay's `/session` create a **one-time hosted page**.
+  Their webhook sides map subscription/mandate events, so a subscription created
+  out-of-band in the dashboard drives the state machine correctly.
+- **No account model** — a subscription keys off the **enrolled device** that ran
+  checkout, so one human with two devices is two subjects.
+- **No entitlement enforcement** — `entitled` is reported by
+  `GET /v1/billing/subscription` and consulted by nothing.
+- **No fraud, chargeback, refund, proration, tax, dunning or reconciliation
+  handling**, no billing admin surface, and no rate limiting on the webhook
+  endpoint (only the 64 KiB body cap).
+- **No PCI attestation** — hosted checkout minimizes scope; it certifies nothing.

@@ -44,6 +44,12 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > Ed25519 signing, `sigil-wasm/device-auth.mjs` implements the client half for the
 > webapp + extension, and each browser keeps its device seed **sealed** in a second
 > `SIGILcli` container rather than plaintext in web storage),
+> the dev-gated **billing / subscription layer** in `sigild` (a provider-agnostic
+> seam with **stdlib-only** Stripe / Razorpay / Juspay adapters — no vendor SDKs —
+> hosted checkout only so the server never touches card data, real raw-body HMAC
+> webhook verification with constant-time comparison, and idempotency keyed on the
+> provider event id; opt-in, `501` by default, UNAUDITED, and **never run against a
+> live provider account**),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -109,3 +115,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07) |
 | [0032](0032-native-desktop-client.md) | Native desktop client — Tauri v2 shell over a headless core crate, `sigil-core` linked natively (no wasm), re-using `cli/`'s container/vault/migration logic and sharing the CLI's vault file | Accepted (2026-07) |
 | [0033](0033-browser-device-identity-storage.md) | Browser device-identity storage — seal the Ed25519 device seed in a second `SIGILcli` container under the vault password (never plaintext web storage, never a `TotpVault` field) | Accepted (2026-07) |
+| [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07) |

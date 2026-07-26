@@ -502,7 +502,8 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   in-memory backend (non-durable) and a Postgres backend that **shares the op-log's
   existing `pgxpool`** (no second pool, no new dependency) over migration
   **`0002_devices.sql`** (`sigil_devices`, `sigil_enrollment_tokens`,
-  `sigil_device_grants`) — so `sigild_schema_version` now reports **2**. That
+  `sigil_device_grants`) — so `sigild_schema_version` reports **2** at that point
+  (**3** once the billing migration below is applied). That
   migration adds **AUTH METADATA ONLY** (public keys, IDs, labels, permissions,
   timestamps, a token digest) and touches **nothing** in `sigil_vault_ops`: the
   **opaque blob, its tamper-evidence hash chain, and the zero-knowledge boundary
@@ -517,6 +518,46 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   extended**, and there is still no account/session model, no key rotation and no
   enrollment rate limiting (see
   [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md)).
+  **Billing / subscriptions (opt-in, dev-gated):** because Sigil is a **paid**
+  product, `sigild` also carries a **provider-agnostic billing seam** —
+  one `billing.Provider` interface with three **stdlib-only** adapters
+  (**Stripe** international; **Razorpay** and **Juspay** for India), a
+  **normalized event vocabulary** (`checkout_completed`,
+  `subscription_activated`, `subscription_renewed`, `subscription_canceled`,
+  `payment_failed`, `ignored`), a **subscription state machine**
+  (`none`/`trialing`/`active`/`past_due`/`canceled`, written as an explicit
+  transition table), and three routes: `POST /v1/billing/checkout` +
+  `GET /v1/billing/subscription` (**device auth v3**, the same choke point as the
+  ops routes — the subject is the **authenticated device ID**, never a body
+  field) and `POST /v1/billing/webhook/{provider}` (authenticated **only** by the
+  provider's own signature over the **raw** body, because a payment provider has
+  no device key). Webhook handling is **idempotent on `(provider, event_id)`**,
+  fused with the state change into **one atomic operation** (a mutex in memory, a
+  transaction in Postgres over migration **`0003_billing.sql`** —
+  `sigil_subscriptions`, `sigil_billing_processed_events`; `sigild_schema_version`
+  → **3**), so a redelivered webhook is a guaranteed no-op that still answers
+  `200`. Two architectural properties: **hosted checkout only** — every adapter
+  asks the provider for a URL and hands it to the client, so **no card data ever
+  enters this process** and there is no field or column anywhere that could hold
+  a PAN/CVV/expiry (PCI scope stays SAQ-A); and **no vendor SDKs** — every
+  adapter is `net/http` + `crypto/hmac` + `encoding/json` + `net/url`, so
+  `sigild`'s go.mod still has exactly **one** direct require (`pgx`) and the
+  verification code stays small enough to audit by reading it.
+  **Honest architectural caveat:** putting a billing layer *inside the sync
+  server* is a **scaffold decision, not a final topology**. It is where it is
+  because that is where the device identity, the config/fail-fast plumbing, the
+  store seams, the audit log and `/metrics` already live — not because a
+  zero-knowledge sync server is the right long-term home for money-adjacent
+  state. A production shape would more likely separate billing (its own service
+  and database, its own blast radius, its own compliance surface) and have
+  `sigild` consume an entitlement, not compute one. Nothing here has been run
+  against a live provider account, the Juspay scheme is explicitly
+  **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, there is **no account model** (a
+  subscription keys off the enrolled device), and there is no
+  fraud/chargeback/refund/proration/tax handling and no PCI attestation (see
+  [`decisions/0034-billing-provider-seam.md`](decisions/0034-billing-provider-seam.md)).
+  Billing touches **nothing** in `sigil_vault_ops` and performs no cryptography
+  on vault contents, so the trust boundary is unchanged.
   `sigild` performs **no cryptography** on vault contents and never sees plaintext
   or vault keys. Full contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
@@ -1074,6 +1115,25 @@ authoritative list, with rationale, is the **defer ledger** in
   multi-instance deploy needs a shared store), and an ownership rule
   (trust-on-first-write) that is a dev heuristic rather than an identity. All of
   it is **dev-gated and UNAUDITED**.
+- **Billing exists in code but has never taken a payment, and lives in the wrong
+  place on purpose.** `sigild` has a real **provider-agnostic billing seam**
+  (Stripe / Razorpay / Juspay adapters, hosted checkout only, raw-body HMAC
+  webhook verification, an idempotent `(provider, event_id)` ledger, a
+  subscription state machine, migration `0003_billing.sql`;
+  [ADR 0034](decisions/0034-billing-provider-seam.md)) — **opt-in, dev-gated,
+  `501` by default, and UNAUDITED**. What it is **not**: it has **never been run
+  against a live provider account** (every test drives a local `httptest` server
+  with fake credentials), the **Juspay** scheme is explicitly
+  **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, recurring *subscription creation* is
+  unimplemented for the two India adapters (their webhook sides map the events,
+  but checkout creates a one-time hosted page), there is **no account model** — a
+  subscription keys off the enrolled **device** — no entitlement enforcement
+  anywhere, and no fraud, chargeback, refund, proration, tax, dunning or
+  reconciliation handling, and **no PCI attestation** (hosted checkout keeps
+  scope minimal; it certifies nothing). **Billing living inside the sync server
+  is provisional**: it is a scaffold placed where the identity, config, storage
+  and observability plumbing already existed, not a claim that money-adjacent
+  state belongs in a zero-knowledge sync server.
 - **No production storage.** The dev op-log now has an opt-in **durable Postgres
   backend** (`SIGILD_OPLOG_POSTGRES`, on `pgx`;
   [ADR 0014](decisions/0014-postgres-durable-oplog-backend.md)) alongside the

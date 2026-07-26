@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 
+	"github.com/ARYDESTROYER/sigil/sigild/internal/billing"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
 )
 
@@ -35,6 +36,19 @@ const (
 	auditEventDeviceRevoked      = "device.revoked"
 	auditEventVaultClaimed       = "vault.claimed"
 	auditEventVaultGranted       = "vault.granted"
+	// Billing events (Phase 45). METADATA ONLY: a provider name, a normalized
+	// event type, an opaque provider event/session reference, our own subject
+	// reference, and a fixed reason enum.
+	//
+	// They NEVER carry an API key, a webhook secret, a signature header, the RAW
+	// WEBHOOK BODY (or any part of it), an email address, a name, a phone
+	// number, an amount, or — by construction, since no such field exists
+	// anywhere in this server — a card number, CVV or expiry date.
+	auditEventBillingCheckout      = "billing.checkout_created"
+	auditEventBillingCheckoutError = "billing.checkout_failed"
+	auditEventBillingWebhook       = "billing.webhook"
+	auditEventBillingWebhookDenied = "billing.webhook_rejected"
+	auditEventBillingTransition    = "billing.subscription_transition"
 )
 
 // authMode reports the op-log's configured auth mode for the append audit line:
@@ -150,6 +164,77 @@ func (h *handlers) auditVaultClaimed(r *http.Request, vaultID, deviceID string) 
 		"request_id", RequestIDFromContext(r.Context()),
 		"vault_id", vaultID,
 		"device_id", deviceID,
+	)
+}
+
+// auditCheckoutCreated logs a hosted checkout session created for a subject.
+// sessionID is the PROVIDER's opaque session handle — useful for reconciling
+// against the provider dashboard, and useless for charging anyone. No amount, no
+// customer contact detail, and no payment-instrument field is recorded (none
+// exists).
+func (h *handlers) auditCheckoutCreated(r *http.Request, provider, subject, sessionID string) {
+	h.cfg.Logger.Info(auditEventBillingCheckout,
+		"event", auditEventBillingCheckout,
+		"request_id", RequestIDFromContext(r.Context()),
+		"provider", provider,
+		"subject", subject,
+		"session_id", sessionID,
+	)
+}
+
+// auditCheckoutFailed logs a failed provider checkout call. The error is a
+// billing.ProviderError (provider + operation + HTTP status) or a transport
+// error — deliberately never the provider's response BODY, which can echo
+// customer data, and never a credential (keys travel in headers, not URLs).
+func (h *handlers) auditCheckoutFailed(r *http.Request, provider, subject string, err error) {
+	h.cfg.Logger.Error(auditEventBillingCheckoutError,
+		"event", auditEventBillingCheckoutError,
+		"request_id", RequestIDFromContext(r.Context()),
+		"provider", provider,
+		"subject", subject,
+		"err", err.Error(),
+	)
+}
+
+// auditWebhook logs an AUTHENTICATED webhook and what we did with it. It records
+// the provider, the NORMALIZED event type, the provider's event ID (the
+// idempotency key, so a duplicate is explainable) and the outcome — never the
+// signature header and never one byte of the raw body.
+func (h *handlers) auditWebhook(r *http.Request, ev billing.Event, outcome string) {
+	h.cfg.Logger.Info(auditEventBillingWebhook,
+		"event", auditEventBillingWebhook,
+		"request_id", RequestIDFromContext(r.Context()),
+		"provider", ev.Provider,
+		"event_type", string(ev.Type),
+		"event_id", ev.ID,
+		"outcome", outcome,
+	)
+}
+
+// auditWebhookRejected logs a webhook we would not act on. reason is a fixed
+// enum naming which class of check failed; it is surfaced ONLY here and in the
+// per-reason metric, never in the HTTP response (the caller gets a coarse 401 or
+// 400). The signature header, the secret and the raw body are never logged.
+func (h *handlers) auditWebhookRejected(r *http.Request, provider, reason string) {
+	h.cfg.Logger.Warn(auditEventBillingWebhookDenied,
+		"event", auditEventBillingWebhookDenied,
+		"request_id", RequestIDFromContext(r.Context()),
+		"provider", provider,
+		"reason", reason,
+	)
+}
+
+// auditSubscriptionTransition logs a REAL subscription status change. It fires
+// once per applied transition — never for a duplicate, stale or illegal
+// delivery — so the audit trail is a faithful history of entitlement.
+func (h *handlers) auditSubscriptionTransition(r *http.Request, provider, subject, from, to string) {
+	h.cfg.Logger.Info(auditEventBillingTransition,
+		"event", auditEventBillingTransition,
+		"request_id", RequestIDFromContext(r.Context()),
+		"provider", provider,
+		"subject", subject,
+		"from", from,
+		"to", to,
 	)
 }
 

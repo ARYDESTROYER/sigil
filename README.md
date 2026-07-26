@@ -179,7 +179,8 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   becoming its owner), and **revocation** — so a request names *which* device signed it
   (`X-Sigil-Device`), a revoked device is refused on its next request, and "authenticated
   but not allowed" is a distinct `403` rather than a blanket `401`. It stores **auth
-  metadata only** (a new `0002_devices.sql` migration; `sigild_schema_version` → `2`) —
+  metadata only** (a new `0002_devices.sql` migration; `sigild_schema_version` → `2`, and
+  `3` once the billing migration below is applied) —
   the opaque blob, its hash chain, and the zero-knowledge boundary are unchanged, and it
   adds no new dependency. **Dev-gated and off by default** (every device route returns
   `501` unless `SIGILD_ENABLE_DEV_OPS` is set), **UNAUDITED**, and **not an account
@@ -189,6 +190,25 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   secrets. See [`docs/api.md`](docs/api.md) and
   [ADR 0031](docs/decisions/0031-multi-device-auth-model.md). Ships a distroless
   `Dockerfile`.
+  **Payment / subscription support exists in code — and only in code.** Because
+  Sigil is a paid product, `sigild` carries a provider-agnostic **billing seam**
+  with three adapters — **Stripe** (international), **Razorpay** and **Juspay**
+  (India) — behind three routes (`POST /v1/billing/checkout`,
+  `POST /v1/billing/webhook/{provider}`, `GET /v1/billing/subscription`). It uses
+  **hosted checkout only**, so **no card data ever reaches the server**; webhook
+  signatures are really verified (HMAC over the raw request body, constant-time),
+  duplicate deliveries are idempotent, and the adapters use **no vendor SDKs**
+  (the server still has exactly one third-party dependency). Be clear about what
+  that is **not**: it is **UNAUDITED**, **dev-gated and `501` by default**, and
+  it has **never been run against a live provider account** — every test drives a
+  local fake server with fake credentials, and the **Juspay** scheme in
+  particular is explicitly unverified against a real dashboard. There is no
+  account model (a subscription keys off an enrolled device), no entitlement
+  enforcement, no fraud/chargeback/refund/tax handling, and no PCI attestation.
+  **Nobody has been charged anything.** See
+  [`docs/api.md`](docs/api.md#billing--subscriptions-dev-gated-opt-in--phase-45),
+  [`docs/deployment.md`](docs/deployment.md) §13 and
+  [ADR 0034](docs/decisions/0034-billing-provider-seam.md).
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

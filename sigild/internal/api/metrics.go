@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	"github.com/ARYDESTROYER/sigil/sigild/internal/billing"
 )
 
 // Metrics holds sigild's process observability counters. They are exported in
@@ -60,6 +62,20 @@ type Metrics struct {
 	// enrollDenied counts enrollment denials by reason, over the enrollment
 	// subset of the same enum.
 	enrollDenied map[authReason]*atomic.Int64
+
+	// Billing counters (Phase 45). Every label below comes from a CLOSED,
+	// compile-time set — the three provider names, the normalized webhook
+	// outcomes, a fixed rejection-reason enum, and the subscription statuses.
+	//
+	// They count ONLY. There is never an API key, a webhook secret, a signature,
+	// a raw webhook body, an event ID, a subject/device ID, an email address, an
+	// amount, or any card field here — a labeled metric with an unbounded label
+	// would both explode cardinality and let an unauthenticated scrape enumerate
+	// customers, so the label sets are closed by construction.
+	billingCheckouts       map[string]*atomic.Int64         // provider
+	billingWebhooks        map[string]*atomic.Int64         // provider|outcome
+	billingWebhookRejected map[string]*atomic.Int64         // reason
+	billingSubTransitions  map[billing.Status]*atomic.Int64 // to-status
 }
 
 // authDenyReasons is the fixed, exhaustive set of non-OK request-auth reasons,
@@ -96,14 +112,46 @@ var enrollDenyReasons = []authReason{
 	reasonStoreUnavailable,
 }
 
+// billingWebhookOutcomes is the closed set of webhook outcomes, in a stable
+// order. "accepted" is a state change; every other value is an acknowledged
+// no-op (all of them are HTTP 200 — see billingWebhook).
+var billingWebhookOutcomes = []string{
+	"accepted",
+	"ignored",
+	"duplicate",
+	"stale",
+	"illegal",
+	"unresolved",
+}
+
+// billingRejectReasons is the closed set of reasons a webhook was NOT accepted.
+// Like the auth reasons these are a fixed enum naming which class of check
+// failed; they are surfaced only to the operator (audit log + this metric),
+// never to the caller.
+var billingRejectReasons = []string{
+	"bad_signature",
+	"malformed",
+	"unknown_provider",
+	"payload_too_large",
+	"store_error",
+}
+
+// billingWebhookKey builds the composite map key for the two-label webhook
+// counter. Both halves come from closed sets, so the key space is fixed.
+func billingWebhookKey(provider, outcome string) string { return provider + "|" + outcome }
+
 // newMetrics returns a fresh, zeroed Metrics for one router/server instance.
 // schemaVersion is the applied op-log DB migration version (0 for mem/file).
 func newMetrics(version string, schemaVersion int64) *Metrics {
 	m := &Metrics{
-		version:       version,
-		schemaVersion: schemaVersion,
-		authDenied:    make(map[authReason]*atomic.Int64, len(authDenyReasons)),
-		enrollDenied:  make(map[authReason]*atomic.Int64, len(enrollDenyReasons)),
+		version:                version,
+		schemaVersion:          schemaVersion,
+		authDenied:             make(map[authReason]*atomic.Int64, len(authDenyReasons)),
+		enrollDenied:           make(map[authReason]*atomic.Int64, len(enrollDenyReasons)),
+		billingCheckouts:       make(map[string]*atomic.Int64, len(billing.SupportedProviders)),
+		billingWebhooks:        make(map[string]*atomic.Int64),
+		billingWebhookRejected: make(map[string]*atomic.Int64, len(billingRejectReasons)),
+		billingSubTransitions:  make(map[billing.Status]*atomic.Int64, len(billing.Statuses)),
 	}
 	for _, r := range authDenyReasons {
 		m.authDenied[r] = new(atomic.Int64)
@@ -111,7 +159,55 @@ func newMetrics(version string, schemaVersion int64) *Metrics {
 	for _, r := range enrollDenyReasons {
 		m.enrollDenied[r] = new(atomic.Int64)
 	}
+	// Billing label sets are fully materialized here — the maps are never
+	// structurally modified afterwards, so a concurrent scrape and a concurrent
+	// increment cannot race.
+	for _, p := range billing.SupportedProviders {
+		m.billingCheckouts[p] = new(atomic.Int64)
+		for _, o := range billingWebhookOutcomes {
+			m.billingWebhooks[billingWebhookKey(p, o)] = new(atomic.Int64)
+		}
+	}
+	for _, reason := range billingRejectReasons {
+		m.billingWebhookRejected[reason] = new(atomic.Int64)
+	}
+	for _, s := range billing.Statuses {
+		m.billingSubTransitions[s] = new(atomic.Int64)
+	}
 	return m
+}
+
+// incBillingCheckout records one hosted checkout session created. An unknown
+// provider name (impossible — it comes from the configured, closed set) is
+// ignored rather than mutating the map concurrently.
+func (m *Metrics) incBillingCheckout(provider string) {
+	if c := m.billingCheckouts[provider]; c != nil {
+		c.Add(1)
+	}
+}
+
+// incBillingWebhook records one ACCEPTED webhook by provider and outcome.
+func (m *Metrics) incBillingWebhook(provider, outcome string) {
+	if c := m.billingWebhooks[billingWebhookKey(provider, outcome)]; c != nil {
+		c.Add(1)
+	}
+}
+
+// incBillingWebhookRejected records one webhook rejected before it could be
+// applied, by the fixed reason enum.
+func (m *Metrics) incBillingWebhookRejected(reason string) {
+	if c := m.billingWebhookRejected[reason]; c != nil {
+		c.Add(1)
+	}
+}
+
+// incBillingTransition records one REAL subscription status change, labeled by
+// the status moved TO. It fires once per applied transition and never for a
+// duplicate, stale or illegal delivery.
+func (m *Metrics) incBillingTransition(to billing.Status) {
+	if c := m.billingSubTransitions[to]; c != nil {
+		c.Add(1)
+	}
 }
 
 // observeHTTP records one served response by total and status class.
@@ -226,6 +322,54 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 		b.WriteString(string(r))
 		b.WriteString(`"} `)
 		b.WriteString(strconv.FormatInt(m.enrollDenied[r].Load(), 10))
+		b.WriteByte('\n')
+	}
+
+	// Billing. Counts only, over closed label sets: provider names, normalized
+	// outcomes, a fixed reason enum, and subscription statuses. Nothing here can
+	// carry a secret, a signature, a webhook body, a subject ID, an email or an
+	// amount.
+	b.WriteString("# HELP sigild_billing_checkouts_total Total hosted checkout sessions created, by provider.\n")
+	b.WriteString("# TYPE sigild_billing_checkouts_total counter\n")
+	for _, p := range billing.SupportedProviders {
+		b.WriteString(`sigild_billing_checkouts_total{provider="`)
+		b.WriteString(p)
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(m.billingCheckouts[p].Load(), 10))
+		b.WriteByte('\n')
+	}
+
+	b.WriteString("# HELP sigild_billing_webhooks_total Total authenticated webhooks handled, by provider and outcome.\n")
+	b.WriteString("# TYPE sigild_billing_webhooks_total counter\n")
+	for _, p := range billing.SupportedProviders {
+		for _, o := range billingWebhookOutcomes {
+			b.WriteString(`sigild_billing_webhooks_total{provider="`)
+			b.WriteString(p)
+			b.WriteString(`",outcome="`)
+			b.WriteString(o)
+			b.WriteString(`"} `)
+			b.WriteString(strconv.FormatInt(m.billingWebhooks[billingWebhookKey(p, o)].Load(), 10))
+			b.WriteByte('\n')
+		}
+	}
+
+	b.WriteString("# HELP sigild_billing_webhook_rejected_total Total webhooks rejected before application, by reason.\n")
+	b.WriteString("# TYPE sigild_billing_webhook_rejected_total counter\n")
+	for _, reason := range billingRejectReasons {
+		b.WriteString(`sigild_billing_webhook_rejected_total{reason="`)
+		b.WriteString(reason)
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(m.billingWebhookRejected[reason].Load(), 10))
+		b.WriteByte('\n')
+	}
+
+	b.WriteString("# HELP sigild_billing_subscription_transitions_total Total applied subscription status transitions, by target status.\n")
+	b.WriteString("# TYPE sigild_billing_subscription_transitions_total counter\n")
+	for _, s := range billing.Statuses {
+		b.WriteString(`sigild_billing_subscription_transitions_total{status="`)
+		b.WriteString(string(s))
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(m.billingSubTransitions[s].Load(), 10))
 		b.WriteByte('\n')
 	}
 

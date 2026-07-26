@@ -85,6 +85,20 @@ type Config struct {
 	// PLAINTEXT tokens never reach this struct, are never stored, and are never
 	// logged. An empty slice means NO device can enroll.
 	EnrollTokenHashes []string
+	// Billing wires the OPT-IN subscription/payment layer (Phase 45). With no
+	// providers configured (the default) Billing.Enabled() is false and every
+	// /v1/billing route returns the deliberate 501 — exactly like the ops and
+	// device routes, and exactly like a server with billing compiled in but
+	// never switched on.
+	//
+	// It additionally requires Devices: checkout and subscription status are
+	// authenticated with the EXISTING device-auth v3 contract, so without a
+	// device registry there is nobody to authenticate a buyer as. cmd/server
+	// rejects that combination at boot; the router gates on it defensively.
+	//
+	// NO CARD DATA passes through this configuration or the handlers behind it:
+	// every provider is used through its HOSTED checkout flow.
+	Billing BillingConfig
 	// AdminToken is the OPTIONAL operator token (SIGILD_ADMIN_TOKEN) that
 	// authorizes the operator-only device routes (list all devices, revoke any
 	// device). Empty (the default) means those operator paths are permanently
@@ -180,6 +194,27 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("POST /v1/devices/{deviceID}/revoke", stub)
 		mux.Handle("POST /v1/vaults/{vaultID}/grants", stub)
 		mux.Handle("GET /v1/vaults/{vaultID}/grants", stub)
+	}
+
+	// Billing routes (hosted checkout, provider webhooks, subscription status).
+	// Dev-gated exactly like everything else stateful AND additionally opt-in via
+	// their own configuration: with either off, all three return the deliberate
+	// 501 rather than 404 or any partial behaviour. Bodies are capped
+	// (oversized -> 413) before any handler runs.
+	if h.billingEnabled() {
+		mux.Handle("POST /v1/billing/checkout",
+			limitBody(maxCheckoutBodyBytes, http.HandlerFunc(h.billingCheckout)))
+		// The webhook is authenticated by the PROVIDER's signature over the raw
+		// body, not by the device contract — see billing.go for why that is the
+		// only endpoint outside the device model.
+		mux.Handle("POST /v1/billing/webhook/{provider}",
+			limitBody(maxWebhookBodyBytes, http.HandlerFunc(h.billingWebhook)))
+		mux.Handle("GET /v1/billing/subscription", http.HandlerFunc(h.billingSubscription))
+	} else {
+		stub := http.HandlerFunc(h.billingNotImplemented)
+		mux.Handle("POST /v1/billing/checkout", limitBody(maxCheckoutBodyBytes, stub))
+		mux.Handle("POST /v1/billing/webhook/{provider}", limitBody(maxWebhookBodyBytes, stub))
+		mux.Handle("GET /v1/billing/subscription", stub)
 	}
 
 	// Outermost first: count every response (even a recoverer-written 500),

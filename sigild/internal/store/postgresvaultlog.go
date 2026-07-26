@@ -284,6 +284,12 @@ func (l *PostgresVaultLog) SchemaVersion(ctx context.Context) (int64, error) {
 	return AppliedVersion(ctx, l.pool)
 }
 
+// Pool exposes the underlying connection pool so a caller can SHARE it with
+// another adapter against the same database (the device registry does exactly
+// that — see NewPostgresDeviceStore), instead of opening a second pool. The
+// PostgresVaultLog retains ownership: the pool is released by Close.
+func (l *PostgresVaultLog) Pool() *pgxpool.Pool { return l.pool }
+
 // Close releases the underlying connection pool. It is safe to call once when
 // the log is no longer needed (e.g. on shutdown or in tests).
 func (l *PostgresVaultLog) Close() {

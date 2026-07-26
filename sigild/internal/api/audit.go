@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+
+	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
 )
 
 // Structured audit events for the DEV op-log. They are emitted through
@@ -24,15 +26,29 @@ const (
 	auditEventList       = "oplog.list"
 	auditEventVerify     = "oplog.verify"
 	auditEventAuthDenied = "oplog.auth_denied"
+	// Device-model events (Phase 41). Like the op-log events they carry
+	// METADATA ONLY: a device ID, a label, a permission, a fixed reason enum.
+	// They NEVER carry a public key, a signature, a nonce, a timestamp value, an
+	// enrollment token (or its digest), an admin token, or blob content.
+	auditEventDeviceEnrolled     = "device.enrolled"
+	auditEventDeviceEnrollDenied = "device.enroll_denied"
+	auditEventDeviceRevoked      = "device.revoked"
+	auditEventVaultClaimed       = "vault.claimed"
+	auditEventVaultGranted       = "vault.granted"
 )
 
 // authMode reports the op-log's configured auth mode for the append audit line:
-// "ed25519" when a device pubkey is configured, else "none".
+// "device" when the v3 multi-device registry is active, "ed25519" for the legacy
+// single configured pubkey, else "none".
 func (h *handlers) authMode() string {
-	if h.cfg.OpLogPubKey != nil {
+	switch {
+	case h.deviceAuthEnabled():
+		return "device"
+	case h.cfg.OpLogPubKey != nil:
 		return "ed25519"
+	default:
+		return "none"
 	}
-	return "none"
 }
 
 // auditAppend logs a SUCCESSFUL op-log append. blob_sha256 is a hex fingerprint
@@ -74,13 +90,76 @@ func (h *handlers) auditVerify(r *http.Request, vaultID string, ok bool, count u
 	)
 }
 
-// auditAuthDenied logs an op-log request rejected by authorizeOps. reason is the
-// fixed enum naming the failed check (never any secret material).
-func (h *handlers) auditAuthDenied(r *http.Request, vaultID string, reason authReason) {
+// auditAuthDenied logs a request rejected by authentication or authorization.
+// reason is the fixed enum naming the failed check; deviceID is the device ID
+// the client PRESENTED (recorded even when it resolved to nothing, so an
+// operator can see who was probing) and is empty in the legacy/no-auth modes.
+// Never any secret material.
+func (h *handlers) auditAuthDenied(r *http.Request, vaultID, deviceID string, reason authReason) {
 	h.cfg.Logger.Warn(auditEventAuthDenied,
 		"event", auditEventAuthDenied,
 		"request_id", RequestIDFromContext(r.Context()),
 		"vault_id", vaultID,
+		"device_id", deviceID,
 		"reason", string(reason),
+		"status", authStatus(reason),
+	)
+}
+
+// auditEnrolled logs a SUCCESSFUL device enrollment. It records the assigned
+// device ID and label only — never the enrolled PUBLIC KEY, never the
+// enrollment token or its digest, never the proof signature.
+func (h *handlers) auditEnrolled(r *http.Request, d store.Device) {
+	h.cfg.Logger.Info(auditEventDeviceEnrolled,
+		"event", auditEventDeviceEnrolled,
+		"request_id", RequestIDFromContext(r.Context()),
+		"device_id", d.ID,
+		"label", d.Label,
+	)
+}
+
+// auditEnrollDenied logs a REJECTED enrollment attempt. reason is the fixed enum
+// naming the failed check; no device ID exists yet, and no token/key/signature
+// is ever logged.
+func (h *handlers) auditEnrollDenied(r *http.Request, reason authReason) {
+	h.cfg.Logger.Warn(auditEventDeviceEnrollDenied,
+		"event", auditEventDeviceEnrollDenied,
+		"request_id", RequestIDFromContext(r.Context()),
+		"reason", string(reason),
+	)
+}
+
+// auditDeviceRevoked logs a device revocation. revokedBy is either "admin" (the
+// operator token path) or the revoking device's own ID (self-revocation) — never
+// the token itself.
+func (h *handlers) auditDeviceRevoked(r *http.Request, deviceID, revokedBy string) {
+	h.cfg.Logger.Warn(auditEventDeviceRevoked,
+		"event", auditEventDeviceRevoked,
+		"request_id", RequestIDFromContext(r.Context()),
+		"device_id", deviceID,
+		"revoked_by", revokedBy,
+	)
+}
+
+// auditVaultClaimed logs a trust-on-first-write ownership claim: this device is
+// now the vault's owner. It is the security-relevant moment when a vault ID
+// becomes bound to a device, so it is logged at Info with both IDs.
+func (h *handlers) auditVaultClaimed(r *http.Request, vaultID, deviceID string) {
+	h.cfg.Logger.Info(auditEventVaultClaimed,
+		"event", auditEventVaultClaimed,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"device_id", deviceID,
+	)
+}
+
+// auditGrant logs an access grant on a vault: which device was granted what.
+func (h *handlers) auditGrant(r *http.Request, vaultID, deviceID, permission string) {
+	h.cfg.Logger.Info(auditEventVaultGranted,
+		"event", auditEventVaultGranted,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"device_id", deviceID,
+		"permission", permission,
 	)
 }

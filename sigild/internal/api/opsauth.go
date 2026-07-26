@@ -23,6 +23,11 @@ const opsAuthSkew = 300 // seconds
 // v2 (this) adds a per-request nonce to the signed message + a server-side
 // replay cache. It is a CLEAN BREAK from v1: a v1 signature (no nonce segment)
 // no longer verifies, and a request without X-Sigil-Nonce is rejected.
+//
+// v3 (see deviceauth.go) supersedes this for the multi-device model. v2 remains
+// here UNCHANGED as the LEGACY single-static-key mode, active only when
+// SIGILD_OPLOG_PUBKEY is set and the device registry is not configured, so
+// existing clients keep working byte-for-byte.
 const opsAuthDomain = "sigil-oplog-auth-v2\n"
 
 // authReason is the machine-readable cause of an op-log auth outcome. The empty
@@ -197,15 +202,6 @@ func (h *handlers) authorizeOps(r *http.Request, body []byte) authReason {
 	return reasonOK
 }
 
-// writeOpsAuthError maps a non-OK authReason to the 401 typed-error envelope,
-// distinguishing a replayed request from a generic signature failure. The error
-// CODE stays "unauthorized" in every case; only the detail differs (and it never
-// echoes the specific reason, to avoid handing a prober a check-by-check oracle
-// — the precise reason goes only to the server-side audit log).
-func writeOpsAuthError(w http.ResponseWriter, reason authReason) {
-	detail := "missing or invalid op-log request signature"
-	if reason == reasonReplayed {
-		detail = "replayed request"
-	}
-	writeError(w, http.StatusUnauthorized, "unauthorized", detail)
-}
+// The response writer for a denied request lives in deviceauth.go
+// (writeAuthError): it handles BOTH the v2 reasons above and the v3 device
+// reasons, and is the single place that decides 401 vs 403 vs 500.

@@ -36,6 +36,11 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > vendored wasm + the proven JS helpers, sealing to the same `SIGILcli` vault, sealed-only
 > `chrome.storage.local` persistence with an in-memory password; dev / UNAUDITED, loaded
 > unpacked and published to no store),
+> the dev op-log's **multi-device auth model** (contract v3 — a device registry of
+> per-device Ed25519 keys, enrollment via an operator token **plus** proof of
+> possession, per-vault grants with trust-on-first-write ownership, and revocation;
+> opt-in, dev-gated, mutually exclusive with the legacy single-static-key v2, and
+> still UNAUDITED),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -98,3 +103,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0028](0028-webapp-vault-persistence-and-unlock.md) | Webapp vault persistence + password-unlock model (persist only the `SIGILcli`-sealed container in `localStorage`; in-memory password) | Accepted (2026-07) |
 | [0029](0029-webapp-pwa-offline-a11y-and-ci.md) | Webapp as an offline-capable, accessible PWA (hand-rolled service worker + manifest) + a Rust/wasm-pack webapp CI job | Accepted (2026-07) |
 | [0030](0030-browser-extension-client.md) | MV3 browser-extension client — popup TOTP authenticator over the vendored wasm + proven helpers (sealed-only `chrome.storage.local`, in-memory password) | Accepted (2026-07) |
+| [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07) |

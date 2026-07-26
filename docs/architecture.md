@@ -425,8 +425,60 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   byte-for-byte, so **`GET …/ops/verify` re-proves the same `tip_hash` after a
   restore** (see
   [`decisions/0018-managed-oplog-migrations-and-backup-integrity.md`](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)).
-  `sigild` performs **no cryptography** and never sees plaintext or keys. Full
-  contract in [`api.md`](api.md).
+  **Multi-device auth model (contract v3, opt-in):** alongside the legacy
+  single-static-key v2 above, `sigild` now has a **real device-identity and
+  authorization model** — opt-in via **`SIGILD_DEVICE_AUTH`**, dev-gated behind
+  `SIGILD_ENABLE_DEV_OPS`, and **mutually exclusive** with `SIGILD_OPLOG_PUBKEY`
+  (setting both makes the server **refuse to boot**, fail-fast before the
+  listener binds). It has four parts:
+  (1) a **device registry** — one Ed25519 public key per device with a
+  **server-assigned** ID (`dev_` + raw-URL-base64 of 16 CSPRNG bytes), a label
+  and an `active`/`revoked` status;
+  (2) **enrollment** (`POST /v1/devices/enroll`) requiring **two independent
+  factors** — an operator-provisioned single-use **enrollment token**
+  (`SIGILD_ENROLL_TOKENS`, held **only** as a SHA-256 digest, optional
+  `SIGILD_ENROLL_TOKEN_TTL`) **plus proof of possession**: a signature over a
+  challenge on a *different* domain (`"sigil-device-enroll-v1\n" + token_sha256 +
+  timestamp + nonce + public_key + label`) verified against the **submitted**
+  key, so neither a stolen token nor a captured proof suffices alone;
+  (3) **per-vault grants** — `(vaultID, deviceID) -> read|write` (write implies
+  read) with **trust-on-first-write ownership**: the first device to
+  authenticate a *write* to an unclaimed vault becomes its owner (atomically — a
+  mutex in memory, a partial `UNIQUE` index in Postgres), reads never claim, and
+  only the owner may grant; and
+  (4) **revocation** (`POST /v1/devices/{deviceID}/revoke`, by the operator
+  `SIGILD_ADMIN_TOKEN` or by the device on itself), checked **before** signature
+  verification so a revoked device is refused on its very next request.
+  Requests name their device in a new **`X-Sigil-Device`** header and sign
+  `"sigil-oplog-auth-v3\n" + device_id + method + path + query + timestamp +
+  nonce + body`; the domain bump *and* the device segment mean **v2 signatures do
+  not verify under v3**. `401` (unauthenticated) and `403` (authenticated but not
+  authorized) are now **distinct**, while the response body stays coarse
+  (`unauthorized` / `forbidden`) — the typed reason goes **only** to the audit log
+  (`device.enrolled`, `device.revoked`, `vault.claimed`, `vault.granted`,
+  `oplog.auth_denied` with `device_id` + `reason`) and the per-reason metric, so
+  there is **no auth oracle**.
+  It rides the **same store seams**: a `store.DeviceStore` interface with an
+  in-memory backend (non-durable) and a Postgres backend that **shares the op-log's
+  existing `pgxpool`** (no second pool, no new dependency) over migration
+  **`0002_devices.sql`** (`sigil_devices`, `sigil_enrollment_tokens`,
+  `sigil_device_grants`) — so `sigild_schema_version` now reports **2**. That
+  migration adds **AUTH METADATA ONLY** (public keys, IDs, labels, permissions,
+  timestamps, a token digest) and touches **nothing** in `sigil_vault_ops`: the
+  **opaque blob, its tamper-evidence hash chain, and the zero-knowledge boundary
+  are completely unchanged**, and the server still does no cryptography on vault
+  contents. All five device routes are dev-gated exactly like the ops routes
+  (`501` when off, never `404`). Honest scope: **dev-gated, opt-in, UNAUDITED** —
+  trust-on-first-write is a dev ownership model rather than an account model,
+  revoking a vault's owner **orphans** it (no ownership transfer), an enrollment
+  token is single-*attempt* (spent before the device row is created), the replay
+  cache is still **per-process**, the in-memory registry is non-durable (a spent
+  token becomes reusable after a restart) and the **file backend was not
+  extended**, and there is still no account/session model, no key rotation and no
+  enrollment rate limiting (see
+  [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md)).
+  `sigild` performs **no cryptography** on vault contents and never sees plaintext
+  or vault keys. Full contract in [`api.md`](api.md).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
   Next.js 15 stealth splash + early-access waitlist. No-index, wallable, no
   product surface.
@@ -666,11 +718,15 @@ rogue-employee and compromised-server adversaries — see
 does not change this: it records metadata and a **SHA-256 fingerprint of the
 already-encrypted blob**, never the blob content or any key, so an audit trail of
 *who appended what, when* coexists with the server never seeing plaintext. Note the current dev op-log is *also*
-non-durable and unauthenticated by default — optionally guarded by a single
-static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, contract v2: a per-request
-nonce checked against a time-bounded in-memory replay cache; real multi-device
-auth is still future) — which is why it is dev-gated-off and must never be
-exposed or hold real secrets.
+non-durable and unauthenticated by default — optionally guarded either by a
+single static Ed25519 dev device key (`SIGILD_OPLOG_PUBKEY`, contract v2: a
+per-request nonce checked against a time-bounded in-memory replay cache) or by
+the opt-in **multi-device model** (`SIGILD_DEVICE_AUTH`, contract v3: a device
+registry, enrollment with proof of possession, per-vault grants and revocation;
+[ADR 0031](decisions/0031-multi-device-auth-model.md)) — which is still
+dev-gated-off, still **UNAUDITED**, and must never be exposed or hold real
+secrets. Neither contract changes the blob: device auth adds **auth metadata
+only**, so the server remains zero-knowledge either way.
 
 **A second, public-key data path exists at the crypto level (not yet wired into
 the product).** The flow above is the *symmetric*, password-derived path
@@ -833,14 +889,22 @@ authoritative list, with rationale, is the **defer ledger** in
   UNAUDITED**, **loaded unpacked and published to no store**, has **no sync** (it
   never talks to `sigild`), and implements **none** of the originally reserved
   extension ambitions (phishing protection, passkey provider, content scripts).
-- **No real auth or authorization.** The dev op-log is wide open by default; an
-  optional `SIGILD_OPLOG_PUBKEY` enables a **single static** Ed25519 dev
-  device-key signature check (contract v2: a per-request nonce plus a
-  time-bounded, **per-process** in-memory replay cache — a multi-instance deploy
-  would need a shared store), but there is no device enrollment, no multi-device
-  registry, no JWT auth, and no per-vault membership check
-  ([`decisions/0008-device-key-request-auth.md`](decisions/0008-device-key-request-auth.md),
-  [`decisions/0010-op-log-auth-v2-nonce-replay.md`](decisions/0010-op-log-auth-v2-nonce-replay.md)).
+- **Auth and authorization now exist for the dev op-log, but no account model
+  does.** The op-log is still **wide open by default**. Two opt-in contracts
+  change that: legacy `SIGILD_OPLOG_PUBKEY` (a **single static** Ed25519 dev key,
+  contract v2, no authorization at all —
+  [ADR 0008](decisions/0008-device-key-request-auth.md),
+  [ADR 0010](decisions/0010-op-log-auth-v2-nonce-replay.md)), and the **v3
+  multi-device model** (`SIGILD_DEVICE_AUTH`) — a real device registry, enrollment
+  with proof of possession, per-vault grants and revocation
+  ([ADR 0031](decisions/0031-multi-device-auth-model.md)). What is still missing
+  is the **product** layer: no user/account model, no session or JWT token
+  issuance ([`../sigild/internal/auth/`](../sigild/internal/auth/) is still a
+  placeholder), no key rotation or re-enrollment, no recovery, no rate limiting on
+  enrollment attempts, a replay cache that is still **per-process** (a
+  multi-instance deploy needs a shared store), and an ownership rule
+  (trust-on-first-write) that is a dev heuristic rather than an identity. All of
+  it is **dev-gated and UNAUDITED**.
 - **No production storage.** The dev op-log now has an opt-in **durable Postgres
   backend** (`SIGILD_OPLOG_POSTGRES`, on `pgx`;
   [ADR 0014](decisions/0014-postgres-durable-oplog-backend.md)) alongside the
@@ -850,7 +914,10 @@ authoritative list, with rationale, is the **defer ledger** in
   backup runbook whose restore integrity is proved by the op-log hash chain**
   ([ADR 0018](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)) —
   but that is **still not a production store**: no PITR / replication, no
-  Redis / object store, and no auth / enrollment / CRDT around it.
+  Redis / object store, and no CRDT around it. (Device enrollment and per-vault
+  authorization *do* now exist as an opt-in dev model,
+  [ADR 0031](decisions/0031-multi-device-auth-model.md) — but they are dev-gated,
+  unaudited, and not an account model.)
 - **Both hybrid constructions are assembled; the hybrid KEM now drives a
   crypto-level seal/open flow, but neither is in the product flow.** For key
   agreement, the **combined hybrid KEM exists as a standalone primitive**

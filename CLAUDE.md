@@ -145,7 +145,9 @@ public, make no security claims, until the audit completes and trademark clears.
   domain prefix `…-v1`→`…-v2`; v1-signed requests no longer verify). **Default off**
   (no pubkey → unauthenticated, behavior unchanged); a **SINGLE static dev key** and
   the replay cache is **per-process/in-memory** (multi-instance needs a shared store,
-  e.g. Redis), dev-only — enrollment / multi-device / JWT remain future. **No crypto
+  e.g. Redis), dev-only — this v2 mode is now the **LEGACY** contract, superseded (when
+  enabled) by the opt-in **multi-device contract v3** below; JWT/session issuance remains
+  future. **No crypto
   on the blob**: the server never decodes it; it
   stores/returns the exact client bytes. **Hardened for reliability + auditability
   (Phase 25, ADR 0015):** the `VaultLog` seam is **request-context-aware** — `Append`/
@@ -218,6 +220,77 @@ public, make no security claims, until the audit completes and trademark clears.
   same `tip_hash`) — the verifier proved a dump→drop→restore preserved the `tip_hash`. Still a
   **dev** backend (no PITR/replication/object-store, no production change-management). Runbook
   in [`docs/deployment.md`](docs/deployment.md) §11–§12.
+  **A REAL MULTI-DEVICE AUTH MODEL — op-log auth contract v3 (Phase 41, ADR 0031),
+  opt-in + dev-gated:** when **`SIGILD_DEVICE_AUTH`** is truthy (requires
+  `SIGILD_ENABLE_DEV_OPS`; **MUTUALLY EXCLUSIVE with `SIGILD_OPLOG_PUBKEY`** — with both
+  set the server **REFUSES TO BOOT**, rc=1, `"invalid device-auth configuration"`), the one
+  static v2 key is replaced by a **device registry**: each request carries a new
+  **`X-Sigil-Device`** header naming an ENROLLED device and is verified against **THAT
+  device's registered Ed25519 public key**. Signed message
+  (`canonicalV3Message`, deviceauth.go): `"sigil-oplog-auth-v3\n" + DEVICE_ID + "\n" +
+  METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY` —
+  the domain bump v2→v3 **plus** the device segment mean **v2 signatures do not verify
+  under v3** (401). Headers: `X-Sigil-Device`/`X-Sigil-Timestamp`/`X-Sigil-Nonce`/
+  `X-Sigil-Signature` (+ `X-Sigil-Enroll-Token`, `X-Sigil-Admin-Token`); the 300 s window
+  and per-process nonce cache are retained. **Five NEW dev-gated routes** (`501` when
+  dev-ops off — never 404): **`POST /v1/devices/enroll`**, **`GET /v1/devices`**,
+  **`POST /v1/devices/{deviceID}/revoke`**, **`POST /v1/vaults/{vaultID}/grants`**,
+  **`GET /v1/vaults/{vaultID}/grants`**; the existing ops routes now also enforce
+  **per-vault authorization** (POST ⇒ write, GET ops + ops/verify ⇒ read).
+  **ENROLLMENT = two mandatory factors:** an operator token (**`SIGILD_ENROLL_TOKENS`**,
+  comma-separated, each ≥16 chars, **held ONLY as SHA-256 digests**; optional
+  **`SIGILD_ENROLL_TOKEN_TTL`**, a positive Go duration — unset ⇒ no expiry but still
+  SINGLE-USE) **PLUS proof of possession** over a DIFFERENT domain
+  (`canonicalEnrollMessage`): `"sigil-device-enroll-v1\n" + TOKEN_SHA256_HEX + "\n" +
+  TIMESTAMP + "\n" + NONCE + "\n" + PUBLIC_KEY_B64 + "\n" + LABEL`, signed by the enrolling
+  key and verified against the **SUBMITTED** public key (body `{"public_key","label"}`,
+  proof in `X-Sigil-Signature`) — so a proof can never be replayed as a request signature.
+  **VERIFY ORDER** (1:1 with the audit reason): headers → timestamp parses → inside 300 s →
+  device resolves → **NOT revoked (checked BEFORE signature verification**, so revocation
+  bites on the next request) → Ed25519 verifies under that device's key → nonce not
+  replayed (recorded ONLY after a valid signature) → per-vault authorization.
+  **AUTHORIZATION:** grants are `(vaultID, deviceID) -> read|write` (write implies read);
+  ownership is **TRUST-ON-FIRST-WRITE** — the first device to authenticate a WRITE to an
+  unclaimed vault becomes owner (atomic: mutex in mem, partial UNIQUE index in Postgres);
+  reads never claim (403 on an unowned vault); only the owner may grant. **401 =
+  unauthenticated, 403 = authorized-not-permitted**, but the client body is only
+  `{"error":"unauthorized"}` / `{"error":"forbidden"}` — the typed reason
+  (`unknown_device`/`revoked_device`/`unauthorized_vault`/`not_vault_owner`/
+  `forbidden_device`/`bad_admin_token`/`bad_proof`/`enrollment_token_used`/… ) goes ONLY to
+  the audit log + metrics, so **there is no auth oracle**. Optional
+  **`SIGILD_ADMIN_TOKEN`** (≥16 chars) gates the operator routes (list all / revoke any);
+  **unset ⇒ those routes are permanently 401 — there is NO implicit open-admin mode**. All
+  four env vars are validated **fail-fast before the listener binds**.
+  **STORAGE:** a new managed migration **`0002_devices.sql`** (0001_init untouched) creates
+  **`sigil_devices`** / **`sigil_enrollment_tokens`** / **`sigil_device_grants`** (+ the
+  partial unique index `sigil_device_grants_one_owner`) → **`sigild_schema_version` now
+  reports 2**. `store.DeviceStore` is the seam: `MemDeviceStore` (non-durable) or
+  `PostgresDeviceStore` **sharing the op-log's existing `pgxpool`** (no second pool, **no new
+  dep** — `pgx` is still the only one). **The op-log blob is UNTOUCHED — this adds AUTH
+  METADATA ONLY, so the hash chain and the zero-knowledge boundary are unaffected.** New
+  metrics: `sigild_device_enrollments_total`, `sigild_device_revocations_total`,
+  `sigild_vault_grants_total`, `sigild_vault_claims_total`, `sigild_oplog_authz_denied_total`,
+  `sigild_device_enroll_denied_total{reason}` (+ new reasons on
+  `sigild_oplog_auth_denied_total{reason}`); new audit events `device.enrolled` /
+  `device.enroll_denied` / `device.revoked` / `vault.claimed` / `vault.granted` carrying
+  `device_id` + `reason` but **never** a key/token/signature/nonce/blob.
+  **HONEST LIMITS (do NOT paper over):** TOFU is a **dev ownership model, not an account
+  model**; an enrollment token is **single-ATTEMPT not single-SUCCESS** (spent before the
+  device row is created, so a duplicate-key enrollment burns it — fail-closed, issue a new
+  token); the **replay nonce cache is per-process/in-memory** (multi-instance needs a shared
+  store; enrollment nonces are prefix-separated in the shared namespace); **revoking a
+  vault's owner ORPHANS the vault** (no ownership transfer); the **in-memory registry is
+  non-durable** (a spent token becomes reusable after restart — warned at boot) and the
+  **file backend was NOT extended** (device auth + `SIGILD_OPLOG_DIR` falls back to the
+  in-memory registry, warned at boot); and it is still **dev-gated, pre-audit, UNAUDITED** —
+  no user/account model, no session/token issuance, **no rate limiting on enrollment
+  attempts**, no key rotation. Contract in [`docs/api.md`](docs/api.md); ADR 0031.
+- `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
+  nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
+  (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
+  `internal/vault` (6–7-line `doc.go` placeholders). They name future work only — note in
+  particular that `internal/auth` is **NOT** where the real auth lives (that is
+  `internal/api/deviceauth.go` + `internal/store/devicestore.go`).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — Next.js 15 app running the libsigil
   core via **WebAssembly, entirely client-side** (over the `@sigil/wasm` loader that

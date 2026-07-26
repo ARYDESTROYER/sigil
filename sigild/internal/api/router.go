@@ -65,6 +65,32 @@ type Config struct {
 	// applied migration version; it stays 0 for the mem/file backends (which
 	// have no migrations).
 	SchemaVersion int64
+
+	// ---- Multi-device auth model (Phase 41). OPT-IN; all default OFF. ----
+
+	// Devices, when non-nil AND DevOpsEnabled is true, turns on the v3
+	// MULTI-DEVICE auth model: every ops request must carry X-Sigil-Device
+	// naming an enrolled device, the signature is verified against THAT device's
+	// registered Ed25519 public key, a revoked device is rejected immediately,
+	// and the device must hold a per-vault grant (401 vs 403 are distinct).
+	// It also wires the device routes (enroll / list / revoke / grants).
+	//
+	// nil (the default) leaves behaviour EXACTLY as before: legacy contract v2
+	// against OpLogPubKey when that is set, or no auth at all. When Devices is
+	// non-nil the v3 model takes precedence and OpLogPubKey is ignored (the
+	// server refuses to start with both configured — see cmd/server).
+	Devices store.DeviceStore
+	// EnrollTokenHashes are the lowercase hex SHA-256 digests of the
+	// operator-provisioned enrollment tokens (from SIGILD_ENROLL_TOKENS). The
+	// PLAINTEXT tokens never reach this struct, are never stored, and are never
+	// logged. An empty slice means NO device can enroll.
+	EnrollTokenHashes []string
+	// AdminToken is the OPTIONAL operator token (SIGILD_ADMIN_TOKEN) that
+	// authorizes the operator-only device routes (list all devices, revoke any
+	// device). Empty (the default) means those operator paths are permanently
+	// unauthorized — there is no implicit open-admin mode. It is compared in
+	// constant time and never logged or exported.
+	AdminToken string
 }
 
 // NewRouter returns the sigild HTTP handler.
@@ -73,12 +99,20 @@ func NewRouter(cfg Config) http.Handler {
 		cfg.Logger = slog.Default()
 	}
 	h := &handlers{cfg: cfg, metrics: newMetrics(cfg.Version, cfg.SchemaVersion)}
-	// Op-log request-auth enabled => attach the in-memory replay cache so a
-	// captured, validly-signed request cannot be replayed within the timestamp
-	// window. Per-process/in-memory only (a multi-instance deploy needs a shared
-	// store, e.g. Redis); dev-only. nil when auth is off (authorizeOps returns
-	// before touching it).
-	if cfg.OpLogPubKey != nil {
+	// The v3 multi-device model is active only when a registry is wired AND the
+	// dev op-log is on — it is dev-gated exactly like the ops routes. When it is
+	// off nothing below changes: the legacy v2 single-key path (or no auth) is
+	// used verbatim.
+	deviceAuth := cfg.DevOpsEnabled && cfg.Devices != nil
+	if deviceAuth {
+		h.devices = cfg.Devices
+	}
+	// Request-auth enabled (either contract) => attach the in-memory replay cache
+	// so a captured, validly-signed request cannot be replayed within the
+	// timestamp window. Per-process/in-memory only (a multi-instance deploy needs
+	// a shared store, e.g. Redis); dev-only. nil when auth is off entirely (the
+	// auth paths return before touching it).
+	if cfg.OpLogPubKey != nil || deviceAuth {
 		h.nonces = newNonceCache()
 	}
 
@@ -127,6 +161,25 @@ func NewRouter(cfg Config) http.Handler {
 		// The verify route is a distinct path, so register its own 501 stub
 		// (it would otherwise 404 instead of the deliberate not-implemented 501).
 		mux.Handle("GET /v1/vaults/{vaultID}/ops/verify", http.HandlerFunc(h.opsNotImplemented))
+	}
+
+	// Device routes (enrollment, listing, revocation, per-vault grants). They are
+	// dev-gated exactly like the ops routes AND additionally require a configured
+	// device registry: with either off, every one of them returns the deliberate
+	// 501 rather than 404 or any partial auth behaviour.
+	if deviceAuth {
+		mux.Handle("POST /v1/devices/enroll", http.HandlerFunc(h.devicesEnroll))
+		mux.Handle("GET /v1/devices", http.HandlerFunc(h.devicesList))
+		mux.Handle("POST /v1/devices/{deviceID}/revoke", http.HandlerFunc(h.devicesRevoke))
+		mux.Handle("POST /v1/vaults/{vaultID}/grants", http.HandlerFunc(h.vaultGrantCreate))
+		mux.Handle("GET /v1/vaults/{vaultID}/grants", http.HandlerFunc(h.vaultGrantList))
+	} else {
+		stub := http.HandlerFunc(h.deviceNotImplemented)
+		mux.Handle("POST /v1/devices/enroll", stub)
+		mux.Handle("GET /v1/devices", stub)
+		mux.Handle("POST /v1/devices/{deviceID}/revoke", stub)
+		mux.Handle("POST /v1/vaults/{vaultID}/grants", stub)
+		mux.Handle("GET /v1/vaults/{vaultID}/grants", stub)
 	}
 
 	// Outermost first: count every response (even a recoverer-written 500),

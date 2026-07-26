@@ -20,23 +20,34 @@ type handlers struct {
 	// in which case NewRouter wires an in-memory MemVaultLog and routes
 	// opsAppend/opsList here instead of the 501 stub.
 	log store.VaultLog
-	// nonces is the op-log request-auth replay cache. NewRouter constructs it
-	// only when cfg.OpLogPubKey is set (auth enabled); it is nil otherwise, and
-	// authorizeOps returns before touching it when auth is off.
+	// nonces is the request-auth replay cache, shared by the v2 op-log contract
+	// and the v3 device contract (enrollment nonces are namespaced, see
+	// enrollNoncePrefix). NewRouter constructs it whenever ANY auth mode is on
+	// (cfg.OpLogPubKey set, or a device registry wired); it is nil otherwise and
+	// the auth paths return before touching it.
 	nonces *nonceCache
+	// devices backs the v3 multi-device auth model: the device registry, the
+	// enrollment-token ledger, and per-vault grants. It is nil unless the device
+	// model is configured AND cfg.DevOpsEnabled — nil means the server keeps its
+	// existing legacy-v2 / no-auth behaviour exactly.
+	devices store.DeviceStore
 	// metrics holds this router's observability counters. NewRouter always
 	// constructs it (non-nil), so every handler can increment without a guard.
 	metrics *Metrics
 }
 
-// denyOps records an op-log auth denial (audit line + metric) and writes the
-// typed 401. It is the single choke point shared by the three ops handlers so
-// the audit event, the auth-denied metric (by reason), and the response stay in
-// lockstep.
-func (h *handlers) denyOps(w http.ResponseWriter, r *http.Request, vaultID string, reason authReason) {
-	h.auditAuthDenied(r, vaultID, reason)
-	h.metrics.incAuthDenied(reason)
-	writeOpsAuthError(w, reason)
+// denyOps records an auth/authz denial (audit line + metrics) and writes the
+// typed error. It is the single choke point shared by the ops and device
+// handlers so the audit event, the per-reason metric, and the response stay in
+// lockstep. The client learns only the status class; the precise reason goes
+// only to the audit log.
+func (h *handlers) denyOps(w http.ResponseWriter, r *http.Request, vaultID string, out authOutcome) {
+	h.auditAuthDenied(r, vaultID, out.DeviceID, out.Reason)
+	h.metrics.incAuthDenied(out.Reason)
+	if authStatus(out.Reason) == http.StatusForbidden {
+		h.metrics.incAuthzDenied()
+	}
+	writeAuthError(w, out.Reason)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -163,12 +174,15 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "could not read request body")
 		return
 	}
-	// Verify the op-log request signature over (method, path, query, ts, nonce,
-	// body) and reject replays. Returns an empty reason (authorized) unless
-	// cfg.OpLogPubKey is set. Must run AFTER the body is read (it is part of the
-	// signed message) and BEFORE we append.
-	if reason := h.authorizeOps(r, blob); reason != "" {
-		h.denyOps(w, r, vaultID, reason)
+	// Authenticate + authorize. In the v3 device model this resolves
+	// X-Sigil-Device, verifies the signature under THAT device's registered key,
+	// rejects a revoked device, and requires WRITE access to THIS vault (claiming
+	// an unowned vault on first write). In legacy v2 mode it is the unchanged
+	// single-key signature check; with no auth configured it always allows. Must
+	// run AFTER the body is read (it is part of the signed message) and BEFORE we
+	// append.
+	if out := h.authorizeOpsRequest(r, blob, vaultID, needWrite); !out.allowed() {
+		h.denyOps(w, r, vaultID, out)
 		return
 	}
 	if len(blob) == 0 {
@@ -216,12 +230,11 @@ func (h *handlers) opsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the op-log request signature over (method, path, query, ts, nonce,
-	// "") and reject replays. GET carries no body, so the signed body is empty.
-	// Returns an empty reason (authorized) unless cfg.OpLogPubKey is set. Must run
-	// BEFORE we list.
-	if reason := h.authorizeOps(r, nil); reason != "" {
-		h.denyOps(w, r, vaultID, reason)
+	// Authenticate + authorize for READ. GET carries no body, so the signed body
+	// is empty. In the v3 device model an unowned vault is NOT claimed by a read:
+	// a device with no grant gets 403.
+	if out := h.authorizeOpsRequest(r, nil, vaultID, needRead); !out.allowed() {
+		h.denyOps(w, r, vaultID, out)
 		return
 	}
 
@@ -312,11 +325,10 @@ func (h *handlers) opsVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the op-log request signature over (method, path, query, ts, nonce,
-	// ""). GET carries no body. Returns an empty reason (authorized) unless
-	// cfg.OpLogPubKey is set.
-	if reason := h.authorizeOps(r, nil); reason != "" {
-		h.denyOps(w, r, vaultID, reason)
+	// Authenticate + authorize for READ (GET carries no body). Same rules as
+	// opsList: no grant on the vault => 403, and a read never claims ownership.
+	if out := h.authorizeOpsRequest(r, nil, vaultID, needRead); !out.allowed() {
+		h.denyOps(w, r, vaultID, out)
 		return
 	}
 

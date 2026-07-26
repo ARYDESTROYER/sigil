@@ -129,17 +129,52 @@ func migrateTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// dropOplogTables removes both op-log tables so a test starts from a fresh DB.
+// dropOplogTables removes every table the migration set creates so a test
+// starts from a genuinely fresh DB. It must be extended whenever a migration
+// adds a table.
 func dropOplogTables(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS sigil_vault_ops`,
+		`DROP TABLE IF EXISTS sigil_device_grants`,
+		`DROP TABLE IF EXISTS sigil_enrollment_tokens`,
+		`DROP TABLE IF EXISTS sigil_devices`,
 		`DROP TABLE IF EXISTS schema_migrations`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			t.Fatalf("drop (%s): %v", stmt, err)
+		}
+	}
+}
+
+// wantAllMigrations returns the full embedded migration set, so the tests below
+// assert against whatever migrations exist rather than a hardcoded count (which
+// would break every time a migration is added).
+func wantAllMigrations(t *testing.T) []Migration {
+	t.Helper()
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	if len(migs) == 0 {
+		t.Fatal("no embedded migrations")
+	}
+	return migs
+}
+
+// assertAppliedMatchesSet checks that `applied` is exactly the embedded
+// migration set, in ascending version order.
+func assertAppliedMatchesSet(t *testing.T, applied []AppliedMigration) {
+	t.Helper()
+	want := wantAllMigrations(t)
+	if len(applied) != len(want) {
+		t.Fatalf("applied = %+v, want the %d embedded migrations", applied, len(want))
+	}
+	for i, m := range want {
+		if applied[i].Version != m.Version || applied[i].Name != m.Name {
+			t.Fatalf("applied[%d] = %+v, want {%d %s}", i, applied[i], m.Version, m.Name)
 		}
 	}
 }
@@ -156,11 +191,16 @@ func TestMigrateFreshDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 1 || applied[0].Version != 1 || applied[0].Name != "0001_init" {
-		t.Fatalf("applied = %+v, want [{1 0001_init}]", applied)
+	assertAppliedMatchesSet(t, applied)
+	if applied[0].Name != "0001_init" {
+		t.Fatalf("first applied migration = %q, want 0001_init", applied[0].Name)
 	}
-	if v, err := AppliedVersion(ctx, pool); err != nil || v != 1 {
-		t.Fatalf("AppliedVersion = (%d, %v), want (1, nil)", v, err)
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		t.Fatalf("latestMigrationVersion: %v", err)
+	}
+	if v, err := AppliedVersion(ctx, pool); err != nil || v != latest {
+		t.Fatalf("AppliedVersion = (%d, %v), want (%d, nil)", v, err, latest)
 	}
 
 	// sigil_vault_ops usable through a PostgresVaultLog over the same pool.
@@ -228,7 +268,8 @@ func TestMigrateStatus(t *testing.T) {
 
 // TestMigrateAdoptsLegacyTable: a DB with a hand-created sigil_vault_ops but no
 // schema_migrations (as the OLD inline DDL left it) is adopted cleanly —
-// Migrate applies 0001 without error and AppliedVersion==1.
+// Migrate applies the whole embedded set without error and AppliedVersion ends
+// at the latest embedded version.
 func TestMigrateAdoptsLegacyTable(t *testing.T) {
 	pool := migrateTestPool(t)
 	dropOplogTables(t, pool)
@@ -248,11 +289,13 @@ func TestMigrateAdoptsLegacyTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate adopt: %v", err)
 	}
-	if len(applied) != 1 || applied[0].Version != 1 {
-		t.Fatalf("adopt applied = %+v, want [version 1]", applied)
+	assertAppliedMatchesSet(t, applied)
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		t.Fatalf("latestMigrationVersion: %v", err)
 	}
-	if v, err := AppliedVersion(ctx, pool); err != nil || v != 1 {
-		t.Fatalf("AppliedVersion after adopt = (%d, %v), want (1, nil)", v, err)
+	if v, err := AppliedVersion(ctx, pool); err != nil || v != latest {
+		t.Fatalf("AppliedVersion after adopt = (%d, %v), want (%d, nil)", v, err, latest)
 	}
 
 	// Table still usable.
@@ -330,18 +373,26 @@ func TestMigrateConcurrentNoDoubleApply(t *testing.T) {
 		}
 		total += len(results[i])
 	}
-	if total != 1 {
-		t.Fatalf("total migrations applied across %d concurrent runs = %d, want exactly 1 (no double-apply)", n, total)
+	// Across ALL concurrent runs each embedded migration must be applied exactly
+	// once — the advisory lock serializes the runs, so the total equals the size
+	// of the migration set, never more.
+	migs := wantAllMigrations(t)
+	if total != len(migs) {
+		t.Fatalf("total migrations applied across %d concurrent runs = %d, want exactly %d (no double-apply)", n, total, len(migs))
 	}
-	if v, err := AppliedVersion(context.Background(), setup); err != nil || v != 1 {
-		t.Fatalf("final AppliedVersion = (%d, %v), want (1, nil)", v, err)
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		t.Fatalf("latestMigrationVersion: %v", err)
+	}
+	if v, err := AppliedVersion(context.Background(), setup); err != nil || v != latest {
+		t.Fatalf("final AppliedVersion = (%d, %v), want (%d, nil)", v, err, latest)
 	}
 	var count int
 	if err := setup.QueryRow(context.Background(),
-		`SELECT count(*) FROM schema_migrations WHERE version = 1`).Scan(&count); err != nil {
+		`SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("schema_migrations rows for v1 = %d, want exactly 1", count)
+	if count != len(migs) {
+		t.Fatalf("schema_migrations rows = %d, want exactly %d (one per migration)", count, len(migs))
 	}
 }

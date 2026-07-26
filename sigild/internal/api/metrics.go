@@ -43,20 +43,57 @@ type Metrics struct {
 	oplogVerifyTotal      atomic.Int64
 	oplogRateLimitedTotal atomic.Int64
 
-	// authDenied counts op-log auth denials, keyed by the fixed authReason enum
-	// so /metrics can label each by reason. Built once (immutable key set); only
-	// the atomic values mutate.
+	// Device-model counters (Phase 41). Counts ONLY — never a device's public
+	// key, an enrollment token (or its digest), an admin token, a signature, a
+	// nonce, or a vault/device ID as a label (an ID label would let a scrape
+	// enumerate the registry).
+	deviceEnrollmentsTotal atomic.Int64
+	deviceRevocationsTotal atomic.Int64
+	vaultGrantsTotal       atomic.Int64
+	vaultClaimsTotal       atomic.Int64
+	authzDeniedTotal       atomic.Int64
+
+	// authDenied counts request auth/authz denials, keyed by the fixed
+	// authReason enum so /metrics can label each by reason. Built once
+	// (immutable key set); only the atomic values mutate.
 	authDenied map[authReason]*atomic.Int64
+	// enrollDenied counts enrollment denials by reason, over the enrollment
+	// subset of the same enum.
+	enrollDenied map[authReason]*atomic.Int64
 }
 
-// authDenyReasons is the fixed, exhaustive set of non-OK auth reasons, in a
-// stable order so the /metrics output is deterministic.
+// authDenyReasons is the fixed, exhaustive set of non-OK request-auth reasons,
+// in a stable order so the /metrics output is deterministic. The first five are
+// the v2 contract's; the rest are added by the v3 device model.
 var authDenyReasons = []authReason{
 	reasonMissingHeaders,
 	reasonBadTimestamp,
 	reasonStaleTimestamp,
 	reasonBadSignature,
 	reasonReplayed,
+	reasonUnknownDevice,
+	reasonRevokedDevice,
+	reasonUnauthorizedVault,
+	reasonNotVaultOwner,
+	reasonForbiddenDevice,
+	reasonBadAdminToken,
+	reasonStoreUnavailable,
+}
+
+// enrollDenyReasons is the fixed set of enrollment-denial reasons, in a stable
+// order. It deliberately does NOT distinguish anything the client is told: the
+// split exists only for the operator's metrics.
+var enrollDenyReasons = []authReason{
+	reasonMissingHeaders,
+	reasonStaleTimestamp,
+	reasonBadEnrollToken,
+	reasonEnrollTokenUsed,
+	reasonEnrollTokenExpired,
+	reasonBadProof,
+	reasonMalformedKey,
+	reasonDeviceExists,
+	reasonReplayed,
+	reasonStoreUnavailable,
 }
 
 // newMetrics returns a fresh, zeroed Metrics for one router/server instance.
@@ -66,9 +103,13 @@ func newMetrics(version string, schemaVersion int64) *Metrics {
 		version:       version,
 		schemaVersion: schemaVersion,
 		authDenied:    make(map[authReason]*atomic.Int64, len(authDenyReasons)),
+		enrollDenied:  make(map[authReason]*atomic.Int64, len(enrollDenyReasons)),
 	}
 	for _, r := range authDenyReasons {
 		m.authDenied[r] = new(atomic.Int64)
+	}
+	for _, r := range enrollDenyReasons {
+		m.enrollDenied[r] = new(atomic.Int64)
 	}
 	return m
 }
@@ -90,14 +131,38 @@ func (m *Metrics) incVerify() { m.oplogVerifyTotal.Add(1) }
 // incRateLimited records one op-log request rejected by the rate limiter.
 func (m *Metrics) incRateLimited() { m.oplogRateLimitedTotal.Add(1) }
 
-// incAuthDenied records one op-log auth denial by reason. An unknown reason
-// (should not occur — reason comes from the fixed enum) is ignored rather than
-// mutating the map concurrently.
+// incAuthDenied records one request auth/authz denial by reason. An unknown
+// reason (should not occur — reason comes from the fixed enum) is ignored rather
+// than mutating the map concurrently.
 func (m *Metrics) incAuthDenied(reason authReason) {
 	if c := m.authDenied[reason]; c != nil {
 		c.Add(1)
 	}
 }
+
+// incEnrollDenied records one denied device-enrollment attempt by reason.
+func (m *Metrics) incEnrollDenied(reason authReason) {
+	if c := m.enrollDenied[reason]; c != nil {
+		c.Add(1)
+	}
+}
+
+// incEnrollment records one successful device enrollment.
+func (m *Metrics) incEnrollment() { m.deviceEnrollmentsTotal.Add(1) }
+
+// incRevocation records one device revocation.
+func (m *Metrics) incRevocation() { m.deviceRevocationsTotal.Add(1) }
+
+// incGrant records one per-vault access grant.
+func (m *Metrics) incGrant() { m.vaultGrantsTotal.Add(1) }
+
+// incVaultClaim records one trust-on-first-write vault ownership claim.
+func (m *Metrics) incVaultClaim() { m.vaultClaimsTotal.Add(1) }
+
+// incAuthzDenied records one AUTHORIZATION denial (a 403), i.e. an
+// authenticated device that was not permitted. It is counted separately from the
+// per-reason breakdown so an operator can alert on 403s alone.
+func (m *Metrics) incAuthzDenied() { m.authzDeniedTotal.Add(1) }
 
 // writePrometheus emits the counters in Prometheus text exposition format
 // (# HELP / # TYPE / samples). Output ordering is deterministic.
@@ -133,13 +198,34 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 	writeCounter(&b, "sigild_oplog_ratelimit_rejected_total",
 		"Total op-log requests rejected by the per-vault rate limiter.", m.oplogRateLimitedTotal.Load())
 
-	b.WriteString("# HELP sigild_oplog_auth_denied_total Total op-log requests denied by request auth, by reason.\n")
+	writeCounter(&b, "sigild_device_enrollments_total",
+		"Total device enrollments accepted.", m.deviceEnrollmentsTotal.Load())
+	writeCounter(&b, "sigild_device_revocations_total",
+		"Total device revocations performed.", m.deviceRevocationsTotal.Load())
+	writeCounter(&b, "sigild_vault_grants_total",
+		"Total per-vault access grants created.", m.vaultGrantsTotal.Load())
+	writeCounter(&b, "sigild_vault_claims_total",
+		"Total vault ownership claims (trust on first write).", m.vaultClaimsTotal.Load())
+	writeCounter(&b, "sigild_oplog_authz_denied_total",
+		"Total requests denied by per-vault authorization (HTTP 403).", m.authzDeniedTotal.Load())
+
+	b.WriteString("# HELP sigild_oplog_auth_denied_total Total requests denied by request auth/authz, by reason.\n")
 	b.WriteString("# TYPE sigild_oplog_auth_denied_total counter\n")
 	for _, r := range authDenyReasons {
 		b.WriteString(`sigild_oplog_auth_denied_total{reason="`)
 		b.WriteString(string(r))
 		b.WriteString(`"} `)
 		b.WriteString(strconv.FormatInt(m.authDenied[r].Load(), 10))
+		b.WriteByte('\n')
+	}
+
+	b.WriteString("# HELP sigild_device_enroll_denied_total Total device enrollment attempts denied, by reason.\n")
+	b.WriteString("# TYPE sigild_device_enroll_denied_total counter\n")
+	for _, r := range enrollDenyReasons {
+		b.WriteString(`sigild_device_enroll_denied_total{reason="`)
+		b.WriteString(string(r))
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(m.enrollDenied[r].Load(), 10))
 		b.WriteByte('\n')
 	}
 

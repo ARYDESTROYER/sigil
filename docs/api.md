@@ -3,9 +3,12 @@
 > **STATUS: pre-audit skeleton.** `sigild` is the Sigil sync-server skeleton. It
 > performs **no cryptography**, holds **no keys**, and stores **no plaintext**.
 > The only stateful surface — the vault operation log — is a **dev-only,
-> opt-in, unauthenticated** store of **opaque client-encrypted blobs** the
+> opt-in** store of **opaque client-encrypted blobs** the
 > server never decrypts or interprets (in-memory by default, with optional
-> file-backed or durable Postgres backends). Nothing
+> file-backed or durable Postgres backends), **unauthenticated unless one of two
+> opt-in auth contracts is configured** (legacy single-key **v2**, or the
+> **multi-device v3** model with a device registry, per-vault authorization and
+> revocation — itself dev-gated and unaudited). Nothing
 > here is audited or production-ready. See [`deployment.md`](deployment.md) for
 > the (not-yet-applied) deploy story and [`sprint-72h.md`](sprint-72h.md) for
 > scope. This reference describes the surface as wired in
@@ -93,18 +96,26 @@ the source of truth for the exact strings):
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `sigild_http_requests_total` | counter | total HTTP requests served |
+| `sigild_http_requests_total{class="…"}` | counter | total HTTP responses served, by status class (`1xx`…`5xx`) |
 | `sigild_oplog_appends_total` | counter | op-log appends accepted (`POST …/ops`) |
 | `sigild_oplog_verify_total` | counter | chain verifies run (`GET …/ops/verify`) |
-| `sigild_oplog_auth_denied_total{reason="…"}` | counter | op-log auth denials, **labelled by reason** (missing / invalid / stale / replayed) |
+| `sigild_oplog_auth_denied_total{reason="…"}` | counter | request auth/authz denials, **labelled by reason** (the fixed enum below) |
+| `sigild_oplog_authz_denied_total` | counter | requests denied by **per-vault authorization** (HTTP `403`) — a subset of the above, broken out so an operator can alert on `403`s alone |
 | `sigild_oplog_ratelimit_rejected_total` | counter | appends rejected with `429` by the per-vault rate limiter |
-| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres) |
+| `sigild_device_enrollments_total` | counter | device enrollments accepted (`POST /v1/devices/enroll`) |
+| `sigild_device_enroll_denied_total{reason="…"}` | counter | enrollment attempts denied, labelled by reason |
+| `sigild_device_revocations_total` | counter | device revocations performed |
+| `sigild_vault_grants_total` | counter | per-vault access grants created |
+| `sigild_vault_claims_total` | counter | vault ownership claims (trust-on-first-write) |
+| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`2`** once `0002_devices.sql` is applied) |
 | `sigild_build_info{version="…"}` | gauge (`1`) | build identity; the version label carries the injected build SHA |
 
-Counters are **process-lifetime and unlabelled by vault** (no per-vault
-cardinality blow-up, and no vault ID — itself client-chosen and potentially
-sensitive — is exported). The endpoint performs **no cryptography** and reads no
-stored bytes; it only reports aggregate counts.
+Counters are **process-lifetime and unlabelled by vault or device** (no per-vault
+cardinality blow-up, and no vault ID or device ID — a device-ID label would let a
+scrape enumerate the registry — is exported). The endpoint performs **no
+cryptography** and reads no stored bytes; it only reports aggregate counts, and
+it never exposes a public key, an enrollment token or its digest, an admin
+token, a signature, or a nonce.
 
 `sigild_schema_version` reflects the applied op-log database migration version for
 the **Postgres backend**; migrations are managed with an **operator CLI**, not an
@@ -125,8 +136,14 @@ status` reports them (default auto-apply at boot, opt out with
 >   verb on this route returns `501 Not Implemented`.** This preserves the
 >   project guardrail of stubbing with `501` rather than shipping behaviour that
 >   would poison the future audit.
-> - **UNAUTHENTICATED.** There is no auth, no identity, no per-vault access
->   control. Anyone who can reach the port can read and append to any vault ID.
+> - **UNAUTHENTICATED BY DEFAULT.** With no auth configured there is no
+>   identity and no per-vault access control: anyone who can reach the port can
+>   read and append to any vault ID. Two **opt-in** contracts change that —
+>   legacy **v2** (`SIGILD_OPLOG_PUBKEY`, one static key, no authorization) and
+>   the **v3 multi-device model** (`SIGILD_DEVICE_AUTH` — device identity,
+>   per-vault grants, revocation; see
+>   [Multi-device auth model](#multi-device-auth-model-contract-v3--dev)). They
+>   are mutually exclusive, and both are dev-gated and **UNAUDITED**.
 > - **THREE BACKENDS behind the `VaultLog` seam.** With the dev flag on, the
 >   op-log is served by one of three interchangeable backends, selected at
 >   startup by **precedence `SIGILD_OPLOG_POSTGRES` > `SIGILD_OPLOG_DIR` >
@@ -224,7 +241,7 @@ unbounded slice.
   {
     "vaultID": "<vaultID>",
     "ops": [
-      { "seq": 1, "blob": "<base64 of the opaque stored bytes>", "hash": "<hex SHA-256 chain hash>" }
+      { "seq": 1, "blob": "<base64 of the opaque stored bytes>", "hash": "<std-base64 SHA-256 chain hash>" }
     ],
     "next": <highest seq returned, to pass as the next `since`>,
     "has_more": <true if more ops exist beyond this page, else false>
@@ -235,7 +252,7 @@ unbounded slice.
   POSTed — the server re-emits ciphertext it never decoded. An unknown vault ID
   returns an empty `ops` array, not an error.
 
-  `hash` is the op's **hex-encoded SHA-256 hash-chain link** (64 hex chars) — the
+  `hash` is the op's **standard-base64-encoded SHA-256 hash-chain link** — the
   tamper-evidence tip for that op, computed over the previous op's hash and this
   op's `(vaultID, seq, blob)` per the construction in
   [Op-log hash chain](#op-log-hash-chain-tamper-evidence) below. It fingerprints
@@ -309,7 +326,7 @@ the request's own method/path/query, exactly as for `GET …/ops`).
     "vaultID": "<vaultID>",
     "ok": true,
     "count": <number of ops in the vault>,
-    "tip_hash": "<hex SHA-256 of the last op's chain link>",
+    "tip_hash": "<std-base64 SHA-256 of the last op's chain link>",
     "broken_at_seq": null
   }
   ```
@@ -317,7 +334,7 @@ the request's own method/path/query, exactly as for `GET …/ops`).
   - `ok` — `true` if the recomputed chain matches every stored per-op hash. An
     empty vault is trivially intact (`ok = true`, `count = 0`).
   - `count` — how many ops were checked.
-  - `tip_hash` — the last op's hex chain hash (the vault's current tip); an empty
+  - `tip_hash` — the last op's std-base64 chain hash (the vault's current tip); an empty
     vault has no ops, so there is no meaningful tip.
   - `broken_at_seq` — `null` when `ok` is `true`; otherwise the **first** `seq`
     whose recomputed hash does not match, i.e. where tamper-evidence tripped.
@@ -336,7 +353,15 @@ own tip hash and re-derives the chain from the per-op `hash` values in
 product's future **signed / Merkle-root** audit log — not a notarized,
 append-only-enforced, or Byzantine-proof log.
 
-### Authentication (optional, dev) — `SIGILD_OPLOG_PUBKEY`
+### Authentication — contract v2 (LEGACY, optional, dev) — `SIGILD_OPLOG_PUBKEY`
+
+> **SUPERSEDED, BUT STILL PRESENT.** Contract **v2** below is the original
+> **single static key** mode. It is unchanged and still supported, but the
+> **multi-device model (contract v3)** — [below](#multi-device-auth-model-contract-v3--dev)
+> — is the model with device identity, per-vault authorization, and revocation.
+> The two are **mutually exclusive**: setting both `SIGILD_DEVICE_AUTH` and
+> `SIGILD_OPLOG_PUBKEY` makes `sigild` **refuse to boot** (a fail-fast config
+> error before the listener binds), so exactly one contract is ever live.
 
 > **DEV-ONLY, off by default, and intentionally minimal.** This is a
 > **single static device key** check, not an account/enrollment system. Each
@@ -440,26 +465,31 @@ shared store); multi-device enrollment / registry / JWT auth is future; and with
 
 ### Audit log (structured server-side events)
 
-Every op-log **append**, **list**, and **auth denial** emits a **structured
-audit event** to the server log (alongside the request-scoped access log). Each
-event carries only **metadata plus an integrity fingerprint** — never the
-payload:
+Every op-log **append**, **list**, **verify**, and **auth denial** — plus every
+device **enrollment**, **enrollment denial**, **revocation**, **vault ownership
+claim**, and **grant** — emits a **structured audit event** to the server log
+(alongside the request-scoped access log). Each event carries only **metadata
+plus an integrity fingerprint** — never the payload:
 
 | Field | Meaning |
 |-------|---------|
-| `event` | the audited action — e.g. `oplog.append`, `oplog.list`, `oplog.auth_denied` |
+| `event` | the audited action — `oplog.append`, `oplog.list`, `oplog.verify`, `oplog.auth_denied`, `device.enrolled`, `device.enroll_denied`, `device.revoked`, `vault.claimed`, `vault.granted` |
 | `request_id` | the request's `X-Request-ID`, to correlate with the access log |
 | `vault_id` | the target vault ID (opaque, client-chosen) |
 | `seq` | the sequence number assigned (append) or the highest returned (list) |
-| `size` | the opaque blob's length in bytes |
+| `size_bytes` | the opaque blob's length in bytes |
 | `blob_sha256` | hex **SHA-256 fingerprint** of the opaque stored bytes — for integrity / traceability only |
-| `auth` / `reason` | on a denial, why it failed (missing / invalid / stale / replayed signature) |
+| `auth` | on an append, which contract was active: `device` (v3), `ed25519` (legacy v2), or `none` |
+| `reason` | on a denial, the fixed enum naming the single check that failed (see [the reason enum](#denial-reasons-audit--metrics-only)) |
+| `device_id` | on the device events and on a denial, the device ID the client **presented** (empty in the legacy/no-auth modes; recorded even when it resolved to nothing, so probing is visible) |
+| `label` / `permission` / `revoked_by` | the enrolled device's label; the permission granted; who performed a revocation (`admin`, or the device's own ID for self-revocation) |
 
 The server logs a **fingerprint** of the ciphertext, **not** the ciphertext: it
-**NEVER** writes the opaque blob content, any signature, nonce, timestamp, or key
-material to the log. Because the fingerprint is taken over bytes that are
-**already client-encrypted**, an operator can prove *who appended what, when*
-without the server ever seeing plaintext — the audit trail does not weaken the
+**NEVER** writes the opaque blob content, any signature, nonce, timestamp value,
+public key, enrollment token (or its digest), admin token, or other key material
+to the log. Because the fingerprint is taken over bytes that are **already
+client-encrypted**, an operator can prove *who appended what, when* without the
+server ever seeing plaintext — the audit trail does not weaken the
 zero-knowledge property (see [`threat-model.md`](threat-model.md)).
 
 Request bodies are read under the **request context**: a client that
@@ -469,17 +499,376 @@ connection) rather than blocking a goroutine.
 
 ---
 
+## Multi-device auth model (contract v3) — DEV
+
+> **DEV-GATED, OPT-IN, and UNAUDITED.** This is a **real** auth model — real
+> `crypto/ed25519` verification against a real device registry, real per-vault
+> authorization, real revocation, no bypass path, no fallback "trusted" key, and
+> no hardcoded credential — but it is **dev-gated** behind
+> `SIGILD_ENABLE_DEV_OPS`, **off by default**, has **not been audited**, and is
+> **not** the product's account/session model. There is no user account, no
+> session or token issuance, no key rotation, no recovery, no hardware
+> attestation, and **no rate limiting on enrollment attempts**. Still plain
+> HTTP in dev. **Do not expose publicly and do not store real secrets.** See
+> [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md).
+
+Contract **v3** replaces v2's one static key with a **device registry**: every
+authenticated request names **which** enrolled device signed it, the server
+verifies the signature against **that device's** registered Ed25519 public key,
+refuses a **revoked** device, and then checks that the device holds a **grant**
+on the requested vault.
+
+### Configuration
+
+| Variable | Required? | Meaning |
+|----------|-----------|---------|
+| `SIGILD_DEVICE_AUTH` | opt-in | `1`/`true` turns on the v3 model. **Requires `SIGILD_ENABLE_DEV_OPS`** (the op-log and its auth model are dev-gated) and is **MUTUALLY EXCLUSIVE with `SIGILD_OPLOG_PUBKEY`** — with both set, `sigild` **exits non-zero at startup** rather than running an ambiguous model. |
+| `SIGILD_ENROLL_TOKENS` | **required when device auth is on** | Comma-separated operator-provisioned enrollment tokens (bootstrap bearer secrets). Each must be **≥ 16 characters**; duplicates are rejected. Only their **SHA-256 digests** ever reach the server's memory, the registry, the audit log, or `/metrics` — the plaintext is never stored. Without at least one token, **no device can ever enroll**. |
+| `SIGILD_ENROLL_TOKEN_TTL` | optional | A **positive Go duration** (e.g. `24h`). A token then expires that long after it was **first registered** — registration is idempotent, so restarts do not extend the clock. **Unset ⇒ tokens never expire, but remain SINGLE-USE.** |
+| `SIGILD_ADMIN_TOKEN` | optional | Operator token for the operator-only routes (list all devices, revoke **any** device); **≥ 16 characters**. **Unset ⇒ those paths are permanently `401`** — there is **no implicit open-admin mode**. Compared in constant time; never logged or exported. |
+
+All four are parsed and validated **fail-fast, before the listener binds**; a
+malformed value is a clear startup error, not a surprise at request time.
+
+**Registry durability.** When the Postgres op-log backend
+(`SIGILD_OPLOG_POSTGRES`) is active, the registry is durable and **shares that
+backend's existing `pgxpool`** (no second pool, no new dependency), using tables
+from migration `0002_devices.sql`; Postgres then enforces single-use tokens and
+single-owner vault claims **across processes**. Otherwise the registry is
+**in-memory and non-durable** — devices, grants and spent-token markers are lost
+on restart, which means a **spent enrollment token becomes reusable after a
+restart** (the server warns loudly at boot). The **file backend
+(`SIGILD_OPLOG_DIR`) was not extended**: device auth alongside it falls back to
+the in-memory registry, also warned at boot.
+
+### Storage (migration `0002_devices.sql`)
+
+Three tables are added on top of the untouched `0001_init`:
+
+| Table | Holds |
+|-------|-------|
+| `sigil_devices` | `device_id` (PK), `public_key` (`bytea`, **UNIQUE** — a key identifies at most one device), `label`, `status`, `created_at`, `revoked_at` |
+| `sigil_enrollment_tokens` | `token_hash` (PK, the SHA-256 **hex digest** — never the token), `issued_at`, `expires_at`, `used_at` (the single-use marker), `used_by` |
+| `sigil_device_grants` | `(vault_id, device_id)` (PK), `permission`, `is_owner`, `created_at`; a **partial `UNIQUE` index `sigil_device_grants_one_owner (vault_id) WHERE is_owner`** makes the ownership claim atomic in the database |
+
+The migration is **pure DDL over auth metadata**: Ed25519 **public** keys,
+server-assigned IDs, labels, permissions, timestamps. It touches **nothing** in
+`sigil_vault_ops` — the opaque blob, its per-op hash chain, and the
+zero-knowledge boundary are **unaffected**. `sigild_schema_version` reports **2**
+once applied.
+
+### Signed request contract (v3)
+
+Every authenticated request carries **four** headers:
+
+| Header | Value |
+|--------|-------|
+| `X-Sigil-Device` | the server-assigned device ID returned at enrollment (`dev_` + raw-URL-base64 of 16 random bytes) |
+| `X-Sigil-Timestamp` | signing time, unix **seconds**, decimal ASCII |
+| `X-Sigil-Nonce` | standard-base64 of a **fresh, per-request** CSPRNG nonce (≥ 16 bytes); signed **verbatim** as the exact header text |
+| `X-Sigil-Signature` | standard-base64 of the 64-byte Ed25519 signature over the message below |
+
+The signed **message** is, byte-for-byte:
+
+```
+MESSAGE = "sigil-oplog-auth-v3\n" + DEVICE_ID + "\n" + METHOD + "\n" + PATH + "\n" + QUERY + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + BODY
+```
+
+```
+sigil-oplog-auth-v3\n
+{DEVICE_ID}\n       EXACT X-Sigil-Device header text
+{METHOD}\n          uppercase HTTP method
+{PATH}\n            URL path, NO query — e.g. /v1/vaults/demo/ops
+{QUERY}\n           raw query string, or "" if none
+{TIMESTAMP}\n       same decimal value sent in X-Sigil-Timestamp
+{NONCE}\n           EXACT X-Sigil-Nonce header text (base64 text, verbatim)
+{BODY}              raw request body bytes; EMPTY for GET
+```
+
+**v3 is a clean break from v2.** The domain line changed (`…-v2` → `…-v3`) *and*
+a device-ID segment was inserted, so a **v2 signature does not verify under v3**
+(`401`) — captured v2 traffic cannot be replayed into the device model.
+
+**Verification order** maps 1:1 to the audited reason:
+
+1. all four headers present → else `missing_headers`
+2. timestamp parses as `int64` → else `bad_timestamp`
+3. `abs(now - ts) ≤ 300 s` → else `stale_timestamp`
+4. `X-Sigil-Device` resolves in the registry → else `unknown_device`
+5. the device is **not revoked** → else `revoked_device`
+6. the signature verifies under **that device's registered public key** → else
+   `bad_signature`
+7. the nonce has not been seen in-window → else `replayed`
+
+Two orderings are load-bearing and deliberate:
+
+- **Revocation (5) is checked BEFORE signature verification (6)**, so a revoked
+  device is refused on its **very next request** no matter how well it signs.
+- **The nonce is recorded ONLY after a valid signature (6)**, so unauthenticated
+  probes can neither populate nor probe the replay cache.
+
+The replay cache is the same time-bounded, concurrency-safe, **per-process
+in-memory** cache as v2: an entry is remembered for exactly as long as a request
+bearing it could still pass the 300 s window, with a hard size cap as a
+backstop. **A multi-instance deployment needs a shared store (e.g. Redis)**;
+device request nonces share one namespace (enrollment nonces are
+prefix-separated).
+
+### Authorization: per-vault grants + trust-on-first-write ownership
+
+A grant maps `(vaultID, deviceID) -> permission`, where `permission` is `read`
+or `write` and **`write` implies `read`**. Each route declares what it needs:
+
+| Route | Needs |
+|-------|-------|
+| `POST /v1/vaults/{vaultID}/ops` | **write** |
+| `GET /v1/vaults/{vaultID}/ops` | read |
+| `GET /v1/vaults/{vaultID}/ops/verify` | read |
+| `POST /v1/vaults/{vaultID}/grants` | **owner** |
+| `GET /v1/vaults/{vaultID}/grants` | read |
+
+**Ownership is TRUST ON FIRST WRITE (TOFU).** A vault with no owner is claimed
+by the **first device that successfully authenticates a WRITE** to it; that
+device becomes the owner with `write` permission. The claim is **atomic** in both
+backends (a mutex in memory; the partial `UNIQUE` index in Postgres), so exactly
+one of N concurrent first-writers wins and the losers get `403`. **Reads never
+claim** — reading an unowned vault is `403`. Only the **owner** may grant another
+device access, and the grantee must be an enrolled, non-revoked device.
+
+> **Honest limitation.** TOFU is a **dev ownership model, not an account model.**
+> It assumes the first writer of a high-entropy, client-chosen vault ID is its
+> legitimate owner; an attacker who writes to an **unclaimed** ID first becomes
+> its owner and locks the real owner out. Revoking a vault's **owner ORPHANS the
+> vault** — there is **no ownership transfer**, so afterwards nobody can grant on
+> it (existing grantees keep only what they already hold).
+
+### `401` vs `403`, and the absence of an auth oracle
+
+- **`401 Unauthorized`** — *unauthenticated*: the request did not prove it came
+  from a known, active device (missing/stale/bad signature, unknown device,
+  revoked device, replayed nonce, bad admin token).
+- **`403 Forbidden`** — *authenticated, but not authorized*: a valid device
+  signature, but no sufficient grant on the vault (`unauthorized_vault`), not
+  the vault owner (`not_vault_owner`), or acting on another device
+  (`forbidden_device`).
+- **`500`** — the registry itself could not be read/written
+  (`store_unavailable`), returned as `500` **specifically so an infrastructure
+  fault is never mistaken for a credential verdict**.
+
+The **response body is coarse on purpose**:
+
+```json
+{ "error": "unauthorized", "detail": "missing or invalid request signature" }
+{ "error": "forbidden",    "detail": "device is not authorized for this vault" }
+```
+
+A prober therefore learns only the status class. The precise cause is a fixed
+enum that goes **ONLY** to the audit log and the per-reason metric — there is
+**no auth oracle** in the response.
+
+#### Denial reasons (audit + metrics only)
+
+`missing_headers`, `bad_timestamp`, `stale_timestamp`, `bad_signature`,
+`replayed`, `unknown_device`, `revoked_device`, `unauthorized_vault`,
+`not_vault_owner`, `forbidden_device`, `bad_admin_token`, `store_unavailable`;
+and for enrollment: `bad_enrollment_token`, `enrollment_token_used`,
+`enrollment_token_expired`, `bad_proof`, `malformed_key`, `device_exists`.
+
+### `POST /v1/devices/enroll` — enroll a device
+
+Registers a device's Ed25519 public key and returns its **server-assigned**
+device ID (clients never choose their own ID, so an ID cannot be squatted).
+
+**Two independent factors, both mandatory:**
+
+1. an operator-provisioned **enrollment token** in `X-Sigil-Enroll-Token`,
+   matched in **constant time** against the configured digests and then **spent
+   atomically** — a token is **single-use**;
+2. **proof of possession** — an Ed25519 signature in `X-Sigil-Signature` over the
+   canonical enrollment challenge, verified against the **public key being
+   submitted**. A bare public-key upload is **never** accepted.
+
+The enrollment challenge uses a **different domain** from the request contract,
+so a proof can never be repurposed as an op-log request signature (or the
+reverse):
+
+```
+CHALLENGE = "sigil-device-enroll-v1\n" + TOKEN_SHA256_HEX + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + PUBLIC_KEY_B64 + "\n" + LABEL
+```
+
+`TOKEN_SHA256_HEX` is the lowercase hex SHA-256 of the presented token;
+`PUBLIC_KEY_B64` and `LABEL` are the **exact strings from the JSON body**, so
+both sides sign the same bytes with no re-encoding ambiguity. Binding the token
+digest means a captured proof cannot be re-presented with a **different** token;
+binding the public key means an interceptor cannot swap in **its own** key while
+reusing a victim's token.
+
+The v2/v3 replay protections apply: the same **300 s** timestamp window and a
+fresh `X-Sigil-Nonce` checked against the shared replay cache (enrollment nonces
+are prefix-namespaced so they cannot collide with request nonces), and the nonce
+is recorded **only after a valid proof**.
+
+- **Headers:** `X-Sigil-Enroll-Token`, `X-Sigil-Timestamp`, `X-Sigil-Nonce`,
+  `X-Sigil-Signature` (the proof). No `X-Sigil-Device` — the device does not
+  exist yet.
+- **Request body** (JSON, capped at **8 KiB**):
+
+  ```json
+  { "public_key": "<standard-base64 of a raw 32-byte Ed25519 public key>", "label": "<human name, ≤ 128 chars>" }
+  ```
+
+- **Success — `201 Created`:**
+
+  ```json
+  { "device_id": "dev_<raw-url-base64>", "label": "laptop", "status": "active", "created_at": "<RFC3339>" }
+  ```
+
+  (`revoked_at` is present only once the device is revoked.) The response
+  deliberately **omits the public key** — the client already has it, and the
+  registry never echoes key material out of an endpoint that does not need to.
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `invalid_request` | body unreadable / over 8 KiB, not a JSON object, or `label` too long |
+  | `400 Bad Request` | `invalid_request` | `public_key` is not the standard-base64 of a **32-byte** Ed25519 public key (`malformed_key`) |
+  | `401 Unauthorized` | `unauthorized` | missing headers, stale timestamp, unknown/spent/expired token, bad proof, or a replayed nonce — **all return the same body**, so a prober cannot distinguish them |
+  | `409 Conflict` | `device_exists` | that public key is already enrolled |
+  | `500` | `internal` | the registry could not be read/written |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+> **Honest limitation — single-ATTEMPT, not single-SUCCESS.** The token is spent
+> **before** the device row is created, so an enrollment that then conflicts on a
+> duplicate key still **burns the token**. That is deliberately fail-closed (the
+> server never silently permits a retry), but an operator must issue a **new**
+> token after such a failure. There is also **no rate limiting on enrollment
+> attempts** — the per-vault op-log limiter does not cover this route.
+
+### `GET /v1/devices` — list devices (operator)
+
+Requires the **operator admin token** in `X-Sigil-Admin-Token`. With
+`SIGILD_ADMIN_TOKEN` unset the route is **permanently `401`** — there is no
+implicit open-admin mode. Public keys are **not** included.
+
+- **Success — `200 OK`:**
+
+  ```json
+  { "devices": [ { "device_id": "dev_…", "label": "laptop", "status": "active|revoked", "created_at": "<RFC3339>", "revoked_at": "<RFC3339, omitted when active>" } ] }
+  ```
+
+- **Errors:** `401 unauthorized` (missing/incorrect admin token, audited as
+  `bad_admin_token`); `500 internal`; `501 not_implemented` when the model is off.
+
+### `POST /v1/devices/{deviceID}/revoke` — revoke a device
+
+A revoked device is rejected on its **very next request** (status is checked
+before its signature is verified). Revocation is **idempotent**: revoking an
+already-revoked device succeeds and keeps the original `revoked_at`. The device
+row is **retained**, never deleted, so the audit trail stays explainable.
+
+**Two authorized paths, neither a bypass:**
+
+- the **operator admin token** (`X-Sigil-Admin-Token`) — may revoke **any**
+  device; this is the break-glass path for a lost/stolen device; or
+- **self-revocation** — a valid **v3-signed** request whose signing device **is**
+  the device named in the path. A device may retire itself; it may **not** revoke
+  another device (that is `403`, audited as `forbidden_device`).
+
+- **Success — `200 OK`:** `{ "device_id": "dev_…", "status": "revoked" }`
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `missing_device_id` / `invalid_request` | empty path segment; body unreadable or over 8 KiB |
+  | `401 Unauthorized` | `unauthorized` | no admin token **and** no valid v3 signature |
+  | `403 Forbidden` | `forbidden` | authenticated, but trying to revoke a **different** device |
+  | `404 Not Found` | `device_not_found` | no such device |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+### `POST /v1/vaults/{vaultID}/grants` — grant a device access to a vault
+
+The requesting device must be the vault's **owner** (the device that claimed it
+on first write); any other authorized device gets `403` (`not_vault_owner`). The
+signature covers the body, so authorization runs **after** the body is read.
+
+- **Auth:** the four v3 headers.
+- **Request body** (JSON, capped at 8 KiB):
+
+  ```json
+  { "device_id": "dev_<grantee>", "permission": "read" }
+  ```
+
+- **Success — `201 Created`:**
+
+  ```json
+  { "device_id": "dev_<grantee>", "permission": "read", "owner": false, "created_at": "<RFC3339>" }
+  ```
+
+  Re-granting updates a non-owner grant's permission; an existing **owner** row
+  is never downgraded.
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `missing_vault_id` / `invalid_request` | empty vault ID; unreadable/oversized body; missing `device_id`; `permission` not `"read"` or `"write"` |
+  | `401 Unauthorized` | `unauthorized` | the v3 signature check failed |
+  | `403 Forbidden` | `forbidden` | authenticated but **not the vault owner**, or holding no grant at all |
+  | `404 Not Found` | `device_not_found` | the grantee is not enrolled |
+  | `409 Conflict` | `device_revoked` | the grantee is revoked — a grant to a revoked device is refused, not silently recorded |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+### `GET /v1/vaults/{vaultID}/grants` — list a vault's grants
+
+Any device with **read** access to the vault may see who else can reach it.
+
+- **Auth:** the four v3 headers (`BODY` is empty for GET).
+- **Success — `200 OK`:**
+
+  ```json
+  {
+    "vaultID": "<vaultID>",
+    "grants": [ { "device_id": "dev_…", "permission": "write", "owner": true, "created_at": "<RFC3339>" } ]
+  }
+  ```
+
+- **Errors:** `400 missing_vault_id`; `401 unauthorized`; `403 forbidden` (no
+  grant — including on an **unowned** vault, since reads never claim); `500
+  internal`; `501 not_implemented`.
+
+### Default posture (all five routes)
+
+With **`SIGILD_ENABLE_DEV_OPS` unset** — the default and the only
+production-safe setting — **every** device route returns:
+
+```json
+{ "error": "not_implemented", "detail": "device enrollment and per-vault authorization are not enabled on this server" }
+```
+
+`501`, never `404`, and never a partial or faked auth behaviour. The same `501`
+applies when dev-ops is on but no registry is configured
+(`SIGILD_DEVICE_AUTH` unset). `GET /metrics` stays `200` throughout — it is never
+dev-gated.
+
+---
+
 ## What production will add (not in the skeleton)
 
 The dev op-log is a wiring placeholder. A production sync server would add, at
 minimum:
 
-- **Authentication and authorization** — full device enrollment, a multi-device
-  registry, JWT bearer tokens, and per-vault membership checks. The optional
-  `SIGILD_OPLOG_PUBKEY` signature check (above) is only a single static DEV
-  device key; its per-request nonce is checked against an in-memory,
-  **per-process** replay cache (a multi-instance deploy would need a shared one),
-  and with it unset the dev route is wide open.
+- **Authentication and authorization** — the dev op-log now *has* a real
+  **multi-device model** (contract v3: device enrollment with proof of
+  possession, a device registry, per-vault grants, and revocation — see
+  [above](#multi-device-auth-model-contract-v3--dev)), but production still owes
+  an **account model**, session/token issuance (JWT bearer tokens,
+  [`../sigild/internal/auth/`](../sigild/internal/auth/)), **key rotation** and
+  re-enrollment, recovery, **rate limiting on enrollment attempts**, a **shared**
+  (not per-process) replay store, and an ownership model stronger than
+  trust-on-first-write. The legacy `SIGILD_OPLOG_PUBKEY` mode remains only a
+  single static DEV key with no authorization at all, and with neither contract
+  configured the dev route is wide open.
 - **Durable, replicated storage** — the opt-in **Postgres** dev backend
   (`SIGILD_OPLOG_POSTGRES`, [`decisions/0014-postgres-durable-oplog-backend.md`](decisions/0014-postgres-durable-oplog-backend.md))
   now gives the dev op-log a durable, concurrent home, but a production store

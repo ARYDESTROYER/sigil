@@ -72,6 +72,23 @@ func main() {
 	}
 
 	devOps := truthy(os.Getenv("SIGILD_ENABLE_DEV_OPS"))
+
+	// Multi-device auth model config, validated BEFORE binding. All of it is
+	// OPT-IN: with SIGILD_DEVICE_AUTH unset the model is OFF and the server
+	// behaves EXACTLY as it did before (legacy single-key contract v2 when
+	// SIGILD_OPLOG_PUBKEY is set, otherwise unauthenticated).
+	deviceAuth, err := validateDeviceAuthConfig(deviceAuthEnv{
+		DeviceAuth:  os.Getenv("SIGILD_DEVICE_AUTH"),
+		DevOps:      os.Getenv("SIGILD_ENABLE_DEV_OPS"),
+		OpLogPubKey: os.Getenv("SIGILD_OPLOG_PUBKEY"),
+		Tokens:      os.Getenv("SIGILD_ENROLL_TOKENS"),
+		TokenTTL:    os.Getenv("SIGILD_ENROLL_TOKEN_TTL"),
+		AdminToken:  os.Getenv("SIGILD_ADMIN_TOKEN"),
+	})
+	if err != nil {
+		logger.Error("invalid device-auth configuration", "err", err)
+		os.Exit(1)
+	}
 	cfg := api.Config{
 		Version: buildinfo.Version,
 		// host:port reachability targets; empty => reported "unconfigured".
@@ -96,6 +113,9 @@ func main() {
 		// still UNAUTHENTICATED unless SIGILD_OPLOG_PUBKEY is set below. None is
 		// the production store (production = Postgres/S3/Redis with a real auth
 		// model, enrollment, CRDT and backups — none of which this has).
+		// pgPool is non-nil only when the Postgres op-log backend is selected. The
+		// device registry SHARES that pool (no second pool, no new dependency).
+		var pgPool *pgxpool.Pool
 		switch {
 		case os.Getenv("SIGILD_OPLOG_POSTGRES") != "":
 			dsn := os.Getenv("SIGILD_OPLOG_POSTGRES")
@@ -111,6 +131,7 @@ func main() {
 				os.Exit(1)
 			}
 			cfg.VaultLog = pgLog
+			pgPool = pgLog.Pool()
 			// Surface the applied migration version via the sigild_schema_version
 			// metric (0 for the mem/file backends, which have no migrations).
 			svCtx, svCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -156,6 +177,49 @@ func main() {
 			}
 			cfg.OpLogPubKey = pub
 			logger.Warn("DEV op-log request AUTH ENABLED: Ed25519, SINGLE configured DEV device key, per-request nonce + per-process in-memory replay cache (not replay-proof across instances) — dev-only, do NOT expose publicly")
+		}
+
+		// Optional MULTI-DEVICE auth model (contract v3). When SIGILD_DEVICE_AUTH
+		// is on, every ops request must name an ENROLLED device via X-Sigil-Device
+		// and hold a per-vault grant; the legacy single key is refused alongside it
+		// (validateDeviceAuthConfig already rejected that combination). The registry
+		// is durable when the Postgres op-log backend is active (sharing its pool,
+		// tables from migration 0002), otherwise in-memory and non-durable — which
+		// means a spent enrollment token becomes usable again after a restart.
+		if deviceAuth.Enabled {
+			if pgPool != nil {
+				cfg.Devices = store.NewPostgresDeviceStore(pgPool)
+			} else {
+				cfg.Devices = store.NewMemDeviceStore()
+				logger.Warn("DEVICE AUTH: registry is IN-MEMORY and NON-DURABLE — devices, grants and spent enrollment tokens are lost on restart; use the Postgres op-log backend for durability")
+			}
+			cfg.AdminToken = deviceAuth.AdminToken
+
+			// Register the operator-provisioned enrollment tokens by DIGEST. This
+			// is idempotent, so a restart never resurrects a token that has already
+			// been spent (the durable backend keeps the used marker).
+			issuedAt := time.Now().UTC()
+			var expiresAt time.Time
+			if deviceAuth.TokenTTL > 0 {
+				expiresAt = issuedAt.Add(deviceAuth.TokenTTL)
+			}
+			regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			for _, token := range deviceAuth.Tokens {
+				hash := api.EnrollTokenHash(token)
+				cfg.EnrollTokenHashes = append(cfg.EnrollTokenHashes, hash)
+				if err := cfg.Devices.RegisterEnrollmentToken(regCtx, hash, issuedAt, expiresAt); err != nil {
+					regCancel()
+					logger.Error("failed to register enrollment token", "err", err)
+					os.Exit(1)
+				}
+			}
+			regCancel()
+
+			logger.Warn("DEV op-log MULTI-DEVICE AUTH ENABLED (contract v3): per-device Ed25519 keys, per-vault authorization, revocation — dev-only, UNAUDITED, do NOT expose publicly",
+				"enrollment_tokens", len(cfg.EnrollTokenHashes),
+				"token_ttl", deviceAuth.TokenTTL.String(),
+				"admin_token_configured", cfg.AdminToken != "",
+				"registry", map[bool]string{true: "postgres", false: "memory"}[pgPool != nil])
 		}
 	}
 
@@ -366,6 +430,133 @@ func effectiveBurst(rate float64, burst int) int {
 		b = 1
 	}
 	return b
+}
+
+// ---- Multi-device auth model configuration (Phase 41) ----
+//
+// Environment, ALL optional; unset => the model is OFF and the server behaves
+// exactly as it did before:
+//
+//	SIGILD_DEVICE_AUTH        "1"/"true" turns on the v3 multi-device model.
+//	                          Requires SIGILD_ENABLE_DEV_OPS (the whole op-log is
+//	                          dev-gated) and is MUTUALLY EXCLUSIVE with
+//	                          SIGILD_OPLOG_PUBKEY (one auth contract at a time).
+//	SIGILD_ENROLL_TOKENS      comma-separated operator-provisioned enrollment
+//	                          tokens (bootstrap secrets). REQUIRED when device
+//	                          auth is on — without one, no device can enroll.
+//	                          Each must be >= minEnrollTokenLen chars. Only their
+//	                          SHA-256 digests are ever stored or compared.
+//	SIGILD_ENROLL_TOKEN_TTL   optional Go duration (e.g. "24h"). When set, a
+//	                          token expires TTL after it was first registered
+//	                          (registration is idempotent, so restarts do not
+//	                          extend the clock). Unset => tokens do not expire,
+//	                          but remain SINGLE-USE.
+//	SIGILD_ADMIN_TOKEN        optional operator token for the operator-only device
+//	                          routes (list all devices, revoke any device). Unset
+//	                          => those paths are permanently unauthorized; there
+//	                          is no implicit open-admin mode.
+
+// minEnrollTokenLen is the minimum length of an operator-provisioned enrollment
+// or admin token. These are bearer secrets, so a short one is a configuration
+// error the server refuses to start with rather than a weak-but-working setup.
+const minEnrollTokenLen = 16
+
+// deviceAuthEnv is the raw environment for the device-auth model, injected so
+// validation is unit-testable without touching the process environment.
+type deviceAuthEnv struct {
+	DeviceAuth  string
+	DevOps      string
+	OpLogPubKey string
+	Tokens      string
+	TokenTTL    string
+	AdminToken  string
+}
+
+// deviceAuthConfig is the validated result.
+type deviceAuthConfig struct {
+	Enabled    bool
+	Tokens     []string // PLAINTEXT, used only to compute digests at boot
+	TokenTTL   time.Duration
+	AdminToken string
+}
+
+// validateDeviceAuthConfig parses + validates the device-auth environment and
+// fails fast on any misconfiguration, BEFORE the listener binds. It never calls
+// os.Exit, so it is unit-testable.
+//
+// When SIGILD_DEVICE_AUTH is not truthy it returns a disabled config and ignores
+// everything else, so a stale/pre-staged SIGILD_ENROLL_TOKENS cannot silently
+// switch the auth model on.
+func validateDeviceAuthConfig(env deviceAuthEnv) (deviceAuthConfig, error) {
+	if !truthy(env.DeviceAuth) {
+		return deviceAuthConfig{}, nil
+	}
+	if !truthy(env.DevOps) {
+		return deviceAuthConfig{}, errors.New("SIGILD_DEVICE_AUTH requires SIGILD_ENABLE_DEV_OPS: the op-log and its auth model are dev-gated")
+	}
+	if strings.TrimSpace(env.OpLogPubKey) != "" {
+		return deviceAuthConfig{}, errors.New("SIGILD_DEVICE_AUTH and SIGILD_OPLOG_PUBKEY are mutually exclusive: the multi-device contract (v3) replaces the single-static-key contract (v2); unset SIGILD_OPLOG_PUBKEY to migrate")
+	}
+
+	tokens, err := parseEnrollTokens(env.Tokens)
+	if err != nil {
+		return deviceAuthConfig{}, fmt.Errorf("SIGILD_ENROLL_TOKENS: %w", err)
+	}
+	if len(tokens) == 0 {
+		return deviceAuthConfig{}, errors.New("SIGILD_DEVICE_AUTH requires SIGILD_ENROLL_TOKENS: without an enrollment token no device can ever enroll")
+	}
+
+	ttl, err := parseTokenTTL(env.TokenTTL)
+	if err != nil {
+		return deviceAuthConfig{}, fmt.Errorf("SIGILD_ENROLL_TOKEN_TTL: %w", err)
+	}
+
+	admin := strings.TrimSpace(env.AdminToken)
+	if admin != "" && len(admin) < minEnrollTokenLen {
+		return deviceAuthConfig{}, fmt.Errorf("SIGILD_ADMIN_TOKEN: must be at least %d characters", minEnrollTokenLen)
+	}
+
+	return deviceAuthConfig{Enabled: true, Tokens: tokens, TokenTTL: ttl, AdminToken: admin}, nil
+}
+
+// parseEnrollTokens splits a comma-separated token list, trimming whitespace and
+// rejecting duplicates and short (weak) tokens. An empty/blank value yields no
+// tokens and no error; the caller decides whether that is fatal.
+func parseEnrollTokens(s string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		if len(token) < minEnrollTokenLen {
+			return nil, fmt.Errorf("each token must be at least %d characters (a short bootstrap secret is guessable)", minEnrollTokenLen)
+		}
+		if _, dup := seen[token]; dup {
+			return nil, errors.New("duplicate token in list")
+		}
+		seen[token] = struct{}{}
+		out = append(out, token)
+	}
+	return out, nil
+}
+
+// parseTokenTTL parses an optional Go duration. Empty => 0 (no expiry). A set
+// value must be a positive duration.
+func parseTokenTTL(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("must be a Go duration such as \"24h\": %w", err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive, got %s", d)
+	}
+	return d, nil
 }
 
 // parseOpLogPubKey parses SIGILD_OPLOG_PUBKEY: the standard-base64 encoding of a

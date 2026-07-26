@@ -107,8 +107,9 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   concurrency-safe per-vault sequencing) — the first real store adapter, and the
   reason `sigild` now has **its first third-party dependency (`pgx`)** and a
   `go.sum`; the core server + the in-memory / file backends stay stdlib-only. All
-  three are **dev-only, NOT a finished production store** (no auth / enrollment,
-  per-vault authorization, or CRDT / merge; the Postgres backend now has managed
+  three are **dev-only, NOT a finished production store** (no CRDT / merge, and no
+  account model — device enrollment and per-vault authorization now exist, but only as
+  the dev-gated, unaudited opt-in model described below; the Postgres backend has managed
   migrations and a chain-verified backup runbook (below), but no PITR / replication).
   Op-log requests
   are **unauthenticated by default**, but
@@ -168,7 +169,26 @@ A paid, multi-platform, end-to-end-encrypted, post-quantum-ready authenticator.
   `sigild_schema_version` gauge. **Backup/restore** is a plain `pg_dump`/`pg_restore`
   whose integrity is provable via the existing hash chain — because the `blob` and `hash`
   columns dump byte-for-byte, `GET …/ops/verify` re-proves the same `tip_hash` after a
-  restore (dev backend only; no PITR/replication yet). Ships a distroless `Dockerfile`.
+  restore (dev backend only; no PITR/replication yet). `sigild` also now has an **opt-in
+  multi-device auth model** (op-log auth **contract v3**, enabled with
+  `SIGILD_DEVICE_AUTH`; mutually exclusive with the single-key `SIGILD_OPLOG_PUBKEY`, and
+  the server refuses to boot if both are set): a **device registry** of per-device Ed25519
+  keys, **enrollment** (`POST /v1/devices/enroll`) that requires an operator-provisioned
+  single-use token **plus a proof of possession** of the enrolling key, **per-vault
+  authorization** (read/write grants, with the first device to write to an unclaimed vault
+  becoming its owner), and **revocation** — so a request names *which* device signed it
+  (`X-Sigil-Device`), a revoked device is refused on its next request, and "authenticated
+  but not allowed" is a distinct `403` rather than a blanket `401`. It stores **auth
+  metadata only** (a new `0002_devices.sql` migration; `sigild_schema_version` → `2`) —
+  the opaque blob, its hash chain, and the zero-knowledge boundary are unchanged, and it
+  adds no new dependency. **Dev-gated and off by default** (every device route returns
+  `501` unless `SIGILD_ENABLE_DEV_OPS` is set), **UNAUDITED**, and **not an account
+  model**: no user accounts, no session/JWT issuance, no key rotation, no rate limiting on
+  enrollment attempts, a per-process replay cache, and trust-on-first-write ownership that
+  orphans a vault if its owner is revoked. Do not expose it publicly or use it for real
+  secrets. See [`docs/api.md`](docs/api.md) and
+  [ADR 0031](docs/decisions/0031-multi-device-auth-model.md). Ships a distroless
+  `Dockerfile`.
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

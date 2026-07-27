@@ -128,8 +128,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
     relays the result as an opaque envelope it cannot read
     ([`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
     That makes it **load-bearing product code and squarely in scope for the audit**.
-    It is still **not** the product's *account* model, there is still **no
-    out-of-band verification** of a recipient's hybrid public key, and the
+    It is still **not** the product's *account* model; out-of-band verification of a
+    recipient's hybrid public key now **exists** as a client-side safety number
+    plus key pinning (§2c), but it protects first contact only if a human actually
+    compares the digits; and the
     envelope's `kem_ct` field stays reserved — the ML-KEM ciphertext travels
     alongside the envelope. See
     [`decisions/0013-hybrid-public-key-seal.md`](decisions/0013-hybrid-public-key-seal.md).
@@ -576,8 +578,11 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   **Vault-sharing relay (same dev gate, same auth choke points):** on top of that
   model `sigild` acts as a **mailbox** for device-to-device key distribution —
   `PUT`/`GET /v1/devices/{deviceID}/hybrid-key` (a device's **public** X25519 +
-  ML-KEM-768 key) and `PUT`/`GET /v1/vaults/{vaultID}/keys/{deviceID}` (an
-  **opaque wrapped vault key**). It is deliberately the dullest possible component:
+  ML-KEM-768 key), `PUT`/`GET /v1/vaults/{vaultID}/keys/{deviceID}` (an
+  **opaque wrapped vault key**) and — for rotation —
+  `GET /v1/vaults/{vaultID}/keys` (recipient **metadata only**, never a blob) plus
+  `DELETE /v1/vaults/{vaultID}/keys/{deviceID}`, both requiring **write** through the
+  *same* `authorizeOpsRequest` choke point as a deposit. It is deliberately the dullest possible component:
   it stores and returns the envelope **byte-for-byte**, holds **no decapsulation
   key**, decodes nothing, and its **only** inspection of key material is a length
   check (32 / 1184 bytes) — validating a curve point would be the server performing
@@ -590,12 +595,16 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   `sigil_vault_key_envelopes`; `sigild_schema_version` → **4**) is purely additive
   and again touches **nothing** in `sigil_vault_ops`. Audit lines
   (`device.hybrid_key_published`, `vault.key_envelope_put`,
-  `vault.key_envelope_get`) carry metadata plus a **SHA-256 fingerprint** of the
+  `vault.key_envelope_get`, plus `vault.key_envelope_list` / `_delete`, which read no
+  blob and so carry no fingerprint) carry metadata plus a **SHA-256 fingerprint** of the
   envelope — never its bytes, never a key. Honest scope: **dev-gated (`501` by
-  default), plain HTTP, UNAUDITED**; there is no out-of-band verification of a
-  published hybrid key, revocation stops future access but cannot un-share a key a
-  device already unwrapped, and there is no re-wrap-on-revoke or rotation schedule
-  (see [`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
+  default), plain HTTP, UNAUDITED**; verification of a published hybrid key is
+  **client-side only** — `sigild` stores and validates no pin and no safety number
+  (§2c) — revocation stops future access but cannot un-share a key a device already
+  unwrapped, and re-keying is the **manual** `vault rotate` with no schedule and no
+  automatic re-wrap on revoke
+  (see [`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)
+  and [`decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md`](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
   **Billing / subscriptions (opt-in, dev-gated):** because Sigil is a **paid**
   product, `sigild` also carries a **provider-agnostic billing seam** —
   one `billing.Provider` interface with three **stdlib-only** adapters
@@ -1185,7 +1194,7 @@ diagram can be a browser, the CLI or the desktop — proven with no mocks by
 [`../desktop/core/tests/server_interop.rs`](../desktop/core/tests/server_interop.rs)
 (desktop ↔ the real `sigil` binary against a real `sigild`), each direction reaching
 the same vault-key fingerprint and the same RFC 6238 code. The browser
-clients keep the recovered key inside their **sealed v2 device-identity container**
+clients keep the recovered key inside their **sealed v3 device-identity container**
 ([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)) where the CLI and the
 desktop app use the same `0600` keyring file.
 
@@ -1205,16 +1214,106 @@ vault key nor the 2FA seed.
 
 **Honest limits.** Dev-gated (`501` by default), plain HTTP, **UNAUDITED**; a
 **custom KEM-then-AEAD, NOT RFC 9180 HPKE**; the **system is not "post-quantum
-secure"**; there is **no out-of-band verification** of a published hybrid public
-key (a hostile registry could substitute its own); revocation stops **future**
-access but cannot make a device forget a key it already unwrapped (remediation is a
-manual re-key + re-share); and there is **no rotation schedule, no re-wrap on
-revoke, and no forward secrecy** for a delivered vault key. Request signatures on
+secure"**. Trust in a fetched public key is addressed — but only partly — by the
+pinning and safety-number layer in §2c below: substitution **after** first contact
+is blocked, **first** contact is trust-on-first-use unless a human compares the
+safety number. Revocation stops **future** access but cannot make a device forget a
+key it already unwrapped; `vault rotate` (§2c) is the remediation and protects
+**future content only**, and it is **manual** — nothing re-keys on revoke and there
+is **no rotation schedule and no forward secrecy** for a delivered vault key.
+Request signatures on
 these routes are **classical Ed25519** — the wrap is hybrid, the authentication is
 not. On the browser clients, converting a personal vault into a shared one is a
 **one-way door** in the UI, and the `Uint8Array`s holding a vault key or a hybrid
 secret are **not zeroized** while the vault is unlocked (JS gives no reliable way to
 do so).
+
+### 2c. Trust in a fetched public key — the client-side pin store
+
+§2b has one structural weakness: step 1 fetches the recipient's hybrid public key
+**from the server**, and the server is explicitly outside the trust boundary. A
+hostile or compromised registry could answer with **its own** key, receive the vault
+key wrapped to itself, and read the vault — invisibly. Phase 50 answers that
+**entirely on the client side**
+([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
+
+⭐ **The architectural point: the pin store is a client-side trust store that the
+server can neither read nor write.** It is not a protocol feature. `sigild` gained
+no knowledge of pins or safety numbers, stores none, serves none, and validates
+none — it still relays opaque bytes. The one copy of "which key do I trust for that
+device" lives on each client, on the trusted side of the boundary, which is the only
+place an answer to a lying server can live.
+
+```
+      CLIENT (trusted)                        ║          SERVER (untrusted)
+  ┌───────────────────────────────┐           ║
+  │ pin store                     │           ║   registry of hybrid PUBLIC keys
+  │  deviceID → {x25519, mlkem,   │           ║        │
+  │             safety_number,    │           ║        │  GET /v1/devices/{B}/hybrid-key
+  │             pinned_at, repins}│           ║        ▼
+  └───────────────┬───────────────┘           ║   whatever the server chooses to say
+                  │                           ║        │
+                  ▼   fetch_hybrid_key_pinned / fetchHybridKeyPinned  ◀───┘
+        ┌─────────────────────┐               ║
+        │ compare RAW bytes   │               ║   ⚠️ the request is authenticated;
+        │  first sight → PIN  │  ⚠️ + warn    ║      the RESPONSE is not. Nothing
+        │  identical   → OK   │               ║      in the protocol binds this key
+        │  DIFFERENT   → STOP │  ⛔ no wrap,  ║      to device B.
+        └─────────────────────┘     no upload ║
+```
+
+**Where the choke point is.** Enforcement rides on **the fetch itself** —
+`fetch_hybrid_key_pinned` (Rust) / `fetchHybridKeyPinned` (JS) return a key only
+after checking it — and **every** wrap path, share and rotate, in both
+implementations, goes through it. That is deliberate: a trust store that some code
+path forgets to consult is worthless. The unchecked `fetch_hybrid_key` /
+`fetchHybridKey` survive only where nothing is wrapped — displaying a safety number,
+the deliberate re-pin, and the desktop's `check_server`.
+
+**Two implementations, not four.** The Rust `sigil-cli` library serves the CLI **and**
+the desktop app ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md));
+`sigil-wasm/sharing.mjs` serves the webapp and the extension. The digest must be
+byte-identical across both or cross-client verification breaks, so both carry the same
+known-answer test and `sigil-wasm/test/pinning-interop.mjs` compares the real `sigil`
+binary's output against the JS module's.
+
+**Where the store lives is per-client, and follows each client's existing rule:**
+
+| Client | Pin store | Mode / protection |
+|--------|-----------|-------------------|
+| `sigil` CLI, native desktop | `hybrid-pins.json` in the state dir (`$HOME/.sigil` by default) — **the same file**, so a CLI pin and a desktop pin are one record | `0600` file in a `0700` dir, written via the same `write_secret_file` helper as other sensitive state (created `0600` up front, `fsync`'d, re-`chmod`'d) |
+| webapp, MV3 extension | a `pins` field **inside the existing sealed device-identity container**, schema **v3** | sealed under the vault password with the same Argon2id → XChaCha20-Poly1305 `SIGILcli` construction as everything else — **the browsers still persist only sealed containers** |
+
+The browser choice matters architecturally: it would have been easy to drop a JSON
+blob in `localStorage`, and that would have broken the invariant from
+[ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md) /
+[ADR 0033](decisions/0033-browser-device-identity-storage.md) that a browser persists
+**nothing in the clear**. Reusing the sealed container keeps the pin store on the same
+password, the same lock/unlock lifecycle, and the same one-key-per-client storage
+footprint. **v1 and v2 containers still open** and yield an **empty** pin store, so an
+existing client keeps working and simply pins on next use.
+
+The pins are **public** key material — but they are security-critical **local** state:
+anything that can rewrite the store can silence the alarm before it fires. That is why
+they get secret-grade treatment on both sides, and it is a real residual risk on a
+compromised host.
+
+**Rotation is the other half.** Pinning and safety numbers protect key
+*distribution*; they do nothing about a key already distributed. `sigil vault rotate`
+(and the desktop command, and the browser UIs) draws a fresh vault key, re-seals the
+container under it, re-wraps to exactly the named devices, and **deletes** every other
+device's envelope through the two Phase 50 routes (`GET /v1/vaults/{V}/keys`,
+`DELETE /v1/vaults/{V}/keys/{deviceID}`). Every recipient is **pin-checked first**, so
+a mismatch aborts before any local or remote state is touched. The full step order and
+its crash-safety reasoning are in
+[`crypto-spec.md`](crypto-spec.md#vault-key-rotation--the-key-lifecycle).
+
+⚠️ **Honest scope, because this is the security story people will read fastest:**
+pinning **cannot** protect first contact — if the server lies the very first time, the
+lie is what gets pinned, and only a human comparing the safety number out of band
+catches it. A user who re-pins without checking defeats it. Rotation protects **future
+content only**; a device that already unwrapped a key keeps what it copied. And all of
+it is **new, unaudited code** in a dev-gated, plain-HTTP posture.
 
 ---
 
@@ -1477,10 +1576,13 @@ authoritative list, with rationale, is the **defer ledger** in
   including every sharing route, is classical Ed25519 only); neither construction is
   wired into the **suite frame** (the envelope's `kem_ct` field stays *reserved* but
   unused); sharing is **not** an account/session model; and the **system is still
-  not "post-quantum secure"**. The sharing flow itself has named gaps — no
-  out-of-band verification of a published hybrid public key, no key rotation
-  schedule, no re-wrap on revoke, and no forward secrecy for a delivered vault key
-  — and it is **dev-gated and UNAUDITED**.
+  not "post-quantum secure"**. The sharing flow's named gaps are **narrower than they
+  were** — key substitution after first contact is now blocked by client-side pinning,
+  and a safety number makes first contact verifiable (§2c) — but the residue is real:
+  **first contact is trust-on-first-use unless a human compares the digits**, there is
+  **no key transparency and no cross-signature**, rotation is **manual** with no
+  schedule and no automatic re-wrap on revoke, and there is **no forward secrecy** for
+  a delivered vault key — and it is **dev-gated and UNAUDITED**.
 - **No real operation / CRDT semantics.** The op-log is a plain append-and-read
   byte journal with a monotonic sequence number and a per-op SHA-256 **hash
   chain** for **tamper-evidence** (detects modify/insert/delete/reorder of stored
@@ -1488,12 +1590,15 @@ authoritative list, with rationale, is the **defer ledger** in
   but still **no signed ops**, no Lamport/Merkle ordering, no conflict-free
   merge, and the chain is **tamper-evident, not tamper-proof** (a hostile server
   can lie about `/ops/verify`; the real check is client-side).
-- **No accounts / sync protocol / key rotation / recovery.** Device-to-device
-  **vault sharing** now exists ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md))
-  and billing exists in code (above), but the rest of the product workflows do
-  not — and sharing itself has **no key-rotation schedule, no re-wrap on revoke, no
-  recovery path, and no key-transparency / out-of-band verification** of a
-  recipient's hybrid public key.
+- **No accounts / sync protocol / recovery.** Device-to-device
+  **vault sharing** now exists ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)),
+  a **vault key can now be rotated and re-wrapped**
+  ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)), and
+  billing exists in code (above), but the rest of the product workflows do
+  not — and sharing still has **no rotation schedule, no automatic re-wrap on revoke,
+  no recovery path, and no key-transparency log or cross-signature** binding a
+  recipient's hybrid public key to its enrolled identity (the safety number puts a
+  **human** in that loop rather than removing the loop).
 - **No live PQ-TLS proof.** `sigild` serves plain HTTP in the skeleton; the hybrid
   `X25519MLKEM768` handshake is unproven on this machine (see
   [`deployment.md`](deployment.md) §3).

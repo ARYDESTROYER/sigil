@@ -64,6 +64,14 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > the `sigil-cli` library rather than reimplementing enrollment, contract-v3 sync or
 > sharing — so all four client surfaces are peers and the canonical signed message still
 > exists in only three implementations**,
+> and **client-side key verification for that sharing flow** (clients **PIN** a device's
+> hybrid public key on first sight and **hard-refuse to wrap** to a changed one, a
+> human-comparable **safety number** allows out-of-band verification that pinning cannot
+> give at first contact, and a vault key can be **ROTATED and re-wrapped** so revocation
+> protects future content — client-side only, mirrored across exactly two
+> implementations, with two new dev-gated `sigild` routes reusing the existing write
+> authorization; still UNAUDITED, and first contact is still trust-on-first-use unless a
+> human actually compares the digits),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -142,3 +150,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0035](0035-device-to-device-vault-sharing.md) | Device-to-device vault sharing — random per-vault key sealed into the unchanged `SIGILcli` container, wrapped per device with `hybrid_seal` (X25519 + ML-KEM-768), relayed as an opaque envelope, authorized by the existing v3 grants | Accepted (2026-07) |
 | [0036](0036-browser-sharing-secret-storage.md) | Browser sharing-secret storage — keep the hybrid secret identity and the vault keyring inside the existing sealed device-identity container (schema bumped to v2, v1 still readable) rather than adding a new store | Accepted (2026-07) |
 | [0037](0037-desktop-reuses-cli-library-for-protocol.md) | The desktop client drives the `sigil-cli` library instead of reimplementing the wire protocol — no fourth copy of the canonical contract-v3 message, and the CLI's own state files | Accepted (2026-07) |
+| [0038](0038-key-pinning-safety-numbers-and-vault-rotation.md) | Key pinning (pin on first sight, **hard-refuse** on change), a human-comparable safety number as the out-of-band check, and vault key rotation with re-wrap — the client-side answer to a key-substituting server, retiring two limitations recorded in [0035](0035-device-to-device-vault-sharing.md) | Accepted (2026-07) |

@@ -23,6 +23,13 @@ use sigil_cli::{
     DeviceIdentity, ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE,
     TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD, VAULT_KEYRING_FILE,
 };
+// Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
+// All of it lives in the sigil-cli LIBRARY so the native desktop app gets the
+// same semantics by calling the same functions (ADR 0037).
+use sigil_cli::{
+    fetch_hybrid_key_pinned, hybrid_safety_number, load_pins, pairwise_safety_number,
+    repin_hybrid_key, rotate_vault_key, HybridPublicIdentity, HYBRID_PIN_FILE,
+};
 use sigil_core::Argon2Params;
 
 /// Environment variable the password is read from. Empty/unset is a hard error.
@@ -99,9 +106,24 @@ USAGE:
                                          Re-seal a PASSWORD vault under a fresh random VAULT KEY
                                          (--publish also wraps it to THIS device and uploads it)
   sigil vault share --vault <id> --to <deviceID> [--permission read|write] [--keyring <f>]
-                    [--key <f>] [--server <url>] [--envelope-out <f>]
+                    [--key <f>] [--pins <f>] [--server <url>] [--envelope-out <f>]
                                          Wrap the vault key to that device's hybrid public key,
-                                         upload the opaque envelope, and grant it access
+                                         upload the opaque envelope, and grant it access.
+                                         REFUSES if that device's key CHANGED since it was pinned
+  sigil vault rotate --vault <id> --to <deviceID> [--to <deviceID> ...] [--file <vaultfile>]
+                     [--keyring <f>] [--pins <f>] [--key <f>] [--server <url>]
+                                         Draw a FRESH vault key, re-seal the vault under it, re-wrap
+                                         it to EXACTLY those devices, and delete every other
+                                         device's envelope. Protects FUTURE content only
+  sigil device safety-number [<deviceID>] [--pair <deviceID>] [--key <f>] [--server <url>]
+                                         Print the human-comparable SAFETY NUMBER of a hybrid public
+                                         key — read it aloud over a TRUSTED channel to verify a key
+                                         BEFORE the first share (--pair is order-independent)
+  sigil device pins [--pins <file>]      List the hybrid public keys this client TRUSTS
+  sigil device repin <deviceID> --yes [--safety-number <digits>] [--pins <f>] [--server <url>]
+                                         DANGEROUS. Accept a CHANGED hybrid key for a device. Only
+                                         after verifying the NEW safety number out of band — a
+                                         changed key may be a KEY-SUBSTITUTION ATTACK
   sigil vault accept --vault <id> [--keyring <f>] [--key <f>] [--hybrid-key <f>]
                      [--server <url>] [--envelope-out <f>]
                                          Collect the envelope addressed to THIS device, unwrap it,
@@ -294,8 +316,14 @@ DEVICE-TO-DEVICE VAULT SHARING (sigil vault ...) — DEV-ONLY, UNAUDITED:
     SIGIL_PASSWORD=... sigil vault rekey --vault demo --file ./a-vault.sigil --publish --key ./a.key
     sigil push --vault demo --in ./a-vault.sigil --key ./a.key
 
-    # A: share to B — fetches B's hybrid PUBLIC key, wraps the vault key to it
-    # with fresh ephemeral entropy, uploads the envelope, and grants B access.
+    # BEFORE the first share: verify B's key out of band. Pinning cannot protect
+    # first contact — only a human comparing these digits can.
+    sigil device safety-number <B_ID> --key ./a.key     # A reads the digits...
+    sigil device safety-number --key ./b.key            # ...B reads its own; they must match
+
+    # A: share to B — fetches B's hybrid PUBLIC key, PINS it on first sight (and
+    # REFUSES loudly if it ever changes), wraps the vault key to it with fresh
+    # ephemeral entropy, uploads the envelope, and grants B access.
     sigil vault share --vault demo --to <B_ID> --permission read --key ./a.key
 
     # B: accept — collects the envelope addressed to B, unwraps it with B's
@@ -303,6 +331,14 @@ DEVICE-TO-DEVICE VAULT SHARING (sigil vault ...) — DEV-ONLY, UNAUDITED:
     sigil vault accept --vault demo --key ./b.key
     sigil pull --vault demo --out-dir ./inbox --key ./b.key
     sigil totp code work --vault ./inbox/demo/op-1.sigil --vault-id demo
+
+    # Later: B is lost/revoked. Revocation alone does not protect content sealed
+    # under the key B already has — ROTATE, naming everyone who KEEPS access.
+    sigil device revoke <B_ID> --admin-token ... --server ...
+    sigil vault rotate --vault demo --to <A_ID> --to <C_ID> --file ./a-vault.sigil --key ./a.key
+    sigil push --vault demo --in ./a-vault.sigil --key ./a.key
+    # Everything added AFTER this is unreadable to B. Anything B already read,
+    # B still has — rotation protects FUTURE content only.
 
   --vault-id <id> is what tells the totp commands to open a file with the VAULT
   KEY for <id> instead of SIGIL_PASSWORD. Without it, nothing changes: existing
@@ -937,6 +973,18 @@ struct DeviceFlags {
     hybrid_key: Option<String>,
     /// Force a NEW hybrid identity even if one already exists on disk.
     regenerate: bool,
+    /// `device safety-number` only: compute the ORDER-INDEPENDENT pairwise
+    /// number between this device and `--pair <deviceID>`.
+    pair: Option<String>,
+    /// `device repin` only: the safety number the human claims to have verified
+    /// out of band. When given it MUST match the presented key, or the re-pin is
+    /// refused — so a typo cannot silently bless an attacker's key.
+    safety_number: Option<String>,
+    /// `device repin` only: the explicit acknowledgement that re-pinning
+    /// accepts a NEW key for a device.
+    yes: bool,
+    /// Override the LOCAL hybrid-key pin store path.
+    pins: Option<String>,
 }
 
 /// Parse the `device` subcommand flags (order-independent), rejecting anything
@@ -954,8 +1002,12 @@ fn parse_device_flags(args: Vec<String>) -> Result<DeviceFlags, String> {
             "--vault" => set_once(&mut f.vault, &mut it, "--vault")?,
             "--permission" => set_once(&mut f.permission, &mut it, "--permission")?,
             "--hybrid-key" => set_once(&mut f.hybrid_key, &mut it, "--hybrid-key")?,
+            "--pair" => set_once(&mut f.pair, &mut it, "--pair")?,
+            "--pins" => set_once(&mut f.pins, &mut it, "--pins")?,
+            "--safety-number" => set_once(&mut f.safety_number, &mut it, "--safety-number")?,
             "--reuse-key" => f.reuse_key = true,
             "--regenerate" => f.regenerate = true,
+            "--yes" => f.yes = true,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
     }
@@ -966,7 +1018,8 @@ fn parse_device_flags(args: Vec<String>) -> Result<DeviceFlags, String> {
 fn cmd_device(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let Some(sub) = args.next() else {
         return Err(
-            "missing device subcommand: enroll | list | revoke | grant | hybrid-publish"
+            "missing device subcommand: enroll | list | revoke | grant | hybrid-publish | \
+             safety-number | pins | repin"
                 .to_string(),
         );
     };
@@ -980,8 +1033,12 @@ fn cmd_device(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         "revoke" => cmd_device_revoke(positional, &f),
         "grant" => cmd_device_grant(positional, &f),
         "hybrid-publish" => cmd_device_hybrid_publish(&f),
+        "safety-number" => cmd_device_safety_number(positional, &f),
+        "pins" => cmd_device_pins(&f),
+        "repin" => cmd_device_repin(positional, &f),
         other => Err(format!(
-            "unknown device subcommand {other:?}; try enroll | list | revoke | grant | hybrid-publish"
+            "unknown device subcommand {other:?}; try enroll | list | revoke | grant | \
+             hybrid-publish | safety-number | pins | repin"
         )),
     }
 }
@@ -1273,6 +1330,249 @@ fn cmd_device_hybrid_publish(f: &DeviceFlags) -> Result<(), String> {
     Ok(())
 }
 
+/// Load THIS device's own hybrid PUBLIC identity from disk (no network).
+fn own_hybrid_public(f: &DeviceFlags) -> Result<(String, HybridPublicIdentity), String> {
+    let identity_path = resolve_identity_path(f.key.clone());
+    let identity = load_identity(&identity_path).map_err(|e| e.to_string())?;
+    let device_id = identity.device_id.clone().ok_or_else(|| {
+        format!(
+            "identity {} has no device_id: run `sigil device enroll` first",
+            identity_path.display()
+        )
+    })?;
+    let secret_path = resolve_hybrid_path(f.hybrid_key.clone(), &identity_path);
+    let public = load_hybrid_public(&hybrid_public_path(&secret_path)).map_err(|e| {
+        format!("{e}\n  -> run `sigil device hybrid-publish` first so this device has a hybrid identity")
+    })?;
+    Ok((device_id, public))
+}
+
+/// `sigil device safety-number [<deviceID>] [--pair <deviceID>]`
+///
+/// Print a SAFETY NUMBER: a short, deterministic fingerprint of a device's FULL
+/// hybrid public key (X25519 public key + ML-KEM-768 encapsulation key) bound to
+/// its device id, rendered as six 5-digit groups.
+///
+/// ⭐ THIS IS THE THING YOU READ ALOUD. Pinning cannot protect the FIRST time you
+/// see a device's key — if the server lied then, the lie is what got pinned. The
+/// only fix is to compare this number with the other person over a channel the
+/// server does not control (a phone call, in person). If the digits match, the
+/// key you are about to wrap a vault key to is really theirs.
+///
+///   * no argument  -> THIS device's own number, read from local files only.
+///   * `<deviceID>` -> that device's number, fetched from the server, plus how it
+///     compares to what this client has pinned. This is READ-ONLY: it never pins
+///     and never re-pins.
+///   * `--pair <deviceID>` -> the ORDER-INDEPENDENT pairwise number for this
+///     device and that one. Both people see the SAME digits regardless of who
+///     runs it, which is what makes it easy to read to each other.
+fn cmd_device_safety_number(target: Option<String>, f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.admin_token.is_some() || f.yes || f.safety_number.is_some() {
+        return Err(
+            "device safety-number takes [<deviceID>] [--pair <deviceID>] [--key/--hybrid-key/--pins/--server] only"
+                .to_string(),
+        );
+    }
+    let (my_id, my_public) = own_hybrid_public(f)?;
+
+    // Pairwise: mix BOTH devices' digests in a canonical sorted order.
+    if let Some(other) = &f.pair {
+        let server = resolve_server(f.server.clone());
+        let identity_path = resolve_identity_path(f.key.clone());
+        let identity = load_identity(&identity_path).map_err(|e| e.to_string())?;
+        let identity_opt = Some(identity);
+        let auth = auth_for(&identity_opt);
+        let theirs = fetch_hybrid_key(&server, other, &auth)
+            .map_err(|e| explain_sharing_error(e, "fetching that device's hybrid public key"))?;
+        let pair = pairwise_safety_number(&my_id, &my_public, other, &theirs)
+            .map_err(|e| e.to_string())?;
+        println!(
+            "PAIRWISE SAFETY NUMBER\n  \
+             {my_id}  <->  {other}\n\n    {pair}\n\n  \
+             Read this to the other person over a TRUSTED channel (a phone call, in person).\n  \
+             It is ORDER-INDEPENDENT: they will see the SAME digits when they run\n  \
+             `sigil device safety-number --pair {my_id}`. If the digits differ, DO NOT SHARE —\n  \
+             something between you is substituting keys."
+        );
+        return Ok(());
+    }
+
+    // Someone else's key, fetched from the registry. Read-only: no pinning here.
+    if let Some(device_id) = target {
+        let server = resolve_server(f.server.clone());
+        let identity_path = resolve_identity_path(f.key.clone());
+        let identity = load_identity(&identity_path).map_err(|e| e.to_string())?;
+        let identity_opt = Some(identity);
+        let auth = auth_for(&identity_opt);
+        let theirs = fetch_hybrid_key(&server, &device_id, &auth)
+            .map_err(|e| explain_sharing_error(e, "fetching that device's hybrid public key"))?;
+        let presented = hybrid_safety_number(&device_id, &theirs).map_err(|e| e.to_string())?;
+        let pins_path = resolve_pins_path(f.pins.clone(), None);
+        let store = load_pins(&pins_path).map_err(|e| e.to_string())?;
+        let pin_line = match store.pins.get(&device_id) {
+            None => "not pinned yet (it will be pinned the first time you share)".to_string(),
+            Some(p) if p.safety_number == presented => {
+                format!("MATCHES the pinned key (pinned at unix {})", p.pinned_at)
+            }
+            Some(p) => format!(
+                "⚠️ DIFFERS from the pinned key ({}) — sharing will REFUSE until you re-pin",
+                p.safety_number
+            ),
+        };
+        println!(
+            "SAFETY NUMBER for device {device_id}\n\n    {presented}\n\n  \
+             pin status: {pin_line}\n  \
+             Confirm these digits with that device's owner over a TRUSTED channel before you\n  \
+             share a vault with them for the FIRST time."
+        );
+        return Ok(());
+    }
+
+    // This device's own number — local files only, works offline.
+    let mine = hybrid_safety_number(&my_id, &my_public).map_err(|e| e.to_string())?;
+    println!(
+        "SAFETY NUMBER for THIS device ({my_id})\n\n    {mine}\n\n  \
+         Read these digits to anyone who is about to share a vault with you, over a channel\n  \
+         the server does not control. Derived from this device's FULL hybrid public key\n  \
+         (X25519 + ML-KEM-768) and its device id — no secret is involved and nothing was\n  \
+         sent anywhere."
+    );
+    Ok(())
+}
+
+/// `sigil device pins [--pins <file>]` — the hybrid public keys this client
+/// TRUSTS, and their safety numbers.
+///
+/// This is the local record the server cannot rewrite. If a device shows a
+/// non-zero re-pin count, a human accepted a key change for it at some point.
+fn cmd_device_pins(f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.admin_token.is_some() || f.yes || f.pair.is_some() {
+        return Err("device pins takes --pins <file> only".to_string());
+    }
+    let pins_path = resolve_pins_path(f.pins.clone(), None);
+    let store = load_pins(&pins_path).map_err(|e| e.to_string())?;
+    if store.pins.is_empty() {
+        println!(
+            "no pinned hybrid keys in {}\n  \
+             A key is pinned the FIRST time this client fetches it (trust on first use).",
+            pins_path.display()
+        );
+        return Ok(());
+    }
+    println!(
+        "{} pinned key(s) in {}:",
+        store.pins.len(),
+        pins_path.display()
+    );
+    for (device_id, pin) in &store.pins {
+        println!(
+            "  {device_id}\n    safety number: {sn}\n    pinned at:     unix {at}{repin}",
+            sn = pin.safety_number,
+            at = pin.pinned_at,
+            repin = if pin.repins == 0 {
+                String::new()
+            } else {
+                format!(
+                    "\n    ⚠️ re-pinned {} time(s) by explicit request",
+                    pin.repins
+                )
+            },
+        );
+    }
+    Ok(())
+}
+
+/// `sigil device repin <deviceID> --yes [--safety-number "<digits>"]`
+///
+/// ⚠️⚠️ DANGEROUS — READ THIS BEFORE USING IT. ⚠️⚠️
+///
+/// Re-pinning tells this client to TRUST A NEW hybrid public key for a device
+/// whose key has CHANGED. There are exactly two reasons a key changes:
+///
+///   1. that device legitimately re-enrolled or regenerated its hybrid identity; or
+///   2. someone — a hostile or compromised server, or anything between you and it
+///      — SUBSTITUTED a key they can decrypt with, so that the next vault key you
+///      share is wrapped to THEM.
+///
+/// Nothing this client can see tells those two apart. Only a human can, by
+/// reading the NEW safety number aloud to the device's owner over a channel the
+/// server does not control. Do that FIRST.
+///
+/// This is the ONLY operation that ever replaces a pin; no share, rotate or fetch
+/// path will do it for you, and none of them will ever accept a changed key.
+///
+/// `--yes` is required. If you pass `--safety-number "<digits>"` it must match
+/// the number of the key the server is presenting, so a mistyped or stale value
+/// refuses rather than blessing the wrong key.
+fn cmd_device_repin(target: Option<String>, f: &DeviceFlags) -> Result<(), String> {
+    if f.token.is_some() || f.admin_token.is_some() || f.pair.is_some() {
+        return Err(
+            "device repin takes <deviceID> --yes [--safety-number <digits>] [--key/--pins/--server] only"
+                .to_string(),
+        );
+    }
+    let device_id = target.ok_or_else(|| {
+        "missing required <deviceID>: `sigil device repin <deviceID> --yes`".to_string()
+    })?;
+    if !f.yes {
+        return Err(format!(
+            "refusing to re-pin {device_id} without --yes.\n  \
+             Re-pinning accepts a DIFFERENT hybrid public key for that device. If the change was\n  \
+             not a deliberate re-enrolment on their side, it is a KEY-SUBSTITUTION ATTACK and\n  \
+             re-pinning would hand the next shared vault key to the attacker.\n  \
+             Verify the new safety number with the device's owner over a TRUSTED out-of-band\n  \
+             channel first (`sigil device safety-number {device_id}`), then re-run with --yes."
+        ));
+    }
+
+    let server = resolve_server(f.server.clone());
+    let identity_path = resolve_identity_path(f.key.clone());
+    let identity = load_identity(&identity_path).map_err(|e| e.to_string())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+    let presented = fetch_hybrid_key(&server, &device_id, &auth)
+        .map_err(|e| explain_sharing_error(e, "fetching that device's hybrid public key"))?;
+    let presented_number =
+        hybrid_safety_number(&device_id, &presented).map_err(|e| e.to_string())?;
+
+    // If the human typed the number they verified, it MUST match what the server
+    // is serving right now — otherwise they verified something else.
+    if let Some(claimed) = &f.safety_number {
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if norm(claimed) != norm(&presented_number) {
+            return Err(format!(
+                "refusing to re-pin {device_id}: the --safety-number you supplied does not match\n  \
+                 the key this server is presenting.\n    \
+                 you verified: {claimed}\n    \
+                 server shows: {presented_number}\n  \
+                 Do NOT re-pin. Either you verified a stale value, or the key changed again\n  \
+                 between your call and this command."
+            ));
+        }
+    }
+
+    let pins_path = resolve_pins_path(f.pins.clone(), None);
+    let (previous, new_number) =
+        repin_hybrid_key(&pins_path, &device_id, &presented).map_err(|e| e.to_string())?;
+    match previous {
+        Some(old) => println!(
+            "RE-PINNED device {device_id}\n  \
+             was: {old}\n  \
+             now: {new_number}\n  \
+             store: {store} (0600)\n  \
+             Future shares to {device_id} will now succeed and will use this key.",
+            store = pins_path.display()
+        ),
+        None => println!(
+            "pinned device {device_id} (nothing was pinned before)\n  \
+             safety number: {new_number}\n  \
+             store: {store} (0600)",
+            store = pins_path.display()
+        ),
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // `sigil vault` — DEVICE-TO-DEVICE VAULT SHARING (Phase 46).
 //
@@ -1295,13 +1595,16 @@ fn cmd_device_hybrid_publish(f: &DeviceFlags) -> Result<(), String> {
 struct VaultFlags {
     /// The shared VAULT ID (the op-log vault, not a local file).
     vault: Option<String>,
-    /// Recipient device ID for `share`.
-    to: Option<String>,
+    /// Recipient device IDs. `share` takes exactly one; `rotate` takes one or
+    /// more (`--to` repeated), naming the devices that KEEP access.
+    to: Vec<String>,
     /// Diagnostic addressee for `accept` (see cmd_vault_accept).
     addressee: Option<String>,
     /// The local sealed vault FILE for `rekey`.
     file: Option<String>,
     keyring: Option<String>,
+    /// Override the LOCAL hybrid-key pin store path.
+    pins: Option<String>,
     key: Option<String>,
     hybrid_key: Option<String>,
     server: Option<String>,
@@ -1321,10 +1624,19 @@ fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--vault" => set_once(&mut f.vault, &mut it, "--vault")?,
-            "--to" => set_once(&mut f.to, &mut it, "--to")?,
+            "--to" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--to requires a value".to_string())?;
+                if f.to.contains(&v) {
+                    return Err(format!("--to {v:?} given more than once"));
+                }
+                f.to.push(v);
+            }
             "--for" => set_once(&mut f.addressee, &mut it, "--for")?,
             "--file" => set_once(&mut f.file, &mut it, "--file")?,
             "--keyring" => set_once(&mut f.keyring, &mut it, "--keyring")?,
+            "--pins" => set_once(&mut f.pins, &mut it, "--pins")?,
             "--key" => set_once(&mut f.key, &mut it, "--key")?,
             "--hybrid-key" => set_once(&mut f.hybrid_key, &mut it, "--hybrid-key")?,
             "--server" => set_once(&mut f.server, &mut it, "--server")?,
@@ -1340,17 +1652,18 @@ fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
 /// Dispatch `sigil vault <sub> ...`.
 fn cmd_vault(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let Some(sub) = args.next() else {
-        return Err("missing vault subcommand: rekey | share | accept | list".to_string());
+        return Err("missing vault subcommand: rekey | share | rotate | accept | list".to_string());
     };
     let rest: Vec<String> = args.collect();
     let f = parse_vault_flags(rest)?;
     match sub.as_str() {
         "rekey" => cmd_vault_rekey(&f),
         "share" => cmd_vault_share(&f),
+        "rotate" => cmd_vault_rotate(&f),
         "accept" => cmd_vault_accept(&f),
         "list" => cmd_vault_list(&f),
         other => Err(format!(
-            "unknown vault subcommand {other:?}; try rekey | share | accept | list"
+            "unknown vault subcommand {other:?}; try rekey | share | rotate | accept | list"
         )),
     }
 }
@@ -1424,7 +1737,7 @@ fn explain_sharing_error(e: CliError, what: &str) -> String {
 /// key and uploads the envelope, so the owner can recover its own vault key from
 /// the server (and, as a side effect, claims the vault ID for this device).
 fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
-    if f.to.is_some() || f.addressee.is_some() {
+    if !f.to.is_empty() || f.addressee.is_some() {
         return Err("vault rekey takes --vault/--file/--keyring/--publish (plus --key/--hybrid-key/--server) only".to_string());
     }
     let vault_id = f
@@ -1494,8 +1807,16 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
         .vault
         .clone()
         .ok_or_else(|| "missing required --vault <id>".to_string())?;
+    if f.to.len() > 1 {
+        return Err(
+            "vault share takes ONE --to <deviceID>; to re-wrap to several devices at once use \
+             `sigil vault rotate --to A --to B`"
+                .to_string(),
+        );
+    }
     let to =
-        f.to.clone()
+        f.to.first()
+            .cloned()
             .ok_or_else(|| "missing required --to <deviceID>".to_string())?;
     let permission = f.permission.clone().unwrap_or_else(|| "read".to_string());
     let server = resolve_server(f.server.clone());
@@ -1515,9 +1836,15 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
             )
         })?;
 
-    // 1) The recipient's PUBLIC hybrid key, straight from the registry.
-    let recipient = fetch_hybrid_key(&server, &to, &auth)
+    // 1) The recipient's PUBLIC hybrid key — through the PIN CHOKE POINT
+    //    (Phase 50). If the key the server hands back differs from the one this
+    //    client pinned, this returns CliError::PinMismatch and we stop HERE:
+    //    nothing is wrapped, nothing is uploaded, and the vault key never
+    //    touches the substituted key.
+    let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
+    let (recipient, pin_status) = fetch_hybrid_key_pinned(&server, &to, &auth, &pins)
         .map_err(|e| explain_sharing_error(e, "fetching the recipient's hybrid public key"))?;
+    let safety = hybrid_safety_number(&to, &recipient).map_err(|e| e.to_string())?;
 
     // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
     let envelope = wrap_vault_key(&recipient, &key).map_err(|e| e.to_string())?;
@@ -1538,9 +1865,14 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
          wrapped the vault key to that device's hybrid public key (X25519 + ML-KEM-768)\n  \
          envelope:    {} bytes, opaque to the server\n  \
          permission:  {permission}\n  \
-         key sha256:  {fp} (fingerprint only)",
+         key sha256:  {fp} (fingerprint only)\n  \
+         key pin:     {status}\n  \
+         safety no.:  {safety}\n  \
+         Verify that safety number with {to}'s owner over a channel the server does NOT\n  \
+         control (a phone call, in person). Pinning alone cannot protect FIRST contact.",
         envelope.len(),
         fp = vault_key_fingerprint(&key),
+        status = pin_status.label(),
     );
     Ok(())
 }
@@ -1555,7 +1887,7 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
 /// ANOTHER device. The server must refuse it with 403 — the flag exists so that
 /// rule is testable from the outside. It never attempts to unwrap.
 fn cmd_vault_accept(f: &VaultFlags) -> Result<(), String> {
-    if f.file.is_some() || f.to.is_some() || f.publish || f.permission.is_some() {
+    if f.file.is_some() || !f.to.is_empty() || f.publish || f.permission.is_some() {
         return Err(
             "vault accept takes --vault/--keyring/--key/--hybrid-key/--server/--envelope-out/--for only"
                 .to_string(),
@@ -1607,6 +1939,122 @@ fn cmd_vault_accept(f: &VaultFlags) -> Result<(), String> {
          open it with: sigil totp list --vault <file> --vault-id {vault_id}",
         keyring = keyring.display(),
         fp = vault_key_fingerprint(&key),
+    );
+    Ok(())
+}
+
+/// Resolve the LOCAL hybrid-key PIN STORE path.
+///
+/// Explicit `--pins <file>` wins. Otherwise the pin store sits BESIDE the vault
+/// keyring, so a client pointed at a non-default state directory keeps all of its
+/// local state together (`--keyring /tmp/a/vault-keys.json` implies
+/// `/tmp/a/hybrid-pins.json`). With neither, it is `$HOME/.sigil/hybrid-pins.json`.
+///
+/// The pin store holds only PUBLIC keys, but it is still security-critical: an
+/// attacker who can rewrite it can silence the substitution alarm. It is written
+/// 0600 inside a 0700 directory like every other piece of local state.
+fn resolve_pins_path(
+    pins_flag: Option<String>,
+    keyring_flag: Option<String>,
+) -> std::path::PathBuf {
+    if let Some(p) = pins_flag {
+        return std::path::PathBuf::from(p);
+    }
+    if let Some(k) = keyring_flag {
+        let kp = std::path::PathBuf::from(k);
+        return match kp.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(HYBRID_PIN_FILE),
+            _ => std::path::PathBuf::from(HYBRID_PIN_FILE),
+        };
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home)
+            .join(".sigil")
+            .join(HYBRID_PIN_FILE),
+        _ => std::path::PathBuf::from(HYBRID_PIN_FILE),
+    }
+}
+
+/// `sigil vault rotate --vault <id> --to <deviceID> [--to <deviceID> ...]`
+///
+/// ROTATE a shared vault's key and RE-WRAP it to exactly the devices named by
+/// `--to`, replacing their envelopes and DELETING the envelope of every other
+/// device that still holds one.
+///
+/// Use it after revoking a device: revocation stops that device talking to the
+/// server, but everything already sealed under the old key stays readable to
+/// anyone who has that key. Rotation is what makes FUTURE content unreadable to
+/// it.
+///
+/// ⚠️ Be clear about what this buys. It protects FUTURE content ONLY. A device
+/// that already unwrapped the previous key keeps that key and whatever it has
+/// already copied — nothing can retract a secret that has already been read.
+///
+/// Every recipient's hybrid key goes through the PIN CHECK first, and a mismatch
+/// aborts the WHOLE rotation before anything local or remote is modified.
+fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
+    if f.addressee.is_some() || f.publish || f.permission.is_some() {
+        return Err(
+            "vault rotate takes --vault/--to (repeatable)/--file/--keyring/--pins/--key/--server only"
+                .to_string(),
+        );
+    }
+    let vault_id = f
+        .vault
+        .clone()
+        .ok_or_else(|| "missing required --vault <id>".to_string())?;
+    if f.to.is_empty() {
+        return Err(
+            "missing required --to <deviceID>: name EVERY device that should keep access \
+             (usually including THIS device, so the owner can still recover its own key)"
+                .to_string(),
+        );
+    }
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+    let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
+    let file = resolve_vault_path(f.file.clone());
+
+    let (_identity_path, identity) = sharing_identity(f.key.clone())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    let report = rotate_vault_key(
+        &server,
+        &vault_id,
+        &file,
+        &keyring,
+        &pins,
+        &f.to,
+        &auth,
+        Argon2Params::RECOMMENDED,
+    )
+    .map_err(|e| explain_sharing_error(e, "rotating the vault key"))?;
+
+    println!(
+        "rotated vault {vault_id}\n  \
+         file:        {file} (re-sealed 0600 under a FRESH random vault key)\n  \
+         old key:     sha256 {old} (retired)\n  \
+         new key:     sha256 {new}",
+        file = file.display(),
+        old = report.old_key_fingerprint,
+        new = report.new_key_fingerprint,
+    );
+    for (device, status) in &report.rewrapped {
+        println!("  re-wrapped:  {device} ({})", status.label());
+    }
+    if report.removed.is_empty() {
+        println!("  removed:     (no stale envelopes)");
+    } else {
+        for device in &report.removed {
+            println!("  removed:     {device} (its envelope was deleted from the server)");
+        }
+    }
+    println!(
+        "  NOTE: this protects FUTURE content only. A device that already unwrapped the OLD key\n  \
+         still holds it and whatever it had already copied. Push the re-sealed vault so the\n  \
+         remaining devices get the new content: sigil push --vault {vault_id} --in {file}",
+        file = file.display()
     );
     Ok(())
 }

@@ -126,3 +126,53 @@ func (s *PostgresDeviceStore) GetKeyEnvelope(ctx context.Context, vaultID, recip
 	}
 	return e, nil
 }
+
+// ListKeyEnvelopeRecipients returns METADATA for every envelope stored for a
+// vault, ordered by recipient device ID. It deliberately selects octet_length()
+// rather than the blob itself: a vault owner needs to know WHICH devices hold a
+// wrapped key, and the ciphertext never has to leave the database for that.
+func (s *PostgresDeviceStore) ListKeyEnvelopeRecipients(ctx context.Context, vaultID string) ([]KeyEnvelopeMeta, error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT vault_id, recipient_device_id, sender_device_id, octet_length(blob), created_at
+		   FROM sigil_vault_key_envelopes
+		  WHERE vault_id = $1
+		  ORDER BY recipient_device_id`, vaultID)
+	if err != nil {
+		return nil, fmt.Errorf("list key envelopes: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]KeyEnvelopeMeta, 0, 8)
+	for rows.Next() {
+		var m KeyEnvelopeMeta
+		if err := rows.Scan(&m.VaultID, &m.RecipientDeviceID, &m.SenderDeviceID, &m.SizeBytes, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("list key envelopes: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list key envelopes: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteKeyEnvelope removes the (vault, recipient) mailbox, reporting
+// ErrKeyEnvelopeNotFound when no row matched so both backends agree.
+func (s *PostgresDeviceStore) DeleteKeyEnvelope(ctx context.Context, vaultID, recipientDeviceID string) error {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM sigil_vault_key_envelopes
+		  WHERE vault_id = $1 AND recipient_device_id = $2`, vaultID, recipientDeviceID)
+	if err != nil {
+		return fmt.Errorf("delete key envelope: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrKeyEnvelopeNotFound
+	}
+	return nil
+}

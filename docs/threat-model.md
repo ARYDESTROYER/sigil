@@ -169,10 +169,16 @@ client side is **what a browser profile now holds**:
   identity first, tries the password, then falls back to each held vault key. Losing
   the password loses the keyring, and with it every shared vault this device accepted
   — there is no recovery path. Conversion is also a **one-way door** in both UIs.
-- **A pasted recipient device ID is trusted as typed.** The UI has no directory and no
-  verification step: the sender pastes an ID, and the registry answers with whatever
-  hybrid public key it has for it. See the substitution gap below — it is the same gap
-  as for the CLI, but a paste-and-click UI makes it easier to walk into.
+- **A pasted recipient device ID is still trusted as typed — but the key behind it is
+  no longer.** The UI has no directory, so the sender pastes an ID and the registry
+  answers for it. Since Phase 50 the browser clients **pin** the hybrid public key
+  behind that ID inside their sealed device-identity container (schema **v3**, field
+  `pins`) and throw `KeyPinMismatchError` if it ever changes, and both UIs can show
+  the **safety number** to compare out of band before the first share. The residual
+  risk is unchanged in kind: a paste-and-click UI makes it easy to share to a
+  never-verified device on **first** sight, and easy to click through a re-pin. The
+  browsers also **fail closed** if a caller forgets to pass its pin store
+  (`requirePinStore` throws) rather than silently treating every key as first-sight.
 
 ### The native desktop client (enrolls, syncs and shares — with the CLI's `0600` files)
 
@@ -211,10 +217,16 @@ host now holds bearer secrets:
   cryptography, and the Tauri capability file grants `core:default` only (no `fs`, `shell`,
   `http` or `dialog` plugin), so it reaches disk and the network only through the explicit
   commands.
-- **Every sharing limit below applies unchanged**, and two are worth naming here: there is
-  **no out-of-band verification of a published hybrid public key** (a hostile registry could
-  substitute one), and **revocation cannot un-learn a vault key this device already
-  accepted**. There is also no key rotation and no re-wrap on revoke.
+- **Every sharing limit below applies unchanged**, including the Phase 50 ones. The
+  desktop gets pinning, safety numbers and rotation **by construction** rather than by
+  mirroring — it calls the same `sigil-cli` functions (`fetch_hybrid_key_pinned`,
+  `rotate_vault_key`, `repin_hybrid_key`) and keeps its pin store in **the same
+  `hybrid-pins.json`** in the same state dir, so a desktop pin and a `sigil` pin are
+  literally the same record. A mismatch surfaces as `DesktopError::KeyPinMismatch`,
+  tagged across the IPC as `"key changed"`. What remains true: **first contact is
+  trust-on-first-use unless the user compares the safety number**, and **revocation
+  cannot un-learn a vault key this device already accepted** — rotation protects only
+  what is written afterwards.
 - **Dev-gated, loopback, plain HTTP, UNAUDITED**, and the GUI itself is build-and-launch
   verified rather than visually verified — all the behaviour above lives in the headless
   core that `desktop/core/tests/server_interop.rs` drives against a real `sigild` and the
@@ -285,12 +297,29 @@ Everything here is **dev-gated (`501` by default), opt-in, plain HTTP in dev, an
 UNAUDITED** — and the cryptography it now leans on (the hybrid combiner and the
 custom KEM-then-AEAD seal) is **the same unaudited code**, only now load-bearing.
 
+⭐ **Phase 50 changed what this section can honestly claim about a hostile
+registry** ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
+Until then a client wrapped a vault key to whatever key the server served, and a
+server that substituted its own received the vault key — invisibly. Now every
+client **pins** a device's hybrid public key on first sight and **hard-refuses**
+if it ever changes; a **safety number** lets two humans verify a key out of band
+*before* the first share; and `vault rotate` re-keys a vault and re-wraps it to a
+chosen set of devices. Read adversary **X** and the limits below together: what
+changed is that substitution after first contact is **detected and blocked**, and
+that first contact is now **verifiable by a human who chooses to verify it**. What
+did **not** change: first contact is otherwise still trust-on-first-use, rotation
+protects future content only, and none of it is audited.
+
 The rows below are **client-agnostic**: the `sigil` CLI, the webapp, the MV3 extension
-and the native desktop app all drive the same four routes with the same v3 signatures,
-so every defense and every gap applies to all four. The client-specific consequences are
-in the subsections above — two more bearer secrets in a browser profile, no zeroization
-and no password recovery for a shared vault on the browsers; `0600` plaintext key files
-on the desktop.
+and the native desktop app all drive the same routes with the same v3 signatures,
+so every defense and every gap applies to all four. There are exactly **two**
+implementations of the pinning and safety-number logic behind them — the Rust
+`sigil-cli` library (used by the CLI *and*, via [ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md),
+the desktop) and `sigil-wasm/sharing.mjs` (used by the webapp and the extension) —
+mirrored, not shared, and kept byte-identical by a cross-tool test. The
+client-specific consequences are in the subsections above — two more bearer secrets
+in a browser profile, no zeroization and no password recovery for a shared vault on
+the browsers; `0600` plaintext key files on the desktop.
 
 | # | Adversary | Capability | Defense as implemented | Layer |
 | --- | --- | --- | --- | --- |
@@ -299,30 +328,48 @@ on the desktop.
 | T | **Revoked device** | Was authorized; still holds its Ed25519 key and its hybrid secret identity | Revocation is checked **before** signature verification, so on its very next request the device gets **`401`** on *every* sharing route — collecting an envelope, publishing a hybrid key, and reading the op-log. Depositing an envelope **for** a revoked recipient is refused with `409 device_revoked` rather than silently stored. **This only stops FUTURE access** — see the limits below | `sigild` request auth |
 | U | **Device publishing a hybrid key it does not own** | Wants a vault key wrapped to *its* key by impersonating another device in the registry | A device may publish **only into its own slot**: the path `deviceID` must equal the authenticated device's ID, else **`403`** (`forbidden_device`). The registry FK means only an **enrolled** device can have a key on file at all. The `sigild` test `TestHybridKeyCannotPublishForAnotherDevice` pins this by forging the mismatch that the CLI cannot produce | `sigild` authorization |
 | V | **Envelope replayer / substituter** | Re-sends a captured envelope deposit, or swaps one envelope for another | The transport is the **v3 signed request contract** (see table above): the body is *inside* the signed message, so a mutated envelope invalidates the signature, and the ±300 s window plus the single-use nonce bound replay. Depositing requires **write** on the vault, so a passive observer cannot deposit anything. A substituted envelope also **fails to open**: `hybrid_open` authenticates, so a wrong or tampered container yields an authentication failure, never plaintext, and `unwrap_vault_key` additionally rejects any recovered plaintext that is not exactly 32 bytes rather than using it as a key | `sigild` request auth + crypto |
-| W | **Log / metrics scraper hunting for key material** | Reads `sigild`'s audit log or scrapes `/metrics` | The three sharing audit events carry **metadata plus a SHA-256 fingerprint** only (`vault.key_envelope_put` / `_get`: vault ID, device IDs, size, `blob_sha256`; `device.hybrid_key_published`: a device ID). **No envelope byte, no vault key, and no hybrid public key is ever logged** — the "no key material in logs" rule is kept absolute even for *public* keys, so there is no judgement call to get wrong later. The three `/metrics` counters are counts with **no vault or device label**. Asserted by a test and by the e2e script, which fails if `SIGILhyb` appears in the server log | `sigild` observability |
+| W | **Log / metrics scraper hunting for key material** | Reads `sigild`'s audit log or scrapes `/metrics` | The three sharing audit events carry **metadata plus a SHA-256 fingerprint** only (`vault.key_envelope_put` / `_get`: vault ID, device IDs, size, `blob_sha256`; `device.hybrid_key_published`: a device ID). **No envelope byte, no vault key, and no hybrid public key is ever logged** — the "no key material in logs" rule is kept absolute even for *public* keys, so there is no judgement call to get wrong later. The `/metrics` counters are counts with **no vault or device label** (Phase 50's `sigild_key_envelope_deletes_total` included). The two Phase 50 events (`vault.key_envelope_list` / `_delete`) carry device IDs and a count and have **no blob to fingerprint**. Asserted by a test and by the e2e script, which fails if `SIGILhyb` appears in the server log | `sigild` observability |
+| X | **Key-substituting server / rogue registry** (Phase 50) | Owns the registry; answers `GET /v1/devices/{B}/hybrid-key` with **its own** hybrid public key so the next share is wrapped to *it* | **Detected and blocked after first contact — not prevented at first contact.** Every client **pins** the first hybrid public key it sees for a device and compares on every later fetch, at the fetch itself (`fetch_hybrid_key_pinned` / `fetchHybridKeyPinned`); a **changed** key is a hard refusal (`CliError::PinMismatch` / `KeyPinMismatchError` / `DesktopError::KeyPinMismatch`) with **nothing wrapped, nothing uploaded, and the pin store not mutated**. There is **no flag, option or default anywhere that accepts a changed key** — only the deliberate `sigil device repin <id> --yes`. For the **first** contact, pinning is worthless by construction, and the answer is the **safety number**: six 5-digit groups over the device id **and both halves** of the hybrid key, compared with the other person over a channel the server does not control. **This defense is only as good as that comparison actually happening.** Proven, not asserted: `pinning-interop.mjs` puts a **rewriting proxy** in front of a real `sigild`, and the client refuses while the stored envelope stays byte-identical to the honest one and does **not** open with the attacker's hybrid secret | Client-side trust store + human verification |
 
 **What vault sharing does NOT defend (be explicit):**
 
-- **No out-of-band verification of a recipient's hybrid public key.** A sender
-  wraps to whatever the registry serves. A **malicious server that substitutes its
-  own hybrid public key** for the recipient's would receive a vault key wrapped to
-  itself — and the recipient would simply see "no envelope"/a failure to unwrap.
-  There are **no safety numbers, no key-transparency log, and no cross-signature**
-  binding a hybrid key to the device's already-enrolled Ed25519 identity. Comparing
-  the `vault list` key fingerprints out of band detects the *result* after the
-  fact; it does not prevent the substitution. **This is the largest gap in the
-  design**, and it is why adversary R above is scoped to *reading a relayed
-  envelope* rather than to *the server being harmless*.
-- **A compromised device keeps its copy of the vault key.** Revocation stops
-  **future** server access; it cannot make a device forget a key it already
-  unwrapped, and the sealed container it already pulled stays openable offline. The
-  e2e script asserts this explicitly rather than hiding it: after revocation,
-  device B still generates correct codes locally. The only remediation is a manual
-  `vault rekey` + re-share.
-- **No re-wrap on revoke, no key rotation, no forward secrecy for the vault key.**
-  Nothing re-keys a vault when a grant is dropped, nothing expires an envelope, and
-  an envelope already delivered cannot be recalled. Republishing a hybrid key does
-  **not** re-wrap envelopes already deposited for that device.
+- ⭐ **First contact is still trust-on-first-use unless a human actually compares
+  the safety number.** Pinning fixes the *second* and every later fetch; it cannot
+  fix the first, because a server that lies the very first time gets its lie
+  pinned. `sigil device safety-number` (and the equivalent in the desktop, webapp
+  and extension UIs) exists so two people can close that window over a phone call
+  or in person — but **nothing forces them to**, nothing detects that they skipped
+  it, and a share to a never-before-seen device proceeds with only a warning and a
+  `first-sight` pin status. There is still **no key-transparency log and no
+  cross-signature** binding a hybrid key to the device's already-enrolled Ed25519
+  identity, which would remove the human from the loop; that remains the
+  highest-value follow-up.
+- **A user who blindly re-pins defeats the whole mechanism.** `device repin`
+  requires `--yes`, and refuses outright if the `--safety-number` supplied does not
+  match what the server is currently serving — but a user who runs it to make an
+  error message go away has handed the attacker exactly what the block prevented.
+  Re-pins are counted (`repins`) and shown by `sigil device pins`, so the *evidence*
+  survives; the decision is still the human's, and it is unrecoverable.
+- **Pinning protects the fetch, not the local machine.** The pin store is a `0600`
+  file (native) or a field inside the sealed device-identity container (browsers).
+  An attacker who can rewrite it — anything running as that user on a native
+  client, anything in the origin/extension context of an *unlocked* browser client
+  — can silence the alarm before it fires.
+- **Rotation protects FUTURE content only.** `sigil vault rotate` draws a fresh
+  vault key, re-seals the vault under it, re-wraps to exactly the named devices and
+  deletes every other device's envelope — but a device that **already unwrapped**
+  the previous key keeps that key and everything it had already copied.
+  Cryptography cannot un-send a secret. The e2e proof states this in both
+  directions: after a rotation the removed device cannot read **new** content, and
+  it still opens the container it pulled **before**.
+- **Revocation still does not re-key anything by itself.** Rotation is a separate,
+  **manual, owner-driven** operation. Nothing re-keys a vault when a grant is
+  dropped, nothing expires an envelope, nothing schedules a rotation, and there is
+  **no forward secrecy** for a vault key already delivered. Republishing a hybrid
+  key does **not** re-wrap envelopes already deposited for that device.
+- **None of this is audited.** Pinning, the safety-number construction and the
+  rotation flow are new, unaudited code in the same dev-gated, plain-HTTP,
+  pre-audit posture as everything around them.
 - **Sharing inherits trust-on-first-write.** A first envelope deposit **claims** an
   unowned vault exactly like a first append, so the ownership caveats above apply
   unchanged.
@@ -344,9 +391,11 @@ on the desktop.
   identity (`$HOME/.sigil/device.hybrid`) and the vault keyring
   (`$HOME/.sigil/vault-keys.json`) are mode `0600` plaintext files — **not** sealed
   under the password, not zeroized, not in an enclave; anything that can read the
-  user's home directory as that user has the vault keys (adversary class 9 above). In
-  the **browser clients** both are sealed under the vault password inside the v2
-  device-identity container, which is **stronger at rest** but **not** while unlocked: the
+  user's home directory as that user has the vault keys (adversary class 9 above) — and
+  can also rewrite `hybrid-pins.json` to silence the key-substitution alarm. In
+  the **browser clients** both are sealed under the vault password inside the v3
+  device-identity container (which now also carries the pin store), which is **stronger
+  at rest** but **not** while unlocked: the
   decrypted key material sits unzeroized in the JS heap, reachable by anything running
   in that origin/extension context (see the browser-sharing subsection above).
 - **Plain HTTP in dev.** Signing proves who sent a request; it is not transport
@@ -411,11 +460,13 @@ security claim, and none of it is a PCI attestation.
 
 **Status note for this repo:** almost none of the defenses in the **first** table
 (adversary classes 1–12, the *intended product* design) is implemented yet — the
-one partial exception is class 8 (*insider with vault export*), where the
-**mechanism** for re-keying and re-wrapping a vault to remaining members' KEM
-public keys now exists in the sharing flow, but the **workflow** does not: nothing
-re-keys automatically on revoke, and revocation cannot recall a key already
-unwrapped. The current `sigild` skeleton performs no crypto on vault contents and
+closest is class 8 (*insider with vault export*), where the **mechanism** is now
+complete and driveable end to end: `vault rotate` re-keys a vault and re-wraps it
+to exactly the remaining members' hybrid public keys, deleting the departing
+device's envelope. The **workflow** around it is still missing — nothing re-keys
+**automatically** on revoke, a rotation is a manual owner-driven command, and
+revocation still cannot recall a key already unwrapped, so the row's promise holds
+only for content written *after* the rotation. The current `sigild` skeleton performs no crypto on vault contents and
 stores only the opaque blobs and opaque envelopes described above. `libsigil`'s
 crypto is still **UNAUDITED**, and it is **no longer all unused**: the hybrid KEM
 and the `hybrid_seal` / `hybrid_open` composition are now **load-bearing** (they

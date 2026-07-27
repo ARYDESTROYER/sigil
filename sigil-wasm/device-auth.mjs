@@ -271,10 +271,24 @@ function checkVaultId(vaultId) {
 // same shape it always did.
 
 /** Schema version this build WRITES for the sealed device-identity JSON. */
-export const DEVICE_IDENTITY_VERSION = 2;
+export const DEVICE_IDENTITY_VERSION = 3;
 
-/** Schema versions this build can READ (v1 predates the sharing fields). */
-const SUPPORTED_DEVICE_IDENTITY_VERSIONS = [1, 2];
+/**
+ * Schema versions this build can READ. v1 predates the sharing fields; v2
+ * predates the Phase 50 hybrid-key PIN STORE.
+ *
+ * ⭐ WHY THE PIN STORE LIVES IN HERE. The browser clients persist ONLY sealed
+ * containers — that is a load-bearing property and Phase 50 does not regress it.
+ * A native client keeps its pin store as a 0600 file in its 0700 state dir; a
+ * browser has no such thing, so the pins ride INSIDE this same sealed container,
+ * under the same one password and the same lock/unlock lifecycle. Nothing new is
+ * written to localStorage / chrome.storage in the clear.
+ *
+ * The pins are PUBLIC key material, but they are security-critical LOCAL state:
+ * an attacker who can rewrite them can silence the key-substitution alarm.
+ * Sealing them is exactly the right treatment.
+ */
+const SUPPORTED_DEVICE_IDENTITY_VERSIONS = [1, 2, 3];
 
 /** X25519 secret scalar length in the sealed hybrid identity. */
 const HYBRID_X25519_SECRET_LEN = 32;
@@ -289,10 +303,11 @@ const VAULT_KEY_LEN = 32;
  *   sealDeviceIdentity(wasm, password, identity, salt, nonce, params)
  *     -> Uint8Array (the sealed container; store THIS, never the secrets)
  *
- * `identity` is `{ deviceId, seed, baseUrl?, hybrid?, vaultKeys? }` where
- * `hybrid` is `{ x25519Secret: Uint8Array(32), mlkemSeed: Uint8Array(64) }` and
- * `vaultKeys` is `{ [vaultId]: Uint8Array(32) }`. The two sharing fields are
- * OPTIONAL and are omitted from the JSON when absent.
+ * `identity` is `{ deviceId, seed, baseUrl?, hybrid?, vaultKeys?, pins? }` where
+ * `hybrid` is `{ x25519Secret: Uint8Array(32), mlkemSeed: Uint8Array(64) }`,
+ * `vaultKeys` is `{ [vaultId]: Uint8Array(32) }`, and `pins` is the Phase 50
+ * hybrid-key pin store `{ version, pins: { [deviceId]: {...} } }`. All three
+ * sharing fields are OPTIONAL and are omitted from the JSON when absent.
  *
  * `salt` and `nonce` are caller-supplied CSPRNG bytes (`crypto.getRandomValues`),
  * exactly as for the TOTP vault. All crypto happens inside the wasm.
@@ -334,6 +349,13 @@ export function sealDeviceIdentity(wasm, password, identity, salt, nonce, params
     }
     obj.vault_keys = keys;
   }
+  // Phase 50: the hybrid-key PIN STORE. Stored as-is (it is already plain JSON of
+  // base64 strings, mirroring cli/src/lib.rs::HybridPinStore) and omitted when
+  // empty, so a client that has never shared writes exactly the shape it always
+  // did.
+  if (identity.pins && Object.keys(identity.pins.pins ?? {}).length > 0) {
+    obj.pins = { version: identity.pins.version ?? 1, pins: identity.pins.pins };
+  }
   const pw = typeof password === "string" ? TEXT_ENCODER.encode(password) : password;
   return new Uint8Array(
     wasm.seal_to_container(
@@ -354,10 +376,12 @@ export function sealDeviceIdentity(wasm, password, identity, salt, nonce, params
  *
  *   -> { deviceId, seed: Uint8Array(32), baseUrl,
  *        hybrid: { x25519Secret, mlkemSeed } | null,
- *        vaultKeys: { [vaultId]: Uint8Array(32) } }
+ *        vaultKeys: { [vaultId]: Uint8Array(32) },
+ *        pins: { version, pins: { [deviceId]: {...} } } }
  *
  * A v1 container (written before sharing existed) opens fine and yields
- * `hybrid: null` with an empty `vaultKeys`.
+ * `hybrid: null` with an empty `vaultKeys`; a v2 container yields an EMPTY pin
+ * store, so an existing client keeps working and simply pins on next use.
  */
 export function openDeviceIdentity(wasm, password, containerBytes) {
   const pw = typeof password === "string" ? TEXT_ENCODER.encode(password) : password;
@@ -398,7 +422,13 @@ export function openDeviceIdentity(wasm, password, containerBytes) {
     vaultKeys[vaultId] = key;
   }
 
-  return { deviceId: obj.device_id, seed, baseUrl: obj.base_url ?? "", hybrid, vaultKeys };
+  // Phase 50 pin store. Absent (v1/v2) => empty, i.e. everything is first-sight.
+  const pins =
+    obj.pins && typeof obj.pins === "object" && typeof obj.pins.pins === "object"
+      ? { version: obj.pins.version ?? 1, pins: obj.pins.pins }
+      : { version: 1, pins: {} };
+
+  return { deviceId: obj.device_id, seed, baseUrl: obj.base_url ?? "", hybrid, vaultKeys, pins };
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

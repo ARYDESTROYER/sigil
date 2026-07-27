@@ -54,6 +54,7 @@ import {
 import {
   generateHybridIdentity,
   hybridPublicIdentity,
+  newPinStore,
   publishHybridKey,
   fetchHybridKey,
   generateVaultKey,
@@ -259,7 +260,12 @@ try {
   const hybridJs = generateHybridIdentity();
   // `auth` is exactly the object openDeviceIdentity returns, so an unlocked
   // browser client passes its device identity straight in.
-  const authJs = { baseUrl: base, deviceId: devJs.deviceId, seed: seedJs, hybrid: hybridJs };
+  // A pin store is REQUIRED on any wrap path (requirePinStore fails closed): an
+  // unlocked browser client passes the store from its sealed device identity.
+  const authJs = {
+    baseUrl: base, deviceId: devJs.deviceId, seed: seedJs, hybrid: hybridJs,
+    pins: newPinStore(),
+  };
   await publishHybridKey(wasm, authJs);
 
   const cliEnroll = sigil(["device", "enroll", "--token", TOKEN_CLI, "--label", "cli-device"]);
@@ -275,7 +281,10 @@ try {
     seed: seedC,
   });
   const hybridC = generateHybridIdentity();
-  const authC = { baseUrl: base, deviceId: devC.deviceId, seed: seedC, hybrid: hybridC };
+  const authC = {
+    baseUrl: base, deviceId: devC.deviceId, seed: seedC, hybrid: hybridC,
+    pins: newPinStore(),
+  };
   await publishHybridKey(wasm, authC);
 
   assert(devJs.deviceId !== cliDeviceId && cliDeviceId !== devC.deviceId, "device ids collided");

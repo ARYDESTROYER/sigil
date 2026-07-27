@@ -57,6 +57,15 @@ use sigil_cli::{
     save_key, unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, CliError, DeviceIdentity,
     RequestAuth, VaultKeyring, VAULT_KEYRING_FILE, VAULT_KEY_LEN,
 };
+// Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
+// The desktop adds NO implementation of its own: it calls the same sigil-cli
+// library functions the CLI does, so the semantics and the safety-number digest
+// cannot drift between the two (ADR 0037).
+use sigil_cli::{
+    fetch_hybrid_key_pinned, hybrid_safety_number, load_pins, pairwise_safety_number,
+    repin_hybrid_key, rotate_vault_key, HybridKeyPin, PinStatus, HYBRID_PIN_FILE,
+};
+use sigil_core::Argon2Params;
 
 use crate::{DesktopError, Result, VaultSession, STATE_DIR_NAME};
 
@@ -171,6 +180,18 @@ fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
             status,
             message: format!("the server returned HTTP {status} while {what}: {body}"),
         },
+        // ⭐ NOT a generic failure. A changed hybrid key is the key-substitution
+        // alarm and must reach the UI as its own thing, with both safety numbers,
+        // so a human can decide.
+        CliError::PinMismatch {
+            device_id,
+            pinned_safety_number,
+            presented_safety_number,
+        } => DesktopError::KeyPinMismatch {
+            device_id,
+            pinned_safety_number,
+            presented_safety_number,
+        },
         other => DesktopError::Vault(format!("{other} (while {what})")),
     }
 }
@@ -245,6 +266,17 @@ impl DeviceConfig {
     #[must_use]
     pub fn keyring_path(&self) -> PathBuf {
         self.state_dir.join(VAULT_KEYRING_FILE)
+    }
+
+    /// Path of the local HYBRID-KEY PIN STORE (`0600`) — the record of which
+    /// public key this device trusts for each other device.
+    ///
+    /// It is the same file name the CLI uses in the same state directory, so a
+    /// desktop state dir and a `sigil` state dir stay interchangeable: pin a key
+    /// in one and the other honours it.
+    #[must_use]
+    pub fn pins_path(&self) -> PathBuf {
+        self.state_dir.join(HYBRID_PIN_FILE)
     }
 
     // -- identity ---------------------------------------------------------
@@ -477,14 +509,21 @@ impl DeviceConfig {
             .vault_key(vault_id)?
             .ok_or_else(|| DesktopError::NotShared(vault_id.to_string()))?;
 
-        // 1) the recipient's PUBLIC hybrid key, straight from the registry
-        let recipient = fetch_hybrid_key(&self.server, to_device, &auth).map_err(|e| {
-            net_error(
-                e,
-                &self.server,
-                "fetching the recipient's hybrid public key",
-            )
-        })?;
+        // 1) the recipient's PUBLIC hybrid key — through the PIN CHOKE POINT.
+        //    A key that differs from the one pinned on first sight raises
+        //    DesktopError::KeyPinMismatch and we stop HERE: nothing is wrapped,
+        //    nothing is uploaded, and the vault key never touches the
+        //    substituted key.
+        let (recipient, _pin) =
+            fetch_hybrid_key_pinned(&self.server, to_device, &auth, &self.pins_path()).map_err(
+                |e| {
+                    net_error(
+                        e,
+                        &self.server,
+                        "fetching the recipient's hybrid public key",
+                    )
+                },
+            )?;
 
         // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce
         let envelope = wrap_vault_key(&recipient, &key)?;
@@ -498,6 +537,171 @@ impl DeviceConfig {
             .map_err(|e| net_error(e, &self.server, "granting vault access"))?;
 
         Ok(vault_key_fingerprint(&key))
+    }
+
+    // -- Phase 50: key verification -------------------------------------
+
+    /// This device's OWN safety number — the digits a user reads aloud so
+    /// someone else can verify this device's hybrid public key BEFORE sharing to
+    /// it for the first time.
+    ///
+    /// Purely LOCAL: it reads the published half of this device's hybrid identity
+    /// off disk and opens no socket, so it works offline and cannot be influenced
+    /// by a server.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::Vault`] when it has no hybrid identity yet (publish one).
+    pub fn my_safety_number(&self) -> Result<String> {
+        let identity = self.enrolled_identity()?;
+        let device_id = identity.device_id.clone().expect("enrolled");
+        let public = load_hybrid_public(&self.hybrid_public_path()).map_err(|_| {
+            DesktopError::Vault(
+                "this device has no hybrid identity yet — publish one first".to_string(),
+            )
+        })?;
+        Ok(hybrid_safety_number(&device_id, &public)?)
+    }
+
+    /// The safety number of ANOTHER device's published hybrid key, plus how it
+    /// compares to what this device has PINNED.
+    ///
+    /// Deliberately READ-ONLY: it never pins and never re-pins, so a user can
+    /// inspect a key (and spot a mismatch) without changing any trust state.
+    /// Returns `(safety number, pin state)` where the pin state is
+    /// `"not pinned yet"`, `"matches the pinned key"` or `"DIFFERS from the
+    /// pinned key"`.
+    ///
+    /// # Errors
+    /// - [`DesktopError::MissingOnServer`] when that device published no key.
+    pub fn peer_safety_number(&self, device_id: &str) -> Result<(String, String)> {
+        let identity = self.enrolled_identity()?;
+        let auth = identity.auth();
+        let public = fetch_hybrid_key(&self.server, device_id, &auth)
+            .map_err(|e| net_error(e, &self.server, "fetching that device's hybrid public key"))?;
+        let presented = hybrid_safety_number(device_id, &public)?;
+        let store = load_pins(&self.pins_path())?;
+        let state = match store.pins.get(device_id) {
+            None => "not pinned yet".to_string(),
+            Some(p) if p.safety_number == presented => "matches the pinned key".to_string(),
+            Some(p) => format!("DIFFERS from the pinned key ({})", p.safety_number),
+        };
+        Ok((presented, state))
+    }
+
+    /// The ORDER-INDEPENDENT pairwise safety number for this device and
+    /// `device_id`: both people see the SAME digits, whoever asks.
+    ///
+    /// # Errors
+    /// - As [`Self::peer_safety_number`], plus [`DesktopError::Vault`] when this
+    ///   device has no hybrid identity.
+    pub fn pairwise_safety_number(&self, device_id: &str) -> Result<String> {
+        let identity = self.enrolled_identity()?;
+        let my_id = identity.device_id.clone().expect("enrolled");
+        let auth = identity.auth();
+        let mine = load_hybrid_public(&self.hybrid_public_path()).map_err(|_| {
+            DesktopError::Vault(
+                "this device has no hybrid identity yet — publish one first".to_string(),
+            )
+        })?;
+        let theirs = fetch_hybrid_key(&self.server, device_id, &auth)
+            .map_err(|e| net_error(e, &self.server, "fetching that device's hybrid public key"))?;
+        Ok(pairwise_safety_number(&my_id, &mine, device_id, &theirs)?)
+    }
+
+    /// The hybrid public keys this device TRUSTS, newest pin state included.
+    /// PUBLIC material only — safe to render.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] on a malformed pin store.
+    pub fn pins(&self) -> Result<Vec<HybridKeyPin>> {
+        Ok(load_pins(&self.pins_path())?.pins.into_values().collect())
+    }
+
+    /// ⚠️ DELIBERATELY accept a CHANGED hybrid key for a device.
+    ///
+    /// This is the ONLY thing that ever replaces a pin. It must be driven by an
+    /// explicit user action AFTER they have compared the new safety number with
+    /// the device's owner over a channel the server does not control — a changed
+    /// key is either a legitimate re-enrolment or a key-substitution attack, and
+    /// nothing on this machine can tell those apart.
+    ///
+    /// `expected` is the safety number the user says they verified; when
+    /// supplied it MUST match the key the server is presenting right now, so a
+    /// stale or mistyped value refuses instead of blessing the wrong key.
+    ///
+    /// Returns `(previous safety number, new safety number)`.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] when `expected` does not match what is served.
+    pub fn repin_device(
+        &self,
+        device_id: &str,
+        expected: Option<&str>,
+    ) -> Result<(Option<String>, String)> {
+        let identity = self.enrolled_identity()?;
+        let auth = identity.auth();
+        let public = fetch_hybrid_key(&self.server, device_id, &auth)
+            .map_err(|e| net_error(e, &self.server, "fetching that device's hybrid public key"))?;
+        let presented = hybrid_safety_number(device_id, &public)?;
+        if let Some(claimed) = expected {
+            let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            if norm(claimed) != norm(&presented) {
+                return Err(DesktopError::Vault(format!(
+                    "refusing to re-pin {device_id}: the safety number you verified ({claimed}) \
+                     does not match the key this server is presenting ({presented}). Do NOT \
+                     re-pin — either the value is stale, or the key changed again."
+                )));
+            }
+        }
+        Ok(repin_hybrid_key(&self.pins_path(), device_id, &public)?)
+    }
+
+    /// ROTATE a shared vault's key and RE-WRAP it to exactly `recipients`,
+    /// deleting every other device's envelope.
+    ///
+    /// The remediation revocation was missing. Every recipient's key goes through
+    /// the PIN CHECK first, so a substituted key aborts the whole rotation before
+    /// the vault file or the server is touched.
+    ///
+    /// ⚠️ It protects FUTURE content ONLY. A device that already unwrapped the
+    /// previous key keeps that key and whatever it had already copied.
+    ///
+    /// Returns `(old fingerprint, new fingerprint, re-wrapped device ids,
+    /// removed device ids)` — fingerprints, never keys.
+    ///
+    /// # Errors
+    /// - [`DesktopError::KeyPinMismatch`] if ANY recipient's key changed.
+    /// - [`DesktopError::NotShared`] when the vault has no key in the keyring.
+    pub fn rotate_vault(
+        &self,
+        vault_id: &str,
+        vault_path: &Path,
+        recipients: &[String],
+    ) -> Result<(String, String, Vec<String>, Vec<String>)> {
+        let identity = self.enrolled_identity()?;
+        let auth = identity.auth();
+        let report = rotate_vault_key(
+            &self.server,
+            vault_id,
+            vault_path,
+            &self.keyring_path(),
+            &self.pins_path(),
+            recipients,
+            &auth,
+            Argon2Params::RECOMMENDED,
+        )
+        .map_err(|e| net_error(e, &self.server, "rotating the vault key"))?;
+        Ok((
+            report.old_key_fingerprint,
+            report.new_key_fingerprint,
+            report
+                .rewrapped
+                .into_iter()
+                .map(|(d, _): (String, PinStatus)| d)
+                .collect(),
+            report.removed,
+        ))
     }
 
     /// ACCEPT a vault shared TO this device: collect the envelope addressed to

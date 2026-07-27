@@ -374,23 +374,186 @@ of a hybrid public key belong together. That is deliberate: validating key mater
 would be the server performing cryptography on it. Correctness of a published key
 is the **client's** business.
 
+### Safety numbers — the out-of-band verification of a hybrid public key
+
+**Status (pre-audit, UNAUDITED).** A wrap is only as trustworthy as the public key
+it wraps to. The **safety number** is the human-comparable fingerprint of one
+device's hybrid public identity: two people read it to each other over a channel
+the server does not control, and matching digits mean the key one is about to wrap
+a vault key to really belongs to the other
+([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
+
+⭐ **MIRRORED — NOT SHARED.** The construction exists in exactly **two**
+implementations: `cli/src/lib.rs` (`hybrid_safety_digest` / `render_safety_number`
+/ `hybrid_safety_number` / `pairwise_safety_number`), used by the `sigil` CLI *and*
+the native desktop app, and `sigil-wasm/sharing.mjs` (`hybridSafetyDigest` /
+`renderSafetyNumber` / `safetyNumber` / `pairwiseSafetyNumber`), used by the webapp
+and the MV3 extension. **They MUST stay byte-identical.** If they ever diverge, two
+people comparing digits across clients would see different numbers and wrongly
+conclude they were under attack. Both sides carry the **same known-answer test**,
+and `sigil-wasm/test/pinning-interop.mjs` drives the **real `sigil` binary** against
+the JS module and compares the printed digits.
+
+**The per-device digest.** SHA-256 over a length-prefixed transcript:
+
+```
+digest = SHA-256( "sigil-safety-number-v1\n"
+                ‖ u32_be(len(device_id)) ‖ device_id
+                ‖ u32_be(32)             ‖ x25519_public_key
+                ‖ u32_be(1184)           ‖ mlkem_encaps_key )
+```
+
+- The prefix is **domain separation**; changing it changes every safety number in
+  existence and would be a version bump, not a fix.
+- Every field is **length-prefixed with a big-endian `u32`** before its bytes, so no
+  two different inputs can produce the same byte stream (`"ab"+"c"` cannot collide
+  with `"a"+"bc"`). The two key lengths are fixed by the algorithms — X25519 public
+  key **32** bytes, ML-KEM-768 encapsulation key **1184** bytes — and are still
+  length-prefixed rather than assumed.
+- ⭐ **BOTH halves of the hybrid key are covered**, so a substitution that swapped
+  only the ML-KEM half would still change the number.
+- ⭐ **The device id is bound in**, so a *genuine* key relayed under a **different**
+  device's id does not verify. Verifying "this key" is meaningless without "…for
+  this device".
+- Input is the **decoded raw key bytes**, never the base64 text, so a server that
+  re-encodes the same key cannot change the number.
+
+**Rendering.** The digest becomes **6 groups of 5 decimal digits** — 30 digits:
+
+```
+group[g] = ( u40_be( digest[5g .. 5g+5] ) ) mod 100000,  zero-padded to 5 digits
+rendered = group[0] ‖ " " ‖ … ‖ " " ‖ group[5]      e.g. "83791 28129 67801 50284 55242 77845"
+```
+
+Each group consumes **5 digest bytes read big-endian** (max `2^40`, exactly
+representable in a JS double, which is why the JS mirror can use plain arithmetic),
+reduced `mod 100000`. Only the first **30** of the 32 digest bytes are consumed.
+30 decimal digits is ≈ **99.6 bits** — short enough to read aloud, long enough that
+searching for a second key with the same number is not a practical attack. It is
+**not** the full 256-bit digest, and it is a **fingerprint for human comparison**,
+not a cryptographic identifier to be used programmatically.
+
+**The pairwise number, and why it is order-independent.** Reading two separate
+numbers to each other invites the classic mistake of comparing the wrong pair, so
+there is a single string both sides see:
+
+```
+d_a = digest(device_a, identity_a)
+d_b = digest(device_b, identity_b)
+(lo, hi) = (d_a, d_b) sorted BYTEWISE ASCENDING          ← this is the whole trick
+pair = render( SHA-256( "sigil-safety-number-pair-v1\n" ‖ lo ‖ hi ) )
+```
+
+Sorting the two 32-byte digests into a **canonical order** before hashing makes the
+input — and therefore the output — identical whichever side computes it:
+`pair(a, b) == pair(b, a)` byte for byte. A **separate domain prefix** keeps a
+pairwise number from ever colliding with a per-device one. Both sides run the same
+comparison loop over the digest bytes, so the ordering rule is itself mirrored.
+
+**No secret is involved.** A safety number is derived entirely from **public** key
+material and a public device id. Computing or displaying one reveals nothing, sends
+nothing, and needs no network for one's *own* number.
+
+### Key pinning — where the number is enforced without a human
+
+A safety number only helps if someone reads it. **Pinning** is the zero-effort half
+that works from the **second** contact onward: the first hybrid public key a client
+sees for a device is recorded, and every later fetch is compared against it.
+
+The enforcement lives at **the fetch itself** — `fetch_hybrid_key_pinned` (Rust) /
+`fetchHybridKeyPinned` (JS) get the key and check the pin in **one call**, and every
+wrap path (share *and* rotate, in both implementations) goes through it. The bare
+`fetch_hybrid_key` / `fetchHybridKey` survive only on paths that **do not wrap**:
+displaying a safety number, the deliberate re-pin, and the desktop's `check_server`.
+
+Three outcomes, and there is deliberately **no fourth**:
+
+| Presented key | Outcome | State change |
+|---------------|---------|--------------|
+| device not seen before | **`FirstSight`** / `"first-sight"` — proceeds, **with a warning** | the key is pinned |
+| byte-identical to the pin | **`Match`** / `"match"` — proceeds silently | none |
+| **different** | ⛔ **hard refusal**: `CliError::PinMismatch` / `KeyPinMismatchError` / `DesktopError::KeyPinMismatch` | **none** — nothing wrapped, nothing uploaded, the pin store **not** mutated |
+
+Comparison is over the **decoded raw key bytes** of both halves. There is **no flag,
+option or default anywhere** that makes a wrap accept a changed key. The only way a
+pin is ever replaced is the explicit `repin_hybrid_key` / `repinHybridKey`, which
+nothing calls automatically, which requires `--yes` at the CLI, which refuses if the
+safety number the user claims to have verified does not match what the server is
+serving right now, and which **counts** re-pins so the evidence survives.
+
+Where the pin store lives is a **client storage** decision, in
+[`architecture.md`](architecture.md) — a `0600` `hybrid-pins.json` natively, a field
+inside the sealed device-identity container in the browsers. Either way it holds only
+**public** key material, and either way it is **security-critical local state**: an
+attacker who can rewrite it can silence the alarm before it fires.
+
+### Vault key rotation — the key lifecycle
+
+Revocation stops future *server access*; it cannot make a device forget a key. The
+remediation is to **retire the key itself**. `rotate_vault_key` (Rust) /
+`rotateVaultKey` (JS) perform, in this order:
+
+1. **Load the current vault key** from the local keyring. A vault with no key there
+   is not rotatable — only a **shared** vault (one already sealed under a random vault
+   key) can be rotated; a password vault must go through `vault rekey` first.
+2. ⭐ **Pin-check EVERY recipient first.** All recipients' hybrid public keys are
+   fetched through the pinned fetch **before anything is mutated**, so a single
+   mismatch aborts the whole rotation with the vault file, the keyring and the server
+   untouched — far better than a half-rotated vault whose new key has already been
+   wrapped to an attacker.
+3. **Draw a fresh 32-byte vault key** from the CSPRNG (`generate_vault_key` /
+   `generateVaultKey`) — a new key, never a derivation of the old one.
+4. **Re-seal the container**: `reseal_container` opens with the **old** key and seals
+   with the **new** one. It is **container-agnostic and never inspects the
+   plaintext**, so it re-keys a TOTP vault or any other `SIGILcli` container
+   identically. The container format does **not** change; only the key does.
+5. **Write the vault** `0600` via **temp file + rename**, so a crash cannot leave a
+   half-written vault.
+6. **Record the new key in the keyring — AFTER the file is in place.** Ordering is
+   deliberate: a crash between the two would otherwise leave the keyring naming a key
+   that opens nothing.
+7. **Wrap and upsert an envelope per recipient**, with fresh ephemeral entropy per
+   wrap exactly as for a first share.
+8. **List, then delete every envelope not in the recipient set**, so a device left out
+   cannot collect the new key. A `404` on delete counts as success — the desired end
+   state already holds.
+
+In the browser the same sequence runs, except that steps 5–6 do not exist as file
+writes: `rotateVaultKey` **returns** the new key and the re-sealed container and the
+caller persists them (into the sealed containers) and pushes.
+
+⚠️ **What rotation guarantees, stated precisely.** Everything sealed **after** the
+rotation is unreadable to a device left out of the recipient set. **Nothing else.** A
+device that already unwrapped the previous key still holds that key and everything it
+had already read or copied — cryptography cannot un-send a secret. Deleting its
+envelope stops it collecting anything **new**; it does not reach into that device.
+
+A rotation is reported as **fingerprints only** (`old_key_fingerprint` /
+`new_key_fingerprint`, the same 16-hex SHA-256 prefix used everywhere else). No vault
+key is ever printed, logged, or returned across a UI boundary.
+
 ### Honest limits (read these with the section above)
 
 - **UNAUDITED**, dev-gated (`501` by default), plain HTTP on localhost. Do not
-  store real 2FA secrets.
+  store real 2FA secrets. The Phase 50 pinning, safety-number and rotation code is
+  **new and unaudited** like everything around it.
 - **Custom KEM-then-AEAD, NOT RFC 9180 HPKE** — no HPKE interoperability, no
   standardized analysis.
 - **The system is NOT "post-quantum secure."** The wrap is designed to stay secret
   if **either** X25519 or ML-KEM-768 holds; that is a property of the construction.
-- **No out-of-band verification of a recipient's hybrid public key.** A device
-  trusts what the registry serves. A malicious server that substitutes its own
-  hybrid public key would receive a vault key wrapped to itself. There is no
-  safety-number, key-transparency, or cross-signature mechanism.
-- **No forward secrecy for a delivered vault key, no rotation schedule, and no
-  re-wrap on revoke.** Revocation stops **future** server access; it cannot make a
-  device forget a key it already unwrapped. Remediation is a manual `vault rekey`
-  + re-share. Republishing a hybrid key does not re-wrap already-deposited
-  envelopes.
+- **The safety number does not verify itself.** Pinning blocks a key that *changes*;
+  only a human comparing digits over a trusted channel can catch a key that was wrong
+  the **first** time. Nothing forces that comparison, nothing detects that it was
+  skipped, and a user who re-pins without checking hands over exactly what the
+  refusal prevented. There is still **no key-transparency log and no
+  cross-signature** binding a hybrid public key to the device's enrolled Ed25519
+  identity — that would remove the human from the loop and remains the highest-value
+  follow-up.
+- **Rotation protects future content only, and is manual.** Revocation stops future
+  server access; a device that already unwrapped a key keeps it. Nothing re-keys
+  automatically on revoke, there is **no rotation schedule**, and there is **no
+  forward secrecy** for a vault key already delivered. Republishing a hybrid key
+  does not re-wrap already-deposited envelopes.
 - **Authentication of the sharing routes is classical Ed25519 only** (contract v3).
   The wrap is hybrid; the request signature is not.
 - **No zeroization of key material in the clients.** Rust `Vec`s and JS

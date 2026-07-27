@@ -11,7 +11,72 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 49, `main` @ origin, clean tree).** Phase 49 put the
+**Where we are (through Phase 50, `main` @ origin, clean tree).** Phase 50 **CLOSED THE
+HOLE THIS REPO HAD BEEN DOCUMENTING AS OPEN** — the one the threat model called *"the
+single largest gap in the design"* and ADR 0035 recorded verbatim: **no out-of-band
+verification of a published hybrid public key**, so a hostile/compromised server could
+substitute its OWN key, receive the vault key wrapped to itself, and read the vault
+INVISIBLY. The request was authenticated; the RESPONSE never was. ⭐ **THREE MECHANISMS,
+ALL CLIENT-SIDE** (ADR 0038): **(1) PINNING** — the first hybrid public key seen for a
+device is PINNED, every later fetch compares RAW bytes of BOTH halves, and a **CHANGED
+key BLOCKS** (`CliError::PinMismatch` / `KeyPinMismatchError` / `DesktopError::KeyPinMismatch`,
+IPC-tagged `"key changed"`): **nothing wrapped, nothing uploaded, the pin store NOT
+mutated**, and there is **NO flag/option/default ANYWHERE that accepts a changed key**;
+an UNCHANGED key proceeds silently; **FIRST SIGHT pins, proceeds and WARNS** — the honest
+limit of TOFU. ⭐ **THE CHOKE POINT IS THE FETCH ITSELF** — `fetch_hybrid_key_pinned` /
+`fetchHybridKeyPinned` fetch + pin-check in ONE call and **EVERY wrap path (share AND
+rotate, both implementations) goes through it**; the bare `fetch_hybrid_key` /
+`fetchHybridKey` survive ONLY on non-wrapping paths (safety-number display, the
+deliberate re-pin, desktop `check_server`). **(2) SAFETY NUMBER** — `SHA-256("sigil-
+safety-number-v1\n" ‖ u32_be(len(deviceId)) ‖ deviceId ‖ u32_be(32) ‖ x25519_public_key ‖
+u32_be(1184) ‖ mlkem_encaps_key)`, rendered as **6 groups × 5 digits** (each = 5 digest
+bytes big-endian mod 100000, zero-padded) ≈ **99.6 bits**; the **PAIRWISE** form sorts the
+two digests **BYTEWISE** then hashes under `"sigil-safety-number-pair-v1\n"` so **both
+sides see the SAME string regardless of order**. It **binds the device id** and covers
+**BOTH key halves**, so a genuine key replayed under another device id does NOT verify.
+**(3) ROTATION** — `rotate_vault_key`/`rotateVaultKey`: **pin-check EVERY recipient FIRST**
+(a mismatch aborts before ANY local or remote mutation), fresh 32-byte key,
+`reseal_container` (open old → seal new, **never inspecting the plaintext**), 0600 via
+temp-file+rename, `keyring_put` **AFTER** the file lands, wrap+upsert per recipient, then
+list + **DELETE every envelope not in the recipient set**. **RE-PIN is deliberate and
+never automatic:** `sigil device repin <id> --yes [--safety-number "<digits>"]` refuses
+without `--yes` and refuses if the supplied number ≠ what the server serves NOW; re-pins
+are **counted** and shown by `sigil device pins`. **NEW CLI:** `device safety-number
+[<id>] [--pair <id>]` / `device pins` / `device repin` / `vault rotate --vault <id> --to
+<dev>…`. **PIN STORE:** natively `hybrid-pins.json` **0600 in the 0700 state dir** (the
+CLI **and** desktop share the SAME file ⇒ one record); in the browsers **INSIDE the
+existing sealed device-identity container**, schema **v2→v3** (`pins` field, v1/v2 still
+open yielding an EMPTY store) — so the browser clients **STILL persist ONLY sealed
+containers**. **EXACTLY TWO IMPLEMENTATIONS** (Rust `sigil-cli` for CLI+desktop via ADR
+0037; `sigil-wasm/sharing.mjs` for webapp+extension), **MIRRORED — MUST stay
+byte-identical**, same KAT on both sides. **sigild gained TWO minimal dev-gated routes**
+reusing the **EXISTING** `authorizeOpsRequest` + `needWrite` (the same check that
+authorizes depositing an envelope): **`GET /v1/vaults/{vaultID}/keys`** (**METADATA ONLY**
+— device id, sender, size, created_at, **never a blob**) and **`DELETE
+/v1/vaults/{vaultID}/keys/{deviceID}`**; **sigild stores/serves/validates NO pin and NO
+safety number**, still **501 by default**, still **exactly ONE direct dependency**.
+✅ **VERIFIED FIRST-HAND:** all **NINE** node tests pass; **cli 77 tests**; desktop **15
+unit + its integration tests**; **sigild `go test -race` green across 4 packages**;
+webapp build + **Playwright 8/8**; **extension 3/3**; `libsigil` `getrandom` still **0**.
+⭐ **THE ATTACK IS BLOCKED, PROVEN LIVE** (`sigil-wasm/test/pinning-interop.mjs`): a
+**rewriting proxy** in front of a real `sigild` swaps B's hybrid public key for an
+ATTACKER's — exactly what a hostile registry does — and the CLI **REFUSES** with an error
+NAMING BOTH safety numbers, explaining it is either a key-substitution attack or a
+legitimate re-enrolment, stating **no vault key was wrapped and nothing was uploaded**,
+and telling the user to confirm out-of-band then re-pin deliberately; the stored envelope
+stays **BYTE-IDENTICAL to the honest one** and does **NOT open with the attacker's hybrid
+secret**; the browser threw `KeyPinMismatchError`; and **Rust and JS safety numbers
+agreed** (per-device, pairwise-from-both-sides, and the shared KAT). ⚠️ **HONEST LIMITS,
+DO NOT SOFTEN:** pinning **CANNOT protect FIRST contact** — the safety number can, but
+**only if a human actually compares it**, and nothing forces or detects that; a user who
+**blindly re-pins defeats it**; **rotation protects FUTURE content ONLY** (a device that
+already unwrapped a key keeps what it copied); anyone who can rewrite the pin store can
+silence the alarm; there is still **no key-transparency log and no cross-signature**
+binding a hybrid key to the enrolled Ed25519 identity (**the highest-value follow-up**);
+and **ALL OF IT IS UNAUDITED**, dev-gated, plain HTTP. **This is NOT "secure now"** — it
+closes one documented hole and narrows another. ADR 0038 (new) + a dated addendum on ADR
+0035 retiring its two stale limitations; details in the Phase 50 entry below.
+Phase 49 put the
 **NATIVE DESKTOP client on the network**: device **enrollment**, **contract-v3 signed
 sync**, and **vault sharing** — so **all four client surfaces (CLI, webapp, MV3
 extension, native desktop) are peers**, and the desktop is no longer offline-only.
@@ -5904,3 +5969,234 @@ processes must both print the published vector.
   nothing.
 - **Visual / UI-driven coverage for the desktop and browser sharing UIs** — every protocol
   claim is proven headlessly; no test clicks the buttons.
+
+---
+
+## 2026-07-27 — Phase 50 (KEY VERIFICATION: pin device keys, safety numbers, and vault key ROTATION — the documented hole closes)
+
+### Why this phase, and what it fixes
+This repo has been carrying a hole **in writing** for four phases. `docs/threat-model.md`
+called it *"the single largest gap in the design"*; ADR 0035 recorded it in its own
+Consequences; the Phase 48 and Phase 49 journal entries both restate it as an inherited
+limit. Stated exactly as it stood:
+
+> **Trust in the published hybrid key is trust in the server's registry.** There is **no
+> out-of-band verification** of a recipient's hybrid public key. A malicious server that
+> substitutes its own hybrid public key for the recipient's would receive a vault key
+> wrapped to itself.
+
+The asymmetry underneath it: **contract v3 authenticates the REQUEST; nothing
+authenticates the RESPONSE.** Device A asks the server for B's hybrid public key and
+wraps the vault key to whatever comes back. Every other defense in the sharing design is
+downstream of that answer being honest — the envelope is unreadable to the server *only*
+because it was sealed to a key the server does not hold. Substitute the key and the whole
+property collapses, **invisibly**: A sees a successful share, B sees an envelope it cannot
+open, which looks exactly like a bug.
+
+The second recorded limit compounded it — **no rotation, no re-wrap on revoke** — so even
+after *detecting* a compromise there was no remediation.
+
+### The three decisions (ADR 0038), and why each is shaped the way it is
+⭐ **1. PIN, and BLOCK on change — never warn.** The first hybrid public key seen for a
+device is pinned; every later fetch compares **decoded RAW bytes of BOTH halves** (so a
+server re-encoding the same key cannot raise a false alarm). Unseen ⇒ `FirstSight` (pin,
+proceed, **warn**). Identical ⇒ `Match` (proceed silently). **Different ⇒ HARD STOP**:
+`CliError::PinMismatch` / `KeyPinMismatchError` / `DesktopError::KeyPinMismatch` — with
+**nothing wrapped, nothing uploaded, and the pin store NOT mutated**.
+
+**Blocking rather than warning is the load-bearing choice.** A warning on a key change is
+a warning users click through, and the cost of clicking through is total compromise of the
+vault being shared. So: **there is no flag, option, env var or default anywhere that makes
+a wrap accept a changed key.** The only escape hatch is a separate, deliberate command.
+
+⭐ **The choke point is the FETCH ITSELF.** `fetch_hybrid_key_pinned` (Rust) /
+`fetchHybridKeyPinned` (JS) fetch the key **and** check the pin in ONE call, and **every**
+wrap path — `vault share` *and* `vault rotate`, in both implementations — goes through it.
+A trust store some code path forgets to consult is worthless, so the check is not a step a
+caller can skip. The bare `fetch_hybrid_key` / `fetchHybridKey` survive **only** where
+nothing is wrapped: safety-number display, the deliberate re-pin, and desktop
+`check_server`.
+
+⭐ **2. SAFETY NUMBER for what pinning structurally cannot do.** Pinning is worthless on
+the *first* fetch — if the server lies then, the lie is what gets pinned. So:
+
+```
+digest = SHA-256( "sigil-safety-number-v1\n"
+                ‖ u32_be(len(device_id)) ‖ device_id
+                ‖ u32_be(32)             ‖ x25519_public_key
+                ‖ u32_be(1184)           ‖ mlkem_encaps_key )
+rendered = 6 groups × 5 digits; group[g] = u40_be(digest[5g..5g+5]) mod 100000
+```
+
+Each choice is deliberate: a **domain-separated prefix**; **length-prefixed fields** so
+`"ab"+"c"` cannot collide with `"a"+"bc"`; **BOTH key halves covered** (a swap of only the
+ML-KEM half still changes the number); **the device id bound in** (a genuine key replayed
+under a different device's id does not verify); **raw bytes, not base64**; and **30 digits
+≈ 99.6 bits** — readable aloud, and not searchable for a collision. The **PAIRWISE** form
+sorts the two per-device digests **BYTEWISE** before hashing under a separate prefix, and
+that sort is the entire trick: it makes the input, and so the output, identical whichever
+side computes it, so both people see the SAME digits and cannot compare the wrong pair.
+
+⭐ **3. ROTATION as the remediation revocation never had.** `rotate_vault_key` /
+`rotateVaultKey`: load the current key → **PIN-CHECK EVERY RECIPIENT FIRST** → fresh
+32-byte key → `reseal_container` (open with old, seal with new, **never inspecting the
+plaintext**, so it re-keys a TOTP vault or any `SIGILcli` container identically, no format
+change) → write **0600 via temp-file + rename** → `keyring_put` **AFTER** the file is in
+place → wrap + upsert per recipient → list + **DELETE every envelope not in the recipient
+set**.
+
+Two orderings were chosen for the **failure** case, not the happy path: pin-checking
+everyone *before* any mutation means a substituted key aborts the whole rotation with the
+vault untouched (a half-rotated vault whose new key had already been wrapped to an
+attacker is worse than no rotation); and writing the keyring *after* the file means a
+crash between them cannot leave the keyring naming a key that opens nothing.
+
+### Where the pin store lives — each client's existing rule, not a new one
+- **Native (`sigil` CLI + desktop, sharing the same file):** `hybrid-pins.json`, **0600 in
+  the 0700 state dir**, through the same `write_secret_file` helper as other sensitive
+  state (created `0600` up front so it is never briefly world-readable, `fsync`'d,
+  re-`chmod`'d). A CLI pin and a desktop pin are literally **one record**.
+- **Browsers:** a `pins` field **inside the existing sealed device-identity container**,
+  schema **v2 → v3**; v1 and v2 still open and yield an **EMPTY** store, and `pins` is
+  omitted when empty so a client that never shared writes the shape it always did.
+
+⭐ The browser choice is the one worth defending: a JSON blob in `localStorage` would have
+been trivial and would have **broken the invariant** from ADR 0028 / ADR 0033 that a
+browser persists **nothing in the clear**. The pins are *public* key material — but they
+are **security-critical LOCAL state**, because anyone who can rewrite them can silence the
+alarm. Sealing them is the right treatment.
+
+### `sigild`: two routes, and deliberately no knowledge
+`GET /v1/vaults/{vaultID}/keys` (**METADATA ONLY** — device id, sender, size,
+`created_at`; **never a blob**, and Postgres selects `octet_length(blob)` so ciphertext
+never leaves the DB) and `DELETE /v1/vaults/{vaultID}/keys/{deviceID}`. Both **dev-gated**
+with everything else and both reusing the **EXISTING `authorizeOpsRequest` with
+`needWrite`** — the same check that authorizes depositing an envelope. That is the correct
+bar rather than a stricter one: **a device that can deposit an envelope can already
+REPLACE any envelope in the vault**, so enumerate + delete grants it no new power.
+`sigild` **stores, serves and validates NO pin and NO safety number** — the trust
+mechanism is entirely client-side, which is the only place it can live when the adversary
+*is* the server. Still **501 by default**; still **exactly ONE direct dependency**.
+
+### ⚠️ The fix I made beyond the phase — `requirePinStore` now FAILS CLOSED
+`requirePinStore(store)` previously returned a **fresh empty store** for `null`/`undefined`.
+That is the wrong failure mode for a security control: a caller that forgot to pass its
+pins would silently get **"every key is first-sight"** — pinning would quietly stop
+protecting anything, with **no error anywhere**, and the exact attack this module exists to
+block would succeed. It now **throws**.
+
+Flipping it immediately **surfaced a genuine stale caller**: the Phase-48
+`sharing-interop.mjs` predates pinning and was relying on the fallback. It now supplies a
+pin store explicitly. Worth recording because it is precisely the class of
+**silent-degradation** bug this project has been bitten by before — a control that still
+"passes" while protecting nothing.
+
+### ✅ VERIFIED FIRST-HAND (the gate)
+- **ALL NINE node tests pass** (roundtrip, interop, hybrid-interop, sync-interop,
+  totp-interop, migration-interop, device-auth-interop, sharing-interop, **pinning-interop**).
+- **cli: 77 tests.** **desktop: 15 unit + its integration tests.** **sigild: `go test -race`
+  green across 4 packages**, one direct dependency. **webapp build + Playwright 8/8.**
+  **extension 3/3.** **`libsigil` `getrandom` still 0.**
+
+⭐ **THE ATTACK IS BLOCKED — proven live, no mocks** (`sigil-wasm/test/pinning-interop.mjs`).
+A **transparent rewriting proxy** sits in front of a REAL `sigild` and, when armed,
+rewrites the response body of `GET /v1/devices/{B}/hybrid-key` to an **ATTACKER's** hybrid
+public key. Requests are forwarded verbatim, so the clients' contract-v3 signatures still
+verify — **which is exactly the point: the request is authenticated, the RESPONSE is not.**
+Results:
+
+- the CLI **REFUSES**, with an error that **NAMES BOTH SAFETY NUMBERS**, explains it is
+  either a **KEY-SUBSTITUTION ATTACK** or a **LEGITIMATE RE-ENROLMENT**, states that **no
+  vault key was wrapped and nothing was uploaded**, and tells the user to confirm the
+  number out-of-band and then re-pin deliberately;
+- ⭐ the part that actually matters: the envelope stored for B is **BYTE-IDENTICAL to the
+  honest one** and **CANNOT be opened with the attacker's hybrid secret** — the vault key
+  was never wrapped to the attacker;
+- the **browser threw `KeyPinMismatchError`**, and a failed check **did NOT mutate the pin
+  store**;
+- **Rust and JS safety numbers AGREED** — per-device, the order-independent pairwise number
+  computed from **both** sides, and the fixed KAT both implementations hardcode
+  (`83791 28129 67801 50284 55242 77845`); different keys give different digits. The
+  construction was also **independently reimplemented from the spec text alone, with no
+  project code, reproducing both the per-device and the pairwise KAT** — so
+  `docs/crypto-spec.md` is exact enough to build from;
+- **ROTATION works and its limit holds:** after revoking B and rotating to `[A, C]`, a NEW
+  secret is **unreadable with B's old key**, B's envelope is **gone from the server**, and
+  still-authorized **C reads the new secret fine**;
+- the deliberate escape hatch behaves: a **legitimate re-enrolment also trips the alarm**
+  (it is indistinguishable from an attack), a re-pin with the **WRONG** safety number is
+  **refused**, and only an explicit `repin --yes` with the RIGHT number restores sharing.
+
+### ⚠️ HONEST LIMITS — do not let this become "secure now"
+- ⭐ **Pinning CANNOT protect FIRST contact.** If the server lies the very first time, the
+  lie is what gets pinned. The **safety number** closes that window **only if a human
+  actually compares it** — nothing forces the comparison and nothing detects that it was
+  skipped; a first-sight share proceeds with a warning.
+- ⭐ **A user who blindly re-pins defeats the whole mechanism.** `--yes` plus the optional
+  safety-number check raise the cost; they cannot stop someone re-pinning to make an error
+  go away. The `repins` counter preserves the *evidence*, not the safety.
+- ⭐ **Rotation protects FUTURE content ONLY.** A device that already unwrapped the previous
+  key keeps that key and everything it copied — cryptography cannot un-send a secret.
+  Deleting an envelope stops it collecting anything **new**; it does not reach into that
+  device. Rotation is also **manual**: nothing re-keys on revoke, no schedule, no forward
+  secrecy.
+- **The pin store is only as safe as its host** — anything that can rewrite it silences the
+  alarm before it fires.
+- **Still no key-transparency log and no cross-signature** binding a hybrid public key to
+  the device's enrolled Ed25519 identity. That would remove the human from the loop and is
+  **the highest-value follow-up**; it was deferred, not dismissed, because it changes the
+  publish payload and registry schema across four clients and the server, whereas this
+  phase could ship complete and proven client-side.
+- **A third mirrored construction to keep in sync**, and its drift mode is nasty: divergence
+  would be **misdiagnosed as an attack by users**. Hence the KAT on both sides and the
+  cross-tool test.
+- **UNAUDITED**, dev-gated (`501` by default), plain HTTP on loopback. **Do NOT store real
+  2FA secrets.** Nothing here makes the system "secure" — it closes one documented hole and
+  narrows another.
+
+### 📄 Docs updated in the same change
+- `docs/threat-model.md` — the **most important edit**: the stale *"no out-of-band
+  verification"* and *"no rotation / no re-wrap on revoke"* statements corrected; a **new
+  adversary row X (key-substituting server / rogue registry)**; the *"what sharing does NOT
+  defend"* list rewritten around the real residual risks (first contact, blind re-pin, the
+  pin store's host, rotation's future-only scope, unaudited); the desktop and browser
+  subsections and the class-8 status note updated.
+- `docs/api.md` — both new routes documented in full (auth, request/response, status codes,
+  the **metadata-only** guarantee, the `501`-by-default posture), plus the authorization
+  table, the metrics table, the two new audit events, "all **eleven** routes", and the CLI /
+  JS / desktop client-support tables.
+- `docs/crypto-spec.md` — the exact safety-number transcript, rendering, and the
+  pairwise ordering rule **and why it is order-independent**; the pin-check outcome table;
+  and the full **rotation key lifecycle** with its ordering rationale.
+- `docs/architecture.md` — new **§2c**: the pin store as a **client-side trust store the
+  server can neither read nor write** (native `0600` file vs sealed container), where it is
+  enforced, and rotation; stale claims in §1, §2b and §6 corrected.
+- `CLAUDE.md` — the new CLI subcommands, the two sigild routes, pin-store locations/modes,
+  the container **v3** bump, the desktop/webapp/extension wiring, and the test list
+  renumbered to **NINE** node tests.
+- `README.md` — an honest short paragraph: clients pin device keys, a safety number lets
+  you verify one by hand, vault keys can be rotated — with the first-contact and
+  future-content-only caveats stated in the same breath.
+- `docs/decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md` — **NEW ADR 0038**
+  covering all three decisions together, with alternatives rejected (warn-instead-of-block,
+  cross-signature, key transparency, after-the-fact fingerprint comparison, auto-re-pin,
+  hex fingerprints, deriving the new key from the old, server-side revocation, and the
+  fail-open pin store) and every residual risk; indexed in `docs/decisions/README.md`.
+- `docs/decisions/0035-device-to-device-vault-sharing.md` — a dated **"Key verification and
+  rotation (added Phase 50, 2026-07-27)"** addendum under the addendum rule in
+  `docs/decisions/README.md`: it reports **only** what changed and points at 0038, edits no
+  original text, and is explicit about which halves of each limitation are **not** retired.
+
+### ➡️ Still open (honest)
+- ⭐ **Cross-sign the hybrid public key with the device's enrolled Ed25519 identity** (sign
+  at publish, verify at wrap) — the one change that would protect **first contact** without
+  a human. Now the clear top of the list.
+- **Key transparency / gossip**, so a pin can be checked against something other than one
+  device's memory.
+- **Automatic re-wrap on revoke** and some rotation policy, so remediation is not purely
+  manual.
+- **Zeroization** of key material on every client — still nothing, anywhere.
+- **Wire the hybrid SIGNATURE into something** — still the only hybrid construction used by
+  nothing; all request auth, including these routes, is classical Ed25519.
+- **UI-driven coverage** for the new key-trust surfaces: the protocol claims are proven
+  headlessly, but no test clicks the safety-number, re-pin or rotate buttons.

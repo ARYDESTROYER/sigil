@@ -196,6 +196,13 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("PUT /v1/vaults/{vaultID}/keys/{deviceID}",
 			limitBody(store.MaxKeyEnvelopeBytes, http.HandlerFunc(h.keyEnvelopePut)))
 		mux.Handle("GET /v1/vaults/{vaultID}/keys/{deviceID}", http.HandlerFunc(h.keyEnvelopeGet))
+		// Rotation support (Phase 50): an owner lists which devices still hold a
+		// wrapped key for a vault, and deletes the stale envelopes of devices it
+		// is rotating away from. Both need WRITE on the vault, through the SAME
+		// authorizeOpsRequest choke point the envelope PUT uses — there is no new
+		// auth path. The list route returns METADATA only, never a blob.
+		mux.Handle("GET /v1/vaults/{vaultID}/keys", http.HandlerFunc(h.keyEnvelopeList))
+		mux.Handle("DELETE /v1/vaults/{vaultID}/keys/{deviceID}", http.HandlerFunc(h.keyEnvelopeDelete))
 	} else {
 		stub := http.HandlerFunc(h.deviceNotImplemented)
 		mux.Handle("POST /v1/devices/enroll", stub)
@@ -208,6 +215,8 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("PUT /v1/vaults/{vaultID}/keys/{deviceID}",
 			limitBody(store.MaxKeyEnvelopeBytes, stub))
 		mux.Handle("GET /v1/vaults/{vaultID}/keys/{deviceID}", stub)
+		mux.Handle("GET /v1/vaults/{vaultID}/keys", stub)
+		mux.Handle("DELETE /v1/vaults/{vaultID}/keys/{deviceID}", stub)
 	}
 
 	// Billing routes (hosted checkout, provider webhooks, subscription status).

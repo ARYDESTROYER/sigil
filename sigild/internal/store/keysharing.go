@@ -29,6 +29,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -170,6 +171,40 @@ type KeySharing interface {
 	// recipientDeviceID) with its Blob EXACTLY as stored, or
 	// ErrKeyEnvelopeNotFound.
 	GetKeyEnvelope(ctx context.Context, vaultID, recipientDeviceID string) (KeyEnvelope, error)
+
+	// ListKeyEnvelopeRecipients returns METADATA for every envelope currently
+	// stored for vaultID, sorted by recipient device ID so the order is stable.
+	// It deliberately does NOT return blobs: this exists so a vault OWNER can
+	// see which devices still hold a wrapped key and delete the stale ones
+	// during a key rotation (Phase 50), not so anyone can bulk-download
+	// ciphertext.
+	//
+	// An unknown vault is not an error — it yields an empty slice.
+	ListKeyEnvelopeRecipients(ctx context.Context, vaultID string) ([]KeyEnvelopeMeta, error)
+	// DeleteKeyEnvelope removes the envelope addressed to (vaultID,
+	// recipientDeviceID). It is IDEMPOTENT: deleting an envelope that is not
+	// there returns ErrKeyEnvelopeNotFound so a caller can distinguish "removed"
+	// from "already absent", and the end state is identical either way.
+	//
+	// Deleting an envelope only stops that device collecting the key in future.
+	// It cannot un-learn a key the device already unwrapped.
+	DeleteKeyEnvelope(ctx context.Context, vaultID, recipientDeviceID string) error
+}
+
+// KeyEnvelopeMeta describes one stored envelope WITHOUT its blob. It is what
+// ListKeyEnvelopeRecipients returns, and what the list route serializes: a vault
+// owner needs to know WHICH devices hold a key, never the ciphertext.
+type KeyEnvelopeMeta struct {
+	// VaultID the envelope belongs to.
+	VaultID string
+	// RecipientDeviceID the envelope is addressed to.
+	RecipientDeviceID string
+	// SenderDeviceID that deposited it.
+	SenderDeviceID string
+	// SizeBytes of the opaque blob (a size, never the content).
+	SizeBytes int
+	// CreatedAt is when it was deposited.
+	CreatedAt time.Time
 }
 
 // ---------------------------------------------------------------------------
@@ -245,4 +280,45 @@ func (s *MemDeviceStore) GetKeyEnvelope(ctx context.Context, vaultID, recipientD
 		return KeyEnvelope{}, ErrKeyEnvelopeNotFound
 	}
 	return e.clone(), nil
+}
+
+// ListKeyEnvelopeRecipients returns metadata (never blobs) for every envelope
+// stored for vaultID, sorted by recipient device ID for a stable order.
+func (s *MemDeviceStore) ListKeyEnvelopeRecipients(ctx context.Context, vaultID string) ([]KeyEnvelopeMeta, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]KeyEnvelopeMeta, 0, len(s.envelopes))
+	for k, e := range s.envelopes {
+		if k.vaultID != vaultID {
+			continue
+		}
+		out = append(out, KeyEnvelopeMeta{
+			VaultID:           e.VaultID,
+			RecipientDeviceID: e.RecipientDeviceID,
+			SenderDeviceID:    e.SenderDeviceID,
+			SizeBytes:         len(e.Blob),
+			CreatedAt:         e.CreatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RecipientDeviceID < out[j].RecipientDeviceID })
+	return out, nil
+}
+
+// DeleteKeyEnvelope removes the (vault, recipient) mailbox, reporting
+// ErrKeyEnvelopeNotFound when there was nothing there.
+func (s *MemDeviceStore) DeleteKeyEnvelope(ctx context.Context, vaultID, recipientDeviceID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := envelopeKey{vaultID: vaultID, recipient: recipientDeviceID}
+	if _, ok := s.envelopes[key]; !ok {
+		return ErrKeyEnvelopeNotFound
+	}
+	delete(s.envelopes, key)
+	return nil
 }

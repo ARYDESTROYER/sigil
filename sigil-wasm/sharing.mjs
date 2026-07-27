@@ -58,10 +58,14 @@
 //
 // HONEST SCOPE: pre-audit, UNAUDITED, DEV / LOCALHOST / PLAIN-HTTP. The hybrid
 // construction is a CUSTOM KEM-then-AEAD, NOT RFC 9180 HPKE; the SYSTEM is NOT
-// "post-quantum secure". There is NO out-of-band verification of a published
-// hybrid public key (a hostile registry could substitute its own — compare
-// fingerprints out of band). Revoking a device stops FUTURE server access; it
-// cannot make a device forget a vault key it already accepted.
+// "post-quantum secure". Revoking a device stops FUTURE server access; it cannot
+// make a device forget a vault key it already accepted — for that, ROTATE (see
+// `rotateVaultKey` below), which protects FUTURE content only.
+//
+// KEY SUBSTITUTION (Phase 50): a published hybrid public key is now PINNED on
+// first sight and a CHANGED key is a hard refusal (`KeyPinMismatchError`), and a
+// human-comparable SAFETY NUMBER closes the first-contact window pinning cannot.
+// See the Phase 50 section at the bottom of this file.
 
 import { signedFetch, grantVaultAccess, DeviceAuthError, explainAuthStatus } from "./device-auth.mjs";
 import { bytesToBase64, base64ToBytes } from "./totp-vault.mjs";
@@ -281,9 +285,12 @@ export async function publishHybridKey(wasm, auth, secretIdentity = null) {
  * a length check and no cryptography on key material, so correctness of a
  * published key is the client's business.
  *
- * ⚠️ There is NO out-of-band verification that this key really belongs to that
- * device — a hostile registry could substitute its own and receive the vault key
- * wrapped to itself. Compare {@link vaultKeyFingerprint} out of band to detect it.
+ * ⚠️ THIS IS THE RAW FETCH AND IT ENFORCES NOTHING. It returns whatever the
+ * server says. A hostile registry could substitute its own key here and receive
+ * the vault key wrapped to itself. Prefer {@link fetchHybridKeyPinned}, which
+ * pins on first sight and REFUSES a changed key — every share/rotate path in
+ * this module uses that one. Use this bare version only for DISPLAY (e.g.
+ * computing a {@link safetyNumber} to read aloud), never to wrap a key.
  */
 export async function fetchHybridKey(wasm, auth, deviceId) {
   checkAuth(auth);
@@ -467,7 +474,7 @@ export async function getKeyEnvelope(wasm, auth, vaultId, deviceId = null) {
 export async function shareVault(
   wasm,
   auth,
-  { vaultId, recipientDeviceId, vaultKey, permission = "read" },
+  { vaultId, recipientDeviceId, vaultKey, permission = "read", pins = null },
 ) {
   checkAuth(auth);
   checkId("vault id", vaultId);
@@ -477,8 +484,19 @@ export async function shareVault(
     throw new Error(`sharing: permission must be "read" or "write", got ${permission}`);
   }
 
-  // 1) the recipient's PUBLIC hybrid key, straight from the registry.
-  const recipient = await fetchHybridKey(wasm, auth, recipientDeviceId);
+  // 1) the recipient's PUBLIC hybrid key — through the PIN CHOKE POINT (Phase
+  //    50). If the key the server hands back differs from the one this client
+  //    pinned, this THROWS KeyPinMismatchError and we stop HERE: nothing is
+  //    wrapped, nothing is uploaded, and the vault key never touches the
+  //    substituted key. `pins` defaults to auth.pins (the store that came out of
+  //    the sealed device-identity container), so an unlocked client enforces
+  //    with no extra wiring.
+  const pinStore = requirePinStore(pins ?? auth.pins);
+  const {
+    identity: recipient,
+    pinStatus,
+    safetyNumber: recipientSafetyNumber,
+  } = await fetchHybridKeyPinned(wasm, auth, recipientDeviceId, pinStore);
   // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
   const envelope = wrapVaultKey(wasm, recipient, vaultKey);
   // 3) DEPOSIT the OPAQUE envelope; the server cannot read it.
@@ -499,6 +517,12 @@ export async function shareVault(
     envelopeBytes: envelope.length,
     permission,
     fingerprint: await vaultKeyFingerprint(vaultKey),
+    // ⭐ Phase 50: what the pin check concluded, and the number the user should
+    // confirm out of band. `pinStatus === "first-sight"` means this key has NOT
+    // been verified by a human yet — a UI should say so.
+    pinStatus,
+    safetyNumber: recipientSafetyNumber,
+    pins: pinStore,
   };
 }
 
@@ -525,5 +549,504 @@ export async function acceptVault(wasm, auth, { vaultId, secretIdentity = null }
     vaultKey,
     envelope,
     fingerprint: await vaultKeyFingerprint(vaultKey),
+  };
+}
+
+// ===========================================================================
+// PHASE 50 — KEY VERIFICATION: SAFETY NUMBERS, KEY PINNING, VAULT ROTATION
+// ===========================================================================
+//
+// ┌─ MIRRORED — NOT SHARED. KEEP BYTE-IDENTICAL WITH cli/src/lib.rs ──────────┐
+// │ Every construction below is duplicated in the sigil-cli LIBRARY (which the │
+// │ `sigil` CLI *and* the native desktop app both call). The safety-number      │
+// │ digest in particular MUST agree byte for byte between Rust and JS, or two   │
+// │ people comparing digits across clients would see different numbers and      │
+// │ conclude they were under attack. Both sides carry the SAME known-answer     │
+// │ test, and sigil-wasm/test/pinning-interop.mjs proves the agreement by       │
+// │ running the real `sigil` binary against this module.                        │
+// └────────────────────────────────────────────────────────────────────────────┘
+//
+// THE HOLE THIS CLOSES. `fetchHybridKey` used to return whatever the server
+// said, and `shareVault` wrapped the vault key to it. A hostile or compromised
+// server could substitute its OWN hybrid public key for the recipient's, receive
+// the vault key wrapped to itself, and read the vault — invisibly.
+//
+//   1. PINNING — zero user effort, works from the SECOND contact onward. The
+//      first key seen for a device is PINNED; every later fetch compares. Changed
+//      => KeyPinMismatchError, a hard stop. Never silently accepted, never
+//      auto-re-pinned.
+//   2. SAFETY NUMBER — closes the FIRST-contact window that pinning cannot. Six
+//      5-digit groups derived from the full hybrid public key + device id, read
+//      aloud over a channel the server does not control. The pairwise variant is
+//      ORDER-INDEPENDENT so both people see the same string.
+//   3. ROTATION — a fresh vault key, the vault re-sealed under it, re-wrapped to
+//      a chosen set of devices, every other envelope deleted. ⚠️ Protects FUTURE
+//      content ONLY: a device that already unwrapped the old key keeps whatever
+//      it copied.
+//
+// WHERE THE PIN STORE LIVES IN A BROWSER. The browser clients persist ONLY
+// sealed containers, and Phase 50 does not regress that: the pin store rides
+// INSIDE the existing sealed device-identity container (device-auth.mjs, schema
+// v3, field `pins`). Nothing new is written to localStorage / chrome.storage in
+// the clear.
+
+// ── safety numbers ───────────────────────────────────────────────────────────
+
+/** Domain separation for a SINGLE device's digest. cli/src/lib.rs::SAFETY_NUMBER_PREFIX. */
+export const SAFETY_NUMBER_PREFIX = "sigil-safety-number-v1\n";
+/** Domain separation for the pairwise digest. cli/src/lib.rs::SAFETY_NUMBER_PAIR_PREFIX. */
+export const SAFETY_NUMBER_PAIR_PREFIX = "sigil-safety-number-pair-v1\n";
+/** Six 5-digit groups = 30 decimal digits ~= 99.6 bits. */
+export const SAFETY_NUMBER_GROUPS = 6;
+/** Digest bytes consumed per rendered group. */
+export const SAFETY_NUMBER_BYTES_PER_GROUP = 5;
+
+/** Concatenate byte chunks into one Uint8Array. */
+function concat(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+}
+
+/** Big-endian u32 length prefix, so no two different inputs share a byte stream. */
+function u32be(n) {
+  return new Uint8Array([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+}
+
+/** A length-prefixed transcript field (mirrors the Rust `absorb_field`). */
+function field(bytes) {
+  return [u32be(bytes.length), bytes];
+}
+
+/**
+ * The raw 32-byte SAFETY DIGEST binding a device id to the FULL hybrid public
+ * key material. MUST match cli/src/lib.rs::hybrid_safety_digest byte for byte:
+ *
+ *   SHA-256( "sigil-safety-number-v1\n"
+ *          ‖ u32_be(len(deviceId)) ‖ deviceId
+ *          ‖ u32_be(32)            ‖ x25519PublicKey
+ *          ‖ u32_be(1184)          ‖ mlkemEncapsKey )
+ *
+ * BOTH halves of the hybrid key are covered, and the device id is bound in, so a
+ * genuine key relayed under a different device's id does not verify.
+ */
+export async function hybridSafetyDigest(deviceId, publicIdentity) {
+  checkId("device id", deviceId);
+  const pub = requirePublicIdentity(publicIdentity);
+  const message = concat([
+    TEXT_ENCODER.encode(SAFETY_NUMBER_PREFIX),
+    ...field(TEXT_ENCODER.encode(deviceId)),
+    ...field(pub.x25519PublicKey),
+    ...field(pub.mlkemEncapsKey),
+  ]);
+  return new Uint8Array(await webcrypto().subtle.digest("SHA-256", message));
+}
+
+/**
+ * Render a 32-byte digest as `"12345 67890 13579 24680 11223 44556"`.
+ *
+ * Each group is 5 digest bytes read BIG-ENDIAN, reduced mod 100000 and
+ * zero-padded. Mirrors cli/src/lib.rs::render_safety_number.
+ */
+export function renderSafetyNumber(digest) {
+  if (!(digest instanceof Uint8Array) || digest.length < SAFETY_NUMBER_GROUPS * SAFETY_NUMBER_BYTES_PER_GROUP) {
+    throw new Error("sharing: renderSafetyNumber needs at least 30 digest bytes");
+  }
+  const groups = [];
+  for (let g = 0; g < SAFETY_NUMBER_GROUPS; g += 1) {
+    let acc = 0;
+    for (let i = 0; i < SAFETY_NUMBER_BYTES_PER_GROUP; i += 1) {
+      // 5 bytes max out at 2^40, well inside a JS double's exact integer range.
+      acc = acc * 256 + digest[g * SAFETY_NUMBER_BYTES_PER_GROUP + i];
+    }
+    groups.push(String(acc % 100000).padStart(5, "0"));
+  }
+  return groups.join(" ");
+}
+
+/**
+ * ⭐ THE NUMBER A USER READS ALOUD. The safety number of ONE device's hybrid
+ * public key.
+ *
+ *   await safetyNumber(deviceId, { x25519PublicKey, mlkemEncapsKey }) -> "..."
+ *
+ * Compare it with the other person over a channel the SERVER DOES NOT CONTROL
+ * (a phone call, in person) BEFORE the first share. Pinning cannot protect first
+ * contact; this is the only thing that can.
+ */
+export async function safetyNumber(deviceId, publicIdentity) {
+  return renderSafetyNumber(await hybridSafetyDigest(deviceId, publicIdentity));
+}
+
+/**
+ * The PAIRWISE safety number for two devices — ORDER-INDEPENDENT, so both sides
+ * see the SAME digits no matter who runs it:
+ *
+ *   (lo, hi) = the two per-device digests sorted BYTEWISE ascending
+ *   SHA-256( "sigil-safety-number-pair-v1\n" ‖ lo ‖ hi )  -> rendered
+ *
+ *   await pairwiseSafetyNumber({ deviceId, identity }, { deviceId, identity })
+ */
+export async function pairwiseSafetyNumber(a, b) {
+  const da = await hybridSafetyDigest(a.deviceId, a.identity);
+  const db = await hybridSafetyDigest(b.deviceId, b.identity);
+  let lo = da;
+  let hi = db;
+  for (let i = 0; i < da.length; i += 1) {
+    if (da[i] !== db[i]) {
+      if (da[i] > db[i]) {
+        lo = db;
+        hi = da;
+      }
+      break;
+    }
+  }
+  const message = concat([TEXT_ENCODER.encode(SAFETY_NUMBER_PAIR_PREFIX), lo, hi]);
+  return renderSafetyNumber(new Uint8Array(await webcrypto().subtle.digest("SHA-256", message)));
+}
+
+// ── the pin store ────────────────────────────────────────────────────────────
+
+/** Schema version of the pin store. Mirrors cli/src/lib.rs::HYBRID_PIN_STORE_VERSION. */
+export const HYBRID_PIN_STORE_VERSION = 1;
+
+/**
+ * ⚠️ THE KEY-SUBSTITUTION ALARM. Thrown when a device's published hybrid public
+ * key differs from the one this client pinned.
+ *
+ * It is a distinct, CATCHABLE class (not a string match) carrying the device id
+ * and BOTH safety numbers, so a UI can render exactly what the human needs to
+ * decide: "here is what we trusted, here is what the server just said, go call
+ * them".
+ *
+ * Reaching this means the caller MUST NOT proceed — and nothing that throws it
+ * has wrapped or uploaded anything.
+ */
+export class KeyPinMismatchError extends Error {
+  constructor(deviceId, pinnedSafetyNumber, presentedSafetyNumber) {
+    super(
+      `REFUSING TO SHARE: the hybrid public key published for device ${deviceId} has CHANGED ` +
+        `since this client pinned it.\n  pinned    safety number: ${pinnedSafetyNumber}\n  ` +
+        `presented safety number: ${presentedSafetyNumber}\n  ` +
+        `This is either a KEY-SUBSTITUTION ATTACK (a hostile or compromised server swapped in a ` +
+        `key it can decrypt with, so it would receive this vault's key) or a LEGITIMATE ` +
+        `RE-ENROLMENT of that device. No vault key was wrapped and nothing was uploaded. ` +
+        `Confirm the presented safety number with the other device's owner over a TRUSTED ` +
+        `out-of-band channel, then re-pin deliberately with repinHybridKey().`,
+    );
+    this.name = "KeyPinMismatchError";
+    /** @type {string} the device whose key changed. */
+    this.deviceId = deviceId;
+    /** @type {string} the safety number we trusted. */
+    this.pinnedSafetyNumber = pinnedSafetyNumber;
+    /** @type {string} the safety number the server just presented. */
+    this.presentedSafetyNumber = presentedSafetyNumber;
+  }
+}
+
+/** A fresh, empty pin store. */
+export function newPinStore() {
+  return { version: HYBRID_PIN_STORE_VERSION, pins: {} };
+}
+
+/** Normalize/validate a pin store, accepting `null`/`undefined` as empty. */
+export function requirePinStore(store) {
+  // FAIL CLOSED. An earlier version returned a fresh empty store for
+  // null/undefined, which is the wrong failure mode for a security control: a
+  // caller that forgot to pass its pins would silently get "every key is
+  // first-sight", i.e. pinning would quietly stop protecting anything and the
+  // key-substitution attack this module exists to block would succeed. No
+  // shipping caller relies on that fallback — the webapp, the extension and the
+  // tests all call newPinStore() explicitly when they genuinely want an empty
+  // store — so an absent store is treated as a programming error, loudly.
+  if (store === null || store === undefined) {
+    throw new Error(
+      "sharing: a pin store is required (pinning is what blocks key substitution). " +
+        "Pass the store from the unlocked device identity, or newPinStore() if you " +
+        "deliberately want to start with no pinned keys.",
+    );
+  }
+  if (typeof store !== "object" || typeof store.pins !== "object" || store.pins === null) {
+    throw new Error("sharing: a pin store must be { version, pins: { [deviceId]: pin } }");
+  }
+  if (store.version !== HYBRID_PIN_STORE_VERSION) {
+    throw new Error(
+      `sharing: unsupported pin store version ${store.version}: expected ${HYBRID_PIN_STORE_VERSION}`,
+    );
+  }
+  return store;
+}
+
+/** Build the pin record for a key as it stands right now (mirrors `make_pin`). */
+async function makePin(deviceId, identity, repins) {
+  const pub = requirePublicIdentity(identity);
+  return {
+    device_id: deviceId,
+    x25519_public_key: bytesToBase64(pub.x25519PublicKey),
+    mlkem_encaps_key: bytesToBase64(pub.mlkemEncapsKey),
+    safety_number: await safetyNumber(deviceId, pub),
+    pinned_at: Math.floor(Date.now() / 1000),
+    repins,
+  };
+}
+
+/** Constant-shape byte comparison (these are PUBLIC keys; no timing concern). */
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * ⭐ THE CHOKE POINT. Compare a fetched hybrid public key against the pin store
+ * and pin it on first sight.
+ *
+ *   await checkAndPin(pins, deviceId, identity)
+ *     -> { status: "first-sight" | "match", safetyNumber, changed: false }
+ *
+ *   * device not in the store -> PINS it (mutating `pins` in place) and returns
+ *     `"first-sight"`;
+ *   * pinned key byte-identical -> `"match"`, store untouched;
+ *   * pinned key DIFFERS -> throws {@link KeyPinMismatchError} and changes
+ *     NOTHING.
+ *
+ * There is deliberately NO option on this function that accepts a changed key.
+ * Re-pinning is a separate, explicit operation ({@link repinHybridKey}).
+ *
+ * The comparison is over DECODED raw bytes, so a server re-encoding the same key
+ * cannot raise a false alarm. The CALLER is responsible for PERSISTING `pins`
+ * afterwards (the browser clients re-seal the device-identity container).
+ */
+export async function checkAndPin(pins, deviceId, identity) {
+  const store = requirePinStore(pins);
+  checkId("device id", deviceId);
+  const pub = requirePublicIdentity(identity);
+
+  const existing = store.pins[deviceId];
+  if (existing) {
+    const pinnedX = base64ToBytes(existing.x25519_public_key ?? "");
+    const pinnedM = base64ToBytes(existing.mlkem_encaps_key ?? "");
+    if (sameBytes(pinnedX, pub.x25519PublicKey) && sameBytes(pinnedM, pub.mlkemEncapsKey)) {
+      return { status: "match", safetyNumber: existing.safety_number, changed: false };
+    }
+    throw new KeyPinMismatchError(
+      deviceId,
+      existing.safety_number,
+      await safetyNumber(deviceId, pub),
+    );
+  }
+
+  const pin = await makePin(deviceId, pub, 0);
+  store.version = HYBRID_PIN_STORE_VERSION;
+  store.pins[deviceId] = pin;
+  return { status: "first-sight", safetyNumber: pin.safety_number, changed: false };
+}
+
+/**
+ * ⚠️ EXPLICIT, DELIBERATE re-pin — the ONLY way a changed key is ever accepted.
+ *
+ *   await repinHybridKey(pins, deviceId, identity)
+ *     -> { previousSafetyNumber: string | null, safetyNumber, repins }
+ *
+ * NOTHING calls this automatically. A UI must make the user act on purpose, and
+ * must tell them WHY it is dangerous: a changed key is either a legitimate
+ * re-enrolment or a key-substitution attack, and only a human comparing the new
+ * safety number out of band can tell those apart.
+ */
+export async function repinHybridKey(pins, deviceId, identity) {
+  const store = requirePinStore(pins);
+  checkId("device id", deviceId);
+  const previous = store.pins[deviceId] ?? null;
+  const repins = previous ? (previous.repins ?? 0) + 1 : 0;
+  const pin = await makePin(deviceId, requirePublicIdentity(identity), repins);
+  store.version = HYBRID_PIN_STORE_VERSION;
+  store.pins[deviceId] = pin;
+  return {
+    previousSafetyNumber: previous ? previous.safety_number : null,
+    safetyNumber: pin.safety_number,
+    repins,
+  };
+}
+
+/**
+ * ⭐ FETCH a device's hybrid public key AND enforce the pin, in one call.
+ *
+ *   await fetchHybridKeyPinned(wasm, auth, deviceId, pins = auth.pins)
+ *     -> { identity, pinStatus, safetyNumber }
+ *
+ * This is what every share/rotate path uses instead of the bare
+ * {@link fetchHybridKey}: a pin store nothing consults is worthless, so the
+ * enforcement rides on the same call that gets the key. `pins` defaults to
+ * `auth.pins` — the pin store that came out of the sealed device-identity
+ * container — so an unlocked browser client enforces automatically.
+ *
+ * @throws {KeyPinMismatchError} when the published key changed.
+ */
+export async function fetchHybridKeyPinned(wasm, auth, deviceId, pins = null) {
+  checkAuth(auth);
+  const store = requirePinStore(pins ?? auth.pins);
+  const identity = await fetchHybridKey(wasm, auth, deviceId);
+  const outcome = await checkAndPin(store, deviceId, identity);
+  return { identity, pinStatus: outcome.status, safetyNumber: outcome.safetyNumber, pins: store };
+}
+
+// ── rotation transport: list + delete envelopes ──────────────────────────────
+
+/** The URL PATH of a vault's envelope COLLECTION (mirrors `key_envelopes_path`). */
+function keyEnvelopesPath(vaultId) {
+  return `/v1/vaults/${vaultId}/keys`;
+}
+
+/**
+ * LIST which devices currently hold a key envelope for a vault.
+ *
+ *   listKeyEnvelopes(wasm, auth, vaultId) -> [{ deviceId, senderDeviceId, sizeBytes, createdAt }]
+ *
+ * Requires WRITE on the vault (an owner-side operation, same choke point as
+ * depositing). METADATA ONLY — the server never returns a blob here.
+ */
+export async function listKeyEnvelopes(wasm, auth, vaultId) {
+  checkAuth(auth);
+  checkId("vault id", vaultId);
+  const path = keyEnvelopesPath(vaultId);
+  const res = await signedFetch(wasm, auth, "GET", path, "", null);
+  if (res.status !== 200) await failResponse(res, "listKeyEnvelopes");
+  const json = await res.json();
+  return (json.recipients ?? []).map((r) => ({
+    deviceId: r.device_id,
+    senderDeviceId: r.sender_device_id ?? "",
+    sizeBytes: r.size_bytes ?? 0,
+    createdAt: r.created_at ?? "",
+  }));
+}
+
+/**
+ * DELETE the envelope addressed to one device, so a device rotated away from a
+ * vault cannot collect the NEW key.
+ *
+ *   deleteKeyEnvelope(wasm, auth, vaultId, deviceId) -> boolean (false = nothing there)
+ *
+ * Requires WRITE on the vault. A 404 is NOT an error for a rotation: the desired
+ * end state ("no envelope") already holds.
+ *
+ * ⚠️ This does not un-learn a key the device already unwrapped. It only stops it
+ * collecting anything new.
+ */
+export async function deleteKeyEnvelope(wasm, auth, vaultId, deviceId) {
+  checkAuth(auth);
+  checkId("vault id", vaultId);
+  checkId("device id", deviceId);
+  const path = keyEnvelopePath(vaultId, deviceId);
+  const res = await signedFetch(wasm, auth, "DELETE", path, "", null);
+  if (res.status === 404) return false;
+  if (res.status !== 200) await failResponse(res, "deleteKeyEnvelope");
+  return true;
+}
+
+// ── rotation ─────────────────────────────────────────────────────────────────
+
+/**
+ * ⭐ ROTATE a vault key and RE-WRAP it to a chosen set of devices.
+ *
+ *   await rotateVaultKey(wasm, auth, {
+ *     vaultId, recipientDeviceIds, sealedVault, oldVaultKey, params, salt?, nonce?, pins?
+ *   }) -> { vaultKey, sealedVault, oldFingerprint, newFingerprint, rewrapped, removed }
+ *
+ * The owner-side remediation that revocation was missing:
+ *
+ *   1. fetch + PIN-CHECK **every** recipient FIRST, so a {@link KeyPinMismatchError}
+ *      aborts the whole rotation before anything is re-sealed or uploaded;
+ *   2. draw a FRESH 32-byte vault key;
+ *   3. re-seal the sealed container under it (open with the old key, seal with
+ *      the new one — container-agnostic, it never inspects the plaintext);
+ *   4. wrap the new key to each recipient and UPSERT the envelope;
+ *   5. DELETE the envelope of every device holding one that is NOT a recipient.
+ *
+ * The CALLER persists the returned `sealedVault` (and pushes it) and the returned
+ * `vaultKey` — this module stores nothing.
+ *
+ * ⚠️ WHAT THIS DOES NOT DO. It protects FUTURE content ONLY. A device that
+ * already unwrapped the PREVIOUS key still holds that key and whatever it had
+ * already copied; cryptography cannot un-send a secret. What it DOES guarantee is
+ * that anything sealed AFTER the rotation is unreadable to a device left out of
+ * `recipientDeviceIds`.
+ */
+export async function rotateVaultKey(
+  wasm,
+  auth,
+  { vaultId, recipientDeviceIds, sealedVault, oldVaultKey, params, salt = null, nonce = null, pins = null },
+) {
+  checkAuth(auth);
+  checkId("vault id", vaultId);
+  if (!Array.isArray(recipientDeviceIds) || recipientDeviceIds.length === 0) {
+    throw new Error(
+      "sharing: rotateVaultKey needs recipientDeviceIds — name EVERY device that keeps access " +
+        "(usually including this one, so the owner can still recover its own key)",
+    );
+  }
+  for (const id of recipientDeviceIds) checkId("device id", id);
+  requireVaultKey(oldVaultKey);
+  const container = sealedVault instanceof Uint8Array ? sealedVault : new Uint8Array(sealedVault);
+  const store = requirePinStore(pins ?? auth.pins);
+
+  // 1) PIN-CHECK EVERYONE BEFORE MUTATING ANYTHING. A substituted key aborts the
+  //    rotation with the vault untouched — far better than a half-rotated vault
+  //    whose key leaked.
+  const resolved = [];
+  for (const deviceId of recipientDeviceIds) {
+    const { identity, pinStatus } = await fetchHybridKeyPinned(wasm, auth, deviceId, store);
+    resolved.push({ deviceId, identity, pinStatus });
+  }
+
+  // 2-3) Fresh key, re-seal the container under it.
+  const c = webcrypto();
+  const vaultKey = generateVaultKey();
+  const plaintext = wasm.open_container(oldVaultKey, container);
+  const p = params ?? { m_cost: 19456, t_cost: 2, p_cost: 1 };
+  const resealed = new Uint8Array(
+    wasm.seal_to_container(
+      vaultKey,
+      salt ?? c.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
+      nonce ?? c.getRandomValues(new Uint8Array(wasm.nonce_len())),
+      p.m_cost,
+      p.t_cost,
+      p.p_cost,
+      plaintext,
+    ),
+  );
+
+  // 4) Re-wrap to every chosen recipient (an UPSERT — the old envelope is
+  //    replaced, not appended to).
+  const rewrapped = [];
+  for (const { deviceId, identity, pinStatus } of resolved) {
+    const envelope = wrapVaultKey(wasm, identity, vaultKey);
+    await putKeyEnvelope(wasm, auth, vaultId, deviceId, envelope);
+    rewrapped.push({ deviceId, pinStatus });
+  }
+
+  // 5) Remove the stale envelopes of everyone left out.
+  const keep = new Set(recipientDeviceIds);
+  const removed = [];
+  for (const existing of await listKeyEnvelopes(wasm, auth, vaultId)) {
+    if (keep.has(existing.deviceId)) continue;
+    if (await deleteKeyEnvelope(wasm, auth, vaultId, existing.deviceId)) {
+      removed.push(existing.deviceId);
+    }
+  }
+
+  return {
+    vaultKey,
+    sealedVault: resealed,
+    oldFingerprint: await vaultKeyFingerprint(oldVaultKey),
+    newFingerprint: await vaultKeyFingerprint(vaultKey),
+    rewrapped,
+    removed,
+    pins: store,
   };
 }

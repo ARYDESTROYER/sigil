@@ -130,6 +130,23 @@ pub enum DesktopError {
     /// HTTP 501: the server has that route switched off (sigild's sync and
     /// device routes are dev-gated).
     NotEnabled(String),
+    /// ⚠️ HYBRID KEY CHANGED. The hybrid public key the server published for a
+    /// device does NOT match the one this device pinned the first time it saw
+    /// it (Phase 50).
+    ///
+    /// This BLOCKS the operation: nothing was wrapped and nothing was uploaded.
+    /// It means either a KEY-SUBSTITUTION ATTACK (a hostile or compromised
+    /// server offering a key it can decrypt with) or a LEGITIMATE re-enrolment
+    /// of that device. Only a human can tell, by comparing the safety numbers
+    /// out of band — so nothing ever re-pins automatically.
+    KeyPinMismatch {
+        /// The device whose published key changed.
+        device_id: String,
+        /// The safety number of the key this device trusted.
+        pinned_safety_number: String,
+        /// The safety number of the key the server just presented.
+        presented_safety_number: String,
+    },
     /// Any other non-2xx status from the server.
     Server {
         /// The HTTP status code.
@@ -170,6 +187,21 @@ impl std::fmt::Display for DesktopError {
             | DesktopError::Forbidden(m)
             | DesktopError::MissingOnServer(m)
             | DesktopError::NotEnabled(m) => write!(f, "{m}"),
+            DesktopError::KeyPinMismatch {
+                device_id,
+                pinned_safety_number,
+                presented_safety_number,
+            } => write!(
+                f,
+                "REFUSED: the hybrid public key published for device {device_id} has CHANGED \
+                 since this device pinned it.\n  pinned    safety number: {pinned_safety_number}\n  \
+                 presented safety number: {presented_safety_number}\n  \
+                 This is either a KEY-SUBSTITUTION ATTACK (a hostile or compromised server \
+                 offering a key it can decrypt with, so it would receive this vault's key) or a \
+                 LEGITIMATE RE-ENROLMENT of that device. Nothing was wrapped and nothing was \
+                 uploaded. Confirm the presented safety number with that device's owner over a \
+                 TRUSTED out-of-band channel, then re-pin deliberately."
+            ),
             DesktopError::Server { message, .. } => write!(f, "{message}"),
         }
     }

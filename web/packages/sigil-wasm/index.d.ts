@@ -256,6 +256,28 @@ export interface DeviceIdentity {
   hybrid?: HybridSecretIdentity | null;
   /** SECRET per-vault keys this device holds (`vaultId -> 32 bytes`). */
   vaultKeys?: Record<string, Uint8Array>;
+  /**
+   * PUBLIC hybrid keys this device TRUSTS (Phase 50 pin store). Not secret, but
+   * security-critical: rewriting it silences the key-substitution alarm, which is
+   * why it rides inside the SEALED device-identity container.
+   */
+  pins?: HybridPinStore;
+}
+
+/** One pinned hybrid public key. Mirrors cli/src/lib.rs::HybridKeyPin. */
+export interface HybridKeyPin {
+  device_id: string;
+  x25519_public_key: string;
+  mlkem_encaps_key: string;
+  safety_number: string;
+  pinned_at: number;
+  repins: number;
+}
+
+/** `device id -> the hybrid public key we trust for it`. */
+export interface HybridPinStore {
+  version: number;
+  pins: Record<string, HybridKeyPin>;
 }
 
 /** An HTTP failure carrying the status, so 401 and 403 are distinguishable. */
@@ -472,6 +494,7 @@ export function shareVault(
     recipientDeviceId: string;
     vaultKey: Uint8Array;
     permission?: "read" | "write";
+    pins?: HybridPinStore | null;
   },
 ): Promise<{
   recipientDeviceId: string;
@@ -479,6 +502,10 @@ export function shareVault(
   envelopeBytes: number;
   permission: string;
   fingerprint: string;
+  /** "first-sight" means this key has NOT been verified by a human yet. */
+  pinStatus: "first-sight" | "match";
+  safetyNumber: string;
+  pins: HybridPinStore;
 }>;
 
 /** ACCEPT a vault shared to this device: collect, unwrap, return the key. */
@@ -491,6 +518,126 @@ export function acceptVault(
   vaultKey: Uint8Array;
   envelope: Uint8Array;
   fingerprint: string;
+}>;
+
+// ── Phase 50: safety numbers, key pinning, rotation ─────────────────────────
+
+export const SAFETY_NUMBER_PREFIX: string;
+export const SAFETY_NUMBER_PAIR_PREFIX: string;
+export const SAFETY_NUMBER_GROUPS: number;
+export const SAFETY_NUMBER_BYTES_PER_GROUP: number;
+export const HYBRID_PIN_STORE_VERSION: number;
+
+/** Raw 32-byte digest over the device id + FULL hybrid public key material. */
+export function hybridSafetyDigest(
+  deviceId: string,
+  publicIdentity: HybridPublicIdentity,
+): Promise<Uint8Array>;
+
+/** Render a digest as six space-separated 5-digit groups. */
+export function renderSafetyNumber(digest: Uint8Array): string;
+
+/**
+ * The human-comparable SAFETY NUMBER of one device's hybrid public key. Read it
+ * aloud over a channel the SERVER DOES NOT CONTROL to verify a key before the
+ * first share — pinning cannot protect first contact.
+ */
+export function safetyNumber(
+  deviceId: string,
+  publicIdentity: HybridPublicIdentity,
+): Promise<string>;
+
+/** ORDER-INDEPENDENT pairwise safety number: both sides see the same string. */
+export function pairwiseSafetyNumber(
+  a: { deviceId: string; identity: HybridPublicIdentity },
+  b: { deviceId: string; identity: HybridPublicIdentity },
+): Promise<string>;
+
+/** ⚠️ Thrown when a device's published hybrid key differs from the pinned one. */
+export class KeyPinMismatchError extends Error {
+  deviceId: string;
+  pinnedSafetyNumber: string;
+  presentedSafetyNumber: string;
+}
+
+/** A fresh, empty pin store. */
+export function newPinStore(): HybridPinStore;
+
+/** Validate/normalize a pin store (null/undefined => empty). */
+export function requirePinStore(store: HybridPinStore | null | undefined): HybridPinStore;
+
+/**
+ * THE CHOKE POINT: pin on first sight, proceed when unchanged, THROW
+ * KeyPinMismatchError when changed. Never accepts a changed key.
+ */
+export function checkAndPin(
+  pins: HybridPinStore | null,
+  deviceId: string,
+  identity: HybridPublicIdentity,
+): Promise<{ status: "first-sight" | "match"; safetyNumber: string; changed: false }>;
+
+/** ⚠️ EXPLICIT re-pin — the ONLY way a changed key is ever accepted. */
+export function repinHybridKey(
+  pins: HybridPinStore | null,
+  deviceId: string,
+  identity: HybridPublicIdentity,
+): Promise<{ previousSafetyNumber: string | null; safetyNumber: string; repins: number }>;
+
+/** FETCH a hybrid key AND enforce the pin. Throws KeyPinMismatchError. */
+export function fetchHybridKeyPinned(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  deviceId: string,
+  pins?: HybridPinStore | null,
+): Promise<{
+  identity: HybridPublicIdentity;
+  pinStatus: "first-sight" | "match";
+  safetyNumber: string;
+  pins: HybridPinStore;
+}>;
+
+/** LIST which devices hold an envelope for a vault (owner, WRITE; metadata only). */
+export function listKeyEnvelopes(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  vaultId: string,
+): Promise<
+  { deviceId: string; senderDeviceId: string; sizeBytes: number; createdAt: string }[]
+>;
+
+/** DELETE one device's envelope (owner, WRITE). false = nothing was there. */
+export function deleteKeyEnvelope(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  vaultId: string,
+  deviceId: string,
+): Promise<boolean>;
+
+/**
+ * ROTATE a vault key: fresh key, re-seal, re-wrap to exactly these devices,
+ * delete every other envelope. Protects FUTURE content only.
+ */
+export function rotateVaultKey(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  args: {
+    vaultId: string;
+    recipientDeviceIds: string[];
+    sealedVault: Uint8Array;
+    oldVaultKey: Uint8Array;
+    params?: Argon2Params;
+    salt?: Uint8Array | null;
+    nonce?: Uint8Array | null;
+    pins?: HybridPinStore | null;
+  },
+): Promise<{
+  vaultKey: Uint8Array;
+  sealedVault: Uint8Array;
+  oldFingerprint: string;
+  newFingerprint: string;
+  rewrapped: { deviceId: string; pinStatus: string }[];
+  removed: string[];
+  pins: HybridPinStore;
 }>;
 
 // ── totp-migration helpers ──────────────────────────────────────────────────

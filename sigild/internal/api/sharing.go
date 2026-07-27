@@ -337,3 +337,111 @@ func (h *handlers) keyEnvelopeGet(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(env.Blob)
 }
+
+// ---------------------------------------------------------------------------
+// Rotation support (Phase 50): list + delete key envelopes.
+//
+// WHY THE SERVER NEEDS THESE AT ALL. A client rotating a vault key re-wraps the
+// NEW key to the devices that are still authorized, and must make sure the
+// devices it is rotating AWAY from cannot collect anything. Re-wrapping alone is
+// not enough: a removed device's OLD envelope would sit in its mailbox forever.
+// The client therefore needs to (a) see which devices hold an envelope and
+// (b) remove the ones it did not re-wrap to.
+//
+// THE AUTHORIZATION RULE, stated once: BOTH routes require WRITE access to the
+// vault, enforced by the EXISTING authorizeOpsRequest choke point — the same one
+// that authorizes depositing an envelope and appending an op. That is the right
+// bar: a device that can deposit an envelope can already replace any envelope in
+// the vault, so being able to enumerate and delete them grants no new power. A
+// read-only grantee gets 403. An unauthenticated caller gets 401. Both are
+// dev-gated with everything else (501 when the device model is off).
+//
+// ZERO-KNOWLEDGE UNCHANGED: the list route returns METADATA ONLY — recipient
+// device id, sender device id, blob SIZE and timestamp. It never returns a blob,
+// so it cannot be used to bulk-download ciphertext, and the server still decodes
+// nothing.
+//
+// HONEST LIMIT: deleting an envelope stops a device collecting the key in
+// FUTURE. It cannot make a device forget a key it already unwrapped.
+// ---------------------------------------------------------------------------
+
+// keyEnvelopeRecipientJSON is one row of the envelope listing. Metadata only.
+type keyEnvelopeRecipientJSON struct {
+	DeviceID       string `json:"device_id"`
+	SenderDeviceID string `json:"sender_device_id"`
+	SizeBytes      int    `json:"size_bytes"`
+	CreatedAt      string `json:"created_at"`
+}
+
+// keyEnvelopeList reports which devices currently hold a wrapped vault key for
+// this vault. Requires WRITE on the vault (an owner-side operation).
+func (h *handlers) keyEnvelopeList(w http.ResponseWriter, r *http.Request) {
+	vaultID := r.PathValue("vaultID")
+	if vaultID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "vault ID is required")
+		return
+	}
+
+	out := h.authorizeOpsRequest(r, nil, vaultID, needWrite)
+	if !out.allowed() {
+		h.denyOps(w, r, vaultID, out)
+		return
+	}
+
+	metas, err := h.devices.ListKeyEnvelopeRecipients(r.Context(), vaultID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "")
+		return
+	}
+	recipients := make([]keyEnvelopeRecipientJSON, 0, len(metas))
+	for _, m := range metas {
+		recipients = append(recipients, keyEnvelopeRecipientJSON{
+			DeviceID:       m.RecipientDeviceID,
+			SenderDeviceID: m.SenderDeviceID,
+			SizeBytes:      m.SizeBytes,
+			CreatedAt:      m.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	h.auditKeyEnvelopeList(r, vaultID, out.DeviceID, len(recipients))
+	writeJSON(w, http.StatusOK, struct {
+		VaultID    string                     `json:"vaultID"`
+		Recipients []keyEnvelopeRecipientJSON `json:"recipients"`
+	}{VaultID: vaultID, Recipients: recipients})
+}
+
+// keyEnvelopeDelete removes the envelope addressed to one device, so a device
+// rotated away from a vault cannot collect the NEW key. Requires WRITE on the
+// vault. 404 when there was nothing there — a rotation treats that as "already
+// in the desired state".
+func (h *handlers) keyEnvelopeDelete(w http.ResponseWriter, r *http.Request) {
+	vaultID := r.PathValue("vaultID")
+	recipientID := r.PathValue("deviceID")
+	if vaultID == "" || recipientID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request",
+			"vault ID and recipient device ID are required")
+		return
+	}
+
+	out := h.authorizeOpsRequest(r, nil, vaultID, needWrite)
+	if !out.allowed() {
+		h.denyOps(w, r, vaultID, out)
+		return
+	}
+
+	if err := h.devices.DeleteKeyEnvelope(r.Context(), vaultID, recipientID); err != nil {
+		if errors.Is(err, store.ErrKeyEnvelopeNotFound) {
+			writeError(w, http.StatusNotFound, "envelope_not_found",
+				"no key envelope is addressed to that device for this vault")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal", "")
+		return
+	}
+	h.auditKeyEnvelopeDelete(r, vaultID, recipientID, out.DeviceID)
+	h.metrics.incKeyEnvelopeDelete()
+	writeJSON(w, http.StatusOK, struct {
+		VaultID  string `json:"vaultID"`
+		DeviceID string `json:"device_id"`
+		Deleted  bool   `json:"deleted"`
+	}{VaultID: vaultID, DeviceID: recipientID, Deleted: true})
+}

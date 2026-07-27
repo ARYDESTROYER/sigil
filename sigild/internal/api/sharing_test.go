@@ -449,3 +449,161 @@ func TestSharingNeverLogsEnvelopeBytes(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Rotation support (Phase 50): GET /v1/vaults/{id}/keys and
+// DELETE /v1/vaults/{id}/keys/{deviceID}.
+// ---------------------------------------------------------------------------
+
+// v3Delete builds and serves a v3-signed DELETE.
+func v3Delete(t *testing.T, env *deviceEnv, dev testDevice, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	signV3(t, req, dev, time.Now().Unix(), randNonce(t), nil)
+	env.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// envelopeList is the JSON shape of the listing route.
+type envelopeList struct {
+	VaultID    string `json:"vaultID"`
+	Recipients []struct {
+		DeviceID       string `json:"device_id"`
+		SenderDeviceID string `json:"sender_device_id"`
+		SizeBytes      int    `json:"size_bytes"`
+		CreatedAt      string `json:"created_at"`
+	} `json:"recipients"`
+}
+
+// TestKeyEnvelopeListReturnsMetadataOnly: the owner sees WHICH devices hold a
+// wrapped key, sorted, with sizes — and the response never contains a blob.
+func TestKeyEnvelopeListReturnsMetadataOnly(t *testing.T) {
+	env := newShareEnv(t)
+	devC := enrollDevice(t, env.deviceEnv, testEnrollToken+"-c", "C")
+	publishHybridKey(t, env.deviceEnv, devC)
+
+	blobB := randBytes(t, 1226)
+	blobC := randBytes(t, 900)
+	if rec := v3Put(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID), blobB); rec.Code != http.StatusCreated {
+		t.Fatalf("put B status = %d, want 201", rec.Code)
+	}
+	if rec := v3Put(t, env.deviceEnv, env.devA, env.keyPath(devC.ID), blobC); rec.Code != http.StatusCreated {
+		t.Fatalf("put C status = %d, want 201", rec.Code)
+	}
+
+	rec := v3Get(t, env.deviceEnv, env.devA, "/v1/vaults/"+env.vault+"/keys")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got envelopeList
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Recipients) != 2 {
+		t.Fatalf("recipients = %d, want 2", len(got.Recipients))
+	}
+	seen := map[string]int{}
+	for _, r := range got.Recipients {
+		seen[r.DeviceID] = r.SizeBytes
+		if r.SenderDeviceID != env.devA.ID {
+			t.Fatalf("sender = %q, want %q", r.SenderDeviceID, env.devA.ID)
+		}
+	}
+	if seen[env.devB.ID] != len(blobB) || seen[devC.ID] != len(blobC) {
+		t.Fatalf("sizes = %v, want B=%d C=%d", seen, len(blobB), len(blobC))
+	}
+	// ⭐ ZERO-KNOWLEDGE: the listing must not carry ciphertext.
+	if bytes.Contains(rec.Body.Bytes(), blobB[:16]) || bytes.Contains(rec.Body.Bytes(), blobC[:16]) {
+		t.Fatal("the envelope listing leaked blob bytes")
+	}
+}
+
+// TestKeyEnvelopeDeleteRemovesTheMailbox: after a delete the recipient's GET is
+// 404 — the whole point of a rotation deleting a stale envelope.
+func TestKeyEnvelopeDeleteRemovesTheMailbox(t *testing.T) {
+	env := newShareEnv(t)
+	blob := randBytes(t, 512)
+	if rec := v3Put(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID), blob); rec.Code != http.StatusCreated {
+		t.Fatalf("put status = %d, want 201", rec.Code)
+	}
+	grantBody, _ := json.Marshal(grantRequest{DeviceID: env.devB.ID, Permission: "read"})
+	if rec := v3Post(t, env.deviceEnv, env.devA, "/v1/vaults/"+env.vault+"/grants", grantBody); rec.Code != http.StatusCreated {
+		t.Fatalf("grant status = %d, want 201", rec.Code)
+	}
+	if rec := v3Get(t, env.deviceEnv, env.devB, env.keyPath(env.devB.ID)); rec.Code != http.StatusOK {
+		t.Fatalf("pre-delete collect = %d, want 200", rec.Code)
+	}
+
+	if rec := v3Delete(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID)); rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if rec := v3Get(t, env.deviceEnv, env.devB, env.keyPath(env.devB.ID)); rec.Code != http.StatusNotFound {
+		t.Fatalf("post-delete collect = %d, want 404", rec.Code)
+	}
+	// Deleting again is a clean 404, not a 500.
+	if rec := v3Delete(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID)); rec.Code != http.StatusNotFound {
+		t.Fatalf("second delete = %d, want 404", rec.Code)
+	}
+	// And the listing is now empty.
+	rec := v3Get(t, env.deviceEnv, env.devA, "/v1/vaults/"+env.vault+"/keys")
+	var got envelopeList
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Recipients) != 0 {
+		t.Fatalf("recipients after delete = %d, want 0", len(got.Recipients))
+	}
+}
+
+// TestKeyEnvelopeListAndDeleteRequireWrite: the documented rule — BOTH routes go
+// through the same WRITE choke point as depositing an envelope. A read-only
+// grantee and an unrelated device are 403; an unsigned request is 401.
+func TestKeyEnvelopeListAndDeleteRequireWrite(t *testing.T) {
+	env := newShareEnv(t)
+	devC := enrollDevice(t, env.deviceEnv, testEnrollToken+"-c", "C")
+	if rec := v3Put(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID), randBytes(t, 256)); rec.Code != http.StatusCreated {
+		t.Fatalf("put status = %d, want 201", rec.Code)
+	}
+	// B gets READ only: enough to collect its own envelope, never enough to
+	// enumerate or delete.
+	grantBody, _ := json.Marshal(grantRequest{DeviceID: env.devB.ID, Permission: "read"})
+	if rec := v3Post(t, env.deviceEnv, env.devA, "/v1/vaults/"+env.vault+"/grants", grantBody); rec.Code != http.StatusCreated {
+		t.Fatalf("grant status = %d, want 201", rec.Code)
+	}
+
+	assertForbidden(t, v3Get(t, env.deviceEnv, env.devB, "/v1/vaults/"+env.vault+"/keys"))
+	assertForbidden(t, v3Delete(t, env.deviceEnv, env.devB, env.keyPath(env.devB.ID)))
+	// A device with no grant at all: also 403.
+	assertForbidden(t, v3Get(t, env.deviceEnv, devC, "/v1/vaults/"+env.vault+"/keys"))
+	assertForbidden(t, v3Delete(t, env.deviceEnv, devC, env.keyPath(env.devB.ID)))
+
+	// Unsigned: 401, not 403.
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/vaults/"+env.vault+"/keys", nil))
+	assertUnauthorized(t, rec)
+	rec = httptest.NewRecorder()
+	env.router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, env.keyPath(env.devB.ID), nil))
+	assertUnauthorized(t, rec)
+}
+
+// TestRotationRoutesAreDevGated: with the device model off both new routes
+// return the deliberate 501 like every other sharing route.
+func TestRotationRoutesAreDevGated(t *testing.T) {
+	for _, cfg := range []Config{
+		{Version: "test", Logger: discardLogger()},
+		{Version: "test", Logger: discardLogger(), DevOpsEnabled: true},
+	} {
+		router := NewRouter(cfg)
+		for _, tc := range []struct{ method, path string }{
+			{http.MethodGet, "/v1/vaults/v1/keys"},
+			{http.MethodDelete, "/v1/vaults/v1/keys/dev_x"},
+		} {
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+			if rec.Code != http.StatusNotImplemented {
+				t.Fatalf("%s %s = %d, want 501", tc.method, tc.path, rec.Code)
+			}
+		}
+	}
+}

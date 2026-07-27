@@ -229,6 +229,43 @@
         <button type="button" id="sharing-accept" data-testid="sharing-accept">
           Accept a vault shared to this device
         </button>
+
+        <!-- Phase 50 — key verification. The safety number is what a human reads
+             aloud to verify a key BEFORE the first share; pinning cannot protect
+             first contact. The mismatch banner BLOCKS sharing. -->
+        <div class="row">
+          <button type="button" id="sharing-my-safety" data-testid="sharing-my-safety">
+            My safety number
+          </button>
+          <button type="button" id="sharing-their-safety" data-testid="sharing-their-safety">
+            Their safety number
+          </button>
+        </div>
+        <p id="sharing-safety-number" class="hint" data-testid="sharing-safety-number"></p>
+
+        <div id="sharing-pin-mismatch" role="alert" hidden data-testid="sharing-pin-mismatch">
+          <p id="sharing-pin-mismatch-text"></p>
+          <button type="button" id="sharing-repin" data-testid="sharing-repin">
+            I verified the new number out of band — re-pin
+          </button>
+        </div>
+
+        <label for="sharing-rotate-to">Rotate: device ids that KEEP access</label>
+        <input
+          id="sharing-rotate-to"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_…, dev_… (include THIS device)"
+          data-testid="sharing-rotate-to"
+        />
+        <button type="button" id="sharing-rotate" data-testid="sharing-rotate">
+          Rotate this vault&rsquo;s key and re-wrap
+        </button>
+        <p class="hint">
+          Draws a fresh vault key, re-seals this vault, re-wraps it to those devices and
+          <strong>deletes every other envelope</strong>. Protects <strong>future content
+          only</strong> — a device that already unwrapped the old key keeps what it copied.
+        </p>
       </details>
     </section>
 

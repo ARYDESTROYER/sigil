@@ -117,6 +117,9 @@ fn ipc(e: DesktopError) -> String {
         DesktopError::NotEnrolled(_) => "not enrolled",
         DesktopError::AlreadyEnrolled(_) => "already enrolled",
         DesktopError::NotShared(_) => "not a shared vault",
+        // ⭐ Its own tag: a changed hybrid key is neither an auth failure nor a
+        // server error. The UI must present it as the key-substitution alarm.
+        DesktopError::KeyPinMismatch { .. } => "key changed",
         DesktopError::Server { .. } => "server error",
         _ => "error",
     };
@@ -560,6 +563,134 @@ fn accept(vault_id: String, state: State<'_, AppState>) -> CmdResult<String> {
         .map_err(ipc)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 50 — key verification and rotation. Every one of these delegates to the
+// sigil-cli library through DeviceConfig; the desktop implements no crypto and
+// no pin logic of its own.
+// ---------------------------------------------------------------------------
+
+/// THIS device's safety number — the digits a user reads aloud so someone else
+/// can verify this device's hybrid public key before sharing to it. Local only.
+#[tauri::command]
+fn my_safety_number(state: State<'_, AppState>) -> CmdResult<String> {
+    sync_config(&state)?.my_safety_number().map_err(ipc)
+}
+
+/// Another device's safety number, plus whether it matches what we pinned.
+/// READ-ONLY: it never pins and never re-pins.
+#[tauri::command]
+fn peer_safety_number(
+    device_id: String,
+    state: State<'_, AppState>,
+) -> CmdResult<(String, String)> {
+    sync_config(&state)?
+        .peer_safety_number(device_id.trim())
+        .map_err(ipc)
+}
+
+/// The ORDER-INDEPENDENT pairwise safety number: both people see the same digits.
+#[tauri::command]
+fn pairwise_safety_number(device_id: String, state: State<'_, AppState>) -> CmdResult<String> {
+    sync_config(&state)?
+        .pairwise_safety_number(device_id.trim())
+        .map_err(ipc)
+}
+
+/// The hybrid public keys this device TRUSTS. Public material only.
+#[tauri::command]
+fn pins(state: State<'_, AppState>) -> CmdResult<Vec<PinView>> {
+    Ok(sync_config(&state)?
+        .pins()
+        .map_err(ipc)?
+        .into_iter()
+        .map(|p| PinView {
+            device_id: p.device_id,
+            safety_number: p.safety_number,
+            pinned_at: p.pinned_at,
+            repins: p.repins,
+        })
+        .collect())
+}
+
+/// One pinned key as the UI sees it — no key bytes, only the safety number.
+#[derive(serde::Serialize)]
+struct PinView {
+    device_id: String,
+    safety_number: String,
+    pinned_at: u64,
+    repins: u32,
+}
+
+/// ⚠️ DELIBERATELY accept a CHANGED hybrid key for a device. The UI must only
+/// reach this from an explicit confirmation that names the risk, and `expected`
+/// carries the safety number the user says they verified out of band.
+#[tauri::command]
+fn repin(
+    device_id: String,
+    expected: Option<String>,
+    state: State<'_, AppState>,
+) -> CmdResult<(Option<String>, String)> {
+    let expected = expected
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty());
+    sync_config(&state)?
+        .repin_device(device_id.trim(), expected.as_deref())
+        .map_err(ipc)
+}
+
+/// ROTATE this vault's key and re-wrap it to exactly `device_ids`, deleting every
+/// other envelope. Protects FUTURE content only.
+#[tauri::command]
+fn rotate(
+    vault_id: String,
+    device_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> CmdResult<RotationView> {
+    let recipients: Vec<String> = device_ids
+        .into_iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if recipients.is_empty() {
+        return Err("list every device that KEEPS access (usually including this one)".to_string());
+    }
+    let config = sync_config(&state)?;
+    let path = {
+        let guard = state
+            .session
+            .lock()
+            .map_err(|_| "vault state poisoned".to_string())?;
+        guard
+            .as_ref()
+            .map(VaultSession::path)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(default_vault_path)
+    };
+    let (old, new, rewrapped, removed) = config
+        .rotate_vault(vault_id.trim(), &path, &recipients)
+        .map_err(ipc)?;
+    // The in-memory session still holds the OLD key, so drop it: the file on disk
+    // is now sealed under the new one and must be unlocked afresh.
+    if let Ok(mut guard) = state.session.lock() {
+        *guard = None;
+    }
+    Ok(RotationView {
+        old_fingerprint: old,
+        new_fingerprint: new,
+        rewrapped,
+        removed,
+    })
+}
+
+/// What a rotation did, for the UI. Fingerprints only — never a key.
+#[derive(serde::Serialize)]
+struct RotationView {
+    old_fingerprint: String,
+    new_fingerprint: String,
+    rewrapped: Vec<String>,
+    removed: Vec<String>,
+}
+
 fn main() {
     // The banner is not only a UI element: anyone launching from a terminal sees
     // it too, and it is the same constant the window renders.
@@ -592,7 +723,13 @@ fn main() {
             push,
             pull,
             share,
-            accept
+            accept,
+            my_safety_number,
+            peer_safety_number,
+            pairwise_safety_number,
+            pins,
+            repin,
+            rotate
         ])
         .run(tauri::generate_context!())
         .expect("could not start the Sigil desktop window");

@@ -1374,6 +1374,18 @@ function SharingPanel({
   const [status, setStatus] = useState("");
   const [fingerprint, setFingerprint] = useState("");
   const [busy, setBusy] = useState(false);
+  // Phase 50 — key verification. `mySafety` is this device's own safety number
+  // (derived locally, no network); `theirSafety` is the recipient's, fetched for
+  // DISPLAY only. `mismatch` is set when a fetched key differs from the pinned
+  // one: that BLOCKS sharing until the user re-pins deliberately.
+  const [mySafety, setMySafety] = useState("");
+  const [theirSafety, setTheirSafety] = useState("");
+  const [mismatch, setMismatch] = useState<{
+    deviceId: string;
+    pinned: string;
+    presented: string;
+  } | null>(null);
+  const [rotateTo, setRotateTo] = useState("");
 
   // 401 (not authenticated) vs 403 (authenticated but not permitted) vs 404
   // (nothing shared yet) are spelled out rather than shown as a generic error —
@@ -1406,7 +1418,19 @@ function SharingPanel({
     try {
       await fn();
     } catch (e) {
-      setStatus(`${what} failed: ${shareMsg(e)}`);
+      // ⭐ A CHANGED hybrid key is not a generic failure. It is either a
+      // key-substitution attack or a legitimate re-enrolment, and only a human
+      // can tell which — so it gets its own loud, blocking state.
+      if (e instanceof wasm.KeyPinMismatchError) {
+        setMismatch({
+          deviceId: e.deviceId,
+          pinned: e.pinnedSafetyNumber,
+          presented: e.presentedSafetyNumber,
+        });
+        setStatus(`${what} was REFUSED: that device's key changed. Nothing was shared.`);
+      } else {
+        setStatus(`${what} failed: ${shareMsg(e)}`);
+      }
     } finally {
       setBusy(false);
     }
@@ -1448,16 +1472,116 @@ function SharingPanel({
       if (!key) throw new Error(`this vault is not shared yet — convert "${id}" to a shared vault first`);
       const to = recipient.trim();
       if (!to) throw new Error("paste the recipient's device id");
+      setMismatch(null);
+      // shareVault fetches the recipient's key through the PIN CHOKE POINT: an
+      // unchanged key proceeds, a CHANGED key throws KeyPinMismatchError and
+      // nothing is wrapped or uploaded.
       const res = await wasm.shareVault(wasm, auth, {
         vaultId: id,
         recipientDeviceId: to,
         vaultKey: key,
         permission,
       });
+      // Persist the (possibly newly-pinned) store INSIDE the sealed container.
+      onUpdateDevice({ pins: res.pins });
       setFingerprint(res.fingerprint);
+      setTheirSafety(res.safetyNumber);
       setStatus(
         `Shared "${id}" with ${to} (${res.permission}). Wrapped the vault key to that device's hybrid public key: ` +
-          `a ${res.envelopeBytes}-byte envelope the server relays but cannot read. Key sha256 ${res.fingerprint}.`,
+          `a ${res.envelopeBytes}-byte envelope the server relays but cannot read. Key sha256 ${res.fingerprint}. ` +
+          (res.pinStatus === "first-sight"
+            ? `FIRST CONTACT — this key was just pinned but NOT yet verified by a human. Read the safety number ` +
+              `below to ${to}'s owner over a trusted channel (a phone call, in person) and check it matches.`
+            : "That device's key matches the one pinned earlier."),
+      );
+    });
+  }
+
+  // Show a safety number so a human can read it aloud. This is what closes the
+  // FIRST-contact window pinning cannot: pinning trusts whatever it saw first.
+  function showMySafety() {
+    void run("Computing this device's safety number", async () => {
+      if (!device!.hybrid) throw new Error("publish this device's hybrid key first");
+      const pub = wasm.hybridPublicIdentity(wasm, device!.hybrid);
+      setMySafety(await wasm.safetyNumber(device!.deviceId, pub));
+      setStatus(
+        "Read these digits to anyone about to share a vault with you, over a channel the server " +
+          "does not control. Nothing was sent anywhere — this is derived from local key material.",
+      );
+    });
+  }
+
+  function showTheirSafety() {
+    void run("Fetching the recipient's safety number", async () => {
+      const to = recipient.trim();
+      if (!to) throw new Error("paste the recipient's device id");
+      const identity = await wasm.fetchHybridKey(wasm, auth, to);
+      const sn = await wasm.safetyNumber(to, identity);
+      setTheirSafety(sn);
+      const pinned = device!.pins?.pins?.[to]?.safety_number;
+      setStatus(
+        pinned
+          ? pinned === sn
+            ? `This matches the key already pinned for ${to}.`
+            : `⚠️ This does NOT match the key pinned for ${to} (${pinned}). Sharing will be REFUSED.`
+          : `${to} is not pinned yet — its key will be pinned the first time you share. Confirm these ` +
+              "digits with its owner over a trusted channel FIRST.",
+      );
+    });
+  }
+
+  // ⚠️ The deliberate escape hatch. Only reachable after a mismatch BLOCKED a
+  // share, and only by an explicit click on a button that says what it means.
+  function repin() {
+    void run("Re-pinning that device's key", async () => {
+      const to = mismatch!.deviceId;
+      const identity = await wasm.fetchHybridKey(wasm, auth, to);
+      const pins = device!.pins ?? wasm.newPinStore();
+      const res = await wasm.repinHybridKey(pins, to, identity);
+      onUpdateDevice({ pins });
+      setMismatch(null);
+      setTheirSafety(res.safetyNumber);
+      setStatus(
+        `Re-pinned ${to}. This client now trusts ${res.safetyNumber} for that device. ` +
+          "If you did not verify those digits with its owner out of band, undo this by re-enrolling.",
+      );
+    });
+  }
+
+  // Rotate the vault key and re-wrap it to exactly the devices named, deleting
+  // every other envelope. Protects FUTURE content only.
+  function rotate() {
+    void run("Rotating the vault key", async () => {
+      const key = device!.vaultKeys?.[id];
+      if (!key) throw new Error(`vault "${id}" is not a shared vault`);
+      const recipients = rotateTo
+        .split(/[\s,]+/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+      if (recipients.length === 0) {
+        throw new Error("list every device id that KEEPS access (comma or space separated)");
+      }
+      // The sealed container as it sits in localStorage — rotation re-seals THOSE
+      // exact bytes under the new key without ever handling the plaintext here.
+      const storedVault = window.localStorage.getItem(STORAGE_KEY);
+      if (!storedVault) throw new Error("no sealed vault in this browser to rotate");
+      const sealed = wasm.base64ToBytes(storedVault);
+      const res = await wasm.rotateVaultKey(wasm, auth, {
+        vaultId: id,
+        recipientDeviceIds: recipients,
+        sealedVault: sealed,
+        oldVaultKey: key,
+        params: ARGON2,
+      });
+      onUpdateDevice({ pins: res.pins });
+      onRekey(id, res.vaultKey);
+      setFingerprint(res.newFingerprint);
+      setStatus(
+        `Rotated "${id}": ${res.oldFingerprint} -> ${res.newFingerprint}. Re-wrapped to ` +
+          `${res.rewrapped.map((r) => r.deviceId).join(", ")}` +
+          (res.removed.length > 0 ? `; deleted the envelope of ${res.removed.join(", ")}` : "") +
+          ". Push the vault so the remaining devices get the new content. NOTE: this protects " +
+          "FUTURE content only — a device that already unwrapped the old key keeps whatever it copied.",
       );
     });
   }
@@ -1520,6 +1644,27 @@ function SharingPanel({
           {device.hybrid
             ? "this device has a hybrid identity (publish it so others can share to you)"
             : "not created yet — publish to create and register one"}
+        </p>
+        <p className="mt-1">
+          <span className="font-medium">Safety number:</span>{" "}
+          {mySafety ? (
+            <span data-testid="sharing-my-safety-number" className="font-mono tracking-wider">
+              {mySafety}
+            </span>
+          ) : (
+            <button
+              data-testid="sharing-my-safety"
+              type="button"
+              className="underline"
+              onClick={showMySafety}
+              disabled={busy}
+            >
+              show
+            </button>
+          )}{" "}
+          <span className="text-neutral-500">
+            — read it aloud to verify this device&rsquo;s key before someone shares to it
+          </span>
         </p>
         <p data-testid="sharing-vault-state">
           <span className="font-medium">Vault &ldquo;{id || "?"}&rdquo;:</span>{" "}
@@ -1585,15 +1730,103 @@ function SharingPanel({
           </select>
         </label>
       </div>
-      <button
-        data-testid="sharing-share"
-        className={`${btnGhost} mt-3`}
-        type="button"
-        onClick={share}
-        disabled={busy || !isShared || recipient.trim() === ""}
-      >
-        Share this vault with that device
-      </button>
+      <div className="mt-3 flex flex-wrap gap-3">
+        <button
+          data-testid="sharing-share"
+          className={btnGhost}
+          type="button"
+          onClick={share}
+          disabled={busy || !isShared || recipient.trim() === "" || mismatch !== null}
+        >
+          Share this vault with that device
+        </button>
+        <button
+          data-testid="sharing-their-safety"
+          className={btnGhost}
+          type="button"
+          onClick={showTheirSafety}
+          disabled={busy || recipient.trim() === ""}
+        >
+          Show that device&rsquo;s safety number
+        </button>
+      </div>
+
+      {theirSafety && (
+        <p
+          data-testid="sharing-their-safety-number"
+          className="mt-2 font-mono text-lg tracking-wider"
+        >
+          {theirSafety}
+        </p>
+      )}
+
+      {/* ⭐ THE ALARM. A changed key BLOCKS sharing. The only way past it is the
+          explicit re-pin button below, which says exactly what it means. */}
+      {mismatch && (
+        <div
+          data-testid="sharing-pin-mismatch"
+          role="alert"
+          className="mt-4 rounded border border-red-500 bg-red-50 p-3 text-sm dark:bg-red-950"
+        >
+          <p className="font-semibold">
+            REFUSED — the hybrid public key for {mismatch.deviceId} has CHANGED.
+          </p>
+          <p className="mt-1">
+            Nothing was shared and no key was wrapped. This is either a{" "}
+            <strong>key-substitution attack</strong> (a hostile or compromised server swapping in a
+            key it can decrypt with, so it would receive this vault&rsquo;s key) or a{" "}
+            <strong>legitimate re-enrolment</strong> of that device. Only you can tell, by reading
+            the new digits to its owner over a channel the server does not control.
+          </p>
+          <p className="mt-2 font-mono text-xs">
+            pinned:&nbsp;&nbsp;&nbsp;{mismatch.pinned}
+            <br />
+            presented: {mismatch.presented}
+          </p>
+          <button
+            data-testid="sharing-repin"
+            className={`${btnGhost} mt-3`}
+            type="button"
+            onClick={repin}
+            disabled={busy}
+          >
+            I verified {mismatch.presented} with its owner — re-pin this device
+          </button>
+        </div>
+      )}
+
+      {/* Rotation: a fresh vault key re-wrapped to exactly these devices. */}
+      <div className="mt-4 border-t border-neutral-200 pt-4 dark:border-neutral-800">
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">
+            Rotate: device ids that KEEP access (comma separated)
+          </span>
+          <input
+            data-testid="sharing-rotate-to"
+            className={`${inputCls} font-mono`}
+            value={rotateTo}
+            onChange={(e) => setRotateTo(e.target.value)}
+            placeholder="dev_…, dev_… (include THIS device)"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <button
+          data-testid="sharing-rotate"
+          className={`${btnGhost} mt-3`}
+          type="button"
+          onClick={rotate}
+          disabled={busy || !isShared || rotateTo.trim() === ""}
+        >
+          Rotate this vault&rsquo;s key and re-wrap
+        </button>
+        <p className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+          Draws a fresh 32-byte vault key, re-seals this vault under it, re-wraps it to those
+          devices and <strong>deletes every other device&rsquo;s envelope</strong>. This protects{" "}
+          <strong>future content only</strong> — a device that already unwrapped the old key keeps
+          whatever it had already copied.
+        </p>
+      </div>
 
       {status && (
         <p data-testid="sharing-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">

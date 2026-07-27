@@ -146,6 +146,26 @@ pub enum CliError {
     /// not published a hybrid public key, or a recovered vault key of the wrong
     /// length. NEVER carries a vault key, a password, or any secret bytes.
     Sharing(String),
+    /// ⚠️ A recipient device's hybrid PUBLIC key does NOT match the key this
+    /// client PINNED the first time it saw that device (Phase 50).
+    ///
+    /// This is the key-substitution alarm and it is a HARD STOP: the caller must
+    /// NOT wrap a vault key to the presented key. It means either (a) a hostile
+    /// or compromised server substituted its OWN key so it could unwrap the
+    /// vault key, or (b) that device legitimately re-enrolled / regenerated its
+    /// hybrid identity. Only a human can tell those apart — by comparing the
+    /// SAFETY NUMBER over a trusted out-of-band channel — so nothing here ever
+    /// auto-re-pins.
+    ///
+    /// Carries only PUBLIC material: the device id and the two safety numbers.
+    PinMismatch {
+        /// The device whose published key changed.
+        device_id: String,
+        /// The safety number of the key this client pinned earlier.
+        pinned_safety_number: String,
+        /// The safety number of the key the server just presented.
+        presented_safety_number: String,
+    },
 }
 
 impl From<RecordError> for CliError {
@@ -198,6 +218,24 @@ impl core::fmt::Display for CliError {
             CliError::HybridSeal(e) => write!(f, "could not hybrid-open record: {e:?}"),
             CliError::Totp(e) => write!(f, "totp vault error: {e}"),
             CliError::Sharing(e) => write!(f, "vault sharing error: {e}"),
+            CliError::PinMismatch {
+                device_id,
+                pinned_safety_number,
+                presented_safety_number,
+            } => write!(
+                f,
+                "REFUSING TO SHARE: the hybrid public key published for device {device_id} has \
+                 CHANGED since this client pinned it.\n  \
+                 pinned    safety number: {pinned_safety_number}\n  \
+                 presented safety number: {presented_safety_number}\n  \
+                 This is either a KEY-SUBSTITUTION ATTACK (a hostile or compromised server \
+                 swapped in a key it can decrypt with, so it would receive this vault's key) or a \
+                 LEGITIMATE RE-ENROLMENT of that device.\n  \
+                 No vault key was wrapped and nothing was uploaded. Confirm the presented safety \
+                 number with the other device's owner over a TRUSTED out-of-band channel (a phone \
+                 call, in person), then re-pin deliberately with \
+                 `sigil device repin {device_id}`."
+            ),
         }
     }
 }
@@ -2697,6 +2735,675 @@ pub fn unwrap_vault_key(
     })
 }
 
+// ===========================================================================
+// PHASE 50 — KEY VERIFICATION: SAFETY NUMBERS, KEY PINNING, VAULT ROTATION
+// ===========================================================================
+//
+// THE HOLE THIS CLOSES. Until now a client fetched a recipient's hybrid PUBLIC
+// key from the server and wrapped a vault key to whatever it got back. A hostile
+// or compromised server could substitute its OWN hybrid public key for the
+// recipient's, receive the vault key wrapped to itself, unwrap it, and read the
+// vault — invisibly. There was also no way to rotate a vault key, so revoking a
+// device did not protect content written after the revocation.
+//
+// THE THREE MITIGATIONS, and honestly what each one is worth:
+//
+//   1. PINNING (zero user effort, works after first contact). The first time this
+//      client sees a device's hybrid public key it PINS it. Every later fetch
+//      compares. Unchanged -> proceed. CHANGED -> [`CliError::PinMismatch`], a
+//      HARD REFUSAL: no wrap, no upload, no auto-re-pin, ever. This converts a
+//      silent substitution into a loud, specific stop. It CANNOT protect the
+//      FIRST contact — if the server lies the very first time, the lie is what
+//      gets pinned.
+//
+//   2. SAFETY NUMBER (closes the first-contact window, costs the user a phone
+//      call). A short, deterministic, human-readable fingerprint over the FULL
+//      hybrid public key material plus the device id. Two people read it to each
+//      other over a channel the server does not control; if the digits match, the
+//      key is the real one. A PAIRWISE number mixes both devices' digests in a
+//      canonical (sorted) order so BOTH sides see the SAME string regardless of
+//      who is "first".
+//
+//   3. ROTATION + RE-WRAP (the remediation revocation was missing). The owner
+//      draws a FRESH vault key, re-seals the vault under it, re-wraps it to a
+//      chosen set of still-authorized devices, and DELETES the envelopes of every
+//      device not in that set. ⚠️ HONEST SCOPE: this protects FUTURE content
+//      ONLY. A device that already unwrapped the previous key keeps everything it
+//      had already copied — cryptography cannot un-send a secret.
+//
+// ⭐ MIRRORED — NOT SHARED. Every byte layout and every semantic below is
+// duplicated in `sigil-wasm/sharing.mjs` (used by the webapp and the MV3
+// extension). The safety-number digest MUST stay byte-identical between the two;
+// `sigil-wasm/test/pinning-interop.mjs` is the cross-tool guard, and both sides
+// carry the same known-answer test. The desktop app calls THIS code (ADR 0037),
+// so there are exactly two implementations, not four.
+//
+// STILL UNAUDITED, still dev/localhost/plain-HTTP.
+
+// --- safety numbers ---------------------------------------------------------
+
+/// Domain-separation prefix for a SINGLE device's safety-number digest.
+///
+/// MIRRORED in `sigil-wasm/sharing.mjs` (`SAFETY_NUMBER_PREFIX`). Changing it
+/// changes every safety number in existence and MUST be a version bump.
+pub const SAFETY_NUMBER_PREFIX: &[u8] = b"sigil-safety-number-v1\n";
+
+/// Domain-separation prefix for the ORDER-INDEPENDENT pairwise safety number.
+///
+/// MIRRORED in `sigil-wasm/sharing.mjs` (`SAFETY_NUMBER_PAIR_PREFIX`).
+pub const SAFETY_NUMBER_PAIR_PREFIX: &[u8] = b"sigil-safety-number-pair-v1\n";
+
+/// How many 5-digit groups a rendered safety number has.
+///
+/// 6 groups x 5 digits = 30 decimal digits ~= 99.6 bits of the SHA-256 digest —
+/// short enough to read aloud, long enough that finding a second key with the
+/// same number is not a thing an attacker does.
+pub const SAFETY_NUMBER_GROUPS: usize = 6;
+
+/// Bytes of digest consumed per rendered group (5 bytes -> one 5-digit group).
+pub const SAFETY_NUMBER_BYTES_PER_GROUP: usize = 5;
+
+/// Length-prefix a field into a hash transcript so no two different inputs can
+/// produce the same byte stream (`"ab"+"c"` must not collide with `"a"+"bc"`).
+fn absorb_field(h: &mut sha2::Sha256, field: &[u8]) {
+    use sha2::Digest as _;
+    h.update((field.len() as u32).to_be_bytes());
+    h.update(field);
+}
+
+/// The raw 32-byte SAFETY DIGEST binding a device id to the FULL hybrid public
+/// key material.
+///
+/// ```text
+///   SHA-256( "sigil-safety-number-v1\n"
+///          ‖ u32_be(len(device_id))  ‖ device_id
+///          ‖ u32_be(32)              ‖ x25519_public_key
+///          ‖ u32_be(1184)            ‖ mlkem_encaps_key )
+/// ```
+///
+/// BOTH halves of the hybrid key are covered — a substitution that swapped only
+/// the ML-KEM half would still change the number. The device id is bound in too,
+/// so a real key relayed under a DIFFERENT device's id does not verify.
+///
+/// # Errors
+/// - [`CliError::Identity`] if the public identity does not decode to the
+///   expected lengths.
+pub fn hybrid_safety_digest(
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+) -> Result<[u8; 32], CliError> {
+    use sha2::Digest as _;
+    let keys = identity.decode()?;
+    let mut h = sha2::Sha256::new();
+    h.update(SAFETY_NUMBER_PREFIX);
+    absorb_field(&mut h, device_id.as_bytes());
+    absorb_field(&mut h, &keys.x25519_public_key);
+    absorb_field(&mut h, &keys.mlkem_encaps_key);
+    Ok(h.finalize().into())
+}
+
+/// Render a 32-byte digest as human-comparable digit groups:
+/// `"12345 67890 13579 24680 11223 44556"`.
+///
+/// Each group is 5 digest bytes read BIG-ENDIAN, reduced mod 100000 and
+/// zero-padded to 5 digits. MIRRORED in `sigil-wasm/sharing.mjs`
+/// (`renderSafetyNumber`).
+pub fn render_safety_number(digest: &[u8; 32]) -> String {
+    let mut groups = Vec::with_capacity(SAFETY_NUMBER_GROUPS);
+    for g in 0..SAFETY_NUMBER_GROUPS {
+        let mut acc: u64 = 0;
+        for i in 0..SAFETY_NUMBER_BYTES_PER_GROUP {
+            acc = (acc << 8) | u64::from(digest[g * SAFETY_NUMBER_BYTES_PER_GROUP + i]);
+        }
+        groups.push(format!("{:05}", acc % 100_000));
+    }
+    groups.join(" ")
+}
+
+/// The SAFETY NUMBER of ONE device's hybrid public key — what a user reads aloud
+/// to verify a key BEFORE first use.
+///
+/// # Errors
+/// - [`CliError::Identity`] if the public identity does not decode.
+pub fn hybrid_safety_number(
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+) -> Result<String, CliError> {
+    Ok(render_safety_number(&hybrid_safety_digest(
+        device_id, identity,
+    )?))
+}
+
+/// The PAIRWISE safety number for two devices — ORDER-INDEPENDENT, so both
+/// people see the SAME digits no matter who calls whom.
+///
+/// ```text
+///   (lo, hi) = the two per-device digests sorted BYTEWISE ascending
+///   SHA-256( "sigil-safety-number-pair-v1\n" ‖ lo ‖ hi )  -> rendered
+/// ```
+///
+/// Sorting is what makes it symmetric: `pair(a, b) == pair(b, a)` byte for byte.
+///
+/// # Errors
+/// - [`CliError::Identity`] if either public identity does not decode.
+pub fn pairwise_safety_number(
+    device_a: &str,
+    identity_a: &HybridPublicIdentity,
+    device_b: &str,
+    identity_b: &HybridPublicIdentity,
+) -> Result<String, CliError> {
+    use sha2::Digest as _;
+    let da = hybrid_safety_digest(device_a, identity_a)?;
+    let db = hybrid_safety_digest(device_b, identity_b)?;
+    let (lo, hi) = if da <= db { (da, db) } else { (db, da) };
+    let mut h = sha2::Sha256::new();
+    h.update(SAFETY_NUMBER_PAIR_PREFIX);
+    h.update(lo);
+    h.update(hi);
+    let digest: [u8; 32] = h.finalize().into();
+    Ok(render_safety_number(&digest))
+}
+
+// --- the pin store ----------------------------------------------------------
+
+/// The version byte written into every local hybrid-key pin store.
+pub const HYBRID_PIN_STORE_VERSION: u8 = 1;
+
+/// Default file name of the LOCAL pin store (inside `$HOME/.sigil`).
+///
+/// It holds only PUBLIC key material, but it is still security-critical LOCAL
+/// state — an attacker who can rewrite it can silence the alarm — so it is
+/// written `0600` in the `0700` state dir like everything else.
+pub const HYBRID_PIN_FILE: &str = "hybrid-pins.json";
+
+/// One pinned hybrid public key: what this client saw the FIRST time (or the
+/// last time a human deliberately re-pinned).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridKeyPin {
+    /// The device whose key this is.
+    pub device_id: String,
+    /// std-base64 of the pinned raw 32-byte X25519 public key.
+    pub x25519_public_key: String,
+    /// std-base64 of the pinned raw 1184-byte ML-KEM-768 encapsulation key.
+    pub mlkem_encaps_key: String,
+    /// The rendered safety number of the pinned key, cached so a mismatch can be
+    /// reported without re-deriving.
+    pub safety_number: String,
+    /// Unix seconds at which this pin was recorded.
+    pub pinned_at: u64,
+    /// How many times a human has deliberately RE-pinned this device. `0` means
+    /// "still the key we saw first". A non-zero value is worth showing a user.
+    #[serde(default)]
+    pub repins: u32,
+}
+
+/// The LOCAL pin store: `device id -> the hybrid public key we trust for it`.
+///
+/// On disk it is JSON `{"version":1,"pins":{...}}` with mode `0600`. It is
+/// per-device LOCAL state and is NEVER uploaded — the whole point is that it is
+/// the one copy of the truth the server cannot rewrite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridPinStore {
+    /// Pin-store format version. Always [`HYBRID_PIN_STORE_VERSION`].
+    pub version: u8,
+    /// `device id -> pin`.
+    #[serde(default)]
+    pub pins: std::collections::BTreeMap<String, HybridKeyPin>,
+}
+
+impl Default for HybridPinStore {
+    fn default() -> Self {
+        HybridPinStore {
+            version: HYBRID_PIN_STORE_VERSION,
+            pins: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// What happened when a fetched key was checked against the pin store.
+///
+/// There is deliberately NO "changed but accepted" variant: a change is
+/// [`CliError::PinMismatch`], never an outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinStatus {
+    /// This device had never been seen; its key was just pinned (TOFU).
+    FirstSight,
+    /// The presented key is byte-identical to the pinned one.
+    Match,
+    /// A human deliberately replaced the pin via [`repin_hybrid_key`].
+    Repinned,
+}
+
+impl PinStatus {
+    /// A short word for logs and CLI output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PinStatus::FirstSight => "first-sight (pinned now)",
+            PinStatus::Match => "matches the pinned key",
+            PinStatus::Repinned => "RE-PINNED by explicit request",
+        }
+    }
+}
+
+/// Read the local pin store at `path`. A MISSING file is not an error — it
+/// yields an empty store, so the first fetch pins.
+///
+/// # Errors
+/// - [`CliError::Sharing`] on an IO error, malformed JSON, or an unsupported
+///   version.
+pub fn load_pins(path: &std::path::Path) -> Result<HybridPinStore, CliError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HybridPinStore::default()),
+        Err(e) => return Err(CliError::Sharing(format!("could not read pin store: {e}"))),
+    };
+    let store: HybridPinStore = serde_json::from_str(&text)
+        .map_err(|e| CliError::Sharing(format!("pin store is not valid JSON: {e}")))?;
+    if store.version != HYBRID_PIN_STORE_VERSION {
+        return Err(CliError::Sharing(format!(
+            "unsupported pin store version {}: expected {HYBRID_PIN_STORE_VERSION}",
+            store.version
+        )));
+    }
+    Ok(store)
+}
+
+/// Write the pin store to `path` with mode `0600`, creating the parent directory
+/// `0700` if needed.
+///
+/// # Errors
+/// - [`CliError::Sharing`] on a serialize, directory, write, or chmod failure.
+pub fn save_pins(path: &std::path::Path, store: &HybridPinStore) -> Result<(), CliError> {
+    let json = serde_json::to_string_pretty(store)
+        .map_err(|e| CliError::Sharing(format!("could not serialize pin store: {e}")))?;
+    write_secret_file(path, json.as_bytes())
+        .map_err(|e| CliError::Sharing(format!("could not write pin store: {e}")))
+}
+
+/// Write `bytes` to `path` with mode `0600`, creating the parent directory
+/// `0700` if needed. Created `0600` UP FRONT so the file is never briefly
+/// world-readable, and re-chmod'd in case it pre-existed with looser modes.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Build the pin record for a key as it stands right now.
+fn make_pin(
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+    repins: u32,
+) -> Result<HybridKeyPin, CliError> {
+    Ok(HybridKeyPin {
+        device_id: device_id.to_string(),
+        x25519_public_key: identity.x25519_public_key.clone(),
+        mlkem_encaps_key: identity.mlkem_encaps_key.clone(),
+        safety_number: hybrid_safety_number(device_id, identity)?,
+        pinned_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        repins,
+    })
+}
+
+/// ⭐ THE CHOKE POINT. Compare a freshly-fetched hybrid public key against the
+/// pin store and pin it on first sight.
+///
+///   * device not in the store -> PIN IT, return [`PinStatus::FirstSight`];
+///   * pinned key is byte-identical -> return [`PinStatus::Match`], store
+///     untouched;
+///   * pinned key DIFFERS -> return [`CliError::PinMismatch`] and change
+///     NOTHING. There is no flag on this function that makes it accept a changed
+///     key: re-pinning is a separate, deliberate operation
+///     ([`repin_hybrid_key`]).
+///
+/// Comparison is over the DECODED raw key bytes, not the base64 text, so a
+/// server that re-encodes the same key cannot trip a false alarm.
+///
+/// # Errors
+/// - [`CliError::PinMismatch`] when the key changed (the alarm).
+/// - [`CliError::Identity`] if either identity does not decode.
+/// - [`CliError::Sharing`] on a pin-store IO failure.
+pub fn check_and_pin(
+    pins_path: &std::path::Path,
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+) -> Result<PinStatus, CliError> {
+    let presented = identity.decode()?;
+    let mut store = load_pins(pins_path)?;
+
+    if let Some(existing) = store.pins.get(device_id) {
+        let pinned = HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: existing.x25519_public_key.clone(),
+            mlkem_encaps_key: existing.mlkem_encaps_key.clone(),
+        }
+        .decode()?;
+        if pinned.x25519_public_key == presented.x25519_public_key
+            && pinned.mlkem_encaps_key == presented.mlkem_encaps_key
+        {
+            return Ok(PinStatus::Match);
+        }
+        return Err(CliError::PinMismatch {
+            device_id: device_id.to_string(),
+            pinned_safety_number: existing.safety_number.clone(),
+            presented_safety_number: hybrid_safety_number(device_id, identity)?,
+        });
+    }
+
+    store.version = HYBRID_PIN_STORE_VERSION;
+    store
+        .pins
+        .insert(device_id.to_string(), make_pin(device_id, identity, 0)?);
+    save_pins(pins_path, &store)?;
+    Ok(PinStatus::FirstSight)
+}
+
+/// ⚠️ EXPLICIT, DELIBERATE re-pin — the ONLY way a changed key is ever accepted.
+///
+/// Overwrites the stored pin for `device_id` with `identity` and bumps its
+/// `repins` counter. NOTHING calls this automatically; it exists so a human who
+/// has just verified the NEW safety number out of band can tell the client "yes,
+/// that device really did re-enrol".
+///
+/// Returns `(previous safety number or None, new safety number)`.
+///
+/// # Errors
+/// - [`CliError::Identity`] / [`CliError::Sharing`] as above.
+pub fn repin_hybrid_key(
+    pins_path: &std::path::Path,
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+) -> Result<(Option<String>, String), CliError> {
+    let mut store = load_pins(pins_path)?;
+    let previous = store.pins.get(device_id).cloned();
+    let repins = previous.as_ref().map(|p| p.repins + 1).unwrap_or(0);
+    let pin = make_pin(device_id, identity, repins)?;
+    let new_number = pin.safety_number.clone();
+    store.version = HYBRID_PIN_STORE_VERSION;
+    store.pins.insert(device_id.to_string(), pin);
+    save_pins(pins_path, &store)?;
+    Ok((previous.map(|p| p.safety_number), new_number))
+}
+
+/// ⭐ FETCH a device's hybrid public key AND enforce the pin in one call.
+///
+/// This is what every share/rotate path uses instead of the bare
+/// [`fetch_hybrid_key`]: a pin store nothing consults is worthless, so the
+/// enforcement lives on the same call that gets the key.
+///
+/// # Errors
+/// - [`CliError::PinMismatch`] when the published key changed — the caller MUST
+///   NOT proceed, and this function has already made sure nothing was wrapped.
+/// - Everything [`fetch_hybrid_key`] can return.
+pub fn fetch_hybrid_key_pinned(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+    pins_path: &std::path::Path,
+) -> Result<(HybridPublicIdentity, PinStatus), CliError> {
+    let identity = fetch_hybrid_key(server, device_id, auth)?;
+    let status = check_and_pin(pins_path, device_id, &identity)?;
+    Ok((identity, status))
+}
+
+// --- vault key rotation + re-wrap ------------------------------------------
+
+/// The URL PATH of a vault's envelope COLLECTION (list / rotate support).
+fn key_envelopes_path(vault: &str) -> String {
+    format!("/v1/vaults/{vault}/keys")
+}
+
+/// One recipient currently holding an envelope for a vault, as reported by the
+/// server. Metadata ONLY — the blob is never listed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvelopeRecipient {
+    /// The device the envelope is addressed to.
+    pub device_id: String,
+    /// The device that deposited it.
+    #[serde(default)]
+    pub sender_device_id: String,
+    /// Size of the opaque envelope in bytes.
+    #[serde(default)]
+    pub size_bytes: usize,
+    /// RFC3339 timestamp of the deposit.
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// LIST which devices currently hold a key envelope for `vault`.
+///
+/// Requires WRITE on the vault (it is an owner-side operation — the same choke
+/// point that authorizes depositing an envelope). Returns METADATA only; the
+/// opaque blobs are never returned by this route.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx (`401`, `403` no write access, `501`).
+/// - [`CliError::BadResponse`] if the `200` body is not the expected JSON.
+pub fn list_key_envelopes(
+    server: &str,
+    vault: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<Vec<EnvelopeRecipient>, CliError> {
+    check_vault(vault)?;
+    #[derive(Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        recipients: Vec<EnvelopeRecipient>,
+    }
+    let path = key_envelopes_path(vault);
+    let req = ureq::get(&join_url(server, &path));
+    let req = apply_auth(req, auth, "GET", &path, "", b"")?;
+    let text = finish(req.call())?;
+    let wire: Wire =
+        serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))?;
+    Ok(wire.recipients)
+}
+
+/// DELETE the envelope addressed to `device_id` for `vault`, so a device removed
+/// from a rotation cannot collect the NEW key.
+///
+/// Requires WRITE on the vault. Returns `true` if an envelope was removed and
+/// `false` if there was nothing there (a `404` is not an error for a rotation —
+/// the desired end state is "no envelope", which already holds).
+///
+/// ⚠️ Deleting an envelope does NOT un-learn a key the device already unwrapped.
+/// It only stops it collecting anything NEW.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx other than `404` (`401`, `403`, `501`).
+pub fn delete_key_envelope(
+    server: &str,
+    vault: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<bool, CliError> {
+    check_vault(vault)?;
+    check_device_id(device_id)?;
+    let path = key_envelope_path(vault, device_id);
+    let req = ureq::delete(&join_url(server, &path));
+    let req = apply_auth(req, auth, "DELETE", &path, "", b"")?;
+    match finish(req.call()) {
+        Ok(_) => Ok(true),
+        Err(CliError::Server { status: 404, .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Re-seal an existing `SIGILcli` container under a NEW secret: open it with
+/// `old_secret`, seal the exact same plaintext under `new_secret`.
+///
+/// Container-agnostic on purpose — it re-keys a TOTP vault, a note, or anything
+/// else that is a `SIGILcli` container, because it never looks at the plaintext.
+///
+/// # Errors
+/// - Whatever [`open_container`] / [`seal_to_container`] return.
+pub fn reseal_container(
+    old_secret: &[u8],
+    new_secret: &[u8],
+    container: &[u8],
+    params: Argon2Params,
+) -> Result<Vec<u8>, CliError> {
+    let plaintext = open_container(old_secret, container)?;
+    seal_to_container(new_secret, &plaintext, params)
+}
+
+/// What a rotation actually did. Contains fingerprints only — never a key.
+#[derive(Debug, Clone)]
+pub struct RotationReport {
+    /// The vault that was rotated.
+    pub vault_id: String,
+    /// SHA-256 fingerprint (16 hex) of the key that was RETIRED.
+    pub old_key_fingerprint: String,
+    /// SHA-256 fingerprint (16 hex) of the NEW key.
+    pub new_key_fingerprint: String,
+    /// Devices the new key was re-wrapped to, with their pin status.
+    pub rewrapped: Vec<(String, PinStatus)>,
+    /// Devices whose stale envelope was DELETED from the server.
+    pub removed: Vec<String>,
+}
+
+/// ⭐ ROTATE a vault key and RE-WRAP it to a chosen set of devices.
+///
+/// The owner-side remediation that revocation was missing:
+///
+///   1. read the CURRENT vault key from the local keyring (required);
+///   2. fetch + PIN-CHECK **every** recipient's hybrid public key FIRST, so a
+///      [`CliError::PinMismatch`] aborts the whole rotation before a single byte
+///      of local or server state is touched;
+///   3. draw a FRESH 32-byte vault key;
+///   4. re-seal the vault FILE under it (mode `0600`, written via a temp file and
+///      renamed, so a crash cannot leave a half-written vault);
+///   5. record the new key in the local keyring;
+///   6. wrap it to each recipient and UPSERT the envelope (replacing the old one);
+///   7. DELETE the envelope of every device that holds one but is NOT in
+///      `recipients`.
+///
+/// `recipients` should normally INCLUDE this device, so the owner can still
+/// recover its own key from the server. The caller decides — this function wraps
+/// to exactly the list it is given.
+///
+/// ⚠️ WHAT THIS DOES NOT DO. It protects FUTURE content only. A device that
+/// already unwrapped the PREVIOUS key still holds that key and whatever it had
+/// already read or copied; nothing can retract that. What it does guarantee is
+/// that everything sealed AFTER the rotation is unreadable to a device left out
+/// of `recipients`.
+///
+/// # Errors
+/// - [`CliError::PinMismatch`] if ANY recipient's key changed (nothing is
+///   mutated).
+/// - [`CliError::Sharing`] if this vault has no key in the keyring, or on an IO
+///   failure.
+/// - [`CliError::Server`] / [`CliError::Http`] from the transport.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_vault_key(
+    server: &str,
+    vault_id: &str,
+    vault_file: &std::path::Path,
+    keyring_path: &std::path::Path,
+    pins_path: &std::path::Path,
+    recipients: &[String],
+    auth: &RequestAuth<'_>,
+    params: Argon2Params,
+) -> Result<RotationReport, CliError> {
+    check_vault(vault_id)?;
+    for r in recipients {
+        check_device_id(r)?;
+    }
+
+    // 1) The key we are retiring. A vault that was never rekeyed has no key here,
+    //    and rotating a PASSWORD vault is not a thing — `vault rekey` is.
+    let old_key = keyring_get(keyring_path, vault_id)?.ok_or_else(|| {
+        CliError::Sharing(format!(
+            "no vault key for {vault_id:?} in {}; only a SHARED vault can be rotated — run \
+             `sigil vault rekey --vault {vault_id}` first",
+            keyring_path.display()
+        ))
+    })?;
+    let container = std::fs::read(vault_file).map_err(|e| {
+        CliError::Sharing(format!(
+            "could not read vault {}: {e}",
+            vault_file.display()
+        ))
+    })?;
+
+    // 2) PIN-CHECK EVERY RECIPIENT BEFORE MUTATING ANYTHING. If one device's key
+    //    was substituted, the whole rotation aborts with the vault untouched —
+    //    far better than a half-rotated vault whose key leaked to an attacker.
+    let mut resolved: Vec<(String, HybridPublicIdentity, PinStatus)> =
+        Vec::with_capacity(recipients.len());
+    for device in recipients {
+        let (identity, status) = fetch_hybrid_key_pinned(server, device, auth, pins_path)?;
+        resolved.push((device.clone(), identity, status));
+    }
+
+    // 3-4) Fresh key, re-seal the vault, write it atomically at 0600.
+    let new_key = generate_vault_key()?;
+    let resealed = reseal_container(&old_key, &new_key, &container, params)?;
+    let tmp = vault_file.with_extension("rotate.tmp");
+    write_secret_file(&tmp, &resealed)
+        .map_err(|e| CliError::Sharing(format!("could not write rotated vault: {e}")))?;
+    std::fs::rename(&tmp, vault_file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        CliError::Sharing(format!(
+            "could not replace vault {}: {e}",
+            vault_file.display()
+        ))
+    })?;
+
+    // 5) The local keyring now points at the new key. Do this AFTER the file is
+    //    in place: if we crashed between, the keyring would name a key that opens
+    //    nothing.
+    keyring_put(keyring_path, vault_id, &new_key)?;
+
+    // 6) Re-wrap to every chosen recipient (an UPSERT — the old envelope is
+    //    replaced, not appended to).
+    let mut rewrapped = Vec::with_capacity(resolved.len());
+    for (device, identity, status) in &resolved {
+        let envelope = wrap_vault_key(identity, &new_key)?;
+        put_key_envelope(server, vault_id, device, &envelope, auth)?;
+        rewrapped.push((device.clone(), *status));
+    }
+
+    // 7) Remove the stale envelopes of everyone left out.
+    let keep: std::collections::BTreeSet<&str> = recipients.iter().map(String::as_str).collect();
+    let mut removed = Vec::new();
+    for existing in list_key_envelopes(server, vault_id, auth)? {
+        if !keep.contains(existing.device_id.as_str())
+            && delete_key_envelope(server, vault_id, &existing.device_id, auth)?
+        {
+            removed.push(existing.device_id);
+        }
+    }
+
+    Ok(RotationReport {
+        vault_id: vault_id.to_string(),
+        old_key_fingerprint: vault_key_fingerprint(&old_key),
+        new_key_fingerprint: vault_key_fingerprint(&new_key),
+        rewrapped,
+        removed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4364,5 +5071,240 @@ mod tests {
             vault_key_fingerprint(&generate_vault_key().expect("k2")),
             fp
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 50 — safety numbers, key pinning, rotation.
+    // -----------------------------------------------------------------------
+
+    /// ⭐ KNOWN ANSWER — the safety number of `kat_identity()` under device id
+    /// `"dev_KAT"`. This exact string is hardcoded in `sigil-wasm/sharing.mjs`
+    /// too; `sigil-wasm/test/pinning-interop.mjs` proves Rust and JS agree.
+    const SAFETY_NUMBER_KAT: &str = "83791 28129 67801 50284 55242 77845";
+
+    /// ⭐ KNOWN ANSWER — the ORDER-INDEPENDENT pairwise number for
+    /// (`dev_A`, kat_identity) and (`dev_B`, kat_identity_b).
+    const PAIRWISE_SAFETY_NUMBER_KAT: &str = "05665 81205 97621 93440 13243 35164";
+
+    /// The FIXED key material both the Rust and the JS known-answer tests use.
+    /// Mirrored verbatim in sigil-wasm/sharing.mjs's `kat` helper and in
+    /// sigil-wasm/test/pinning-interop.mjs. Not a real key — a deterministic
+    /// fixture, chosen so both implementations can build it from a one-line loop.
+    fn kat_identity() -> HybridPublicIdentity {
+        let x: Vec<u8> = (0..X25519_PUBLIC_KEY_LEN).map(|i| i as u8).collect();
+        let m: Vec<u8> = (0..ML_KEM768_ENCAPS_KEY_LEN)
+            .map(|i| ((i * 7 + 11) % 256) as u8)
+            .collect();
+        HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: BASE64.encode(&x),
+            mlkem_encaps_key: BASE64.encode(&m),
+        }
+    }
+
+    /// A second fixture that differs from `kat_identity` in ONE byte of the
+    /// X25519 half — the minimal substitution an attacker could attempt.
+    fn kat_identity_b() -> HybridPublicIdentity {
+        let mut x: Vec<u8> = (0..X25519_PUBLIC_KEY_LEN).map(|i| i as u8).collect();
+        x[0] ^= 0x01;
+        let m: Vec<u8> = (0..ML_KEM768_ENCAPS_KEY_LEN)
+            .map(|i| ((i * 7 + 11) % 256) as u8)
+            .collect();
+        HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: BASE64.encode(&x),
+            mlkem_encaps_key: BASE64.encode(&m),
+        }
+    }
+
+    #[test]
+    fn safety_number_known_answer() {
+        // ⭐ KAT. This exact string is asserted in sigil-wasm/sharing.mjs's tests
+        // and re-checked across the two implementations by
+        // sigil-wasm/test/pinning-interop.mjs. If this changes, every safety
+        // number every user ever wrote down changes — it is a version bump, not
+        // a bug fix.
+        let sn = hybrid_safety_number("dev_KAT", &kat_identity()).expect("safety number");
+        assert_eq!(sn, SAFETY_NUMBER_KAT);
+        // Shape: 6 groups of exactly 5 digits, space separated.
+        let groups: Vec<&str> = sn.split(' ').collect();
+        assert_eq!(groups.len(), SAFETY_NUMBER_GROUPS);
+        assert!(groups
+            .iter()
+            .all(|g| g.len() == 5 && g.chars().all(|c| c.is_ascii_digit())));
+    }
+
+    #[test]
+    fn safety_number_binds_device_id_and_both_key_halves() {
+        let a = hybrid_safety_number("dev_A", &kat_identity()).expect("a");
+        // Same key, DIFFERENT device id -> different number (the id is bound in,
+        // so a real key replayed under another device's id does not verify).
+        let b = hybrid_safety_number("dev_B", &kat_identity()).expect("b");
+        assert_ne!(a, b);
+        // One flipped bit in the X25519 half -> different number.
+        let c = hybrid_safety_number("dev_A", &kat_identity_b()).expect("c");
+        assert_ne!(a, c);
+        // One flipped bit in the ML-KEM half -> different number.
+        let mut m = BASE64
+            .decode(kat_identity().mlkem_encaps_key.as_bytes())
+            .expect("b64");
+        m[1183] ^= 0x80;
+        let d = hybrid_safety_number(
+            "dev_A",
+            &HybridPublicIdentity {
+                version: HYBRID_IDENTITY_VERSION,
+                x25519_public_key: kat_identity().x25519_public_key,
+                mlkem_encaps_key: BASE64.encode(&m),
+            },
+        )
+        .expect("d");
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn pairwise_safety_number_is_order_independent() {
+        let ab = pairwise_safety_number("dev_A", &kat_identity(), "dev_B", &kat_identity_b())
+            .expect("ab");
+        let ba = pairwise_safety_number("dev_B", &kat_identity_b(), "dev_A", &kat_identity())
+            .expect("ba");
+        assert_eq!(ab, ba, "a pairwise safety number MUST be order-independent");
+        assert_eq!(ab, PAIRWISE_SAFETY_NUMBER_KAT);
+        // And it is not just one of the two single numbers.
+        assert_ne!(ab, hybrid_safety_number("dev_A", &kat_identity()).unwrap());
+    }
+
+    #[test]
+    fn pin_first_sight_then_match_then_hard_refuse_on_change() {
+        let dir = tempdir("pins");
+        let pins = dir.join(HYBRID_PIN_FILE);
+
+        // First sight -> pinned.
+        assert_eq!(
+            check_and_pin(&pins, "dev_B", &kat_identity()).expect("first"),
+            PinStatus::FirstSight
+        );
+        // The pin store is 0600.
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&pins).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Unchanged -> proceed.
+        assert_eq!(
+            check_and_pin(&pins, "dev_B", &kat_identity()).expect("match"),
+            PinStatus::Match
+        );
+        // CHANGED -> hard refusal, with BOTH safety numbers for the human.
+        let err = check_and_pin(&pins, "dev_B", &kat_identity_b()).expect_err("must refuse");
+        match &err {
+            CliError::PinMismatch {
+                device_id,
+                pinned_safety_number,
+                presented_safety_number,
+            } => {
+                assert_eq!(device_id, "dev_B");
+                assert_eq!(
+                    pinned_safety_number,
+                    &hybrid_safety_number("dev_B", &kat_identity()).unwrap()
+                );
+                assert_eq!(
+                    presented_safety_number,
+                    &hybrid_safety_number("dev_B", &kat_identity_b()).unwrap()
+                );
+            }
+            other => panic!("expected PinMismatch, got {other:?}"),
+        }
+        // The message names the device and says what to do.
+        let msg = err.to_string();
+        assert!(msg.contains("dev_B"));
+        assert!(msg.contains("KEY-SUBSTITUTION ATTACK"));
+        assert!(msg.contains("repin"));
+
+        // ⭐ And the store was NOT silently updated: the ORIGINAL key still
+        // matches, so a second attempt with the attacker key still refuses.
+        assert_eq!(
+            check_and_pin(&pins, "dev_B", &kat_identity()).expect("still pinned to the real key"),
+            PinStatus::Match
+        );
+        assert!(check_and_pin(&pins, "dev_B", &kat_identity_b()).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repin_is_explicit_and_counted() {
+        let dir = tempdir("repin");
+        let pins = dir.join(HYBRID_PIN_FILE);
+        check_and_pin(&pins, "dev_B", &kat_identity()).expect("first");
+
+        let (old, new) = repin_hybrid_key(&pins, "dev_B", &kat_identity_b()).expect("repin");
+        assert_eq!(
+            old.as_deref(),
+            Some(
+                hybrid_safety_number("dev_B", &kat_identity())
+                    .unwrap()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            new,
+            hybrid_safety_number("dev_B", &kat_identity_b()).unwrap()
+        );
+        // Now the NEW key is the accepted one and the OLD one alarms.
+        assert_eq!(
+            check_and_pin(&pins, "dev_B", &kat_identity_b()).expect("new matches"),
+            PinStatus::Match
+        );
+        assert!(check_and_pin(&pins, "dev_B", &kat_identity()).is_err());
+        assert_eq!(load_pins(&pins).unwrap().pins["dev_B"].repins, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pin_store_round_trips_and_rejects_a_bad_version() {
+        let dir = tempdir("pinstore");
+        let pins = dir.join(HYBRID_PIN_FILE);
+        assert!(load_pins(&pins).expect("missing is empty").pins.is_empty());
+        check_and_pin(&pins, "dev_A", &kat_identity()).expect("pin");
+        let store = load_pins(&pins).expect("reload");
+        assert_eq!(store.version, HYBRID_PIN_STORE_VERSION);
+        assert_eq!(store.pins["dev_A"].device_id, "dev_A");
+        assert_eq!(store.pins["dev_A"].repins, 0);
+
+        std::fs::write(&pins, r#"{"version":9,"pins":{}}"#).unwrap();
+        assert!(load_pins(&pins).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reseal_container_changes_the_secret_but_not_the_plaintext() {
+        let old_key = [7u8; VAULT_KEY_LEN];
+        let new_key = [9u8; VAULT_KEY_LEN];
+        let plaintext = b"the secret that must survive a rotation";
+        let c1 = seal_to_container(&old_key, plaintext, FAST).expect("seal");
+        let c2 = reseal_container(&old_key, &new_key, &c1, FAST).expect("reseal");
+
+        // The NEW key opens it and yields the SAME plaintext.
+        assert_eq!(open_container(&new_key, &c2).expect("open new"), plaintext);
+        // ⭐ The OLD key no longer opens the rotated container — that is the whole
+        // point of a rotation.
+        assert!(open_container(&old_key, &c2).is_err());
+        // And the ciphertext genuinely changed.
+        assert_ne!(c1, c2);
+    }
+
+    /// Create a unique temp directory under the OS temp dir.
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-{tag}-{nanos}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
     }
 }

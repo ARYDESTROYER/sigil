@@ -345,6 +345,77 @@ $("share-form").addEventListener("submit", async (e) => {
   toast(`shared ${id} (key sha256 ${fp}) — wrapped to that device, opaque to the server`);
 });
 
+// ── Phase 50: safety numbers, the pin alarm, and rotation ──────────────────
+
+/** Show a safety number (or a pin verdict) in the dedicated line. */
+function showSafety(text) {
+  $("safety-number").textContent = text;
+}
+
+$("my-safety-btn").addEventListener("click", async () => {
+  const sn = await call("my_safety_number");
+  showSafety(`This device: ${sn}`);
+  toast(
+    "Read these digits to whoever is about to share a vault with you, over a channel the " +
+      "server does not control. Nothing was sent anywhere."
+  );
+});
+
+$("peer-safety-btn").addEventListener("click", async () => {
+  const to = $("share-device").value.trim();
+  if (!to) return toast("enter the recipient device id first");
+  const [sn, state] = await call("peer_safety_number", { deviceId: to });
+  showSafety(`${to}: ${sn}`);
+  toast(`Pin state: ${state}. Confirm the digits with that device's owner out of band.`);
+});
+
+$("pairwise-safety-btn").addEventListener("click", async () => {
+  const to = $("share-device").value.trim();
+  if (!to) return toast("enter the recipient device id first");
+  const sn = await call("pairwise_safety_number", { deviceId: to });
+  showSafety(`Pairwise with ${to}: ${sn}`);
+  toast(
+    "This number is ORDER-INDEPENDENT: the other device sees exactly the same digits. " +
+      "If they differ, do NOT share."
+  );
+});
+
+$("pins-btn").addEventListener("click", async () => {
+  const rows = await call("pins");
+  if (rows.length === 0) {
+    showSafety("No keys pinned yet — the first share pins the key it sees.");
+    return;
+  }
+  showSafety(
+    rows
+      .map(
+        (p) =>
+          `${p.device_id}: ${p.safety_number}` +
+          (p.repins > 0 ? ` (re-pinned ${p.repins}x by explicit request)` : "")
+      )
+      .join("  |  ")
+  );
+});
+
+$("rotate-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = vaultId();
+  if (!id) return;
+  const deviceIds = $("rotate-devices")
+    .value.split(/[\s,]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const r = await call("rotate", { vaultId: id, deviceIds });
+  toast(
+    `rotated ${id}: ${r.old_fingerprint} -> ${r.new_fingerprint}; re-wrapped to ` +
+      `${r.rewrapped.join(", ")}` +
+      (r.removed.length > 0 ? `; deleted the envelope of ${r.removed.join(", ")}` : "") +
+      ". The vault is now locked — unlock it with the shared vault id. This protects " +
+      "FUTURE content only."
+  );
+  refresh();
+});
+
 $("accept-btn").addEventListener("click", async () => {
   const id = vaultId();
   if (!id) return;

@@ -60,6 +60,7 @@ type Metrics struct {
 	hybridKeyPublishesTotal atomic.Int64
 	keyEnvelopePutsTotal    atomic.Int64
 	keyEnvelopeGetsTotal    atomic.Int64
+	keyEnvelopeDeletesTotal atomic.Int64
 
 	// authDenied counts request auth/authz denials, keyed by the fixed
 	// authReason enum so /metrics can label each by reason. Built once
@@ -270,6 +271,10 @@ func (m *Metrics) incKeyEnvelopePut() { m.keyEnvelopePutsTotal.Add(1) }
 // incKeyEnvelopeGet records one envelope collected by its recipient.
 func (m *Metrics) incKeyEnvelopeGet() { m.keyEnvelopeGetsTotal.Add(1) }
 
+// incKeyEnvelopeDelete records one envelope removed by a vault owner during a
+// key rotation (Phase 50). A counter only — no vault ID, no device ID, no blob.
+func (m *Metrics) incKeyEnvelopeDelete() { m.keyEnvelopeDeletesTotal.Add(1) }
+
 // incAuthzDenied records one AUTHORIZATION denial (a 403), i.e. an
 // authenticated device that was not permitted. It is counted separately from the
 // per-reason breakdown so an operator can alert on 403s alone.
@@ -323,6 +328,8 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 		"Total opaque wrapped-vault-key envelopes deposited.", m.keyEnvelopePutsTotal.Load())
 	writeCounter(&b, "sigild_vault_key_envelope_fetches_total",
 		"Total opaque wrapped-vault-key envelopes collected by their recipient.", m.keyEnvelopeGetsTotal.Load())
+	writeCounter(&b, "sigild_key_envelope_deletes_total",
+		"Total opaque wrapped-vault-key envelopes deleted during a vault key rotation.", m.keyEnvelopeDeletesTotal.Load())
 	writeCounter(&b, "sigild_oplog_authz_denied_total",
 		"Total requests denied by per-vault authorization (HTTP 403).", m.authzDeniedTotal.Load())
 

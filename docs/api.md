@@ -117,6 +117,7 @@ the source of truth for the exact strings):
 | `sigild_device_hybrid_keys_published_total` | counter | device hybrid **public** key publishes, including re-publishes (`PUT /v1/devices/{deviceID}/hybrid-key`) |
 | `sigild_vault_key_envelopes_total` | counter | opaque wrapped-vault-key envelopes deposited (`PUT /v1/vaults/{vaultID}/keys/{deviceID}`) |
 | `sigild_vault_key_envelope_fetches_total` | counter | envelopes collected by their recipient (`GET /v1/vaults/{vaultID}/keys/{deviceID}`) |
+| `sigild_key_envelope_deletes_total` | counter | envelopes deleted during a vault key rotation (`DELETE /v1/vaults/{vaultID}/keys/{deviceID}`). A count only — no vault ID, no device ID, no blob |
 | `sigild_billing_checkouts_total{provider="…"}` | counter | hosted checkout sessions created, by provider (`stripe`/`razorpay`/`juspay`) |
 | `sigild_billing_webhooks_total{provider="…",outcome="…"}` | counter | **authenticated** webhooks handled, by provider and outcome (`accepted`, `ignored`, `duplicate`, `stale`, `illegal`, `unresolved`) |
 | `sigild_billing_webhook_rejected_total{reason="…"}` | counter | webhooks rejected **before** application, by reason (`bad_signature`, `malformed`, `unknown_provider`, `payload_too_large`, `store_error`) |
@@ -661,6 +662,8 @@ or `write` and **`write` implies `read`**. Each route declares what it needs:
 | `GET /v1/vaults/{vaultID}/grants` | read |
 | `PUT /v1/vaults/{vaultID}/keys/{deviceID}` | **write** (a first deposit **claims** an unowned vault, exactly like a first append) |
 | `GET /v1/vaults/{vaultID}/keys/{deviceID}` | read **and** being the addressee |
+| `GET /v1/vaults/{vaultID}/keys` | **write** (rotation support; metadata only) |
+| `DELETE /v1/vaults/{vaultID}/keys/{deviceID}` | **write** (rotation support) |
 
 **Ownership is TRUST ON FIRST WRITE (TOFU).** A vault with no owner is claimed
 by the **first device that successfully authenticates a WRITE** to it; that
@@ -965,11 +968,12 @@ boots a **real** sigild with `SIGILD_DEVICE_AUTH=1` and drives the JS client
 against it (enroll, claim, grant, revoke, tamper, stale, token reuse). Same
 **dev-only, plain-HTTP, UNAUDITED** posture as the CLI: no TLS, loopback only.
 
-### Default posture (all nine routes)
+### Default posture (all eleven routes)
 
 With **`SIGILD_ENABLE_DEV_OPS` unset** — the default and the only
 production-safe setting — **every** device route **and every vault-sharing route**
-(the four in the [next section](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46))
+(the six in the [next section](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)
+— the original four plus the two Phase 50 rotation routes)
 returns:
 
 ```json
@@ -986,7 +990,7 @@ discarded, and the envelope route keeps its size cap even while stubbed.
 
 ## Device-to-device vault sharing (DEV-GATED, opt-in) — Phase 46
 
-> **DEV-GATED, OPT-IN, and UNAUDITED.** These four routes let one enrolled device
+> **DEV-GATED, OPT-IN, and UNAUDITED.** These **six** routes let one enrolled device
 > hand a vault's encryption key to another **without the server ever being able to
 > read it**. The relay is real and the authorization is real (it is the *same* v3
 > code path as the op-log, not a parallel one), but it is **gated off by default**
@@ -995,6 +999,14 @@ discarded, and the envelope route keeps its size cap even while stubbed.
 > `hybrid_seal` path, the human password never shared — is specified in
 > [`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use).
 > See [ADR 0035](decisions/0035-device-to-device-vault-sharing.md).
+>
+> **Phase 50 added the last two** (`GET …/keys`, `DELETE …/keys/{deviceID}`) to
+> support **vault key rotation**, and added a purely **client-side** trust control
+> around the fetch: clients **pin** a device's hybrid public key and refuse to wrap
+> to a changed one, verifiable out of band with a **safety number**
+> ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
+> **`sigild` gained no knowledge of any of that** — it does not store, serve or
+> validate a pin or a safety number, and it still performs no cryptography.
 
 ### The shape of the flow
 
@@ -1174,16 +1186,92 @@ Returns the envelope **byte-for-byte as it was uploaded**.
   | `500 Internal Server Error` | `internal` | the store could not be read |
   | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
 
+### `GET /v1/vaults/{vaultID}/keys` — list who holds a wrapped key (METADATA ONLY)
+
+Added in **Phase 50** to support **key rotation**
+([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)). A
+client rotating a vault key must know which devices still hold an envelope, so it
+can delete the ones it did not re-wrap to — re-wrapping alone would leave a removed
+device's old envelope sitting in its mailbox.
+
+- **Auth:** the four v3 headers. Requires **`write`** on the vault, through the
+  **same `authorizeOpsRequest` choke point** that authorizes depositing an envelope
+  — **no new auth path**. That is the right bar rather than a stricter one: a device
+  that can deposit an envelope can already **replace** any envelope in the vault, so
+  enumerating them grants it no new power. A read-only grantee gets `403`.
+- ⭐ **Metadata only — never a blob.** The response carries a recipient device ID, the
+  sender's device ID, the envelope's **size** and its timestamp. It **cannot** be used
+  to bulk-download ciphertext, and the server still decodes nothing. The Postgres
+  backend selects `octet_length(blob)` rather than the blob, so the ciphertext never
+  leaves the database for this route.
+- **Ordering:** by recipient device ID, stable across backends. An unknown vault is
+  **not** an error — it lists zero recipients.
+- **Success — `200 OK`:**
+
+  ```json
+  {
+    "vaultID": "<vaultID>",
+    "recipients": [
+      { "device_id": "dev_B", "sender_device_id": "dev_A", "size_bytes": 1226, "created_at": "<RFC3339>" }
+    ]
+  }
+  ```
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `invalid_request` | missing vault ID |
+  | `401 Unauthorized` | `unauthorized` | v3 signature check failed — including a **revoked** device |
+  | `403 Forbidden` | `forbidden` | authenticated but holding no **write** grant on the vault |
+  | `500 Internal Server Error` | `internal` | the store could not be read |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+### `DELETE /v1/vaults/{vaultID}/keys/{deviceID}` — remove a device's envelope
+
+Removes the envelope addressed to one device, so a device rotated **away** from a
+vault cannot collect the **new** key.
+
+- **Auth:** identical to the list route — the four v3 headers and **`write`** on the
+  vault, through the same `authorizeOpsRequest` choke point.
+- ⚠️ **What it does and does not do.** It stops that device collecting anything
+  **new**. It **cannot** make a device forget a key it already unwrapped, and it does
+  not touch the op-log: the sealed containers that device already pulled stay openable
+  offline forever.
+- **Success — `200 OK`:**
+
+  ```json
+  { "vaultID": "<vaultID>", "device_id": "dev_B", "deleted": true }
+  ```
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `invalid_request` | missing vault or device ID |
+  | `401 Unauthorized` | `unauthorized` | v3 signature check failed — including a **revoked** device |
+  | `403 Forbidden` | `forbidden` | authenticated but holding no **write** grant on the vault |
+  | `404 Not Found` | `envelope_not_found` | nothing was addressed to that device for this vault |
+  | `500 Internal Server Error` | `internal` | the store could not be written |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
+  A rotating client treats the `404` as **success**, not failure: the desired end
+  state ("no envelope for that device") already holds. `delete_key_envelope` /
+  `deleteKeyEnvelope` therefore return `false` rather than raising.
+
 ### Audit log
 
-Three events, all **metadata plus a fingerprint** — the envelope bytes, the vault
-key, the hybrid public keys, signatures and nonces are **never** logged:
+Five events, all **metadata plus (where there is a blob) a fingerprint** — the
+envelope bytes, the vault key, the hybrid public keys, signatures and nonces are
+**never** logged:
 
 | Event | Fields |
 |-------|--------|
 | `device.hybrid_key_published` | `request_id`, `device_id`. The key bytes are public, but are still not logged: an audit line is not a key-distribution channel |
 | `vault.key_envelope_put` | `request_id`, `vault_id`, `recipient_device_id`, `sender_device_id`, `size_bytes`, `blob_sha256` (hex SHA-256 of the opaque envelope) |
 | `vault.key_envelope_get` | `request_id`, `vault_id`, `recipient_device_id`, `size_bytes`, `blob_sha256` |
+| `vault.key_envelope_list` | `request_id`, `vault_id`, `device_id` (the caller), `returned_count`. **No `blob_sha256`** — the route never reads a blob, so there is nothing to fingerprint |
+| `vault.key_envelope_delete` | `request_id`, `vault_id`, `recipient_device_id`, `device_id` (the caller). Records **who removed whose** envelope; again no blob is read |
 
 The shared `blob_sha256` lets an operator correlate "the sender uploaded X" with
 "the recipient collected X" **without the server retaining the ciphertext**.
@@ -1199,9 +1287,13 @@ and [`../cli/src/lib.rs`](../cli/src/lib.rs)):
 |---------|-----------------|
 | `sigil device hybrid-publish [--key <f>] [--hybrid-key <f>] [--regenerate] [--server <url>]` | `PUT /v1/devices/{deviceID}/hybrid-key` — generates the hybrid identity if absent (secret `0600`, never uploaded), publishes only the public half |
 | `sigil vault rekey --vault <id> [--file <vaultfile>] [--publish] [--keyring <f>]` | none, unless `--publish` → `PUT /v1/vaults/{vaultID}/keys/{deviceID}` (wraps the new key to **this** device) |
-| `sigil vault share --vault <id> --to <deviceID> [--permission read\|write] [--envelope-out <f>]` | `GET /v1/devices/{to}/hybrid-key`, then `PUT /v1/vaults/{vaultID}/keys/{to}`, then `POST /v1/vaults/{vaultID}/grants` |
+| `sigil vault share --vault <id> --to <deviceID> [--permission read\|write] [--pins <f>] [--envelope-out <f>]` | `GET /v1/devices/{to}/hybrid-key` **through the pin check**, then `PUT /v1/vaults/{vaultID}/keys/{to}`, then `POST /v1/vaults/{vaultID}/grants`. **Refuses** (nothing wrapped, nothing uploaded) if the recipient's key changed since it was pinned |
 | `sigil vault accept --vault <id> [--hybrid-key <f>] [--envelope-out <f>] [--for <deviceID>]` | `GET /v1/vaults/{vaultID}/keys/{deviceID}` — collect, unwrap, store the key locally |
+| `sigil vault rotate --vault <id> --to <deviceID> [--to <deviceID> …] [--file <f>] [--pins <f>]` | `GET /v1/devices/{to}/hybrid-key` **for every recipient first** (a pin mismatch aborts before anything is touched), then `PUT …/keys/{to}` per recipient, then `GET /v1/vaults/{vaultID}/keys` and `DELETE …/keys/{deviceID}` for every device **not** named |
 | `sigil vault list [--keyring <f>]` | none — prints which vaults this device holds a key for, as **fingerprints only** |
+| `sigil device safety-number [<deviceID>] [--pair <deviceID>]` | `GET /v1/devices/{deviceID}/hybrid-key` when given a target (**read-only — never pins and never re-pins**); with no argument it is purely local and works offline |
+| `sigil device pins [--pins <f>]` | none — lists the hybrid public keys this client **trusts**, their safety numbers, when they were pinned, and any **re-pin count** |
+| `sigil device repin <deviceID> --yes [--safety-number "<digits>"]` | `GET /v1/devices/{deviceID}/hybrid-key`, then replaces the local pin. ⚠️ The **only** way a changed key is ever accepted: refuses without `--yes`, and refuses if the `--safety-number` supplied does not match the key the server is presenting right now |
 
 Supporting client state, none of which is ever uploaded:
 
@@ -1209,7 +1301,15 @@ Supporting client state, none of which is ever uploaded:
   `$HOME/.sigil/device.hybrid`), mode `0600`, with the shareable public half at
   `<identity>.hybrid.pub`;
 - the **vault keyring** at `$HOME/.sigil/vault-keys.json` (override with
-  `--keyring`), mode `0600`, JSON `{"version":1,"keys":{"<vaultID>":"<b64 32 bytes>"}}`.
+  `--keyring`), mode `0600`, JSON `{"version":1,"keys":{"<vaultID>":"<b64 32 bytes>"}}`;
+- the **hybrid-key pin store** at `$HOME/.sigil/hybrid-pins.json` (override with
+  `--pins`; it also follows `--keyring`'s directory), mode `0600` in the `0700` state
+  dir, JSON `{"version":1,"pins":{"<deviceID>":{device_id, x25519_public_key,
+  mlkem_encaps_key, safety_number, pinned_at, repins}}}`. It holds only **public** key
+  material, but it is security-critical **local** state — an attacker who can rewrite
+  it can silence the key-substitution alarm — so it gets the same treatment as a
+  secret. The **desktop app uses the same file in the same directory**, so a `sigil`
+  pin and a desktop pin are one record ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)).
 
 `sigil totp add|list|code|remove|import|export` gained **`--vault-id <id>`**, which
 opens a file with the **vault key** for `<id>` instead of `SIGIL_PASSWORD`
@@ -1237,8 +1337,12 @@ its vendored copy). It covers all four routes, plus the two composed operations:
 | `fetchHybridKey(wasm, auth, deviceId)` | `GET /v1/devices/{deviceID}/hybrid-key` |
 | `putKeyEnvelope(wasm, auth, vaultId, recipientDeviceId, envelopeBytes)` | `PUT /v1/vaults/{vaultID}/keys/{deviceID}` |
 | `getKeyEnvelope(wasm, auth, vaultId, deviceId?)` | `GET /v1/vaults/{vaultID}/keys/{deviceID}` (defaults to `auth.deviceId`) |
-| `shareVault(wasm, auth, {vaultId, recipientDeviceId, vaultKey, permission})` | `GET …/hybrid-key`, then `PUT …/keys/{to}`, then `POST …/grants` — the same three-step composition as `sigil vault share`, so authorization and key distribution cannot drift |
+| `fetchHybridKeyPinned(wasm, auth, deviceId, pins?)` | `GET /v1/devices/{deviceID}/hybrid-key` **plus the pin check in the same call** — the choke point every wrap path uses. `pins` defaults to `auth.pins`. **Throws `KeyPinMismatchError`** on a changed key |
+| `listKeyEnvelopes(wasm, auth, vaultId)` | `GET /v1/vaults/{vaultID}/keys` — metadata only |
+| `deleteKeyEnvelope(wasm, auth, vaultId, deviceId)` | `DELETE /v1/vaults/{vaultID}/keys/{deviceID}` — returns `false` on a `404` rather than raising |
+| `shareVault(wasm, auth, {vaultId, recipientDeviceId, vaultKey, permission, pins?})` | `GET …/hybrid-key` **through `fetchHybridKeyPinned`**, then `PUT …/keys/{to}`, then `POST …/grants` — the same composition as `sigil vault share`, so authorization and key distribution cannot drift. Returns `pinStatus` + `safetyNumber` so a UI can say whether the key has ever been human-verified |
 | `acceptVault(wasm, auth, {vaultId, secretIdentity?})` | `GET …/keys/{deviceID}` — collect, unwrap, return the 32-byte key |
+| `rotateVaultKey(wasm, auth, {vaultId, recipientDeviceIds, sealedVault, oldVaultKey, params, pins?})` | pin-checks **every** recipient first, then `PUT …/keys/{to}` per recipient, then `GET …/keys` + `DELETE …/keys/{deviceID}` for everyone else. Returns the new key and the re-sealed container — **the caller persists and pushes them** |
 
 `auth` is exactly the object `openDeviceIdentity` returns plus a `baseUrl`, so an
 unlocked client passes its device identity straight in. Supporting surface:
@@ -1254,9 +1358,20 @@ through `device-auth.mjs`; the module hand-rolls nothing. Entropy is JS-supplied
 ephemeral X25519 secret / ML-KEM coin / AEAD nonce. `unwrapVaultKey` rejects any
 recovered plaintext that is not exactly 32 bytes rather than using it as a key.
 
-The browser clients store the hybrid secret identity and every accepted vault key
-**inside their sealed device-identity container** (schema v2), never in plaintext web
-storage — see [ADR 0036](decisions/0036-browser-sharing-secret-storage.md).
+The browser clients store the hybrid secret identity, every accepted vault key **and
+(since Phase 50) the hybrid-key pin store** inside their sealed device-identity
+container — schema **v3**, field `pins` — never in plaintext web storage. A v1 or v2
+container still opens and yields an **empty** pin store, so an existing client keeps
+working and simply pins on next use. See
+[ADR 0036](decisions/0036-browser-sharing-secret-storage.md) and
+[ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md).
+
+The pinning surface itself calls **no route**: `safetyNumber` / `pairwiseSafetyNumber`
+/ `renderSafetyNumber`, `newPinStore` / `requirePinStore` / `checkAndPin` /
+`repinHybridKey` and the `KeyPinMismatchError` class are pure local computation over
+`crypto.subtle`. `requirePinStore` **fails closed**: a missing store throws rather than
+defaulting to an empty one, so a caller that forgets to pass its pins cannot silently
+degrade pinning into a no-op.
 
 The semantics are **MIRRORED — not shared — from `sharing.go` (this server, the source
 of truth) and `cli/src/lib.rs`**; drift yields a `400`/`403` or an envelope the CLI
@@ -1288,6 +1403,13 @@ worth knowing when reading the rest of this document:
   the same device on this server.
 - **Contract selection is the CLI's rule**, unchanged: v3 when enrolled, legacy v2 for
   an identity with no device id, unsigned with no identity.
+- **Phase 50 came for free, for the same reason.** The desktop calls
+  `fetch_hybrid_key_pinned`, `rotate_vault_key` and `repin_hybrid_key` from the same
+  library and keeps its pins in the **same `hybrid-pins.json`** in the same state dir,
+  so there is no second pin store and no second safety-number implementation to keep in
+  sync. `DeviceConfig::{peer_safety_number, pairwise_safety_number, pins, repin_device,
+  rotate_vault}` surface it, and a mismatch reaches the UI as
+  `DesktopError::KeyPinMismatch`, tagged `"key changed"`.
 - **Proof:** [`../desktop/core/tests/server_interop.rs`](../desktop/core/tests/server_interop.rs)
   boots a **real** sigild (dev-ops + device auth) and builds the **real** `sigil`
   binary, and shares a vault **both ways** — desktop → CLI and CLI → desktop, each
@@ -1299,14 +1421,21 @@ worth knowing when reading the rest of this document:
 
 - **Dev-gated (`501` by default), plain HTTP, localhost, UNAUDITED.** Do not
   expose it and do not store real 2FA secrets.
-- **No out-of-band verification of a published hybrid public key.** A sender trusts
-  what the registry serves; a malicious server could substitute its own key and
-  receive a vault key wrapped to itself. There are no safety numbers, no key
-  transparency, and no cross-signature.
-- **Revocation does not un-share.** It stops **future** access; a device that
-  already collected and unwrapped an envelope keeps the vault key. Remediation is a
-  manual `vault rekey` + re-share — there is **no automatic re-wrap on revoke and
-  no rotation schedule**.
+- **Key substitution is blocked after first contact — not at it.** Clients pin a
+  device's hybrid public key and hard-refuse a changed one, so a registry that
+  substitutes a key after you have seen the real one is stopped with nothing wrapped
+  and nothing uploaded. The **first** fetch is still trust-on-first-use: the
+  **safety number** exists to close that window, but only if a human actually
+  compares it out of band, and a user who re-pins without checking gives the
+  attacker what the block prevented. There is still **no key transparency and no
+  cross-signature** binding a hybrid key to the device's enrolled Ed25519 identity
+  ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
+- **Revocation does not un-share, and rotation only protects the future.** Revocation
+  stops **future server access**; a device that already collected and unwrapped an
+  envelope keeps the vault key and whatever it copied. `vault rotate` is the
+  remediation — a fresh key, the vault re-sealed, re-wrapped to exactly the named
+  devices, every other envelope deleted — but it is **manual and owner-driven**:
+  nothing re-keys automatically on revoke and there is **no rotation schedule**.
 - **No forward secrecy for a delivered vault key**, and republishing a hybrid key
   does not re-wrap already-deposited envelopes.
 - **One mailbox per (vault, recipient).** A deposit is an upsert, so any device with

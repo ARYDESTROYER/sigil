@@ -392,13 +392,30 @@ public, make no security claims, until the audit completes and trademark clears.
   metadata + a **`blob_sha256` fingerprint**, NEVER the bytes or any key; metrics
   `sigild_device_hybrid_keys_published_total` / `sigild_vault_key_envelopes_total` /
   `sigild_vault_key_envelope_fetches_total` (counts only, no vault/device label).
-  ⚠️ **HONEST SCOPE:** dev-gated/`501`, plain HTTP, UNAUDITED; **no out-of-band
-  verification** of a published hybrid key (a hostile registry could substitute its own);
-  revocation stops FUTURE access but **cannot un-learn** a key a device already unwrapped
-  (remediation = manual `vault rekey` + re-share); **no re-wrap on revoke, no rotation, no
-  forward secrecy**; one mailbox per (vault, recipient) so any writer can overwrite; **no
-  rate limiting**; request signatures are **classical Ed25519** (the wrap is hybrid, the
-  auth is not). Contract in [`docs/api.md`](docs/api.md); key hierarchy in
+  **TWO MORE ROUTES for ROTATION (Phase 50, ADR 0038)** — same dev gate, and reusing the
+  **EXISTING `authorizeOpsRequest` with `needWrite`**, i.e. the very check that authorizes
+  depositing an envelope (a device that can deposit can already REPLACE any envelope, so
+  enumerate+delete grants no new power): **`GET /v1/vaults/{vaultID}/keys`** →
+  `{vaultID, recipients:[{device_id, sender_device_id, size_bytes, created_at}]}` —
+  ⭐ **METADATA ONLY, NEVER a blob** (Postgres selects `octet_length(blob)`, so ciphertext
+  never leaves the DB), sorted by recipient, unknown vault ⇒ empty list — and
+  **`DELETE /v1/vaults/{vaultID}/keys/{deviceID}`** → `{vaultID, device_id, deleted:true}`,
+  `404 envelope_not_found` when absent (a rotating client treats that as success). Store
+  methods `ListKeyEnvelopeRecipients`/`DeleteKeyEnvelope` (+ `KeyEnvelopeMeta`) on Mem +
+  Postgres; audit `vault.key_envelope_list` (`returned_count`) / `vault.key_envelope_delete`
+  (`recipient_device_id` + caller) — **no `blob_sha256`, because neither route reads a blob**;
+  metric `sigild_key_envelope_deletes_total` (count only). ⭐ **sigild gained NO knowledge of
+  pins or safety numbers** — it stores none, serves none, validates none — and still has
+  **exactly ONE direct dependency**.
+  ⚠️ **HONEST SCOPE:** dev-gated/`501`, plain HTTP, UNAUDITED; verification of a published
+  hybrid key is **CLIENT-SIDE ONLY** (pinning + safety numbers, ADR 0038) and **cannot
+  protect FIRST contact** unless a human compares the digits; revocation stops FUTURE
+  access but **cannot un-learn** a key a device already unwrapped (remediation = `vault
+  rotate`, which protects **FUTURE content only** and is **manual** — no automatic re-wrap
+  on revoke, no rotation schedule, **no forward secrecy**); one mailbox per (vault,
+  recipient) so any writer can overwrite; **no rate limiting**; request signatures are
+  **classical Ed25519** (the wrap is hybrid, the auth is not). Contract in
+  [`docs/api.md`](docs/api.md); key hierarchy + the safety-number construction in
   [`docs/crypto-spec.md`](docs/crypto-spec.md).
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
@@ -455,15 +472,22 @@ public, make no security claims, until the audit completes and trademark clears.
   pasted recipient device id with read/write (`shareVault`), and **accept** a vault
   shared to this device (`acceptVault` → pull → open); `explainSharingStatus` renders
   401/403/404 distinctly. ⭐ **NOTHING NEW IS PERSISTED IN THE CLEAR:** the EXISTING
-  sealed device-identity container was extended **v1→v2** rather than adding a store, so
-  `sigil.webapp.device.v1` now seals `{version:2, device_id, seed, base_url,
-  hybrid:{x25519_secret, mlkem_seed}, vault_keys:{...}}` — the Ed25519 seed, the hybrid
-  SECRET identity and every accepted vault key in ONE container under the vault
+  sealed device-identity container was extended **v1→v2** (and **v2→v3** in Phase 50)
+  rather than adding a store, so
+  `sigil.webapp.device.v1` now seals `{version:3, device_id, seed, base_url,
+  hybrid:{x25519_secret, mlkem_seed}, vault_keys:{...}, pins:{...}}` — the Ed25519 seed,
+  the hybrid SECRET identity, every accepted vault key **and the hybrid-key PIN STORE**
+  in ONE container under the vault
   password. `localStorage` still holds exactly TWO keys, both sealed containers
   (`sigil.webapp.vault.v1` + `sigil.webapp.device.v1`); the password and all decrypted
   secrets are memory-only and cleared on lock/forget/unload. **Unlock now opens the
   device identity FIRST, tries the password, then falls back to each held vault key**,
-  so a shared vault re-opens after a reload. Do NOT store real 2FA secrets.
+  so a shared vault re-opens after a reload. **Phase 50 (ADR 0038) added the key-trust UI
+  to the same panel:** show this device's / a peer's **safety number** (`wasm.safetyNumber`),
+  a `wasm.KeyPinMismatchError` catch that **BLOCKS the share** and renders both safety
+  numbers with a deliberate re-pin (`wasm.repinHybridKey`) behind it, and **rotate**
+  (`wasm.rotateVaultKey`) — with `onUpdateDevice({ pins: res.pins })` re-sealing the
+  container so the pins persist. Do NOT store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -611,6 +635,46 @@ public, make no security claims, until the audit completes and trademark clears.
   **`cli/tests/e2e-sharing.sh`** (real sigild + real CLI, three devices, no mocks).
   Dev/localhost/plain-HTTP/UNAUDITED; custom KEM-then-AEAD (NOT RFC 9180 HPKE); the
   SYSTEM is NOT "post-quantum secure"; revocation cannot un-learn an accepted key.
+  ⭐ Also **`sigil device safety-number|pins|repin`** and **`sigil vault rotate`** —
+  **KEY VERIFICATION + ROTATION** (Phase 50, ADR 0038), the client-side answer to a
+  **key-substituting server**. ⚠️ **THE CHOKE POINT is the FETCH:**
+  `fetch_hybrid_key_pinned(server, device_id, auth, pins_path)` fetches a hybrid public
+  key **and pin-checks it in ONE call**, and **EVERY wrap path (share AND rotate) goes
+  through it**; the bare `fetch_hybrid_key` survives only where nothing is wrapped
+  (safety-number display, the deliberate re-pin, desktop `check_server`). `check_and_pin`
+  compares **decoded RAW bytes of BOTH halves**: unseen ⇒ `PinStatus::FirstSight` (pins,
+  proceeds, **warns**); identical ⇒ `Match` (proceeds silently); **DIFFERENT ⇒
+  `CliError::PinMismatch`, a HARD STOP** — nothing wrapped, nothing uploaded, **the pin
+  store NOT mutated**. **There is NO flag/option/default anywhere that accepts a changed
+  key.** Commands: `device safety-number [<deviceID>] [--pair <deviceID>]` (READ-ONLY —
+  never pins or re-pins; no arg = this device's own number, works offline; `--pair` is the
+  ORDER-INDEPENDENT pairwise number), `device pins [--pins <f>]` (what this client TRUSTS,
+  + `pinned_at` and any **re-pin count**), `device repin <deviceID> --yes
+  [--safety-number "<digits>"]` (⚠️ the **ONLY** thing that ever replaces a pin — refuses
+  without `--yes`, and refuses if the supplied number ≠ what the server is serving RIGHT
+  NOW), and `vault rotate --vault <id> --to <deviceID>... [--file <f>] [--keyring <f>]
+  [--pins <f>]` → `rotate_vault_key`: load the current key, ⭐ **pin-check EVERY recipient
+  FIRST** (a mismatch aborts before ANY local/remote mutation), fresh 32-byte key,
+  `reseal_container` (open with old, seal with new — **never inspects the plaintext**),
+  write **0600 via temp-file + rename**, `keyring_put` **AFTER** the file is in place,
+  wrap+upsert per recipient, then `list_key_envelopes` + `delete_key_envelope` for
+  everyone left out. **SAFETY NUMBER:** `hybrid_safety_digest` = `SHA-256("sigil-safety-
+  number-v1\n" ‖ u32_be(len(device_id)) ‖ device_id ‖ u32_be(32) ‖ x25519_public_key ‖
+  u32_be(1184) ‖ mlkem_encaps_key)`, `render_safety_number` = 6 groups × 5 digits (each =
+  5 digest bytes big-endian mod 100000, zero-padded) ≈ 99.6 bits; `pairwise_safety_number`
+  sorts the two digests **BYTEWISE** then hashes under `"sigil-safety-number-pair-v1\n"`,
+  so both sides see the SAME string. It binds the **device id** and covers **BOTH** key
+  halves. ⭐ **MIRRORED — NOT SHARED** with `sigil-wasm/sharing.mjs`; **MUST stay
+  byte-identical** (both carry the same KAT `83791 28129 67801 50284 55242 77845`).
+  **Local state:** the pin store `$HOME/.sigil/hybrid-pins.json` (`HYBRID_PIN_FILE`,
+  `--pins` overrides, else follows `--keyring`'s dir; **0600 in the 0700 dir** via
+  `write_secret_file`; `{"version":1,"pins":{"<devID>":{device_id, x25519_public_key,
+  mlkem_encaps_key, safety_number, pinned_at, repins}}}`) — PUBLIC key material, but
+  **security-critical LOCAL state**: anyone who can rewrite it can silence the alarm.
+  ⚠️ **HONEST SCOPE:** pinning **cannot protect FIRST contact** (the safety number can,
+  but only if a human actually compares it); a user who blindly re-pins defeats it;
+  rotation protects **FUTURE content ONLY** (a device that already unwrapped a key keeps
+  what it copied); UNAUDITED.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.
@@ -788,11 +852,18 @@ public, make no security claims, until the audit completes and trademark clears.
   byte layouts are **MIRRORED — not shared — from `cli/src/lib.rs` and
   `sigild/internal/api/sharing.go`** and MUST stay in sync (drift yields a 400/403 or
   an envelope the CLI cannot open). **`device-auth.mjs`'s sealed device-identity
-  container was bumped v1→v2** to carry the sharing secrets: `sealDeviceIdentity` /
-  `openDeviceIdentity` now round-trip `{version:2, device_id, seed, base_url,
-  hybrid:{x25519_secret, mlkem_seed}, vault_keys:{<vaultId>: b64 32 bytes}}`, with
-  `DEVICE_IDENTITY_VERSION = 2`; **v1 containers still open** (→ `hybrid: null`, empty
-  keyring), so it is backward compatible (ADR 0036). Proven by
+  container was bumped v1→v2** to carry the sharing secrets, and **v2→v3 in Phase 50**
+  to carry the hybrid-key **PIN STORE**: `sealDeviceIdentity` /
+  `openDeviceIdentity` now round-trip `{version:3, device_id, seed, base_url,
+  hybrid:{x25519_secret, mlkem_seed}, vault_keys:{<vaultId>: b64 32 bytes},
+  pins:{version, pins:{<devID>:{…}}}}`, with
+  `DEVICE_IDENTITY_VERSION = 3` and `SUPPORTED_DEVICE_IDENTITY_VERSIONS = [1,2,3]`;
+  **v1 AND v2 containers still open** (→ `hybrid: null` / empty keyring / **EMPTY pin
+  store**, i.e. everything is first-sight), so it is backward compatible, and the
+  `pins` field is **omitted when empty** so a client that has never shared writes the
+  shape it always did (ADR 0036, ADR 0038). ⭐ **The browser clients therefore STILL
+  persist ONLY sealed containers** — nothing new goes into `localStorage` /
+  `chrome.storage` in the clear. Proven by
   **`sigil-wasm/test/sharing-interop.mjs`** — boots a LIVE `sigild` + builds the REAL
   `sigil` binary and shares **BOTH ways**: (a) JS seals a vault under a random vault
   key, pushes, shares a **1226-byte** envelope → the real CLI accepts, unwraps to the
@@ -802,6 +873,27 @@ public, make no security claims, until the audit completes and trademark clears.
   relayed envelope is byte-identical ciphertext holding no key/seed; two wraps of the
   same key differ; the server logged only fingerprints. Dev / localhost / plain-HTTP,
   UNAUDITED. ADR 0035, ADR 0036.
+  **Now ALSO PINS device keys, computes SAFETY NUMBERS and ROTATES vault keys (Phase 50,
+  ADR 0038) — the JS half of the key-substitution defense**, in the SAME
+  `sigil-wasm/sharing.mjs`: `safetyNumber` / `pairwiseSafetyNumber` /
+  `hybridSafetyDigest` / `renderSafetyNumber` (+ `SAFETY_NUMBER_PREFIX` /
+  `SAFETY_NUMBER_PAIR_PREFIX` / `SAFETY_NUMBER_GROUPS` / `SAFETY_NUMBER_BYTES_PER_GROUP`),
+  `newPinStore` / `requirePinStore` / `checkAndPin` / `repinHybridKey` /
+  `HYBRID_PIN_STORE_VERSION`, the ⭐ choke point **`fetchHybridKeyPinned(wasm, auth,
+  deviceId, pins = auth.pins)`** (fetch + pin-check in ONE call; **every** wrap path —
+  `shareVault` AND `rotateVaultKey` — goes through it), the catchable
+  **`KeyPinMismatchError`** (carries `deviceId` + BOTH safety numbers), the transport
+  `listKeyEnvelopes` / `deleteKeyEnvelope`, and **`rotateVaultKey`** (pin-check EVERY
+  recipient FIRST → fresh key → re-seal → wrap+upsert per recipient → delete every other
+  envelope; **returns** the new key + re-sealed container for the CALLER to persist and
+  push). The safety-number construction is **MIRRORED — not shared — from
+  `cli/src/lib.rs`** and **MUST stay byte-identical** (same KAT on both sides; divergence
+  would make two people comparing digits wrongly conclude they were under attack). ⚠️
+  **`requirePinStore` FAILS CLOSED** — a missing store **throws** rather than defaulting
+  to empty, because the old fallback meant a caller that forgot its pins silently got
+  "every key is first-sight", i.e. the control degraded into a no-op. Proven by
+  **`sigil-wasm/test/pinning-interop.mjs`** (below). It does **NO crypto itself** (SHA-256
+  via `crypto.subtle`, KEM/AEAD in the wasm), so `Cargo.lock`s stay `getrandom`==0.
 - `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
   whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
   as **WebAssembly inside the extension page** — the **second real product client
@@ -841,10 +933,14 @@ public, make no security claims, until the audit completes and trademark clears.
   device) over a **vendored `sharing.mjs`** — `build.sh` now copies it beside
   `totp-vault.mjs` / `totp-migration.mjs` / `sync.mjs` / `device-auth.mjs` (it imports
   two of them, so all five must stay siblings). Storage matches the webapp: the sealed
-  device-identity container is the **v2 schema** carrying the hybrid secret + the vault
-  keyring beside the seed, so `chrome.storage.local` still holds only the two sealed
+  device-identity container is the **v3 schema** carrying the hybrid secret, the vault
+  keyring **and the Phase 50 pin store** beside the seed, so `chrome.storage.local` still
+  holds only the two sealed
   containers, and **unlock opens the identity, tries the password, then falls back to
-  each held vault key**. ⚠️ **`manifest.json` gained
+  each held vault key**. **Phase 50 (ADR 0038) added the same key-trust UI as the webapp**
+  — safety numbers, a `KeyPinMismatchError` that **BLOCKS** the share and offers a
+  deliberate `repinHybridKey`, and `rotateVaultKey` — with `persistDevice({...device,
+  pins})` re-sealing the container so pins survive a reload. ⚠️ **`manifest.json` gained
   `"host_permissions": ["http://127.0.0.1/*", "http://localhost/*"]`** — MV3 extension
   pages cannot fetch cross-origin without an explicit host permission; it is
   deliberately **LOOPBACK-ONLY** (with an explanatory comment in the manifest) so the
@@ -987,8 +1083,15 @@ public, make no security claims, until the audit completes and trademark clears.
   (screencapture denied → no screenshot proof; all behaviour lives in the headless core
   the tests drive), the server side is **dev-gated / loopback / plain HTTP**, and there
   is still **no QR scanning, no code verification, no hardened zeroization**; the
-  other native platforms (**mobile especially**) remain unbuilt. Do NOT store real 2FA
-  secrets. ADR 0032, ADR 0037.
+  other native platforms (**mobile especially**) remain unbuilt. **Phase 50 (ADR 0038)
+  reached the desktop for free, by the same reuse rule:** `net.rs` calls the library's
+  `fetch_hybrid_key_pinned` / `rotate_vault_key` / `repin_hybrid_key` and keeps its pins
+  in **the SAME `hybrid-pins.json`** in the same state dir (so a desktop pin and a
+  `sigil` pin are ONE record — no second pin store, no second safety-number
+  implementation), exposing `DeviceConfig::{peer_safety_number, pairwise_safety_number,
+  pins, repin_device, rotate_vault}`; a mismatch is `DesktopError::KeyPinMismatch`, tagged
+  across the IPC as **`"key changed"`**. Do NOT store real 2FA
+  secrets. ADR 0032, ADR 0037, ADR 0038.
 - `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
   `extension/` and `desktop/` are now real — see above.)
 
@@ -1040,14 +1143,15 @@ cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/8 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/8 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/8 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/8 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/8 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/8 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/8 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/8 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/9 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/9 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/9 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/9 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/9 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/9 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/9 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/9 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/9 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build

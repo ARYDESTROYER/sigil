@@ -343,3 +343,49 @@ through these routes.
   desktop's hybrid secret and vault keyring are **`0600` plaintext files**, which is
   **weaker at rest than the browser clients**, whose equivalents are sealed in a
   `SIGILcli` container under the vault password. Nothing is zeroized on either.
+
+## Key verification and rotation (added Phase 50, 2026-07-27)
+
+The Consequences above recorded two limitations as accepted costs. **Both are now
+retired**, by [ADR 0038](0038-key-pinning-safety-numbers-and-vault-rotation.md). This
+addendum reports only what changed; nothing in the Status, Context, Decision or
+Consequences text above has been edited, and **no decision recorded above was revised**
+— the key hierarchy, the `SIGILhyb` envelope, the four original routes and the
+authorization model are unchanged.
+
+- **"Trust in the published hybrid key is trust in the server's registry … no
+  out-of-band verification … the single largest gap in the design"** — retired as
+  written. Clients now **pin** a device's hybrid public key on first sight and
+  **hard-refuse** to wrap to a changed one (nothing wrapped, nothing uploaded, the pin
+  store not mutated), and a **safety number** — six 5-digit groups over the device id
+  and **both** halves of the hybrid key — lets two people verify a key over a channel
+  the server does not control. ⚠️ **What is not retired:** pinning cannot protect
+  **first contact**, so a never-before-seen key is still trust-on-first-use unless a
+  human actually compares the safety number; and there is still **no key-transparency
+  log and no cross-signature** binding a hybrid key to the device's enrolled Ed25519
+  identity.
+- **"No automatic re-wrap on revoke, no key rotation schedule, and no forward secrecy
+  for the vault key"** — partly retired. A vault key can now be **rotated and re-wrapped**
+  (`sigil vault rotate`, plus the desktop command and both browser UIs): a fresh key,
+  the container re-sealed under it, re-wrapped to exactly the named devices, and every
+  other device's envelope **deleted**. ⚠️ **Still true:** rotation protects **FUTURE
+  content only** — a device that already unwrapped the previous key keeps it and
+  whatever it copied — and it is **manual**; nothing re-keys automatically on revoke,
+  there is still **no rotation schedule**, and there is still **no forward secrecy** for
+  a key already delivered.
+- **Two routes were added to this section's four**, both dev-gated and both reusing the
+  **existing** write authorization that already guards an envelope deposit:
+  `GET /v1/vaults/{vaultID}/keys` (recipient **metadata only** — never a blob) and
+  `DELETE /v1/vaults/{vaultID}/keys/{deviceID}`. `sigild` stores, serves and validates
+  **no** pin and **no** safety number; the trust mechanism is entirely client-side.
+- **Proof:** [`../../sigil-wasm/test/pinning-interop.mjs`](../../sigil-wasm/test/pinning-interop.mjs)
+  puts a **rewriting proxy** in front of a real `sigild` to simulate a hostile registry
+  substituting a hybrid public key, and shows the CLI refusing while the stored envelope
+  stays byte-identical to the honest one and does **not** open with the attacker's
+  hybrid secret; that the Rust and JS safety numbers agree, including the
+  order-independent pairwise form; and that after a rotation a removed device cannot
+  read new content while a still-authorized device can.
+- **Everything else above still applies**, unchanged: dev-gated (`501` by default),
+  plain HTTP, **UNAUDITED**, a custom KEM-then-AEAD rather than RFC 9180 HPKE, the
+  system is **not** "post-quantum secure", and the client-side key storage caveats for
+  each surface stand.

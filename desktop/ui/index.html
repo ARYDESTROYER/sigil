@@ -215,6 +215,46 @@
         <div class="row">
           <button id="accept-btn" class="ghost">Accept a vault shared with me</button>
         </div>
+
+        <!-- Phase 50 — KEY VERIFICATION. A published hybrid key is PINNED on
+             first sight and a CHANGED key BLOCKS sharing. The safety number is
+             what closes the first-contact window pinning cannot: read it aloud
+             over a channel the server does not control. -->
+        <hr />
+        <p class="hint">
+          <strong>Verify a key before the first share.</strong> Sharing pins the key it
+          sees the first time; if it ever changes, sharing is REFUSED. Pinning cannot
+          protect that first contact — only comparing these digits with the other
+          person, over a channel the server does not control, can.
+        </p>
+        <div class="row">
+          <button id="my-safety-btn" class="ghost">My safety number</button>
+          <button id="peer-safety-btn" class="ghost">Their safety number</button>
+          <button id="pairwise-safety-btn" class="ghost">Pairwise (both see the same)</button>
+        </div>
+        <p id="safety-number" class="hint" aria-live="polite"></p>
+        <div class="row">
+          <button id="pins-btn" class="ghost">Keys this device trusts</button>
+        </div>
+
+        <hr />
+        <p class="hint">
+          <strong>Rotate.</strong> Draws a fresh vault key, re-seals this vault under it,
+          re-wraps it to exactly the devices you list and <strong>deletes every other
+          device&rsquo;s envelope</strong>. Use it after revoking a device. It protects
+          <strong>future content only</strong> — a device that already unwrapped the old
+          key keeps whatever it had already copied. The vault locks afterwards.
+        </p>
+        <form id="rotate-form" autocomplete="off">
+          <label for="rotate-devices">Device ids that KEEP access (comma separated)</label>
+          <input
+            id="rotate-devices"
+            spellcheck="false"
+            placeholder="dev_…, dev_… (include THIS device)"
+            required
+          />
+          <button type="submit" class="ghost">Rotate this vault&rsquo;s key</button>
+        </form>
       </details>
     </section>
 

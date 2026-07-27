@@ -190,6 +190,86 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		}
 	})
 
+	t.Run("KeyEnvelopeListAndDelete", func(t *testing.T) {
+		// Phase 50 rotation support: an owner enumerates which devices hold a
+		// wrapped key and deletes the stale ones. METADATA only — no blob leaves
+		// the store through the listing.
+		s := newStore(t)
+		sender := newTestDevice(t, "A")
+		b := newTestDevice(t, "B")
+		c := newTestDevice(t, "C")
+		for _, d := range []Device{sender, b, c} {
+			if err := s.CreateDevice(ctx, d); err != nil {
+				t.Fatalf("CreateDevice: %v", err)
+			}
+		}
+		vault := "vault-rotate-" + uniqueTag()
+
+		// An unknown vault lists empty rather than erroring.
+		if got, err := s.ListKeyEnvelopeRecipients(ctx, vault); err != nil || len(got) != 0 {
+			t.Fatalf("list on empty vault = (%v, %v), want ([], nil)", got, err)
+		}
+		// Deleting nothing is ErrKeyEnvelopeNotFound, so a caller can tell
+		// "removed" from "already absent".
+		if err := s.DeleteKeyEnvelope(ctx, vault, b.ID); !errors.Is(err, ErrKeyEnvelopeNotFound) {
+			t.Fatalf("delete missing = %v, want ErrKeyEnvelopeNotFound", err)
+		}
+
+		blobB := testEnvelopeBlob(t, 1226)
+		blobC := testEnvelopeBlob(t, 700)
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		for _, e := range []KeyEnvelope{
+			{VaultID: vault, RecipientDeviceID: b.ID, SenderDeviceID: sender.ID, Blob: blobB, CreatedAt: now},
+			{VaultID: vault, RecipientDeviceID: c.ID, SenderDeviceID: sender.ID, Blob: blobC, CreatedAt: now},
+			// A DIFFERENT vault must not appear in this vault's listing.
+			{VaultID: vault + "-other", RecipientDeviceID: b.ID, SenderDeviceID: sender.ID, Blob: blobB, CreatedAt: now},
+		} {
+			if err := s.PutKeyEnvelope(ctx, e); err != nil {
+				t.Fatalf("PutKeyEnvelope: %v", err)
+			}
+		}
+
+		got, err := s.ListKeyEnvelopeRecipients(ctx, vault)
+		if err != nil {
+			t.Fatalf("ListKeyEnvelopeRecipients: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("listed %d recipients, want 2 (%+v)", len(got), got)
+		}
+		// Sorted by recipient device ID, so the order is stable across backends.
+		if got[0].RecipientDeviceID > got[1].RecipientDeviceID {
+			t.Fatalf("listing is not sorted by recipient: %+v", got)
+		}
+		sizes := map[string]int{}
+		for _, m := range got {
+			sizes[m.RecipientDeviceID] = m.SizeBytes
+			if m.SenderDeviceID != sender.ID || m.VaultID != vault {
+				t.Fatalf("metadata = %+v, want vault=%s sender=%s", m, vault, sender.ID)
+			}
+		}
+		if sizes[b.ID] != len(blobB) || sizes[c.ID] != len(blobC) {
+			t.Fatalf("sizes = %v, want B=%d C=%d", sizes, len(blobB), len(blobC))
+		}
+
+		// Delete C's mailbox: C can no longer collect, B is untouched, and the
+		// other vault's envelope is untouched.
+		if err := s.DeleteKeyEnvelope(ctx, vault, c.ID); err != nil {
+			t.Fatalf("DeleteKeyEnvelope: %v", err)
+		}
+		if _, err := s.GetKeyEnvelope(ctx, vault, c.ID); !errors.Is(err, ErrKeyEnvelopeNotFound) {
+			t.Fatalf("get after delete = %v, want ErrKeyEnvelopeNotFound", err)
+		}
+		if _, err := s.GetKeyEnvelope(ctx, vault, b.ID); err != nil {
+			t.Fatalf("deleting C removed B's envelope: %v", err)
+		}
+		if _, err := s.GetKeyEnvelope(ctx, vault+"-other", b.ID); err != nil {
+			t.Fatalf("deleting in one vault affected another: %v", err)
+		}
+		if err := s.DeleteKeyEnvelope(ctx, vault, c.ID); !errors.Is(err, ErrKeyEnvelopeNotFound) {
+			t.Fatalf("second delete = %v, want ErrKeyEnvelopeNotFound", err)
+		}
+	})
+
 	t.Run("KeyEnvelopeRejectsBadSizeAndUnknownRecipient", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "B")

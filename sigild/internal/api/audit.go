@@ -43,6 +43,8 @@ const (
 	auditEventHybridKeyPublished = "device.hybrid_key_published"
 	auditEventKeyEnvelopePut     = "vault.key_envelope_put"
 	auditEventKeyEnvelopeGet     = "vault.key_envelope_get"
+	auditEventKeyEnvelopeList    = "vault.key_envelope_list"
+	auditEventKeyEnvelopeDelete  = "vault.key_envelope_delete"
 	// Billing events (Phase 45). METADATA ONLY: a provider name, a normalized
 	// event type, an opaque provider event/session reference, our own subject
 	// reference, and a fixed reason enum.
@@ -298,5 +300,31 @@ func (h *handlers) auditGrant(r *http.Request, vaultID, deviceID, permission str
 		"vault_id", vaultID,
 		"device_id", deviceID,
 		"permission", permission,
+	)
+}
+
+// auditKeyEnvelopeList logs a vault owner enumerating which devices hold a
+// wrapped key (Phase 50 rotation support). Counts and device IDs only — the
+// route never touches a blob, so there is nothing to fingerprint.
+func (h *handlers) auditKeyEnvelopeList(r *http.Request, vaultID, callerID string, count int) {
+	h.cfg.Logger.Info(auditEventKeyEnvelopeList,
+		"event", auditEventKeyEnvelopeList,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"device_id", callerID,
+		"returned_count", count,
+	)
+}
+
+// auditKeyEnvelopeDelete logs an owner removing a device's envelope during a
+// rotation. It records WHO removed WHOSE envelope; there is no blob to
+// fingerprint because the route deletes without reading one.
+func (h *handlers) auditKeyEnvelopeDelete(r *http.Request, vaultID, recipientID, callerID string) {
+	h.cfg.Logger.Info(auditEventKeyEnvelopeDelete,
+		"event", auditEventKeyEnvelopeDelete,
+		"request_id", RequestIDFromContext(r.Context()),
+		"vault_id", vaultID,
+		"recipient_device_id", recipientID,
+		"device_id", callerID,
 	)
 }

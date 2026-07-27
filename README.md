@@ -229,16 +229,27 @@ audited; see the status note below.)
   is not the addressee gets a `403`, and a revoked device a `401`. Honest limits:
   it is **dev-gated (`501` by default), localhost/plain HTTP, and UNAUDITED**; the
   wrapping is a **custom KEM-then-AEAD composition, not RFC 9180 HPKE**, so the
-  **system is not "post-quantum secure"**; there is **no out-of-band verification**
-  of a recipient's published hybrid key; and **revoking a device cannot make it
-  forget a key it already accepted** — there is no key rotation, no automatic
-  re-wrap on revoke, and no forward secrecy for a delivered vault key. **Every client
-  that talks to the server can now share** — the `sigil` CLI, the webapp and the
-  browser extension — and a vault shared from one opens on the others; still dev-gated
-  and unaudited. See
+  **system is not "post-quantum secure"**. **Every client
+  that talks to the server can now share** — the `sigil` CLI, the webapp, the
+  browser extension and the desktop app — and a vault shared from one opens on the
+  others; still dev-gated and unaudited.
+  **Clients pin the key they share to, and you can verify it by hand.** The first
+  time a client sees another device's hybrid public key it records it, and if that
+  key ever changes the client **refuses to share** rather than warning — nothing is
+  wrapped and nothing is uploaded. Because pinning cannot help the *first* time you
+  see a key, each client can also show a **safety number**: six groups of five digits
+  derived from that device's key and id, which two people read to each other over a
+  phone call or in person to confirm they match. A vault key can also be **rotated**
+  and re-wrapped to the devices that keep access. Honest limits: **first contact is
+  trust-on-first-use unless someone actually compares the safety number**, accepting
+  a changed key is a deliberate command that a user can still get wrong, **rotation
+  protects only content written afterwards** (a device that already unwrapped a key
+  keeps what it copied), and this is **new, unaudited code** like everything around
+  it. See
   [`docs/api.md`](docs/api.md#device-to-device-vault-sharing-dev-gated-opt-in--phase-46),
-  [`docs/crypto-spec.md`](docs/crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use)
-  and [ADR 0035](docs/decisions/0035-device-to-device-vault-sharing.md).
+  [`docs/crypto-spec.md`](docs/crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use),
+  [ADR 0035](docs/decisions/0035-device-to-device-vault-sharing.md)
+  and [ADR 0038](docs/decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md).
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from
@@ -286,9 +297,14 @@ audited; see the status note below.)
   shared), `sigil vault share --to <deviceID>` wraps that key to the recipient's
   hybrid public key and uploads the opaque envelope, and `sigil vault accept`
   unwraps it on the other side; `sigil totp … --vault-id <id>` then opens the shared
-  vault. Keys are never printed — only a short fingerprint. **Dev-gated and
+  vault. Keys are never printed — only a short fingerprint. `sigil device
+  safety-number` prints the digits you read aloud to verify a device's key before the
+  first share, `sigil device pins` lists the keys this client trusts, and `sigil vault
+  rotate --to <deviceID>…` re-keys a vault and re-wraps it to exactly those devices.
+  **Dev-gated and
   UNAUDITED**, and revoking a device cannot make it forget a key it already
-  accepted (see the sharing note above).
+  accepted — rotation only protects what is written afterwards (see the sharing note
+  above).
   Standalone
   crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build is not
   audited; **do not store real 2FA secrets yet**. Public copy obeys

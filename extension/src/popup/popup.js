@@ -51,12 +51,21 @@ import {
 } from "../../vendor/device-auth.mjs";
 import {
   generateHybridIdentity,
+  hybridPublicIdentity,
   publishHybridKey,
+  fetchHybridKey,
   generateVaultKey,
   vaultKeyFingerprint,
   shareVault,
   acceptVault,
   explainSharingStatus,
+  // Phase 50 — key verification + rotation. Same module the webapp uses; there is
+  // no extension-specific copy of any of this.
+  safetyNumber,
+  repinHybridKey,
+  rotateVaultKey,
+  newPinStore,
+  KeyPinMismatchError,
 } from "../../vendor/sharing.mjs";
 
 /** chrome.storage.local key holding ONLY the sealed container, base64. */
@@ -761,18 +770,164 @@ $("sharing-share").addEventListener("click", async () => {
     const key = device.vaultKeys?.[id];
     if (!key) throw new Error(`vault "${id}" is not shared yet — convert it to a shared vault first`);
     say("Wrapping the vault key and sharing…");
+    hidePinMismatch();
+    // shareVault goes through the PIN CHOKE POINT: an unchanged key proceeds, a
+    // CHANGED key throws KeyPinMismatchError and nothing is wrapped or uploaded.
     const res = await shareVault(wasm, auth, {
       vaultId: id,
       recipientDeviceId: to,
       vaultKey: key,
       permission: $("sharing-permission").value === "write" ? "write" : "read",
     });
+    // Persist the (possibly newly-pinned) store INSIDE the sealed container.
+    await persistDevice({ ...device, pins: res.pins });
+    $("sharing-safety-number").textContent = `Safety number for ${to}: ${res.safetyNumber}`;
     say(
       `Shared "${id}" with ${to} (${res.permission}): a ${res.envelopeBytes}-byte envelope the ` +
-        `server relays but cannot read. Key sha256 ${res.fingerprint}.`,
+        `server relays but cannot read. Key sha256 ${res.fingerprint}. ` +
+        (res.pinStatus === "first-sight"
+          ? "FIRST CONTACT — the key was just pinned but NOT verified by a human. Read the safety " +
+            "number to its owner over a trusted channel and check it matches."
+          : "That device's key matches the one pinned earlier."),
     );
   } catch (e) {
+    if (showPinMismatch(e)) return;
     say(`Share failed: ${sharingErr(e)}`, "error");
+  }
+});
+
+// ── Phase 50: safety numbers, the pin alarm, and rotation ───────────────────
+
+/** Hide the key-change alarm and re-enable sharing. */
+function hidePinMismatch() {
+  const box = $("sharing-pin-mismatch");
+  if (box) box.hidden = true;
+  pendingRepin = null;
+}
+
+/** The device whose key changed, awaiting a DELIBERATE re-pin. */
+let pendingRepin = null;
+
+/**
+ * ⭐ THE ALARM. A changed hybrid key is not a generic failure: it is either a
+ * key-substitution attack or a legitimate re-enrolment, and only a human can tell
+ * which. Show both numbers and BLOCK until they act.
+ */
+function showPinMismatch(e) {
+  if (!(e instanceof KeyPinMismatchError)) return false;
+  pendingRepin = e.deviceId;
+  const box = $("sharing-pin-mismatch");
+  $("sharing-pin-mismatch-text").textContent =
+    `REFUSED — the hybrid public key for ${e.deviceId} has CHANGED. Nothing was shared and no ` +
+    `key was wrapped. This is either a KEY-SUBSTITUTION ATTACK (a hostile or compromised server ` +
+    `swapping in a key it can decrypt with) or a LEGITIMATE RE-ENROLMENT of that device. ` +
+    `pinned: ${e.pinnedSafetyNumber} — presented: ${e.presentedSafetyNumber}. ` +
+    `Read the presented digits to its owner over a channel the server does not control.`;
+  box.hidden = false;
+  say(`Share REFUSED: ${e.deviceId}'s key changed. Nothing was shared.`, "error");
+  return true;
+}
+
+$("sharing-my-safety").addEventListener("click", async () => {
+  try {
+    if (!device) throw new Error("enroll this browser as a device first (Sync above)");
+    if (!device.hybrid) throw new Error("publish this device's hybrid key first");
+    const pub = hybridPublicIdentity(wasm, device.hybrid);
+    const sn = await safetyNumber(device.deviceId, pub);
+    $("sharing-safety-number").textContent = `This device (${device.deviceId}): ${sn}`;
+    say(
+      "Read these digits to anyone about to share a vault with you, over a channel the server " +
+        "does not control. Nothing was sent — this is derived from local key material.",
+    );
+  } catch (e) {
+    say(`Safety number failed: ${sharingErr(e)}`, "error");
+  }
+});
+
+$("sharing-their-safety").addEventListener("click", async () => {
+  try {
+    const auth = sharingAuth();
+    const to = $("sharing-recipient").value.trim();
+    if (!to) throw new Error("paste the recipient's device id");
+    const identity = await fetchHybridKey(wasm, auth, to);
+    const sn = await safetyNumber(to, identity);
+    $("sharing-safety-number").textContent = `${to}: ${sn}`;
+    const pinned = device.pins?.pins?.[to]?.safety_number;
+    say(
+      pinned
+        ? pinned === sn
+          ? `This matches the key already pinned for ${to}.`
+          : `This does NOT match the key pinned for ${to} (${pinned}). Sharing will be REFUSED.`
+        : `${to} is not pinned yet. Confirm these digits with its owner over a trusted channel ` +
+            "BEFORE the first share.",
+      pinned && pinned !== sn ? "error" : undefined,
+    );
+  } catch (e) {
+    say(`Safety number failed: ${sharingErr(e)}`, "error");
+  }
+});
+
+// ⚠️ The deliberate escape hatch. Only reachable after a mismatch BLOCKED a
+// share, and only by an explicit click on a button that says what it means.
+$("sharing-repin").addEventListener("click", async () => {
+  try {
+    if (!pendingRepin) throw new Error("nothing to re-pin");
+    const auth = sharingAuth();
+    const identity = await fetchHybridKey(wasm, auth, pendingRepin);
+    const pins = device.pins ?? newPinStore();
+    const res = await repinHybridKey(pins, pendingRepin, identity);
+    await persistDevice({ ...device, pins });
+    const who = pendingRepin;
+    hidePinMismatch();
+    say(
+      `Re-pinned ${who}. This client now trusts ${res.safetyNumber} for that device. If you did ` +
+        "not verify those digits with its owner out of band, that was a mistake.",
+    );
+  } catch (e) {
+    say(`Re-pin failed: ${sharingErr(e)}`, "error");
+  }
+});
+
+$("sharing-rotate").addEventListener("click", async () => {
+  try {
+    const auth = sharingAuth();
+    const id = sharingVaultId();
+    const key = device.vaultKeys?.[id];
+    if (!key) throw new Error(`vault "${id}" is not a shared vault`);
+    const recipients = $("sharing-rotate-to")
+      .value.split(/[\s,]+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if (recipients.length === 0) {
+      throw new Error("list every device id that KEEPS access (comma or space separated)");
+    }
+    const stored = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
+    if (!stored) throw new Error("no sealed vault in this browser to rotate");
+    say("Rotating the vault key and re-wrapping…");
+    const res = await rotateVaultKey(wasm, auth, {
+      vaultId: id,
+      recipientDeviceIds: recipients,
+      sealedVault: base64ToBytes(stored),
+      oldVaultKey: key,
+      params: ARGON2,
+    });
+    await persistDevice({
+      ...device,
+      pins: res.pins,
+      vaultKeys: { ...(device.vaultKeys ?? {}), [id]: res.vaultKey },
+    });
+    await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(res.sealedVault) });
+    sealSecret = res.vaultKey;
+    say(
+      `Rotated "${id}": ${res.oldFingerprint} -> ${res.newFingerprint}. Re-wrapped to ` +
+        `${res.rewrapped.map((r) => r.deviceId).join(", ")}` +
+        (res.removed.length > 0 ? `; deleted the envelope of ${res.removed.join(", ")}` : "") +
+        ". Push the vault so the remaining devices get the new content. This protects FUTURE " +
+        "content only — a device that already unwrapped the old key keeps what it copied.",
+    );
+  } catch (e) {
+    if (showPinMismatch(e)) return;
+    say(`Rotate failed: ${sharingErr(e)}`, "error");
   }
 });
 

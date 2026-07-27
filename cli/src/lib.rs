@@ -1349,6 +1349,12 @@ pub struct DeviceInfo {
     /// RFC 3339 revocation time, absent while active.
     #[serde(default)]
     pub revoked_at: Option<String>,
+    /// The ACCOUNT this device belongs to (Phase 52). ADDITIVE and OPTIONAL: a
+    /// server without the account model simply omits it, and this crate never
+    /// sends it — the account is always derived server-side from the verified
+    /// signature, never named by a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 /// ENROLL this device's Ed25519 public key with sigild and return the assigned
@@ -1509,6 +1515,254 @@ pub fn grant_vault_access(
     let req = ureq::post(&url).set("Content-Type", "application/json");
     let req = apply_auth(req, auth, "POST", &path, "", &body)?;
     finish(req.send_bytes(&body))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The ACCOUNT model (Phase 52). Client half of sigild's four account routes.
+//
+// WHAT AN ACCOUNT IS: a server-assigned id sitting on a device row. Entitlement
+// and vault ownership key off THAT id instead of the device id, so a second
+// device of the same account inherits the subscription and can still administer
+// a vault after its sibling is revoked.
+//
+// THE STRUCTURAL RULE, MIRRORED HERE: no request built below names an account.
+// There is no account_id path segment, query parameter or body field anywhere —
+// the server always takes the account from the device row of the signature it
+// just verified. That is what closes every cross-account IDOR, and it is why
+// these functions take only a [`RequestAuth`].
+//
+// NO NEW CRYPTO, NO NEW WIRE FORMAT: every call below rides the EXISTING
+// contract v3 `apply_auth` path. There is no new signed-message domain and no
+// new header, so the three canonical-message implementations (Go server, this
+// crate, sigil-wasm) are untouched and stay byte-identical.
+//
+// JOINING NEEDS NO CODE AT ALL: an invite is presented in the EXISTING
+// `X-Sigil-Enroll-Token` header, and the enrollment challenge already binds the
+// token DIGEST — so `sigil device enroll --token <invite>` joins the inviter's
+// account with the enrollment path completely unchanged.
+//
+// STATUS: dev-gated + pre-audit + UNAUDITED, plain HTTP. An account is AUTH
+// METADATA ONLY: membership confers AUTHORIZATION, never DECRYPTION — a joined
+// device can authenticate and see its entitlement, and can read nothing until an
+// existing member wraps the vault key to its hybrid public key.
+// ---------------------------------------------------------------------------
+
+/// Reject invite IDs that cannot be placed verbatim in a URL path segment.
+///
+/// Same rule as [`check_device_id`]: non-empty, no `/`, no ASCII whitespace.
+/// Server IDs are `inv_` + base64url, so a legitimate handle always passes.
+fn check_invite_id(invite_id: &str) -> Result<(), CliError> {
+    if invite_id.is_empty()
+        || invite_id.contains('/')
+        || invite_id.chars().any(|c| c.is_whitespace())
+    {
+        return Err(CliError::Key(format!(
+            "invalid invite id {invite_id:?}: must be non-empty with no '/' or whitespace"
+        )));
+    }
+    Ok(())
+}
+
+/// The CALLER's own account and its members, as reported by `GET /v1/account`.
+///
+/// There is no route that reads another account and none that enumerates
+/// accounts, so this is always "mine".
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountInfo {
+    /// The server-assigned account ID (`acct_…`, or `acct_mig_…` for a device
+    /// adopted by the migration that introduced accounts).
+    pub account_id: String,
+    /// RFC 3339 creation time, when the server knows it.
+    #[serde(default)]
+    pub created_at: String,
+    /// How many ACTIVE devices are in the account. This — not `devices.len()` —
+    /// is what `device_limit` bounds: the cap is on CONCURRENT devices, so
+    /// revoking one FREES its seat.
+    #[serde(default)]
+    pub device_count: usize,
+    /// How many members are REVOKED. Reported separately rather than folded into
+    /// the limit, so history stays visible without consuming capacity.
+    #[serde(default)]
+    pub revoked_device_count: usize,
+    /// The server's configured per-account device cap.
+    #[serde(default)]
+    pub device_limit: usize,
+    /// The member devices. Metadata only — the registry never echoes keys.
+    #[serde(default)]
+    pub devices: Vec<DeviceInfo>,
+}
+
+/// One OPEN invite in a listing. METADATA ONLY: it carries the PUBLIC handle and
+/// never the secret, never the digest — a minted invite can never be recovered
+/// from the server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountInviteInfo {
+    /// The PUBLIC handle, used for revocation.
+    pub invite_id: String,
+    /// Which member device minted it.
+    #[serde(default)]
+    pub created_by_device_id: String,
+    /// RFC 3339 creation time.
+    #[serde(default)]
+    pub created_at: String,
+    /// RFC 3339 expiry.
+    #[serde(default)]
+    pub expires_at: String,
+    /// Whether the invite is PINNED to one Ed25519 public key (so an intercepted
+    /// invite cannot be redeemed by anyone else).
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// A freshly minted invite. ⚠️ [`CreatedAccountInvite::invite`] is a BEARER
+/// SECRET returned exactly ONCE by the server: anyone who reads it inside its TTL
+/// can join the account (unless it was pinned to a public key). It is never
+/// re-served, never logged, and never stored.
+#[derive(Clone, Deserialize)]
+pub struct CreatedAccountInvite {
+    /// The PUBLIC handle for listing and revocation. Not a secret.
+    pub invite_id: String,
+    /// ⚠️ THE SECRET. Present only in the response that minted it.
+    pub invite: String,
+    /// The account it joins (the minting device's own).
+    #[serde(default)]
+    pub account_id: String,
+    /// RFC 3339 expiry.
+    #[serde(default)]
+    pub expires_at: String,
+    /// Whether it is pinned to one Ed25519 public key.
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// REDACTED on purpose: the secret must not reach a log line via a stray
+/// `{:?}`. Every other field is metadata and is shown.
+impl std::fmt::Debug for CreatedAccountInvite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedAccountInvite")
+            .field("invite_id", &self.invite_id)
+            .field("invite", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("expires_at", &self.expires_at)
+            .field("pinned", &self.pinned)
+            .finish()
+    }
+}
+
+/// READ the signing device's own account: its ID, its member devices, and the
+/// server's device cap.
+///
+/// Requires a contract v3 identity ([`RequestAuth::V3`]) — the account is taken
+/// from the verified signature, so an unsigned or v2 request cannot resolve one.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (not authenticated / revoked),
+///   `403` (not permitted — which INCLUDES the device carrying no account at
+///   all, an invariant violation the server fails CLOSED on rather than falling
+///   back to the device id; the body is the same coarse `forbidden` as any other
+///   refusal, so the two cannot be told apart from here), `501` (the account
+///   model is not enabled on that server).
+pub fn get_account(server: &str, auth: &RequestAuth<'_>) -> Result<AccountInfo, CliError> {
+    let path = "/v1/account";
+    let req = ureq::get(&join_url(server, path));
+    let req = apply_auth(req, auth, "GET", path, "", b"")?;
+    let text = finish(req.call())?;
+    serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))
+}
+
+/// MINT a single-use invite that lets ANOTHER device join the signing device's
+/// account.
+///
+/// `ttl_seconds` may only SHORTEN the invite's life — the server clamps it to its
+/// own configured ceiling. `invitee_public_key`, when given, PINS the invite to
+/// that one Ed25519 public key, so an intercepted invite cannot be redeemed by
+/// anyone else; nothing forces pinning, and an UNPINNED invite is a bearer secret
+/// for its whole TTL over a plain-HTTP dev transport.
+///
+/// The redeeming device presents the returned secret as its `--token` to
+/// `sigil device enroll` — the enrollment path is unchanged.
+///
+/// ⚠️ The returned secret is shown ONCE. This crate never writes it to a file and
+/// never logs it.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401`, `409` (`invite_limit` — too many
+///   open invites, or `account_full`), `501`.
+pub fn create_account_invite(
+    server: &str,
+    auth: &RequestAuth<'_>,
+    ttl_seconds: Option<u64>,
+    invitee_public_key: Option<&[u8; SIG_PUBLIC_KEY_LEN]>,
+) -> Result<CreatedAccountInvite, CliError> {
+    // NOTE WHAT IS NOT HERE: no account_id and no subject. The invite always
+    // lands in the CALLER's account, resolved from the signature server-side.
+    #[derive(Serialize)]
+    struct InviteBody {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttl_seconds: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        invitee_public_key: Option<String>,
+    }
+    let body = serde_json::to_vec(&InviteBody {
+        ttl_seconds,
+        invitee_public_key: invitee_public_key.map(|k| BASE64.encode(k)),
+    })
+    .map_err(|e| CliError::Key(format!("could not serialize invite body: {e}")))?;
+
+    let path = "/v1/account/invites";
+    let req = ureq::post(&join_url(server, path)).set("Content-Type", "application/json");
+    let req = apply_auth(req, auth, "POST", path, "", &body)?;
+    let text = finish(req.send_bytes(&body))?;
+    serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))
+}
+
+/// LIST the signing device's account's OPEN invites. METADATA ONLY — the secret
+/// and its digest are never served, by either the server or this function.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx (`401`, `403` — including a missing
+///   account, `501`).
+pub fn list_account_invites(
+    server: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<Vec<AccountInviteInfo>, CliError> {
+    #[derive(Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        invites: Vec<AccountInviteInfo>,
+    }
+    let path = "/v1/account/invites";
+    let req = ureq::get(&join_url(server, path));
+    let req = apply_auth(req, auth, "GET", path, "", b"")?;
+    let text = finish(req.call())?;
+    let wire: Wire =
+        serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))?;
+    Ok(wire.invites)
+}
+
+/// REVOKE an unredeemed invite of the signing device's account.
+///
+/// The server scopes the lookup by `(account, invite_id)`, so a FOREIGN invite
+/// handle and a MISSING one are indistinguishable — both answer `404`. There is
+/// no enumeration oracle, which is why this returns the same error either way.
+///
+/// # Errors
+/// - [`CliError::Key`] if the handle is not a usable path segment.
+/// - [`CliError::Server`] on a non-2xx: `401`, `404` (`invite_not_found` — unknown
+///   OR belonging to another account), `501`.
+pub fn revoke_account_invite(
+    server: &str,
+    auth: &RequestAuth<'_>,
+    invite_id: &str,
+) -> Result<(), CliError> {
+    check_invite_id(invite_id)?;
+    let path = format!("/v1/account/invites/{invite_id}/revoke");
+    // An empty body is sent and is exactly what gets signed.
+    let body: &[u8] = b"";
+    let req = ureq::post(&join_url(server, &path)).set("Content-Type", "application/json");
+    let req = apply_auth(req, auth, "POST", &path, "", body)?;
+    finish(req.send_bytes(body))?;
     Ok(())
 }
 
@@ -4848,6 +5102,255 @@ mod tests {
             grant_vault_access("http://127.0.0.1:1", "demo", "dev_B", "admin", &id.auth()),
             Err(CliError::Key(_))
         ));
+    }
+
+    // --- The ACCOUNT model (Phase 52) --------------------------------------
+    //
+    // The invariant these pin: every account call is a plain contract v3 request
+    // (no new header, no new signed-message domain) and NO request ever names an
+    // account — the server derives it from the signature it verified.
+
+    #[test]
+    fn get_account_signs_v3_and_names_no_account() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_ME".to_string());
+        let id = kf.decode().expect("decode");
+
+        let json = "{\"account_id\":\"acct_AAA\",\"created_at\":\"2026-07-26T00:00:00Z\",\
+             \"device_count\":2,\"device_limit\":10,\
+             \"devices\":[{\"device_id\":\"dev_ME\",\"account_id\":\"acct_AAA\",\"status\":\"active\"},\
+             {\"device_id\":\"dev_SIB\",\"account_id\":\"acct_AAA\",\"status\":\"active\"}]}";
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            )
+            .into_boxed_str(),
+        );
+
+        let (base, handle) = spawn_mock(response);
+        let acct = get_account(&base, &id.auth()).expect("get_account ok");
+        assert_eq!(acct.account_id, "acct_AAA");
+        assert_eq!(acct.device_count, 2);
+        assert_eq!(acct.device_limit, 10);
+        assert_eq!(acct.devices.len(), 2);
+        // The ADDITIVE DeviceInfo field parses...
+        assert_eq!(acct.devices[0].account_id.as_deref(), Some("acct_AAA"));
+
+        let req = handle.join().expect("thread");
+        assert_eq!(req.request_line, "GET /v1/account HTTP/1.1");
+        assert_eq!(req.header("x-sigil-device"), Some("dev_ME"));
+        assert!(req.body.is_empty(), "a GET must send no body");
+
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+        let msg = handbuilt_v3("dev_ME", "GET", "/v1/account", "", &ts, &nonce, b"");
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(
+            verify(&id.public_key, &msg, &sig).is_ok(),
+            "the account route must verify under the EXISTING v3 message"
+        );
+        // ...and no new header was invented for it.
+        assert!(req.header("x-sigil-account").is_none());
+        assert!(req.header("x-sigil-enroll-token").is_none());
+    }
+
+    #[test]
+    fn device_info_parses_without_an_account_id() {
+        // BACKWARD COMPATIBILITY: a pre-account server omits the field entirely.
+        let d: DeviceInfo = serde_json::from_str(
+            "{\"device_id\":\"dev_OLD\",\"label\":\"laptop\",\"status\":\"active\"}",
+        )
+        .expect("parse");
+        assert_eq!(d.device_id, "dev_OLD");
+        assert!(d.account_id.is_none());
+    }
+
+    #[test]
+    fn create_invite_signs_its_body_and_never_names_an_account() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_HOST".to_string());
+        let id = kf.decode().expect("decode");
+
+        let json = "{\"invite_id\":\"inv_XYZ\",\"invite\":\"join_SECRET\",\
+             \"account_id\":\"acct_AAA\",\"expires_at\":\"2026-07-26T00:15:00Z\",\"pinned\":false}";
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            )
+            .into_boxed_str(),
+        );
+
+        let (base, handle) = spawn_mock(response);
+        let inv = create_account_invite(&base, &id.auth(), None, None).expect("mint ok");
+        assert_eq!(inv.invite_id, "inv_XYZ");
+        assert_eq!(inv.invite, "join_SECRET");
+        // The secret must never reach a log line through Debug.
+        let debug = format!("{inv:?}");
+        assert!(
+            !debug.contains("join_SECRET"),
+            "Debug must redact the invite secret, got {debug}"
+        );
+        assert!(debug.contains("inv_XYZ"), "the public handle stays visible");
+
+        let req = handle.join().expect("thread");
+        assert_eq!(req.request_line, "POST /v1/account/invites HTTP/1.1");
+        assert_eq!(req.header("x-sigil-device"), Some("dev_HOST"));
+        // With no options the body is an EMPTY JSON object: no account_id, no
+        // subject, nothing that could steer which account the invite lands in.
+        let body = req.body.clone();
+        assert_eq!(String::from_utf8(body.clone()).unwrap(), "{}");
+
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+        let msg = handbuilt_v3(
+            "dev_HOST",
+            "POST",
+            "/v1/account/invites",
+            "",
+            &ts,
+            &nonce,
+            &body,
+        );
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(verify(&id.public_key, &msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn create_invite_sends_ttl_and_pinned_key_when_asked() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_HOST".to_string());
+        let id = kf.decode().expect("decode");
+        let pin = [7u8; SIG_PUBLIC_KEY_LEN];
+
+        let json = "{\"invite_id\":\"inv_P\",\"invite\":\"join_S\",\"pinned\":true}";
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            )
+            .into_boxed_str(),
+        );
+
+        let (base, handle) = spawn_mock(response);
+        let inv = create_account_invite(&base, &id.auth(), Some(120), Some(&pin)).expect("mint ok");
+        assert!(inv.pinned);
+
+        let req = handle.join().expect("thread");
+        let body = String::from_utf8(req.body.clone()).unwrap();
+        assert_eq!(
+            body,
+            format!(
+                "{{\"ttl_seconds\":120,\"invitee_public_key\":\"{}\"}}",
+                BASE64.encode(pin)
+            )
+        );
+        assert!(
+            !body.contains("account_id") && !body.contains("subject"),
+            "the body must never name an account: {body}"
+        );
+    }
+
+    #[test]
+    fn list_invites_returns_metadata_only_and_revoke_scopes_by_handle() {
+        let mut kf = generate_key().expect("keygen");
+        kf.device_id = Some("dev_HOST".to_string());
+        let id = kf.decode().expect("decode");
+
+        let json = "{\"invites\":[{\"invite_id\":\"inv_1\",\"created_by_device_id\":\"dev_HOST\",\
+             \"created_at\":\"2026-07-26T00:00:00Z\",\"expires_at\":\"2026-07-26T00:15:00Z\",\"pinned\":true}]}";
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base, handle) = spawn_mock(response);
+        let invites = list_account_invites(&base, &id.auth()).expect("list ok");
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].invite_id, "inv_1");
+        assert!(invites[0].pinned);
+        let req = handle.join().expect("thread");
+        assert_eq!(req.request_line, "GET /v1/account/invites HTTP/1.1");
+        assert_eq!(req.header("x-sigil-device"), Some("dev_HOST"));
+
+        // Revocation is by the PUBLIC handle in the path, signed under v3.
+        let revoked = "{\"invite_id\":\"inv_1\",\"revoked\":true}";
+        let ok: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{revoked}",
+                revoked.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base, handle) = spawn_mock(ok);
+        revoke_account_invite(&base, &id.auth(), "inv_1").expect("revoke ok");
+        let req = handle.join().expect("thread");
+        assert_eq!(
+            req.request_line,
+            "POST /v1/account/invites/inv_1/revoke HTTP/1.1"
+        );
+        let ts = req.header("x-sigil-timestamp").expect("ts").to_string();
+        let nonce = req.header("x-sigil-nonce").expect("nonce").to_string();
+        let sig_b64 = req.header("x-sigil-signature").expect("sig").to_string();
+        let msg = handbuilt_v3(
+            "dev_HOST",
+            "POST",
+            "/v1/account/invites/inv_1/revoke",
+            "",
+            &ts,
+            &nonce,
+            b"",
+        );
+        let sig: [u8; sigil_core::SIGNATURE_LEN] = BASE64
+            .decode(sig_b64.as_bytes())
+            .expect("sig b64")
+            .try_into()
+            .expect("sig 64");
+        assert!(verify(&id.public_key, &msg, &sig).is_ok());
+
+        // An invite handle that could not sit in a URL path segment never
+        // reaches the network.
+        assert!(matches!(
+            revoke_account_invite("http://127.0.0.1:1", &id.auth(), "bad/handle"),
+            Err(CliError::Key(_))
+        ));
+        assert!(matches!(
+            revoke_account_invite("http://127.0.0.1:1", &id.auth(), ""),
+            Err(CliError::Key(_))
+        ));
+    }
+
+    #[test]
+    fn account_calls_are_unsigned_when_the_identity_is_not_enrolled() {
+        // No new auth path was invented: RequestAuth::None still sends nothing,
+        // which is exactly how the server answers 401 rather than guessing.
+        let json = "{\"error\":\"unauthorized\"}";
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+                json.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base, handle) = spawn_mock(response);
+        let err = get_account(&base, &RequestAuth::None).expect_err("must fail");
+        assert!(matches!(err, CliError::Server { status: 401, .. }));
+        let req = handle.join().expect("thread");
+        assert!(req.header("x-sigil-device").is_none());
+        assert!(req.header("x-sigil-signature").is_none());
     }
 
     #[test]

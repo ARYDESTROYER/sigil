@@ -623,6 +623,127 @@ fn accept(vault_id: String, state: State<'_, AppState>) -> CmdResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 52 — ACCOUNTS. An account groups this person's own devices; it is what a
+// subscription and a vault's OWNERSHIP belong to, so revoking the device that
+// first wrote a vault no longer orphans it. Every command delegates to
+// DeviceConfig, which delegates to the sigil-cli library — no protocol here.
+//
+// NOTHING TAKES AN ACCOUNT ID: the server reads the account off the signature it
+// verified, which is why there is no account parameter to get wrong.
+// ---------------------------------------------------------------------------
+
+/// One member device as the UI sees it. Metadata only.
+#[derive(serde::Serialize)]
+struct MemberView {
+    device_id: String,
+    label: String,
+    status: String,
+    created_at: String,
+    revoked_at: String,
+    is_this_device: bool,
+}
+
+/// This device's account and its members.
+#[derive(serde::Serialize)]
+struct AccountViewIpc {
+    account_id: String,
+    created_at: String,
+    device_count: usize,
+    device_limit: usize,
+    members: Vec<MemberView>,
+}
+
+/// A minted invite. ⚠️ `invite` is a BEARER SECRET crossing the IPC exactly once,
+/// by necessity — the human has to carry it to the other device, the same way an
+/// enrollment token travels IN. The UI must show it once and never persist it.
+#[derive(serde::Serialize)]
+struct MintedInviteView {
+    invite_id: String,
+    invite: String,
+    account_id: String,
+    expires_at: String,
+    pinned: bool,
+}
+
+/// An OPEN invite in a listing: the public handle and metadata, never a secret.
+#[derive(serde::Serialize)]
+struct OpenInviteView {
+    invite_id: String,
+    created_by_device_id: String,
+    created_at: String,
+    expires_at: String,
+    pinned: bool,
+}
+
+/// Which account this device is in, and who else is in it.
+#[tauri::command]
+fn account_status(state: State<'_, AppState>) -> CmdResult<AccountViewIpc> {
+    let a = sync_config(&state)?.account().map_err(ipc)?;
+    Ok(AccountViewIpc {
+        account_id: a.account_id,
+        created_at: a.created_at,
+        device_count: a.device_count,
+        device_limit: a.device_limit,
+        members: a
+            .members
+            .into_iter()
+            .map(|m| MemberView {
+                device_id: m.device_id,
+                label: m.label,
+                status: m.status,
+                created_at: m.created_at,
+                revoked_at: m.revoked_at,
+                is_this_device: m.is_this_device,
+            })
+            .collect(),
+    })
+}
+
+/// Mint a SINGLE-USE invite so one more device can join this account. The other
+/// device redeems it as its ordinary enrollment token — there is no join command.
+#[tauri::command]
+fn account_invite(
+    ttl_seconds: Option<u64>,
+    state: State<'_, AppState>,
+) -> CmdResult<MintedInviteView> {
+    let ttl = ttl_seconds.filter(|t| *t > 0);
+    let inv = sync_config(&state)?.create_invite(ttl).map_err(ipc)?;
+    Ok(MintedInviteView {
+        invite_id: inv.invite_id,
+        invite: inv.invite,
+        account_id: inv.account_id,
+        expires_at: inv.expires_at,
+        pinned: inv.pinned,
+    })
+}
+
+/// This account's OPEN invites. Metadata only — a minted secret is unrecoverable.
+#[tauri::command]
+fn account_invites(state: State<'_, AppState>) -> CmdResult<Vec<OpenInviteView>> {
+    Ok(sync_config(&state)?
+        .list_invites()
+        .map_err(ipc)?
+        .into_iter()
+        .map(|i| OpenInviteView {
+            invite_id: i.invite_id,
+            created_by_device_id: i.created_by_device_id,
+            created_at: i.created_at,
+            expires_at: i.expires_at,
+            pinned: i.pinned,
+        })
+        .collect())
+}
+
+/// Revoke an unredeemed invite by its PUBLIC handle. A foreign handle and a
+/// missing one are deliberately indistinguishable.
+#[tauri::command]
+fn account_revoke_invite(invite_id: String, state: State<'_, AppState>) -> CmdResult<()> {
+    sync_config(&state)?
+        .revoke_invite(invite_id.trim())
+        .map_err(ipc)
+}
+
+// ---------------------------------------------------------------------------
 // Phase 50 — key verification and rotation. Every one of these delegates to the
 // sigil-cli library through DeviceConfig; the desktop implements no crypto and
 // no pin logic of its own.
@@ -790,7 +911,11 @@ fn main() {
             pairwise_safety_number,
             pins,
             repin,
-            rotate
+            rotate,
+            account_status,
+            account_invite,
+            account_invites,
+            account_revoke_invite
         ])
         .run(tauri::generate_context!())
         .expect("could not start the Sigil desktop window");

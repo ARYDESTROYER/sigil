@@ -237,6 +237,9 @@ function applySync(sync) {
     $("server-url").value = sync.server;
   }
   $("enroll-block").hidden = !sync.configured;
+  // The account panel needs an ENROLLED identity: the server reads the account
+  // off the signature, so an un-enrolled device has nothing to ask about.
+  $("account-block").hidden = !sync.configured || !sync.enrolled;
   $("vault-block").hidden = !sync.configured;
   $("share-block").hidden = !sync.configured;
 
@@ -309,6 +312,104 @@ $("publish-hybrid-btn").addEventListener("click", async () => {
   const fp = await call("publish_hybrid");
   toast(`hybrid public key published (sha256 ${fp}) — the secret half never left this machine`);
   await refreshSync();
+});
+
+// --- Account (which devices are yours) --------------------------------------
+//
+// Nothing here names an account: the server derives it from this device's
+// signature, so there is no account field to get wrong or to abuse.
+
+/** Fill the account facts table. Ids and counts only — never a key or a secret. */
+function putAccountFacts(pairs) {
+  const dl = $("account-facts");
+  dl.textContent = "";
+  for (const [key, value, dim] of pairs) {
+    const dt = document.createElement("dt");
+    dt.textContent = key;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (dim) dd.className = "off";
+    dl.append(dt, dd);
+  }
+}
+
+/** Hide the one-time invite secret again (on any other account action). */
+function clearInviteOutput() {
+  $("account-invite-out").hidden = true;
+  $("account-invite-out").textContent = "";
+  $("account-invite-warning").hidden = true;
+}
+
+$("account-status-btn").addEventListener("click", async () => {
+  clearInviteOutput();
+  const a = await call("account_status");
+  const rows = [
+    ["account", a.account_id],
+    [
+      "devices",
+      `${a.device_count} of ${a.device_limit} active` +
+        (a.revoked_device_count
+          ? ` · ${a.revoked_device_count} revoked (a revoked device does not use a seat)`
+          : ""),
+    ],
+  ];
+  for (const m of a.members) {
+    rows.push([
+      m.is_this_device ? "this device" : "member",
+      `${m.device_id} · ${m.status}${m.label ? ` · ${m.label}` : ""}`,
+      m.status !== "active",
+    ]);
+  }
+  if (a.device_count < 2) {
+    rows.push([
+      "warning",
+      "only one device in this account. There is NO RECOVERY — enroll a second one.",
+    ]);
+  }
+  putAccountFacts(rows);
+});
+
+$("account-invite-btn").addEventListener("click", async () => {
+  clearInviteOutput();
+  const inv = await call("account_invite", { ttlSeconds: null });
+  // Shown ONCE, in the DOM only, never persisted. It is cleared by the next
+  // account action or by locking the vault.
+  $("account-invite-warning").hidden = false;
+  const out = $("account-invite-out");
+  out.textContent =
+    `${inv.invite}\n\n` +
+    `handle:  ${inv.invite_id}  (use this to revoke it)\n` +
+    `expires: ${inv.expires_at}\n` +
+    `pinned:  ${inv.pinned ? "yes" : "no — anyone who reads it can use it"}`;
+  out.hidden = false;
+  toast("invite minted — shown once, not stored anywhere");
+});
+
+$("account-invites-btn").addEventListener("click", async () => {
+  clearInviteOutput();
+  const invites = await call("account_invites");
+  if (invites.length === 0) {
+    putAccountFacts([["open invites", "none"]]);
+    return;
+  }
+  putAccountFacts(
+    invites.map((i) => [
+      "open invite",
+      `${i.invite_id} · by ${i.created_by_device_id} · expires ${i.expires_at}` +
+        (i.pinned ? " · pinned" : ""),
+    ])
+  );
+});
+
+$("account-revoke-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearInviteOutput();
+  const field = $("account-invite-id");
+  const id = field.value.trim();
+  if (!id) return;
+  await call("account_revoke_invite", { inviteId: id });
+  field.value = "";
+  toast(`invite ${id} revoked`);
 });
 
 $("convert-btn").addEventListener("click", async () => {

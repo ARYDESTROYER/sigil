@@ -30,6 +30,10 @@ use sigil_cli::{
     fetch_hybrid_key_pinned, hybrid_safety_number, load_pins, pairwise_safety_number,
     repin_hybrid_key, rotate_vault_key, HybridPublicIdentity, HYBRID_PIN_FILE,
 };
+// Phase 52 — the ACCOUNT model. Membership is what entitlement and vault
+// ownership key off, so a second device inherits both. Every call rides the
+// EXISTING contract v3 request path: no new signed message, no new header.
+use sigil_cli::{create_account_invite, get_account, list_account_invites, revoke_account_invite};
 use sigil_core::Argon2Params;
 
 /// Environment variable the password is read from. Empty/unset is a hard error.
@@ -290,6 +294,45 @@ MULTI-DEVICE AUTH (sigil device ...) — CONTRACT v3, DEV-ONLY:
   possession of the device private key. HONEST SCOPE: dev/localhost/plain HTTP,
   UNAUDITED; no account model, no key rotation, no recovery.
 
+ACCOUNTS (sigil account ...) — WHO OWNS THE VAULT AND WHO IS ENTITLED, DEV-ONLY:
+  An ACCOUNT is a group of your own devices. It is what a subscription and a
+  vault's ownership belong to — so paying on one device entitles the others, and
+  revoking one device does not orphan its vaults. An account is AUTH METADATA
+  ONLY: no email, no password, no session. The server never sees a vault key.
+
+  A second device joins with a SINGLE-USE INVITE minted by a device already in
+  the account. There is no separate \"join\" command — an invite IS an enrollment
+  token, so the enrollment path is completely unchanged:
+
+    sigil account status                          # which account am I in?
+    sigil account invite                          # prints ONE invite secret
+    sigil account invite --ttl 300                # ...shorter-lived
+    sigil account invite --pin-key \"<b64 pubkey>\"  # ...redeemable by ONE key only
+    sigil account invites                         # open invites (metadata only)
+    sigil account revoke-invite <inviteID>        # kill one before it is used
+
+    # on the joining device — the ORDINARY enroll command:
+    sigil device enroll --token <the invite> --label phone --key ./b.key
+
+  No request ever names an account: the server reads yours off the signature it
+  just verified, which is why there is no --account flag anywhere.
+
+  !! HONEST SCOPE: dev-gated, plain HTTP, UNAUDITED.
+  * NO RECOVERY. An account is reachable only through a member device's private
+    key. Lose or revoke every device and the account, its vaults and its
+    subscription are permanently unreachable — by you and by us. Keep two
+    devices enrolled.
+  * Joining grants AUTHORIZATION, never DECRYPTION. A new device reads nothing
+    until a member wraps the vault key to it (`sigil vault share`).
+  * Membership is FLAT: any member may invite, revoke every other member, and
+    run checkout. Revoking a compromised device does NOT revoke the devices it
+    invited — the audit log names the inviter, but nothing prevents it.
+  * An UNPINNED invite is a bearer secret over plain HTTP for its whole life.
+  * Membership is immutable: no transfer, no merge, no account deletion. A
+    device enrolled into the wrong account can only be revoked and re-enrolled.
+  * Devices enrolled before the account model each got their OWN account, so an
+    existing phone + laptop are TWO accounts with TWO subscriptions. !!
+
 DEVICE-TO-DEVICE VAULT SHARING (sigil vault ...) — DEV-ONLY, UNAUDITED:
   This is how a SECOND device gets into the SAME vault. The key hierarchy:
 
@@ -447,6 +490,7 @@ fn run() -> Result<(), String> {
         }
         "totp" => cmd_totp(args),
         "device" => cmd_device(args),
+        "account" => cmd_account(args),
         "vault" => cmd_vault(args),
         "push" => {
             let p = parse_push(args)?;
@@ -1053,8 +1097,9 @@ fn explain_device_error(e: CliError, what: &str) -> String {
              clock must be within 300s of the server."
         ),
         CliError::Server { status: 403, .. } => format!(
-            "{e}\n  -> HTTP 403: authenticated, but not permitted to {what}. A device may only revoke\n     \
-             ITSELF, and only a vault's OWNER may grant access to it."
+            "{e}\n  -> HTTP 403: authenticated, but not permitted to {what}. A device may revoke ITSELF or\n     \
+             a SIBLING in its own account (an unknown device looks the same as a foreign one — that is\n     \
+             deliberate), and only a device of the vault's OWNING ACCOUNT may grant access to it."
         ),
         CliError::Server { status: 409, .. } => format!(
             "{e}\n  -> HTTP 409: that public key is already enrolled. Use the existing identity file, or\n     \
@@ -1157,8 +1202,14 @@ fn cmd_device_list(f: &DeviceFlags) -> Result<(), String> {
     println!("{} device(s):", devices.len());
     for d in &devices {
         let revoked = d.revoked_at.as_deref().unwrap_or("-");
+        // account is ADDITIVE: a server without the account model omits it, and
+        // the line then reads exactly as it always did.
+        let account = match d.account_id.as_deref() {
+            Some(a) if !a.is_empty() => format!("  account={a}"),
+            _ => String::new(),
+        };
         println!(
-            "  {id}  status={status}  label={label:?}  created={created}  revoked={revoked}",
+            "  {id}  status={status}  label={label:?}  created={created}  revoked={revoked}{account}",
             id = d.device_id,
             status = d.status,
             label = d.label,
@@ -1170,8 +1221,11 @@ fn cmd_device_list(f: &DeviceFlags) -> Result<(), String> {
 
 /// `sigil device revoke <deviceID> [--admin-token <t>] [--key <file>]`
 ///
-/// Authorized EITHER by the operator admin token (may revoke any device) OR by the
-/// device itself (a contract v3 signature whose device ID IS `<deviceID>`).
+/// THREE authorized paths, matching the server: the operator admin token (may
+/// revoke ANY device), SELF-revocation, and — since the account model (Phase 52)
+/// — a SIBLING in the same account. The client therefore no longer refuses to
+/// send a revocation for another device: whether it is a sibling is a fact only
+/// the server's registry knows, so it decides and answers 403 if not.
 fn cmd_device_revoke(target: Option<String>, f: &DeviceFlags) -> Result<(), String> {
     if f.token.is_some() || f.vault.is_some() || f.permission.is_some() {
         return Err("device revoke takes <deviceID> plus --admin-token/--key/--server only".into());
@@ -1194,12 +1248,15 @@ fn cmd_device_revoke(target: Option<String>, f: &DeviceFlags) -> Result<(), Stri
             ))
         }
     };
+    // A signing identity that is not the target is NO LONGER refused here: a
+    // device may revoke a SIBLING in its own account (Phase 52), and only the
+    // server's registry knows whether the target is one. We do still insist the
+    // identity be enrolled, because an unsigned request could only ever be 401.
     if let (None, Some(id)) = (&admin, &identity) {
-        if id.device_id.as_deref() != Some(target.as_str()) {
+        if id.device_id.is_none() {
             return Err(format!(
-                "that identity is device {:?}, not {target:?}; a device may only revoke ITSELF \
-                 (use --admin-token to revoke another device)",
-                id.device_id.as_deref().unwrap_or("<not enrolled>")
+                "identity for {target:?} has no device_id: run `sigil device enroll` first, or pass \
+                 --admin-token to revoke as the operator"
             ));
         }
     }
@@ -1589,6 +1646,325 @@ fn cmd_device_repin(target: Option<String>, f: &DeviceFlags) -> Result<(), Strin
 // DEV-ONLY, UNAUDITED, plain HTTP. The vault key is never printed — only its
 // SHA-256 fingerprint, so two devices can prove they hold the same key.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// `sigil account ...` — the ACCOUNT model (Phase 52).
+//
+// WHY IT EXISTS: before this, a subscription was bought by a DEVICE and a vault
+// was owned by a DEVICE, so paying on your phone did not entitle your laptop and
+// revoking a vault's owner orphaned the vault. An account is a server-assigned
+// id on the device row that entitlement and vault ownership key off instead.
+//
+// HOW A SECOND DEVICE JOINS: a member mints a single-use INVITE, and the joining
+// device presents it as its ordinary enrollment token —
+//
+//     sigil account invite --key ./a.key          # on a device already in the account
+//     sigil device enroll --token join_… --key ./b.key
+//
+// There is NO new subcommand for joining and no new wire format: the enrollment
+// challenge already binds the token DIGEST, so an invite rides the existing
+// X-Sigil-Enroll-Token header on the unchanged enrollment path.
+//
+// NO REQUEST HERE NAMES AN ACCOUNT. The server always reads it off the device row
+// of the signature it just verified, which is what makes a cross-account request
+// unconstructible rather than merely rejected.
+//
+// HONEST SCOPE: dev-gated, plain HTTP, UNAUDITED. Membership confers
+// AUTHORIZATION, never DECRYPTION — a joined device still reads nothing until a
+// member wraps the vault key to its hybrid public key (`sigil vault share`).
+// Membership is FLAT (any member may invite, revoke any sibling and run
+// checkout) and there is NO RECOVERY: lose every device in an account and the
+// account is permanently unreachable.
+// ---------------------------------------------------------------------------
+
+/// Parsed flags for the `account` subcommands.
+#[derive(Default)]
+struct AccountFlags {
+    server: Option<String>,
+    key: Option<String>,
+    /// `account invite` only: shorten the invite's life (seconds). The server
+    /// clamps it to its own ceiling — a client may never LENGTHEN it.
+    ttl: Option<String>,
+    /// `account invite` only: PIN the invite to one Ed25519 public key
+    /// (standard base64 of 32 bytes), so an intercepted invite is useless to
+    /// anyone else.
+    pin_key: Option<String>,
+}
+
+fn parse_account_flags(args: Vec<String>) -> Result<AccountFlags, String> {
+    let mut f = AccountFlags::default();
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--server" => set_once(&mut f.server, &mut it, "--server")?,
+            "--key" => set_once(&mut f.key, &mut it, "--key")?,
+            "--ttl" => set_once(&mut f.ttl, &mut it, "--ttl")?,
+            "--pin-key" => set_once(&mut f.pin_key, &mut it, "--pin-key")?,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    Ok(f)
+}
+
+/// Dispatch `sigil account <sub> ...`.
+fn cmd_account(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let Some(sub) = args.next() else {
+        return Err("missing account subcommand: status | invite | invites | revoke-invite".into());
+    };
+    let rest: Vec<String> = args.collect();
+    let (positional, flags) = take_positional(&rest);
+    let f = parse_account_flags(flags.to_vec())?;
+
+    match sub.as_str() {
+        "status" => cmd_account_status(&f),
+        "invite" => cmd_account_invite(&f),
+        "invites" => cmd_account_invites(&f),
+        "revoke-invite" => cmd_account_revoke_invite(positional, &f),
+        other => Err(format!(
+            "unknown account subcommand {other:?}; try status | invite | invites | revoke-invite"
+        )),
+    }
+}
+
+/// Explain an account-route HTTP failure. Never echoes an invite secret.
+fn explain_account_error(e: CliError, what: &str) -> String {
+    match &e {
+        CliError::Server { status: 401, .. } => format!(
+            "{e}\n  -> HTTP 401: sigild did not authenticate this device for {what}. The identity must be\n     \
+             ENROLLED (contract v3), not revoked, and the clock within 300s of the server."
+        ),
+        CliError::Server { status: 404, .. } => format!(
+            "{e}\n  -> HTTP 404: no such OPEN invite in YOUR account. An invite that belongs to another\n     \
+             account is indistinguishable from one that does not exist — that is deliberate, so the\n     \
+             route cannot be used to enumerate invites."
+        ),
+        CliError::Server { status: 409, .. } => format!(
+            "{e}\n  -> HTTP 409: refused. Either the account already has the maximum number of OPEN invites\n     \
+             (revoke one with `sigil account revoke-invite <inviteID>`), or it is at its device limit."
+        ),
+        CliError::Server { status: 403, .. } => format!(
+            "{e}\n  -> HTTP 403: refused. Either this device is not authorized for that account/vault, or —\n     \
+             if it was enrolled by a PRE-ACCOUNT-MODEL sigild against an already-migrated database — it\n     \
+             carries NO ACCOUNT at all, which the server refuses everywhere. The bodies are deliberately\n     \
+             identical (no oracle); the operator can tell them apart in the audit log, and repairs the\n     \
+             second with `sigild migrate adopt`."
+        ),
+        CliError::Server { status: 500, .. } => format!(
+            "{e}\n  -> HTTP 500: a server-side fault (the device registry could not be read or written).\n     \
+             This is NOT a verdict on this device — retry, and check the server's logs."
+        ),
+        CliError::Server { status: 501, .. } => format!(
+            "{e}\n  -> HTTP 501: this sigild does not have the account model enabled. Start it with\n     \
+             SIGILD_ENABLE_DEV_OPS=1 SIGILD_DEVICE_AUTH=1."
+        ),
+        _ => e.to_string(),
+    }
+}
+
+/// Load the enrolled identity every account command needs. Accounts are resolved
+/// from the SIGNATURE, so an unenrolled (or unsigned) identity cannot name one —
+/// we say that here rather than letting the server answer a bare 401.
+fn account_identity(key: Option<String>) -> Result<(std::path::PathBuf, DeviceIdentity), String> {
+    let path = resolve_identity_path(key);
+    let identity = load_identity(&path).map_err(|e| e.to_string())?;
+    if identity.device_id.is_none() {
+        return Err(format!(
+            "identity {} has no device_id: run `sigil device enroll` first (the account routes are \
+             contract v3 — the server reads your account off the signature, so an unenrolled key \
+             cannot name one)",
+            path.display()
+        ));
+    }
+    Ok((path, identity))
+}
+
+/// `sigil account status [--key <file>] [--server <url>]`
+///
+/// Show THIS device's account and its members. There is no way to ask about
+/// another account: the server derives it from the verified signature.
+fn cmd_account_status(f: &AccountFlags) -> Result<(), String> {
+    if f.ttl.is_some() || f.pin_key.is_some() {
+        return Err("account status takes --key/--server only".into());
+    }
+    let server = resolve_server(f.server.clone());
+    let (path, identity) = account_identity(f.key.clone())?;
+    let me = identity.device_id.clone().unwrap_or_default();
+    let auth = identity.auth();
+
+    let acct = get_account(&server, &auth)
+        .map_err(|e| explain_account_error(e, "reading your account"))?;
+
+    println!(
+        "account {id}{created}\n  devices: {count}/{limit} active{revoked}\n  identity: {path}",
+        id = acct.account_id,
+        created = if acct.created_at.is_empty() {
+            String::new()
+        } else {
+            format!(" (created {})", acct.created_at)
+        },
+        count = acct.device_count,
+        limit = acct.device_limit,
+        // Say it out loud: the cap counts ACTIVE devices, so a revoked device is
+        // listed below but does not hold a seat.
+        revoked = if acct.revoked_device_count == 0 {
+            String::new()
+        } else {
+            format!(
+                "  ({} revoked — a revoked device does not use a seat)",
+                acct.revoked_device_count
+            )
+        },
+        path = path.display(),
+    );
+    for d in &acct.devices {
+        let marker = if d.device_id == me {
+            " <- this device"
+        } else {
+            ""
+        };
+        println!(
+            "  {id}  status={status}  label={label:?}  created={created}{marker}",
+            id = d.device_id,
+            status = d.status,
+            label = d.label,
+            created = d.created_at,
+        );
+    }
+    if acct.devices.len() < 2 {
+        // Not a nag: the only remedy for a lost account is another device that
+        // is already in it, and there is no recovery path of any kind.
+        println!(
+            "\n  NOTE: this account has one device. There is NO RECOVERY — if you lose it, the\n  \
+             account and its vaults are permanently unreachable. Enroll a second device:\n    \
+             sigil account invite            # here\n    \
+             sigil device enroll --token <invite>   # on the other device"
+        );
+    }
+    Ok(())
+}
+
+/// `sigil account invite [--ttl <seconds>] [--pin-key <b64>]`
+///
+/// Mint a SINGLE-USE invite that lets one more device join this account. The
+/// secret is printed ONCE, to stdout, and is never written to a file or a log.
+fn cmd_account_invite(f: &AccountFlags) -> Result<(), String> {
+    let server = resolve_server(f.server.clone());
+    let (_, identity) = account_identity(f.key.clone())?;
+    let auth = identity.auth();
+
+    let ttl = match &f.ttl {
+        None => None,
+        Some(s) => Some(
+            s.parse::<u64>()
+                .map_err(|_| format!("--ttl {s:?} must be a positive whole number of seconds"))
+                .and_then(|v| {
+                    if v == 0 {
+                        Err("--ttl must be greater than 0".to_string())
+                    } else {
+                        Ok(v)
+                    }
+                })?,
+        ),
+    };
+    let pin = match &f.pin_key {
+        None => None,
+        Some(b64) => {
+            use base64::Engine as _;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(b64.as_bytes())
+                .map_err(|e| format!("--pin-key must be standard base64: {e}"))?;
+            let arr: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+                format!(
+                    "--pin-key must decode to exactly 32 bytes (an Ed25519 public key), got {}",
+                    raw.len()
+                )
+            })?;
+            Some(arr)
+        }
+    };
+
+    let inv = create_account_invite(&server, &auth, ttl, pin.as_ref())
+        .map_err(|e| explain_account_error(e, "minting an invite"))?;
+
+    // The secret is shown exactly once. Warn BEFORE printing it, on stderr, so a
+    // piped stdout still carries only the value.
+    if inv.pinned {
+        eprintln!(
+            "!! This invite is PINNED to one public key: only that key can redeem it. It is still\n\
+             !! single-use and expires at {}. It is shown ONCE and is not recoverable.",
+            inv.expires_at
+        );
+    } else {
+        eprintln!(
+            "!! This invite is a BEARER SECRET: anyone who reads it before {} can join your account\n\
+             !! and inherit its subscription. The dev transport is PLAIN HTTP. Pass --pin-key <b64>\n\
+             !! (the joining device's public key) to bind it to one device. Shown ONCE.",
+            inv.expires_at
+        );
+    }
+    println!("{}", inv.invite);
+    println!(
+        "  invite_id: {id}  (public handle — revoke with `sigil account revoke-invite {id}`)\n  \
+         account:   {acct}\n  expires:   {exp}\n  redeem on the other device with:\n    \
+         sigil device enroll --token <the invite above> --label <name>",
+        id = inv.invite_id,
+        acct = inv.account_id,
+        exp = inv.expires_at,
+    );
+    println!(
+        "  NOTE: joining grants AUTHORIZATION only. The new device reads nothing until you share a\n  \
+         vault key to it: `sigil vault share --vault <id> --to <its device id>`."
+    );
+    Ok(())
+}
+
+/// `sigil account invites` — list this account's OPEN invites (metadata only).
+fn cmd_account_invites(f: &AccountFlags) -> Result<(), String> {
+    if f.ttl.is_some() || f.pin_key.is_some() {
+        return Err("account invites takes --key/--server only".into());
+    }
+    let server = resolve_server(f.server.clone());
+    let (_, identity) = account_identity(f.key.clone())?;
+    let auth = identity.auth();
+
+    let invites = list_account_invites(&server, &auth)
+        .map_err(|e| explain_account_error(e, "listing invites"))?;
+    if invites.is_empty() {
+        println!("no open invites");
+        return Ok(());
+    }
+    println!("{} open invite(s):", invites.len());
+    for i in &invites {
+        println!(
+            "  {id}  created_by={by}  created={created}  expires={exp}  pinned={pinned}",
+            id = i.invite_id,
+            by = i.created_by_device_id,
+            created = i.created_at,
+            exp = i.expires_at,
+            pinned = i.pinned,
+        );
+    }
+    println!(
+        "  (metadata only — the server cannot re-serve an invite secret, and neither can this CLI)"
+    );
+    Ok(())
+}
+
+/// `sigil account revoke-invite <inviteID>` — kill an unredeemed invite.
+fn cmd_account_revoke_invite(target: Option<String>, f: &AccountFlags) -> Result<(), String> {
+    if f.ttl.is_some() || f.pin_key.is_some() {
+        return Err("account revoke-invite takes <inviteID> plus --key/--server only".into());
+    }
+    let target = target.ok_or_else(|| "missing <inviteID> to revoke".to_string())?;
+    let server = resolve_server(f.server.clone());
+    let (_, identity) = account_identity(f.key.clone())?;
+    let auth = identity.auth();
+
+    revoke_account_invite(&server, &auth, &target)
+        .map_err(|e| explain_account_error(e, "revoking an invite"))?;
+    println!("revoked invite {target}");
+    Ok(())
+}
 
 /// Parsed flags for the `vault` subcommands.
 #[derive(Default)]

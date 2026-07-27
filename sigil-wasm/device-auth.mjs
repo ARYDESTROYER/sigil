@@ -34,8 +34,15 @@
 // (fetch, crypto.subtle, btoa/atob). The only environment-specific bit is base64,
 // which is feature-detected.
 //
-// Pre-audit / UNAUDITED / DEV / LOCALHOST / PLAIN-HTTP. Not the product's account
-// or key-management model. Do NOT point it at a remote host.
+// ACCOUNTS (Phase 52) live at the bottom of this file: getAccount /
+// createAccountInvite / listAccountInvites / revokeAccountInvite. They add NO
+// canonical message and NO header — an account invite is redeemed by the
+// UNCHANGED enrollDevice, and every account call is an ordinary v3 request.
+//
+// Pre-audit / UNAUDITED / DEV / LOCALHOST / PLAIN-HTTP. This is a real
+// authorization model, not a reviewed one, and an account is AUTH METADATA ONLY:
+// no email, no password, no session, no recovery. Do NOT point it at a remote
+// host.
 
 import { pushContainer, pullContainers } from "./sync.mjs";
 
@@ -459,9 +466,13 @@ export function explainAuthStatus(status) {
     case 401:
       return "401 unauthorized — this device is not authenticated (unknown, revoked, bad signature, clock skew over 300s, or a replayed request).";
     case 403:
-      return "403 forbidden — this device IS authenticated but is not authorized for that vault. Ask the vault owner to grant it access.";
+      return "403 forbidden — this device IS authenticated but is not permitted. Either it is not authorized for that vault (ask a device in the owning account to grant it access), or it carries NO ACCOUNT at all — which happens only when a pre-account-model server enrolled it against an already-migrated database, and which an operator repairs with `sigild migrate adopt`. The two are deliberately indistinguishable from here.";
+    case 404:
+      return "404 not found — no such open invite in YOUR account. An invite belonging to another account is deliberately indistinguishable from one that never existed.";
     case 409:
-      return "409 conflict — that public key is already enrolled.";
+      return "409 conflict — that public key is already enrolled, or the account is at its device / open-invite limit.";
+    case 500:
+      return "500 server error — a server-side fault (the device registry could not be read or written). It is NOT a verdict on this device: retry.";
     case 501:
       return "501 not implemented — the server does not have the device model enabled (SIGILD_ENABLE_DEV_OPS + SIGILD_DEVICE_AUTH).";
     default:
@@ -512,8 +523,18 @@ async function failResponse(res, what) {
  *      WASM) over {@link canonicalEnrollMessage}, which binds the token digest,
  *      the timestamp, a fresh nonce, the submitted public key and the label.
  *
- * The token is single-use: a FAILED attempt burns it too, exactly as the server
- * documents. Throws {@link DeviceAuthError} on any non-201.
+ * An OPERATOR enrollment token is single-use and a FAILED attempt burns it too,
+ * exactly as the server documents.
+ *
+ * ⭐ JOINING AN ACCOUNT USES THIS SAME CALL (Phase 52). An account INVITE minted
+ * by a device already in an account (see {@link createAccountInvite}) is passed
+ * as `token` here, verbatim — the enrollment challenge already binds the token
+ * DIGEST, so an invite needs no new header, no new signed-message domain and no
+ * client change. An operator token founds a NEW account; an invite JOINS the
+ * inviter's. The returned `accountId` says which, and is `""` against a server
+ * without the account model.
+ *
+ * Throws {@link DeviceAuthError} on any non-201.
  */
 export async function enrollDevice(wasm, { baseUrl, token, label = "", seed }) {
   if (!token) throw new Error("device-auth: an enrollment token is required");
@@ -559,6 +580,8 @@ export async function enrollDevice(wasm, { baseUrl, token, label = "", seed }) {
     label: json.label ?? label,
     status: json.status ?? "active",
     createdAt: json.created_at ?? "",
+    // ADDITIVE (Phase 52): a server without the account model omits it.
+    accountId: json.account_id ?? "",
   };
 }
 
@@ -777,5 +800,155 @@ export async function listDevices({ baseUrl, adminToken }) {
     headers: { [HEADER_ADMIN_TOKEN]: adminToken },
   });
   if (res.status !== 200) await failResponse(res, "listDevices");
+  return res.json();
+}
+
+// ── the ACCOUNT model (Phase 52) ─────────────────────────────────────────────
+//
+// An ACCOUNT is a group of one person's own devices. It is what a SUBSCRIPTION
+// and a VAULT'S OWNERSHIP belong to — so paying on one device entitles the
+// others, and revoking one device no longer orphans the vaults it claimed.
+//
+// THE STRUCTURAL RULE, MIRRORED HERE: nothing below puts an account id in a
+// path, a query string or a body. The server always reads the account off the
+// device row of the signature it just verified, which is what makes a
+// cross-account request unconstructible rather than merely rejected. If you ever
+// find yourself wanting to add an `accountId` parameter to one of these, the
+// design has failed.
+//
+// NO NEW CRYPTO AND NO NEW WIRE FORMAT: every call rides the EXISTING
+// {@link signedFetch} contract-v3 path, and JOINING rides the EXISTING
+// {@link enrollDevice} path with the invite as its `token`. The three canonical
+// message implementations (Go server, Rust CLI, this module) are untouched.
+//
+// HONEST SCOPE — surface these in any UI built on this module:
+//   * NO RECOVERY. An account is reachable only through a member device's
+//     private key. Lose or revoke every device and the account, its vaults and
+//     its subscription are permanently unreachable.
+//   * Joining grants AUTHORIZATION, never DECRYPTION. A joined device reads
+//     nothing until a member wraps the vault key to its hybrid public key
+//     (sharing.mjs). "Device joined — waiting for a key from another device" is
+//     the honest state to render.
+//   * Membership is FLAT: any member may invite, revoke every other member, and
+//     run checkout. Revoking a compromised device does NOT revoke the devices it
+//     invited.
+//   * An UNPINNED invite is a BEARER SECRET for its whole TTL, over a plain-HTTP
+//     dev transport.
+
+/** Reject invite handles that cannot sit verbatim in a URL path segment. */
+function checkInviteId(inviteId) {
+  if (typeof inviteId !== "string" || inviteId === "" || /[\/\s]/.test(inviteId)) {
+    throw new Error(`device-auth: invalid invite id ${JSON.stringify(inviteId)}`);
+  }
+}
+
+/**
+ * READ the signing device's own account.
+ *
+ *   getAccount(wasm, identity, baseUrl)
+ *     -> { account_id, created_at, device_count, device_limit, devices: [...] }
+ *
+ * There is no route that reads another account and none that enumerates them, so
+ * this is always "mine". A 403 can mean the device carries no account — the
+ * server fails CLOSED there rather than falling back to the device id, and does
+ * it with the SAME coarse body as any other refusal so no oracle appears. That
+ * state is only produced by a pre-account-model server writing to an
+ * already-migrated database; the operator repairs it with `sigild migrate adopt`.
+ */
+export async function getAccount(wasm, identity, baseUrl) {
+  const res = await signedFetch(wasm, { ...identity, baseUrl }, "GET", "/v1/account", "", null);
+  if (res.status !== 200) await failResponse(res, "getAccount");
+  return res.json();
+}
+
+/**
+ * MINT a single-use invite that lets ONE more device join this account.
+ *
+ *   createAccountInvite(wasm, identity, baseUrl, { ttlSeconds?, inviteePublicKey? })
+ *     -> { invite_id, invite, account_id, expires_at, pinned }
+ *
+ * ⚠️ `invite` is a BEARER SECRET returned exactly ONCE: it is never re-served,
+ * never logged and stored only as a digest. Show it once, do not persist it, and
+ * clear it from memory after use — the same handling this module already gives
+ * an enrollment token.
+ *
+ * `ttlSeconds` may only SHORTEN the invite's life (the server clamps to its own
+ * ceiling). `inviteePublicKey` (a 32-byte Uint8Array, the joining device's
+ * Ed25519 public key from {@link devicePublicKey}) PINS the invite to that one
+ * key, so an intercepted invite is useless to anyone else. Nothing forces
+ * pinning; prefer it whenever the UI can carry the public key back.
+ *
+ * The joining device redeems it through the UNCHANGED {@link enrollDevice}.
+ */
+export async function createAccountInvite(
+  wasm,
+  identity,
+  baseUrl,
+  { ttlSeconds = 0, inviteePublicKey = null } = {},
+) {
+  // NOTE WHAT IS NOT HERE: no account id and no subject. The invite always lands
+  // in the CALLER's account, resolved server-side from the signature.
+  const payload = {};
+  if (ttlSeconds > 0) payload.ttl_seconds = Math.floor(ttlSeconds);
+  if (inviteePublicKey) {
+    if (!(inviteePublicKey instanceof Uint8Array) || inviteePublicKey.length !== DEVICE_SEED_LEN) {
+      throw new Error(
+        `device-auth: inviteePublicKey must be a ${DEVICE_SEED_LEN}-byte Uint8Array (an Ed25519 public key)`,
+      );
+    }
+    payload.invitee_public_key = bytesToBase64(inviteePublicKey);
+  }
+  const body = TEXT_ENCODER.encode(JSON.stringify(payload));
+
+  const res = await signedFetch(
+    wasm,
+    { ...identity, baseUrl },
+    "POST",
+    "/v1/account/invites",
+    "",
+    body,
+    { "Content-Type": "application/json" },
+  );
+  if (res.status !== 201) await failResponse(res, "createAccountInvite");
+  return res.json();
+}
+
+/**
+ * LIST this account's OPEN invites. METADATA ONLY — the secret and its digest are
+ * never served, so a minted invite can never be recovered from the server.
+ */
+export async function listAccountInvites(wasm, identity, baseUrl) {
+  const res = await signedFetch(
+    wasm,
+    { ...identity, baseUrl },
+    "GET",
+    "/v1/account/invites",
+    "",
+    null,
+  );
+  if (res.status !== 200) await failResponse(res, "listAccountInvites");
+  return res.json();
+}
+
+/**
+ * REVOKE an unredeemed invite of this account, by its PUBLIC handle.
+ *
+ * The server scopes the lookup by (account, invite id), so a FOREIGN handle and a
+ * MISSING one both answer 404 — there is no enumeration oracle, which is why this
+ * cannot tell you which it was.
+ */
+export async function revokeAccountInvite(wasm, identity, baseUrl, inviteId) {
+  checkInviteId(inviteId);
+  const path = `/v1/account/invites/${inviteId}/revoke`;
+  const res = await signedFetch(
+    wasm,
+    { ...identity, baseUrl },
+    "POST",
+    path,
+    "",
+    new Uint8Array(0),
+    { "Content-Type": "application/json" },
+  );
+  if (res.status !== 200) await failResponse(res, "revokeAccountInvite");
   return res.json();
 }

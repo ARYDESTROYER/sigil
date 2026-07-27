@@ -128,7 +128,9 @@ func (s *PostgresDeviceStore) GetKeyEnvelope(ctx context.Context, vaultID, recip
 }
 
 // ListKeyEnvelopeRecipients returns METADATA for every envelope stored for a
-// vault, ordered by recipient device ID. It deliberately selects octet_length()
+// vault, ordered by recipient device ID — BYTE-WISE (COLLATE "C"), so the order
+// matches Go's own string comparison on every database (see
+// PostgresDeviceStore.ListDevices). It deliberately selects octet_length()
 // rather than the blob itself: a vault owner needs to know WHICH devices hold a
 // wrapped key, and the ciphertext never has to leave the database for that.
 func (s *PostgresDeviceStore) ListKeyEnvelopeRecipients(ctx context.Context, vaultID string) ([]KeyEnvelopeMeta, error) {
@@ -139,7 +141,7 @@ func (s *PostgresDeviceStore) ListKeyEnvelopeRecipients(ctx context.Context, vau
 		`SELECT vault_id, recipient_device_id, sender_device_id, octet_length(blob), created_at
 		   FROM sigil_vault_key_envelopes
 		  WHERE vault_id = $1
-		  ORDER BY recipient_device_id`, vaultID)
+		  ORDER BY recipient_device_id COLLATE "C"`, vaultID)
 	if err != nil {
 		return nil, fmt.Errorf("list key envelopes: %w", err)
 	}

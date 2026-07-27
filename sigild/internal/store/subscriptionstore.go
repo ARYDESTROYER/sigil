@@ -46,9 +46,15 @@ var ErrSubscriptionNotFound = errors.New("store: subscription not found")
 
 // Subscription is one subject's billing record.
 //
-// Subject is OUR identifier for the payer (in the current dev model, the
-// enrolled device ID that ran checkout). CustomerRef/SubscriptionRef are the
-// PROVIDER's opaque handles.
+// Subject is OUR identifier for the payer: since Phase 52 it is the ACCOUNT the
+// enrolled device that ran checkout belongs to, so entitlement follows the
+// customer across their devices. Migration 0005 rewrote the pre-existing
+// device-keyed rows in place. CustomerRef/SubscriptionRef are the PROVIDER's
+// opaque handles.
+//
+// The type is UNCHANGED — an opaque string — which is why making accounts the
+// billing subject needed no interface change, no signature change and no backend
+// rewrite of this money-handling seam.
 type Subscription struct {
 	Subject          string
 	Provider         string

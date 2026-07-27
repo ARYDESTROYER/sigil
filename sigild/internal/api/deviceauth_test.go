@@ -30,11 +30,13 @@ const (
 	testAdminToken  = "test-admin-token-000000000000001"
 )
 
-// testDevice is a client-side keypair plus the device ID the server assigned it.
+// testDevice is a client-side keypair plus the device ID — and, since Phase 52,
+// the ACCOUNT ID — the server assigned it.
 type testDevice struct {
-	ID   string
-	Pub  ed25519.PublicKey
-	Priv ed25519.PrivateKey
+	ID      string
+	Account string
+	Pub     ed25519.PublicKey
+	Priv    ed25519.PrivateKey
 }
 
 // deviceEnv bundles a dev-ops router with the v3 device model enabled and the
@@ -126,7 +128,10 @@ func enrollDevice(t *testing.T, env *deviceEnv, token, label string) testDevice 
 	if out.DeviceID == "" || out.Status != string(store.DeviceActive) {
 		t.Fatalf("enroll response = %+v, want a device_id and status=active", out)
 	}
-	return testDevice{ID: out.DeviceID, Pub: pub, Priv: priv}
+	if out.AccountID == "" {
+		t.Fatalf("enroll response = %+v, want an account_id", out)
+	}
+	return testDevice{ID: out.DeviceID, Account: out.AccountID, Pub: pub, Priv: priv}
 }
 
 // signV3 sets the four v3 contract headers on req, signing the canonical v3

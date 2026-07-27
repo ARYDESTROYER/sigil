@@ -49,7 +49,12 @@ func newTestDeviceStore(t *testing.T) *PostgresDeviceStore {
 			`DELETE FROM sigil_device_hybrid_keys WHERE updated_at >= $1`,
 			`DELETE FROM sigil_device_grants WHERE created_at >= $1`,
 			`DELETE FROM sigil_enrollment_tokens WHERE issued_at >= $1`,
+			// Account rows (Phase 52). Invites and vault-owner rows FK-reference
+			// sigil_accounts, and sigil_devices does too, so accounts go LAST.
+			`DELETE FROM sigil_account_invites WHERE created_at >= $1`,
+			`DELETE FROM sigil_vault_owners WHERE claimed_at >= $1`,
 			`DELETE FROM sigil_devices WHERE created_at >= $1`,
+			`DELETE FROM sigil_accounts WHERE created_at >= $1`,
 		} {
 			if _, err := s.pool.Exec(cctx, q, before.Add(-time.Minute)); err != nil {
 				t.Logf("cleanup %q: %v", q, err)

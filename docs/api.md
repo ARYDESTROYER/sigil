@@ -12,7 +12,12 @@
 > **vault-sharing relay** ([below](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)):
 > the server parks a device's **public** hybrid key and an **opaque wrapped vault
 > key** for a recipient device, returning both verbatim — it holds no
-> decapsulation key and cannot read the envelope it relays. A **dev-gated, opt-in
+> decapsulation key and cannot read the envelope it relays. On top of the v3
+> model sits an **account** ([below](#account-model-dev-gated--phase-52)): a
+> server-assigned id on the device row that **entitlement** and **vault
+> ownership** key off instead of the device. It is **auth metadata only** — no
+> email, no password, no session, **no recovery** — and ⭐ **no request anywhere
+> names an account**. A **dev-gated, opt-in
 > billing layer** (hosted checkout + provider webhooks, [below](#billing--subscriptions-dev-gated-opt-in--phase-45))
 > stores subscription state but **no card data**, and has **never been run
 > against a live payment provider**. Nothing
@@ -113,7 +118,11 @@ the source of truth for the exact strings):
 | `sigild_device_enroll_denied_total{reason="…"}` | counter | enrollment attempts denied, labelled by reason |
 | `sigild_device_revocations_total` | counter | device revocations performed |
 | `sigild_vault_grants_total` | counter | per-vault access grants created |
-| `sigild_vault_claims_total` | counter | vault ownership claims (trust-on-first-write) |
+| `sigild_vault_claims_total` | counter | vault ownership claims (trust-on-first-write — **by account** since Phase 52) |
+| `sigild_accounts_created_total` | counter | accounts created (an **operator-token** enrollment always founds a new one) |
+| `sigild_account_invites_created_total` | counter | account invites minted (`POST /v1/account/invites`) |
+| `sigild_account_invites_revoked_total` | counter | account invites revoked before use |
+| `sigild_account_joins_total` | counter | devices that joined an **existing** account by redeeming an invite |
 | `sigild_device_hybrid_keys_published_total` | counter | device hybrid **public** key publishes, including re-publishes (`PUT /v1/devices/{deviceID}/hybrid-key`) |
 | `sigild_vault_key_envelopes_total` | counter | opaque wrapped-vault-key envelopes deposited (`PUT /v1/vaults/{vaultID}/keys/{deviceID}`) |
 | `sigild_vault_key_envelope_fetches_total` | counter | envelopes collected by their recipient (`GET /v1/vaults/{vaultID}/keys/{deviceID}`) |
@@ -122,7 +131,7 @@ the source of truth for the exact strings):
 | `sigild_billing_webhooks_total{provider="…",outcome="…"}` | counter | **authenticated** webhooks handled, by provider and outcome (`accepted`, `ignored`, `duplicate`, `stale`, `illegal`, `unresolved`) |
 | `sigild_billing_webhook_rejected_total{reason="…"}` | counter | webhooks rejected **before** application, by reason (`bad_signature`, `malformed`, `unknown_provider`, `payload_too_large`, `store_error`) |
 | `sigild_billing_subscription_transitions_total{status="…"}` | counter | **applied** subscription status transitions, by target status (`none`, `trialing`, `active`, `past_due`, `canceled`) |
-| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`4`** once `0004_key_sharing.sql` is applied) |
+| `sigild_schema_version` | gauge | applied op-log DB migration version (`0` when the backend is not Postgres; **`5`** once `0005_accounts.sql` is applied) |
 | `sigild_build_info{version="…"}` | gauge (`1`) | build identity; the version label carries the injected build SHA |
 
 Counters are **process-lifetime and unlabelled by vault or device** (no per-vault
@@ -135,6 +144,14 @@ token, a signature, or a nonce. The four **vault-sharing** counters
 `sigild_vault_key_envelope_fetches_total`, `sigild_key_envelope_deletes_total`)
 follow the same rule: they are counts only, carrying no envelope byte, no hybrid
 public key, no vault key, and no vault or device ID as a label.
+
+The four **account** counters (Phase 52) follow the same rule and are counts only:
+**no account id, device id, vault id or invite handle may ever become a label**, and
+the account model deliberately added **no fine-grained invite-failure counter** —
+`/metrics` is always-on and unauthenticated, so a per-cause counter there would be a
+weak correlatable oracle on invite state. Every invite failure collapses onto an
+**existing** coarse label on `sigild_device_enroll_denied_total{reason}` (whose only
+new value is `account_full`); the fine-grained cause goes to the audit log alone.
 
 Every **billing** label above comes from a **closed set materialized at startup**
 (the three provider names, the six outcomes, the five rejection reasons, the five
@@ -561,9 +578,20 @@ on the requested vault.
 | `SIGILD_ENROLL_TOKENS` | **required when device auth is on** | Comma-separated operator-provisioned enrollment tokens (bootstrap bearer secrets). Each must be **≥ 16 characters**; duplicates are rejected. Only their **SHA-256 digests** ever reach the server's memory, the registry, the audit log, or `/metrics` — the plaintext is never stored. Without at least one token, **no device can ever enroll**. |
 | `SIGILD_ENROLL_TOKEN_TTL` | optional | A **positive Go duration** (e.g. `24h`). A token then expires that long after it was **first registered** — registration is idempotent, so restarts do not extend the clock. **Unset ⇒ tokens never expire, but remain SINGLE-USE.** |
 | `SIGILD_ADMIN_TOKEN` | optional | Operator token for the operator-only routes (list all devices, revoke **any** device); **≥ 16 characters**. **Unset ⇒ those paths are permanently `401`** — there is **no implicit open-admin mode**. Compared in constant time; never logged or exported. |
+| `SIGILD_ACCOUNT_MAX_DEVICES` | optional | Member devices per account. Default **10**, range `[1, 1000]`. Counts **ACTIVE devices only** — a revoked device frees its seat. Anti-freeloading, **not** anti-fraud. |
+| `SIGILD_ACCOUNT_MAX_INVITES` | optional | **Open** (unused, unexpired, unrevoked) invites per account. Default **5**, range `[1, 100]`. It bounds stored **state**, not request volume — there is **no rate limit on invite minting**. |
+| `SIGILD_ACCOUNT_INVITE_TTL` | optional | Go duration; how long a freshly minted invite stays redeemable. Default **15m**, must be `> 0` and `<= 24h`. A client may request a **shorter** life, never a longer one. |
 
-All four are parsed and validated **fail-fast, before the listener binds**; a
-malformed value is a clear startup error, not a surprise at request time.
+All seven are parsed and validated **fail-fast, before the listener binds**; a
+malformed value is a clear startup error, not a surprise at request time. An
+account value **outside its range is an error, never a silent clamp**.
+
+> **There is deliberately no `SIGILD_ACCOUNTS` switch.** The account model
+> ([below](#account-model-dev-gated--phase-52)) rides `SIGILD_DEVICE_AUTH`,
+> because a binary that could run either ownership model would hold **two
+> ownership truths at once**. Setting any `SIGILD_ACCOUNT_*` variable **without**
+> `SIGILD_DEVICE_AUTH` is a **boot error** — a knob that silently does nothing is
+> worse than a refusal.
 
 **Registry durability.** When the Postgres op-log backend
 (`SIGILD_OPLOG_POSTGRES`) is active, the registry is durable and **shares that
@@ -582,7 +610,7 @@ Three tables are added on top of the untouched `0001_init`:
 
 | Table | Holds |
 |-------|-------|
-| `sigil_devices` | `device_id` (PK), `public_key` (`bytea`, **UNIQUE** — a key identifies at most one device), `label`, `status`, `created_at`, `revoked_at` |
+| `sigil_devices` | `device_id` (PK), `public_key` (`bytea`, **UNIQUE** — a key identifies at most one device), `label`, `status`, `created_at`, `revoked_at`, and — since `0005_accounts.sql` — a **nullable** `account_id` |
 | `sigil_enrollment_tokens` | `token_hash` (PK, the SHA-256 **hex digest** — never the token), `issued_at`, `expires_at`, `used_at` (the single-use marker), `used_by` |
 | `sigil_device_grants` | `(vault_id, device_id)` (PK), `permission`, `is_owner`, `created_at`; a **partial `UNIQUE` index `sigil_device_grants_one_owner (vault_id) WHERE is_owner`** makes the ownership claim atomic in the database |
 
@@ -591,9 +619,11 @@ server-assigned IDs, labels, permissions, timestamps. It touches **nothing** in
 `sigil_vault_ops` — the opaque blob, its per-op hash chain, and the
 zero-knowledge boundary are **unaffected**. `sigild_schema_version` reports **2**
 once applied (**3** once `0003_billing.sql` is applied — see
-[Billing](#billing--subscriptions-dev-gated-opt-in--phase-45) — and **4** once
+[Billing](#billing--subscriptions-dev-gated-opt-in--phase-45) — **4** once
 `0004_key_sharing.sql` is applied, see
-[Vault sharing](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)).
+[Vault sharing](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46) —
+and **5** once `0005_accounts.sql` is applied, see
+[Account model](#storage-migration-0005_accountssql)).
 
 ### Signed request contract (v3)
 
@@ -652,10 +682,11 @@ backstop. **A multi-instance deployment needs a shared store (e.g. Redis)**;
 device request nonces share one namespace (enrollment nonces are
 prefix-separated).
 
-### Authorization: per-vault grants + trust-on-first-write ownership
+### Authorization: account ownership + per-vault grants (trust-on-first-write)
 
-A grant maps `(vaultID, deviceID) -> permission`, where `permission` is `read`
-or `write` and **`write` implies `read`**. Each route declares what it needs:
+Ownership belongs to an **account** and a grant maps `(vaultID, deviceID) ->
+permission`, where `permission` is `read` or `write` and **`write` implies
+`read`**. Each route declares what it needs:
 
 | Route | Needs |
 |-------|-------|
@@ -669,20 +700,39 @@ or `write` and **`write` implies `read`**. Each route declares what it needs:
 | `GET /v1/vaults/{vaultID}/keys` | **write** (rotation support; metadata only) |
 | `DELETE /v1/vaults/{vaultID}/keys/{deviceID}` | **write** (rotation support) |
 
-**Ownership is TRUST ON FIRST WRITE (TOFU).** A vault with no owner is claimed
-by the **first device that successfully authenticates a WRITE** to it; that
-device becomes the owner with `write` permission. The claim is **atomic** in both
-backends (a mutex in memory; the partial `UNIQUE` index in Postgres), so exactly
-one of N concurrent first-writers wins and the losers get `403`. **Reads never
-claim** — reading an unowned vault is `403`. Only the **owner** may grant another
-device access, and the grantee must be an enrolled, non-revoked device.
+**Ownership is TRUST ON FIRST WRITE — by ACCOUNT (Phase 52).** A vault with no
+owner is claimed by the **first account that successfully authenticates a WRITE**
+to it. The claim is **atomic** in both backends (a mutex in memory; the
+`sigil_vault_owners` **PRIMARY KEY** in Postgres), so exactly one of N concurrent
+first-writers wins — and a loser belonging to the **winning account** is allowed
+through, because two siblings racing a legitimate first write must both succeed.
+**Reads and `GET`/`DELETE …/keys` never claim** — reading an unowned vault is
+`403`.
 
-> **Honest limitation.** TOFU is a **dev ownership model, not an account model.**
-> It assumes the first writer of a high-entropy, client-chosen vault ID is its
-> legitimate owner; an attacker who writes to an **unclaimed** ID first becomes
-> its owner and locks the real owner out. Revoking a vault's **owner ORPHANS the
-> vault** — there is **no ownership transfer**, so afterwards nobody can grant on
-> it (existing grantees keep only what they already hold).
+Three rules follow, and they are the whole authorization model:
+
+1. **Every device of the owning account has full access to that vault, with no
+   grant row of its own.** This is the fix for the orphaning defect: revoking the
+   device that happened to claim a vault no longer strands it.
+2. **Ownership (`needOwner`) is satisfied ONLY by account ownership.** A legacy
+   `is_owner` grant row **never** satisfies it, so data drift cannot hand
+   ownership powers to a non-owning account.
+3. **A cross-account share is still a per-DEVICE grant.** Key envelopes are
+   addressed to a *device's* hybrid identity, so an account-wide grant would
+   authorize devices holding no envelope — authorization and knowledge would
+   drift apart.
+
+The `is_owner` flag on `sigil_device_grants` is **retained as the per-device VIEW**
+of the same fact (so `GET …/grants` stays byte-identical for existing data and
+existing clients), but **no authorization decision reads it**.
+
+> **Honest limitation.** Trust-on-first-write **did not go away — it moved up one
+> level.** An attacker who writes to an **unclaimed**, high-entropy vault ID
+> first becomes its owning account and locks the real owner out with a `403`.
+> Ownership **never moves between accounts** (no transfer, merge or split), and
+> while revoking one device no longer orphans a vault, **losing or revoking every
+> device in an account does** — permanently, with **no recovery** (see
+> [Account model → honest limits](#account-model--honest-limits)).
 
 ### `401` vs `403`, and the absence of an auth oracle
 
@@ -690,12 +740,33 @@ device access, and the grantee must be an enrolled, non-revoked device.
   from a known, active device (missing/stale/bad signature, unknown device,
   revoked device, replayed nonce, bad admin token).
 - **`403 Forbidden`** — *authenticated, but not authorized*: a valid device
-  signature, but no sufficient grant on the vault (`unauthorized_vault`), not
-  the vault owner (`not_vault_owner`), or acting on another device
-  (`forbidden_device`).
+  signature, but no sufficient grant on the vault (`unauthorized_vault`), the
+  vault belongs to another account (`forbidden_account`), not the vault's owning
+  account (`not_vault_owner`), acting on another account's device
+  (`forbidden_device`), **the signing device carries no account at all**
+  (`missing_account`), or **the vault's only ownership record is a legacy owner
+  grant whose device resolves to no account** (`vault_owner_unresolved`).
 - **`500`** — the registry itself could not be read/written
   (`store_unavailable`), returned as `500` **specifically so an infrastructure
   fault is never mistaken for a credential verdict**.
+
+> **Only a genuine FAULT is a `500`.** `missing_account` and
+> `vault_owner_unresolved` are **data states the server can read plainly** — both
+> are produced by a **pre-0005 binary** writing to an already-migrated database
+> (a rolling deploy or a rollback window) — so they are **refusals, not
+> malfunctions**, and answer `403`. They still **fail closed**: such a device is
+> refused everywhere and the server **never falls back to the device ID**, which
+> would silently resurrect the model the account replaced. The client body is
+> **byte-identical to every other `403`**, so no oracle appears; the typed reason
+> reaches only the audit log and the already-closed metric label set. The repair
+> is **`sigild migrate adopt`** (see
+> [`deployment.md` §11](deployment.md#11-schema-migrations-postgres-backend)).
+>
+> ⚠️ **The comment at `sigild/internal/store/migrations/0005_accounts.sql:42` is
+> STALE.** It says a NULL account "FAILS CLOSED (`missing_account` -> 500)". The
+> behaviour is **`403`**, as documented here. That file is an **applied
+> migration** and must not be edited — changing an applied migration's bytes is
+> worse than a stale comment — so **this reference is the authority**.
 
 The **response body is coarse on purpose**:
 
@@ -712,9 +783,19 @@ enum that goes **ONLY** to the audit log and the per-reason metric — there is
 
 `missing_headers`, `bad_timestamp`, `stale_timestamp`, `bad_signature`,
 `replayed`, `unknown_device`, `revoked_device`, `unauthorized_vault`,
-`not_vault_owner`, `forbidden_device`, `bad_admin_token`, `store_unavailable`;
+`not_vault_owner`, `forbidden_device`, `bad_admin_token`, `store_unavailable`,
+plus the account-model reasons `missing_account`, `forbidden_account` and
+`vault_owner_unresolved`;
 and for enrollment: `bad_enrollment_token`, `enrollment_token_used`,
-`enrollment_token_expired`, `bad_proof`, `malformed_key`, `device_exists`.
+`enrollment_token_expired`, `bad_proof`, `malformed_key`, `device_exists`,
+`account_full`.
+
+Account-**invite** failures carry a second, **finer** cause that goes to the
+**audit log only** — never a response body, never a metric label:
+`invite_unknown`, `invite_revoked`, `inviter_inactive`, `invite_used`,
+`invite_expired`, `invite_key_mismatch`, `account_full`, `device_exists`,
+`store_unavailable`. From a client, an unknown / used / expired / revoked invite
+and a revoked inviter are **indistinguishable**.
 
 ### `POST /v1/devices/enroll` — enroll a device
 
@@ -723,12 +804,38 @@ device ID (clients never choose their own ID, so an ID cannot be squatted).
 
 **Two independent factors, both mandatory:**
 
-1. an operator-provisioned **enrollment token** in `X-Sigil-Enroll-Token`,
-   matched in **constant time** against the configured digests and then **spent
-   atomically** — a token is **single-use**;
+1. a **credential** in `X-Sigil-Enroll-Token` — either an operator-provisioned
+   **enrollment token** (matched in **constant time** against the configured
+   digests and then **spent atomically**; **single-use**) **or, since Phase 52,
+   an account INVITE** (see [Account model](#account-model-dev-gated--phase-52));
 2. **proof of possession** — an Ed25519 signature in `X-Sigil-Signature` over the
    canonical enrollment challenge, verified against the **public key being
    submitted**. A bare public-key upload is **never** accepted.
+
+> ⭐ **AN INVITE IS PRESENTED IN THE EXISTING HEADER, UNDER THE EXISTING
+> CHALLENGE.** Nothing about the wire changed to make joining work — no new
+> header, no new signed-message domain, **no fourth canonical message to keep
+> byte-identical across Go/Rust/JS** — because the challenge below already binds
+> the credential's **SHA-256 digest**, and the digest already binds *which*
+> credential is in play. **Today's shipped clients can already join an account:**
+> `sigil device enroll --token <invite>`, or pasting the invite into the webapp's
+> or extension's existing enrollment-token field.
+>
+> **Which one it is, is decided at the atomic write, not on the unauthenticated
+> path.** The server checks only whether the presented digest matches a
+> configured **operator** token — with **no early return** and **no invite
+> lookup**, which would be a database round trip on the unauthenticated path and
+> a timing side channel on invite-hash existence. The proof and nonce checks are
+> byte-identical to Phase 41. Then:
+>
+> - an **operator token always founds a NEW account** (there is no operator route
+>   that inserts a device into an existing account); and
+> - **anything else is resolved as an INVITE**, which always **joins the
+>   inviter's** account and never founds one.
+>
+> **Invites are single-SUCCESS; operator tokens stay single-ATTEMPT.** Redemption
+> and the device insert are **one** operation, so N concurrent redemptions create
+> exactly one device and a failed insert leaves the invite usable.
 
 The enrollment challenge uses a **different domain** from the request contract,
 so a proof can never be repurposed as an op-log request signature (or the
@@ -762,12 +869,16 @@ is recorded **only after a valid proof**.
 - **Success — `201 Created`:**
 
   ```json
-  { "device_id": "dev_<raw-url-base64>", "label": "laptop", "status": "active", "created_at": "<RFC3339>" }
+  { "device_id": "dev_<raw-url-base64>", "account_id": "acct_<raw-url-base64>", "label": "laptop", "status": "active", "created_at": "<RFC3339>" }
   ```
 
   (`revoked_at` is present only once the device is revoked.) The response
   deliberately **omits the public key** — the client already has it, and the
   registry never echoes key material out of an endpoint that does not need to.
+  **`account_id` is ADDITIVE** (Phase 52): it names the account the device landed
+  in — a **new** one for an operator token, the **inviter's** for an invite — and
+  is **omitted when empty**, so a device row written by a rolled-back pre-0005
+  binary renders the shape it always did. Existing clients ignore it.
 
 - **Errors:**
 
@@ -775,8 +886,9 @@ is recorded **only after a valid proof**.
   |--------|--------------|------|
   | `400 Bad Request` | `invalid_request` | body unreadable / over 8 KiB, not a JSON object, or `label` too long |
   | `400 Bad Request` | `invalid_request` | `public_key` is not the standard-base64 of a **32-byte** Ed25519 public key (`malformed_key`) |
-  | `401 Unauthorized` | `unauthorized` | missing headers, stale timestamp, unknown/spent/expired token, bad proof, or a replayed nonce — **all return the same body**, so a prober cannot distinguish them |
+  | `401 Unauthorized` | `unauthorized` | missing headers, stale timestamp, unknown/spent/expired token, an unknown/used/expired/revoked **invite**, a revoked inviter, a **pinned-invite key mismatch**, bad proof, or a replayed nonce — **all return the same body**, so a prober cannot distinguish them |
   | `409 Conflict` | `device_exists` | that public key is already enrolled |
+  | `409 Conflict` | `account_full` | the invite resolved, but the target account is at `SIGILD_ACCOUNT_MAX_DEVICES` **active** devices. Reachable **only after** a credential and a valid proof have been accepted — exactly like `device_exists` — so the distinct status leaks nothing the caller did not already hold |
   | `500` | `internal` | the registry could not be read/written |
   | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
 
@@ -786,6 +898,11 @@ is recorded **only after a valid proof**.
 > server never silently permits a retry), but an operator must issue a **new**
 > token after such a failure. There is also **no rate limiting on enrollment
 > attempts** — the per-vault op-log limiter does not cover this route.
+>
+> **Account INVITES are different, on purpose: they are single-SUCCESS.** An
+> operator can re-mint a token from a shell; a customer mid-flow on a phone
+> cannot. Redemption and the device insert are one atomic operation, so a failed
+> insert leaves the invite usable.
 
 ### `GET /v1/devices` — list devices (operator)
 
@@ -796,8 +913,10 @@ implicit open-admin mode. Public keys are **not** included.
 - **Success — `200 OK`:**
 
   ```json
-  { "devices": [ { "device_id": "dev_…", "label": "laptop", "status": "active|revoked", "created_at": "<RFC3339>", "revoked_at": "<RFC3339, omitted when active>" } ] }
+  { "devices": [ { "device_id": "dev_…", "account_id": "acct_…", "label": "laptop", "status": "active|revoked", "created_at": "<RFC3339>", "revoked_at": "<RFC3339, omitted when active>" } ] }
   ```
+
+  (`account_id` is additive and omitted when empty — see the enrollment response.)
 
 - **Errors:** `401 unauthorized` (missing/incorrect admin token, audited as
   `bad_admin_token`); `500 internal`; `501 not_implemented` when the model is off.
@@ -809,13 +928,23 @@ before its signature is verified). Revocation is **idempotent**: revoking an
 already-revoked device succeeds and keeps the original `revoked_at`. The device
 row is **retained**, never deleted, so the audit trail stays explainable.
 
-**Two authorized paths, neither a bypass:**
+**Three authorized paths, none a bypass:**
 
 - the **operator admin token** (`X-Sigil-Admin-Token`) — may revoke **any**
-  device; this is the break-glass path for a lost/stolen device; or
+  device; this is the break-glass path for a lost/stolen device;
 - **self-revocation** — a valid **v3-signed** request whose signing device **is**
-  the device named in the path. A device may retire itself; it may **not** revoke
-  another device (that is `403`, audited as `forbidden_device`).
+  the device named in the path; or
+- **sibling revocation (Phase 52)** — a valid v3-signed request from **another
+  device of the SAME account**. Membership is **flat**, so this is symmetric:
+  ⚠️ **one compromised member device can revoke every other device in its
+  account.** That is visible in the audit log (`device.revoked` records
+  `revoked_by` and `account_id`); it is not prevented.
+
+**No existence oracle on the non-admin paths:** an **unknown** device and a
+device belonging to **another account** both answer `403` (audited as
+`forbidden_device`), never `404`. Only the **admin** path keeps its `404` — an
+operator holding the admin token can already enumerate the registry via
+`GET /v1/devices`.
 
 - **Success — `200 OK`:** `{ "device_id": "dev_…", "status": "revoked" }`
 - **Errors:**
@@ -824,14 +953,16 @@ row is **retained**, never deleted, so the audit trail stays explainable.
   |--------|--------------|------|
   | `400 Bad Request` | `missing_device_id` / `invalid_request` | empty path segment; body unreadable or over 8 KiB |
   | `401 Unauthorized` | `unauthorized` | no admin token **and** no valid v3 signature |
-  | `403 Forbidden` | `forbidden` | authenticated, but trying to revoke a **different** device |
-  | `404 Not Found` | `device_not_found` | no such device |
+  | `403 Forbidden` | `forbidden` | authenticated, but the target is neither this device nor a sibling in its account — **or does not exist**; also when the signing device carries no account (`missing_account`) |
+  | `404 Not Found` | `device_not_found` | no such device — **admin path only** |
   | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
 
 ### `POST /v1/vaults/{vaultID}/grants` — grant a device access to a vault
 
-The requesting device must be the vault's **owner** (the device that claimed it
-on first write); any other authorized device gets `403` (`not_vault_owner`). The
+The requesting device must belong to the vault's **owning ACCOUNT** (Phase 52 —
+any member qualifies, not only the device that happened to claim it); any other
+authorized device gets `403` (`not_vault_owner`). ⚠️ **A legacy `is_owner` grant
+row does NOT satisfy this** — ownership is an account property, full stop. The
 signature covers the body, so authorization runs **after** the body is read.
 
 - **Auth:** the four v3 headers.
@@ -871,9 +1002,18 @@ Any device with **read** access to the vault may see who else can reach it.
   ```json
   {
     "vaultID": "<vaultID>",
+    "owner_account_id": "acct_…",
     "grants": [ { "device_id": "dev_…", "permission": "write", "owner": true, "created_at": "<RFC3339>" } ]
   }
   ```
+
+  **`owner_account_id` is ADDITIVE (Phase 52) and load-bearing for
+  comprehension:** every device of the owning account holds full access **without
+  appearing in a grant row**, so without this field the response would read as
+  "nobody owns this vault". It is **omitted when the vault is unclaimed**. The
+  `grants` array and its `owner` flag are **byte-identical to before** — the flag
+  is retained as the per-device *view* of ownership, and no authorization
+  decision reads it.
 
 - **Errors:** `400 missing_vault_id`; `401 unauthorized`; `403 forbidden` (no
   grant — including on an **unowned** vault, since reads never claim); `500
@@ -989,6 +1129,315 @@ applies when dev-ops is on but no registry is configured
 (`SIGILD_DEVICE_AUTH` unset). The bodies of `PUT`/`POST` requests are drained and
 discarded, and the envelope route keeps its size cap even while stubbed.
 `GET /metrics` stays `200` throughout — it is never dev-gated.
+
+The **four account routes** ([below](#account-model-dev-gated--phase-52)) are
+gated identically but answer their **own** `501` stub, whose detail names that
+surface:
+
+```json
+{ "error": "not_implemented", "detail": "the account model (membership and invites) is not enabled on this server" }
+```
+
+---
+
+## Account model (DEV-GATED) — Phase 52
+
+> **DEV-GATED and UNAUDITED, and explicitly NOT an identity system.** An account
+> is **auth metadata only**: a server-assigned id on a device row. There is **no
+> email, no password, no session, no PII — and NO RECOVERY of any kind.** It is
+> active exactly when the v3 device model is (which already requires
+> `SIGILD_ENABLE_DEV_OPS`); there is deliberately **no separate switch**. See
+> [ADR 0040](decisions/0040-account-model.md).
+
+**Why it exists.** Before Phase 52 the only subject was a **device**, and two
+defects followed: a subscription belonged to a device, so **paying on your phone
+did not entitle your laptop**; and a vault was owned by a device, so **revoking
+that device orphaned the vault forever**. An account is the larger subject both
+of those needed.
+
+**The model in one sentence:** an account is a **server-assigned id on the device
+row**; a **single-use invite** minted by a member device is the only way a second
+device joins; and ⭐ **no request anywhere names an account** — the server always
+takes it from the device row of the signature it just verified.
+
+That last clause is structural, not defensive: there is **no path segment, no
+query parameter and no body field** anywhere in this API that names an account,
+so a cross-account request is **unconstructible**, not merely rejected. (A mint
+body carrying `account_id` or `subject` is ignored by `encoding/json`.)
+
+**What membership does and does not buy.** Membership confers **AUTHORIZATION,
+never DECRYPTION**. A joined device can authenticate and see its entitlement, and
+reads **nothing** until an existing member wraps the vault key to its hybrid
+public key
+([vault sharing](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)).
+The corollary is the reassuring half: **a hostile server can insert a device into
+any account** — it owns the registry — **and still cannot decrypt anything.**
+
+### How a second device joins
+
+There is **no join route**. A member mints an invite and the joining device
+presents it as its ordinary enrollment token:
+
+```
+device already in the account          the joining device
+──────────────────────────────         ─────────────────────────────────────────
+POST /v1/account/invites        ──▶     (paste the invite secret)
+  201 { "invite": "join_…" }            POST /v1/devices/enroll
+                                          X-Sigil-Enroll-Token: join_…
+                                          + the SAME proof of possession
+                                        201 { "device_id": …, "account_id": … }
+```
+
+The invite rides the **existing `X-Sigil-Enroll-Token` header** under the
+**existing enrollment challenge**, because that challenge already binds the
+credential's SHA-256 **digest**. **No new header, no new signed-message domain,
+no fourth canonical message** — see
+[`POST /v1/devices/enroll`](#post-v1devicesenroll--enroll-a-device).
+
+### Configuration
+
+The three `SIGILD_ACCOUNT_*` variables are documented with the rest of the v3
+configuration [above](#configuration). Summary: `SIGILD_ACCOUNT_MAX_DEVICES`
+(default **10**), `SIGILD_ACCOUNT_MAX_INVITES` (default **5**),
+`SIGILD_ACCOUNT_INVITE_TTL` (default **15m**) — all validated fail-fast before
+the listener binds, and all a **boot error** without `SIGILD_DEVICE_AUTH`.
+
+### Storage (migration `0005_accounts.sql`)
+
+| Table / column | Holds |
+|----------------|-------|
+| `sigil_accounts` | `account_id` (PK, `acct_` + raw-URL-base64 of 16 CSPRNG bytes), `created_at`, `created_by_device_id`. **No label and no status column** — a label is user data with no server-side use (and exactly where an email would get typed); a status column no route sets is dead schema |
+| `sigil_devices.account_id` | **Nullable**, referencing `sigil_accounts`. Deliberately nullable so a rolled-back pre-0005 binary can still enroll; the "every device has an account" invariant is enforced in the **application** |
+| `sigil_account_invites` | `invite_hash` (PK — the lowercase-hex **SHA-256** of the secret; the secret itself is **never** stored), `invite_id` (the **public** handle, UNIQUE), `account_id`, `created_by_device_id`, `invitee_public_key` (nullable — the pin), `created_at`, `expires_at`, `used_at`, `used_by_device_id`, `revoked_at` |
+| `sigil_vault_owners` | `vault_id` (**PK** — what makes the claim single-winner across processes), `account_id`, `claimed_by_device_id`, `claimed_at`. **This is the authority on vault ownership** |
+
+The migration ends with an **adoption backfill**, inside its single transaction:
+every already-enrolled device (active **and** revoked) gets its own singleton
+account named `acct_mig_<device_id>`; vault ownership is backfilled from existing
+`is_owner` grants (reading that table, writing nothing back to it); and
+subscriptions whose subject names a device are re-keyed to that device's account.
+`sigil_billing_processed_events.subject` is deliberately **not** rewritten.
+
+It is **pure DDL plus a metadata backfill**: **no column created here can hold a
+vault key, a password, a plaintext, a card detail, an email, a phone number, a
+display name, a bearer token, a signature or a nonce**, and `sigil_vault_ops` is
+not named anywhere in it — so the opaque blob and its tamper-evidence hash chain
+are byte-for-byte unchanged and `GET …/ops/verify` returns the **same
+`tip_hash`** before and after. `sigild_schema_version` reports **5** once applied.
+
+⚠️ **The comment at `0005_accounts.sql:42` is STALE:** it says a NULL account
+"FAILS CLOSED (`missing_account` -> 500)". The behaviour is **`403`** (see
+[`401` vs `403`](#401-vs-403-and-the-absence-of-an-auth-oracle)). That file is an
+**applied migration** and is not edited; this reference is the authority.
+
+### `GET /v1/account` — the caller's own account
+
+Returns the **authenticated device's** account and its members. There is no route
+that reads another account and none that enumerates accounts.
+
+- **Auth:** the four v3 headers (`BODY` is empty for GET).
+- **Success — `200 OK`:**
+
+  ```json
+  {
+    "account_id": "acct_…",
+    "created_at": "<RFC3339>",
+    "device_count": 2,
+    "revoked_device_count": 1,
+    "device_limit": 10,
+    "devices": [
+      { "device_id": "dev_…", "account_id": "acct_…", "label": "laptop", "status": "active", "created_at": "<RFC3339>" },
+      { "device_id": "dev_…", "account_id": "acct_…", "label": "old phone", "status": "revoked", "created_at": "<RFC3339>", "revoked_at": "<RFC3339>" }
+    ]
+  }
+  ```
+
+  ⚠️ **`device_count` COUNTS ACTIVE DEVICES ONLY**, because that is what
+  `device_limit` bounds: the cap is on **concurrent** devices, so **a revoked
+  device frees its seat**. `revoked_device_count` (new) reports the rest
+  separately rather than folding history into the limit, and `devices[]` still
+  lists **both**, so nothing is hidden.
+  <br>*(This is a behaviour change from the first cut of Phase 52, where revoked
+  devices consumed seats permanently — which turned the cap into a lifetime
+  enrollment limit that no operation could reverse, bricking an account under
+  exactly the "revoke and re-enroll" remedy this model prescribes.)*
+  <br>`created_at` is omitted if the account row cannot be read.
+
+- **Errors:** `401 unauthorized`; `403 forbidden` (the signing device carries no
+  account — audited as `missing_account`, repaired with `sigild migrate adopt`);
+  `500 internal`; `501 not_implemented`.
+
+### `POST /v1/account/invites` — mint a single-use invite
+
+Mints an invite for the **caller's** account. The secret is returned **exactly
+once, here** — it is never re-served, never logged, never a metric label, and
+only its SHA-256 digest is stored.
+
+- **Auth:** the four v3 headers (the signature covers the body, so authentication
+  runs after the body is read).
+- **Request body** (JSON, optional, capped at **8 KiB**):
+
+  ```json
+  { "ttl_seconds": 300, "invitee_public_key": "<standard-base64 of a raw 32-byte Ed25519 public key>" }
+  ```
+
+  Both fields are optional. `ttl_seconds` may only **shorten** the invite's life
+  — a value longer than the server's configured ceiling is ignored, never
+  honoured. `invitee_public_key` **PINS** the invite to one key, so an
+  intercepted invite cannot be redeemed by anyone else. **Note what is not here:
+  no `account_id` and no `subject`.**
+
+- **Success — `201 Created`:**
+
+  ```json
+  { "invite_id": "inv_…", "invite": "join_…", "account_id": "acct_…", "expires_at": "<RFC3339>", "pinned": false }
+  ```
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `invalid_request` | body unreadable / over 8 KiB, not a JSON object, or `invitee_public_key` is not the standard-base64 of a **32-byte** key |
+  | `401 Unauthorized` | `unauthorized` | the v3 signature check failed |
+  | `403 Forbidden` | `forbidden` | the signing device carries no account (`missing_account`) |
+  | `409 Conflict` | `account_full` | the account is already at `SIGILD_ACCOUNT_MAX_DEVICES` **active** devices — refused early, because minting an invite that could only ever fail is worse than a clear `409` |
+  | `409 Conflict` | `invite_limit` | the account already holds `SIGILD_ACCOUNT_MAX_INVITES` **open** invites |
+  | `500` | `internal` | the registry could not be read/written |
+  | `501 Not Implemented` | `not_implemented` | the account model is not enabled |
+
+> ⚠️ **An UNPINNED invite is a BEARER SECRET for its whole TTL**, and the dev
+> transport is **plain HTTP with no TLS**. Anyone who reads it in time can join
+> the account and inherit its entitlement. Pinning closes that; **nothing forces
+> pinning**.
+
+### `GET /v1/account/invites` — list this account's open invites
+
+**METADATA ONLY.** The secret and its digest are never served — a minted invite
+can never be recovered from the server.
+
+- **Auth:** the four v3 headers.
+- **Success — `200 OK`:**
+
+  ```json
+  {
+    "invites": [
+      { "invite_id": "inv_…", "created_by_device_id": "dev_…", "created_at": "<RFC3339>", "expires_at": "<RFC3339>", "pinned": true }
+    ]
+  }
+  ```
+
+  Only **open** invites (unused, unrevoked, unexpired) are listed, ordered by
+  `created_at` then `invite_id`.
+
+- **Errors:** `401 unauthorized`; `403 forbidden` (`missing_account`);
+  `500 internal`; `501 not_implemented`.
+
+### `POST /v1/account/invites/{inviteID}/revoke` — kill an unredeemed invite
+
+`{inviteID}` is the **public handle** (`inv_…`), never the digest.
+
+- **Auth:** the four v3 headers.
+- **Success — `200 OK`:** `{ "invite_id": "inv_…", "revoked": true }`
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `missing_invite_id` / `invalid_request` | empty path segment; body unreadable or over 8 KiB |
+  | `401 Unauthorized` | `unauthorized` | the v3 signature check failed |
+  | `403 Forbidden` | `forbidden` | the signing device carries no account (`missing_account`) |
+  | `404 Not Found` | `invite_not_found` | no such **open** invite |
+  | `500` | `internal` | the registry could not be read/written |
+  | `501 Not Implemented` | `not_implemented` | the account model is not enabled |
+
+> **No enumeration oracle.** The store scopes the update by
+> `(account_id, invite_id)`, so an invite handle belonging to **another account**
+> and one that **never existed** are indistinguishable — both `404`.
+
+### Audit log
+
+Four new events, all **metadata only**. They carry account ids, device ids, the
+**public** invite handle, an expiry and a fixed reason enum — and **never** an
+invite secret, an invite digest, an enrollment token, a key, a signature, a nonce
+or one byte of a blob.
+
+| Event | Fields |
+|-------|--------|
+| `account.created` | `request_id`, `account_id`, `created_by_device_id` — an operator-token enrollment founded a new account |
+| `account.device_joined` | `request_id`, `account_id`, `device_id`, `invited_by`, `invite_id` — names the **inviter**, which is what makes a planted device *visible* after the fact (flat membership means it is not *prevented*) |
+| `account.invite_created` | `request_id`, `invite_id`, `account_id`, `device_id`, `expires_at`, `pinned` |
+| `account.invite_revoked` | `request_id`, `invite_id`, `account_id`, `device_id` |
+
+Existing events gained fields: `device.enrolled` and `device.revoked` carry
+`account_id` (and `device.revoked`'s `revoked_by` may now be a **sibling** device
+id); `vault.claimed` carries `account_id` beside the claiming `device_id`;
+`device.enroll_denied` carries a fine-grained `invite_reason` **in addition to**
+the coarse `reason`; and the billing events carry both the account `subject` and
+the `device_id` that ran the checkout.
+
+### Client support
+
+| Client | What it can do |
+|--------|----------------|
+| **`sigil` CLI** | **full** — `sigil account status`, `sigil account invite [--ttl <seconds>] [--pin-key <b64>]`, `sigil account invites`, `sigil account revoke-invite <inviteID>`. Joining is the ordinary `sigil device enroll --token <invite>`; there is **no join subcommand**, by design |
+| **Native desktop** | **full** — the same four operations, over `DeviceConfig::{account, create_invite, list_invites, revoke_invite}` and four new Tauri commands, reusing the `sigil-cli` library exactly as [ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md) requires |
+| **Webapp / MV3 extension** | **partial, by design** — both can **JOIN** (an invite pastes into their existing enrollment-token field, since the wire is unchanged) and can **READ** the account (`getAccount`) and render the honest *"joined — waiting for a key from another device"* state. Neither has a UI to **mint**, list or revoke an invite |
+
+The JS half lives in
+[`../sigil-wasm/device-auth.mjs`](../sigil-wasm/device-auth.mjs) —
+`getAccount` / `createAccountInvite` / `listAccountInvites` /
+`revokeAccountInvite`, every one an ordinary `signedFetch` v3 request. It adds
+**no canonical message and no header**, and joining is the **unchanged**
+`enrollDevice`.
+
+### Account model — honest limits
+
+All nineteen are enumerated in
+[ADR 0040](decisions/0040-account-model.md#bad--honest-limitations-all-real-none-papered-over).
+The ones that change what this API *means*:
+
+1. ⚠️ **NO RECOVERY, AT ALL.** No email, no password, no recovery code, no
+   operator break-glass. **Lose or revoke every device in an account and the
+   account is permanently unreachable, its vaults permanently unreadable by the
+   customer AND by us, and its subscription stranded.** The orphan failure
+   **narrowed** (from "revoke one device" to "lose every device"); it was **not
+   eliminated**. The guidance is "keep two devices enrolled" — a mitigation, not
+   a fix.
+2. **Membership is FLAT.** Any member may invite, revoke **every** other member,
+   run checkout and administer every account-owned vault. **Revoking a
+   compromised device does NOT revoke the devices it invited** — the audit log
+   names the inviter, but nothing prevents it. No quorum, no re-authentication.
+3. **Trust-on-first-write moved up a level; it did not go away.** The first
+   *account* to write an unclaimed vault owns it.
+4. **Ownership never moves between accounts and membership is immutable** — no
+   transfer, merge, split or account deletion. A device in the wrong account can
+   only be revoked and re-enrolled.
+5. **NO ACCOUNT MERGE.** Every device enrolled before `0005` is adopted into its
+   **own** singleton account, so an existing two-device customer ends up with
+   **two accounts and two billing subjects**. The remedy is manual and leaves a
+   second subscription row for an operator to reconcile.
+6. **Entitlement is REPORTED, never ENFORCED.** No route refuses service to an
+   unentitled account. What changed is only that a cancel or refund now demotes
+   the whole account at once.
+7. **`SIGILD_ACCOUNT_MAX_DEVICES` is anti-freeloading, not anti-fraud**, and a
+   compromised provider webhook secret now moves an **account's** status rather
+   than one device's.
+8. **No rate limiting** on `POST /v1/devices/enroll` or
+   `POST /v1/account/invites` — the caps bound stored **state**, not request
+   volume — and **no sweep job for expired invites**.
+9. **The replay nonce cache is still per-process and in-memory.** Invite
+   consumption is DB-atomic and therefore multi-instance safe; **signed requests
+   are not**.
+10. **The in-memory registry is still non-durable** (accounts, memberships,
+    invites and vault-owner rows all vanish on restart — warned at boot), and the
+    **file op-log backend was still not extended**.
+11. ⚠️ **Rollback is survivable but not free.** A pre-Phase-52 binary run after
+    `0005` is applied enrolls devices with `account_id NULL`; rolling forward,
+    those devices are refused everywhere with a coarse `403`. **Any device
+    enrolled during a rollback window needs `sigild migrate adopt` afterwards**,
+    and the **boot warning** is how an operator knows. See
+    [`deployment.md` §11](deployment.md#11-schema-migrations-postgres-backend).
+12. **Still dev-gated, `501` by default, plain HTTP, pre-audit, UNAUDITED** — a
+    real authorization model, **not a reviewed one**.
 
 ---
 
@@ -1505,13 +1954,16 @@ authenticated by the provider's HMAC (or, for Juspay's basic scheme, its
 endpoint credentials) and by nothing else — and correspondingly it can **create
 no session, read no vault, and name no subject of its own choosing**.
 
-**The subject is server-derived.** A checkout's subject is the **authenticated
-device ID** (`dev_…`), taken from the verified signature and **never** from the
-request body; `GET /v1/billing/subscription` likewise reports only the caller's
-own record and takes no subject parameter. A client therefore cannot buy — or
-query — a subscription on another subject's behalf. There is **no account model
-yet**: "subject" means "enrolled device", which is an honest scaffold, not the
-product's billing identity (see the limits at the end of this section).
+**The subject is server-derived.** Since Phase 52 a checkout's subject is the
+authenticated device's **ACCOUNT ID** (`acct_…`), derived from the verified
+signature and **never** read from the request body;
+`GET /v1/billing/subscription` likewise reports only the caller's own account and
+takes no subject parameter. A client therefore cannot buy — or query — a
+subscription on another subject's behalf, because there is no body, query or path
+field anywhere that names one. "Subject" now means **account**, so paying on one
+device entitles the others ([Account model](#account-model-dev-gated--phase-52));
+it is still **not** an identity — there is no email, no password and no recovery
+(see the limits at the end of this section).
 
 ### Default posture — the deliberate `501`
 
@@ -1554,6 +2006,15 @@ Request body (optional; `{}` or an empty body is valid):
 
 Note what is **absent**: no subject (server-derived), no amount override, and no
 payment-instrument field of any kind.
+
+⭐ **The subject is the authenticated device's ACCOUNT (Phase 52), not the
+device.** That is the whole point of the account model on this route: a customer
+who pays on their phone is entitled on their laptop, and a cancel, refund or
+chargeback demotes the **account** at once rather than one device. It is still
+**server-derived** — there is no body, query or path field anywhere that names a
+subject — and a device carrying **no account** is refused with a coarse `403`
+(`missing_account`) **before** the provider or the store is touched, never
+falling back to the device id.
 
 `201 Created`:
 
@@ -1761,15 +2222,17 @@ precise reason goes only to the server-side audit log and the per-reason metric.
 
 ### `GET /v1/billing/subscription` — the caller's own status
 
-**Auth: device auth v3** (signed with an empty body). The subject is taken from
-the verified signature, so this endpoint **cannot be used to enumerate other
-subjects** — there is no query parameter and no subject field to supply.
+**Auth: device auth v3** (signed with an empty body). The subject is **derived
+from** the verified signature, so this endpoint **cannot be used to enumerate
+other subjects** — there is no query parameter and no subject field to supply.
+Since Phase 52 the subject is the signing device's **ACCOUNT**, so a **sibling
+device that never ran checkout still sees the account's entitlement**.
 
 `200 OK`:
 
 ```json
 {
-  "subject": "dev_AbCdEf…",
+  "subject": "acct_AbCdEf…",
   "provider": "stripe",
   "status": "active",
   "entitled": true,
@@ -1781,7 +2244,18 @@ subjects** — there is no query parameter and no subject field to supply.
 "Never subscribed" is a valid answer, not a fault — it returns `200` with
 `{"subject":"…","status":"none","entitled":false}`. `provider`,
 `current_period_end` and `updated_at` are omitted when unset. `401` on failed
-device auth, `500` on a store fault, `501` when billing is off.
+device auth, **`403` when the signing device carries no account**
+(`missing_account`), `500` on a store fault, `501` when billing is off.
+
+> **Cross-cutover subjects.** A hosted checkout started **before** migration
+> `0005` put a **device** id into the provider's metadata, and a provider echoes
+> that back forever. Incoming webhook subjects are therefore **resolved, not
+> trusted**: a known account passes through, an enrolled device becomes its
+> account, and anything else is **blanked** so the store falls back to its
+> `(provider, subscription_ref)` lookup and, failing that, answers `unresolved`
+> (a `200` that changes nothing). A provider-supplied string can never **invent**
+> a subscription row. This is a lookup on an already-signature-verified value, so
+> it adds no trust — it can only narrow what an event may touch.
 
 ### Configuration (environment)
 
@@ -1871,13 +2345,21 @@ amount:
   *webhook* sides already map subscription/mandate events, so a subscription
   created out-of-band drives the state machine correctly. This is a deliberate
   omission, not an oversight.
-- **No account model.** Subscriptions key off the **authenticated device**, so a
-  user with two devices has two subjects. There is no user, no household, no
-  organization, no seat model, and no transfer.
+- **An ACCOUNT is now the subject — but it is not an identity.** Since Phase 52 a
+  subscription keys off the signing device's **account**
+  ([above](#account-model-dev-gated--phase-52)), so a user's devices share one
+  subject. There is still **no user record, no email, no household, no
+  organization, no seat model, no transfer and NO RECOVERY**; ⚠️ **every device
+  enrolled before migration `0005` was adopted into its OWN singleton account**,
+  so an existing two-device customer has **two accounts and two billing
+  subjects**, reconcilable only by hand. A compromised provider webhook secret
+  now moves an **account's** status rather than one device's.
 - **No invoicing, proration, tax, refunds, chargebacks, dunning or reconciliation
   job**, and no admin surface for billing.
 - **No entitlement enforcement.** `entitled` is reported; nothing in the op-log
-  or device routes consults it yet.
+  or device routes consults it. Gating the op-log on payment status would lock a
+  customer out of their own 2FA codes over a failed card, and needs grace periods
+  and dunning that do not exist — a deliberate deferral, not an oversight.
 - **The in-memory store is non-durable** (see above), and there is **no PCI
   attestation** — hosted checkout keeps scope minimal, it does not certify
   anything.
@@ -1894,11 +2376,15 @@ minimum:
 - **Authentication and authorization** — the dev op-log now *has* a real
   **multi-device model** (contract v3: device enrollment with proof of
   possession, a device registry, per-vault grants, and revocation — see
-  [above](#multi-device-auth-model-contract-v3--dev)), but production still owes
-  an **account model**, session/token issuance (JWT bearer tokens,
+  [above](#multi-device-auth-model-contract-v3--dev)) and a real (if minimal)
+  **account model** on top of it
+  ([above](#account-model-dev-gated--phase-52)), but production still owes an
+  **identity** layer — no email, no password, **no recovery of any kind** today —
+  plus session/token issuance (JWT bearer tokens,
   [`../sigild/internal/auth/`](../sigild/internal/auth/)), **key rotation** and
-  re-enrollment, recovery, **rate limiting on enrollment attempts**, a **shared**
-  (not per-process) replay store, and an ownership model stronger than
+  re-enrollment, **rate limiting on enrollment attempts and invite minting**, a
+  **shared** (not per-process) replay store, roles inside an account (membership
+  is flat), account transfer/merge/deletion, and an ownership model stronger than
   trust-on-first-write. The legacy `SIGILD_OPLOG_PUBKEY` mode remains only a
   single static DEV key with no authorization at all, and with neither contract
   configured the dev route is wide open.

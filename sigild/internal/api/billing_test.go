@@ -43,7 +43,14 @@ type billingTestEnv struct {
 	provider  *httptest.Server
 	lastForm  func() string
 	checkouts *int
+	// billingCfg is the exact BillingConfig this router was built with, so a
+	// test can rebuild a router over the SAME stores (see billingConfigFor).
+	billingCfg BillingConfig
 }
+
+// billingConfigFor returns the BillingConfig behind env, so another router can
+// be built over the same subscription store and the same stand-in provider.
+func billingConfigFor(env *billingTestEnv) BillingConfig { return env.billingCfg }
 
 // newBillingEnv builds a fully wired billing router. The provider adapters are
 // pointed at a LOCAL httptest server standing in for Stripe.
@@ -70,6 +77,29 @@ func newBillingEnv(t *testing.T) *billingTestEnv {
 	}
 	subs := store.NewMemSubscriptionStore()
 
+	billingCfg := BillingConfig{
+		Providers: map[string]billing.Provider{
+			billing.ProviderStripe: billing.NewStripe(billing.StripeConfig{
+				SecretKey:     apiTestStripeSecretKey,
+				WebhookSecret: apiTestStripeWebhookSec,
+				PriceID:       "price_test_api",
+				BaseURL:       provider.URL,
+				HTTPClient:    provider.Client(),
+			}),
+			billing.ProviderRazorpay: billing.NewRazorpay(billing.RazorpayConfig{
+				KeyID:         apiTestRazorpayKeyID,
+				KeySecret:     apiTestRazorpayKeySec,
+				WebhookSecret: apiTestRazorpayHookSec,
+				AmountMinor:   49900,
+				BaseURL:       provider.URL,
+				HTTPClient:    provider.Client(),
+			}),
+		},
+		DefaultProvider: billing.ProviderStripe,
+		Subscriptions:   subs,
+		SuccessURL:      "https://app.test/ok",
+		CancelURL:       "https://app.test/cancel",
+	}
 	router := NewRouter(Config{
 		Version:           "test",
 		Logger:            discardLogger(),
@@ -77,37 +107,16 @@ func newBillingEnv(t *testing.T) *billingTestEnv {
 		Devices:           devices,
 		EnrollTokenHashes: []string{hash},
 		AdminToken:        testAdminToken,
-		Billing: BillingConfig{
-			Providers: map[string]billing.Provider{
-				billing.ProviderStripe: billing.NewStripe(billing.StripeConfig{
-					SecretKey:     apiTestStripeSecretKey,
-					WebhookSecret: apiTestStripeWebhookSec,
-					PriceID:       "price_test_api",
-					BaseURL:       provider.URL,
-					HTTPClient:    provider.Client(),
-				}),
-				billing.ProviderRazorpay: billing.NewRazorpay(billing.RazorpayConfig{
-					KeyID:         apiTestRazorpayKeyID,
-					KeySecret:     apiTestRazorpayKeySec,
-					WebhookSecret: apiTestRazorpayHookSec,
-					AmountMinor:   49900,
-					BaseURL:       provider.URL,
-					HTTPClient:    provider.Client(),
-				}),
-			},
-			DefaultProvider: billing.ProviderStripe,
-			Subscriptions:   subs,
-			SuccessURL:      "https://app.test/ok",
-			CancelURL:       "https://app.test/cancel",
-		},
+		Billing:           billingCfg,
 	})
 
 	return &billingTestEnv{
-		deviceEnv: &deviceEnv{router: router, devices: devices},
-		subs:      subs,
-		provider:  provider,
-		lastForm:  func() string { return lastBody },
-		checkouts: &checkouts,
+		deviceEnv:  &deviceEnv{router: router, devices: devices},
+		subs:       subs,
+		provider:   provider,
+		lastForm:   func() string { return lastBody },
+		checkouts:  &checkouts,
+		billingCfg: billingCfg,
 	}
 }
 
@@ -234,14 +243,19 @@ func TestCheckoutHappyPath(t *testing.T) {
 		t.Fatalf("provider hit %d times", *env.checkouts)
 	}
 
-	// THE SUBJECT IS SERVER-DERIVED: the outbound request carries the
-	// AUTHENTICATED device ID, regardless of anything in the body.
-	if !strings.Contains(env.lastForm(), dev.ID) {
-		t.Fatalf("outbound checkout did not carry the authenticated device as subject: %s", env.lastForm())
+	// THE SUBJECT IS SERVER-DERIVED, and since Phase 52 it is the authenticated
+	// device's ACCOUNT — regardless of anything in the body, and never the
+	// device (a device-keyed subscription would not follow the customer to
+	// their other devices).
+	if !strings.Contains(env.lastForm(), dev.Account) {
+		t.Fatalf("outbound checkout did not carry the authenticated device's account as subject: %s", env.lastForm())
+	}
+	if strings.Contains(env.lastForm(), dev.ID) {
+		t.Fatalf("outbound checkout carried the DEVICE id as subject: %s", env.lastForm())
 	}
 
 	// StartCheckout bound the subject without granting entitlement.
-	sub, err := env.subs.GetSubscription(t.Context(), dev.ID)
+	sub, err := env.subs.GetSubscription(t.Context(), dev.Account)
 	if err != nil {
 		t.Fatalf("GetSubscription: %v", err)
 	}
@@ -265,8 +279,8 @@ func TestCheckoutSubjectCannotBeSpoofed(t *testing.T) {
 	if strings.Contains(form, "dev_someone_else") || strings.Contains(form, "dev_victim") {
 		t.Fatalf("a client-supplied subject reached the provider: %s", form)
 	}
-	if !strings.Contains(form, dev.ID) {
-		t.Fatalf("outbound subject was not the authenticated device: %s", form)
+	if !strings.Contains(form, dev.Account) {
+		t.Fatalf("outbound subject was not the authenticated device's account: %s", form)
 	}
 }
 
@@ -453,7 +467,7 @@ func TestWebhookIdempotency(t *testing.T) {
 		t.Fatalf("second status = %q, want duplicate", r2.Status)
 	}
 
-	sub, err := env.subs.GetSubscription(t.Context(), dev.ID)
+	sub, err := env.subs.GetSubscription(t.Context(), dev.Account)
 	if err != nil {
 		t.Fatalf("GetSubscription: %v", err)
 	}
@@ -539,7 +553,7 @@ func TestWebhookRazorpaySignedOverRawBody(t *testing.T) {
 	if resp.Status != "accepted" {
 		t.Fatalf("status = %q", resp.Status)
 	}
-	sub, err := env.subs.GetSubscription(t.Context(), dev.ID)
+	sub, err := env.subs.GetSubscription(t.Context(), dev.Account)
 	if err != nil {
 		t.Fatalf("GetSubscription: %v", err)
 	}
@@ -567,7 +581,7 @@ func TestWebhookIllegalTransitionIs200NoChange(t *testing.T) {
 	if resp.Status != "illegal" {
 		t.Fatalf("status = %q, want illegal", resp.Status)
 	}
-	if _, err := env.subs.GetSubscription(t.Context(), dev.ID); err == nil {
+	if _, err := env.subs.GetSubscription(t.Context(), dev.Account); err == nil {
 		t.Fatal("an illegal event created a subscription record")
 	}
 }
@@ -597,7 +611,7 @@ func TestWebhookStaleEventDoesNotRegress(t *testing.T) {
 	if resp.Status != "stale" {
 		t.Fatalf("status = %q, want stale", resp.Status)
 	}
-	sub, err := env.subs.GetSubscription(t.Context(), dev.ID)
+	sub, err := env.subs.GetSubscription(t.Context(), dev.Account)
 	if err != nil {
 		t.Fatalf("GetSubscription: %v", err)
 	}
@@ -659,8 +673,8 @@ func TestSubscriptionReportsCallerStatus(t *testing.T) {
 	if resp.Status != string(billing.StatusNone) || resp.Entitled {
 		t.Fatalf("resp = %+v", resp)
 	}
-	if resp.Subject != dev.ID {
-		t.Fatalf("subject = %q, want the authenticated device", resp.Subject)
+	if resp.Subject != dev.Account {
+		t.Fatalf("subject = %q, want the authenticated device's account", resp.Subject)
 	}
 
 	// After an activating webhook: "active", entitled.
@@ -683,8 +697,9 @@ func TestSubscriptionReportsCallerStatus(t *testing.T) {
 	}
 }
 
-// TestSubscriptionIsPerDevice: one device's payment does not entitle another.
-func TestSubscriptionIsPerDevice(t *testing.T) {
+// TestSubscriptionIsPerAccount: one ACCOUNT's payment does not entitle another,
+// and the endpoint still takes no subject of any kind.
+func TestSubscriptionIsPerAccount(t *testing.T) {
 	env := newBillingEnv(t)
 	payer := enrollDevice(t, env.deviceEnv, testEnrollToken, "payer")
 
@@ -706,7 +721,7 @@ func TestSubscriptionIsPerDevice(t *testing.T) {
 	rec := v3Get(t, env.deviceEnv, payer, "/v1/billing/subscription?subject=someone_else")
 	var resp subscriptionResponse
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp.Subject != payer.ID {
+	if resp.Subject != payer.Account {
 		t.Fatalf("a query parameter changed the subject to %q", resp.Subject)
 	}
 }

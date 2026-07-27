@@ -72,6 +72,14 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > implementations, with two new dev-gated `sigild` routes reusing the existing write
 > authorization; still UNAUDITED, and first contact is still trust-on-first-use unless a
 > human actually compares the digits),
+> the **account model** (an account is a **server-assigned id on the device row** that
+> **entitlement** and **vault ownership** key off instead of the device, so paying on one
+> device covers the others and revoking a vault's claimant no longer orphans it; a second
+> device joins with a **single-use invite** that rides the **unchanged** enrollment
+> challenge — no fourth canonical message — and ⭐ **no request anywhere names an
+> account**, which closes cross-account access structurally rather than defensively;
+> still dev-gated, `501` by default, UNAUDITED, and explicitly **not an identity system:
+> there is no email, no password and NO RECOVERY**),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -143,12 +151,13 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0028](0028-webapp-vault-persistence-and-unlock.md) | Webapp vault persistence + password-unlock model (persist only the `SIGILcli`-sealed container in `localStorage`; in-memory password) | Accepted (2026-07) |
 | [0029](0029-webapp-pwa-offline-a11y-and-ci.md) | Webapp as an offline-capable, accessible PWA (hand-rolled service worker + manifest) + a Rust/wasm-pack webapp CI job | Accepted (2026-07) |
 | [0030](0030-browser-extension-client.md) | MV3 browser-extension client — popup TOTP authenticator over the vendored wasm + proven helpers (sealed-only `chrome.storage.local`, in-memory password) | Accepted (2026-07) |
-| [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07) |
+| [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07); limitations 1 & 4 (device-scoped ownership, orphaned vaults) revised by [0040](0040-account-model.md) |
 | [0032](0032-native-desktop-client.md) | Native desktop client — Tauri v2 shell over a headless core crate, `sigil-core` linked natively (no wasm), re-using `cli/`'s container/vault/migration logic and sharing the CLI's vault file | Accepted (2026-07) |
 | [0033](0033-browser-device-identity-storage.md) | Browser device-identity storage — seal the Ed25519 device seed in a second `SIGILcli` container under the vault password (never plaintext web storage, never a `TotpVault` field) | Accepted (2026-07) |
-| [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07); §4's idempotency key revised by [0039](0039-webhook-idempotency-from-signed-bytes.md) |
+| [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07); §4's idempotency key revised by [0039](0039-webhook-idempotency-from-signed-bytes.md), and its device-scoped subject revised by [0040](0040-account-model.md) |
 | [0035](0035-device-to-device-vault-sharing.md) | Device-to-device vault sharing — random per-vault key sealed into the unchanged `SIGILcli` container, wrapped per device with `hybrid_seal` (X25519 + ML-KEM-768), relayed as an opaque envelope, authorized by the existing v3 grants | Accepted (2026-07) |
 | [0036](0036-browser-sharing-secret-storage.md) | Browser sharing-secret storage — keep the hybrid secret identity and the vault keyring inside the existing sealed device-identity container (schema bumped to v2, v1 still readable) rather than adding a new store | Accepted (2026-07) |
 | [0037](0037-desktop-reuses-cli-library-for-protocol.md) | The desktop client drives the `sigil-cli` library instead of reimplementing the wire protocol — no fourth copy of the canonical contract-v3 message, and the CLI's own state files | Accepted (2026-07) |
 | [0038](0038-key-pinning-safety-numbers-and-vault-rotation.md) | Key pinning (pin on first sight, **hard-refuse** on change), a human-comparable safety number as the out-of-band check, and vault key rotation with re-wrap — the client-side answer to a key-substituting server, retiring two limitations recorded in [0035](0035-device-to-device-vault-sharing.md) | Accepted (2026-07) |
 | [0039](0039-webhook-idempotency-from-signed-bytes.md) | Webhook idempotency keys must be derived from bytes the provider's signature covers (`Event.DedupKey`; Razorpay keys on the signed body, not the `X-Razorpay-Event-Id` header), and Juspay's default webhook scheme becomes `hmac` — revising §4 of [0034](0034-billing-provider-seam.md) | Accepted (2026-07) |
+| [0040](0040-account-model.md) | Accounts as the subject of entitlement and the owner of vaults — a server-assigned account id on the device row, single-use invites over the **unchanged** enrollment challenge (no fourth canonical message), and **no request anywhere names an account** — revising limitations 1 & 4 of [0031](0031-multi-device-auth-model.md) and the device-scoped subject of [0034](0034-billing-provider-seam.md) | Accepted (2026-07) |

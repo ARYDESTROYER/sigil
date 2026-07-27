@@ -65,6 +65,12 @@ use sigil_cli::{
     fetch_hybrid_key_pinned, hybrid_safety_number, load_pins, pairwise_safety_number,
     repin_hybrid_key, rotate_vault_key, HybridKeyPin, PinStatus, HYBRID_PIN_FILE,
 };
+// Phase 52 — the ACCOUNT model. Same rule again: the desktop implements no
+// protocol of its own, it calls the sigil-cli library functions the CLI calls,
+// so a desktop account request and a `sigil account …` request are the same
+// bytes. JOINING needs nothing new — an invite is redeemed by the UNCHANGED
+// `enroll_device` path (ADR 0037, ADR 0040).
+use sigil_cli::{create_account_invite, get_account, list_account_invites, revoke_account_invite};
 use sigil_core::Argon2Params;
 
 use crate::{DesktopError, Result, VaultSession, STATE_DIR_NAME};
@@ -133,6 +139,81 @@ pub struct ServerCheck {
     pub hybrid_published: bool,
     /// A short human-readable explanation, safe to display. Never secret.
     pub detail: String,
+}
+
+/// One member device of this device's account. METADATA ONLY — the registry
+/// never echoes public keys, and nothing here is secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMember {
+    /// The server-assigned device id. Opaque, not secret.
+    pub device_id: String,
+    /// The human label given at enrollment.
+    pub label: String,
+    /// `"active"` or `"revoked"`.
+    pub status: String,
+    /// RFC 3339 enrollment time.
+    pub created_at: String,
+    /// RFC 3339 revocation time, empty while active.
+    pub revoked_at: String,
+    /// Whether this row is the device running this app.
+    pub is_this_device: bool,
+}
+
+/// This device's ACCOUNT: the group of devices that share entitlement and vault
+/// ownership. There is no way to ask about another account — the server derives
+/// it from the verified signature, so this is always "mine".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountView {
+    /// The server-assigned account id (`acct_…`). An identifier, never a credential.
+    pub account_id: String,
+    /// RFC 3339 creation time, when the server reports one.
+    pub created_at: String,
+    /// How many ACTIVE devices are in the account — the number the cap applies
+    /// to. A revoked device does not consume a seat.
+    pub device_count: usize,
+    /// How many revoked devices the account still lists. They remain visible as
+    /// history but do NOT count against [`Self::device_limit`].
+    pub revoked_device_count: usize,
+    /// The server's configured per-account device cap.
+    pub device_limit: usize,
+    /// The member devices.
+    pub members: Vec<AccountMember>,
+}
+
+/// A freshly minted account invite.
+///
+/// ⚠️ [`MintedInvite::invite`] is a BEARER SECRET the server returns exactly ONCE.
+/// Anyone who reads it inside its TTL can join this account and inherit its
+/// subscription, and the dev transport is plain HTTP. Show it once, do not
+/// persist it, and clear it from the UI after use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedInvite {
+    /// The PUBLIC handle, for listing and revocation. Not a secret.
+    pub invite_id: String,
+    /// ⚠️ THE SECRET. Never logged, never stored, never re-served.
+    pub invite: String,
+    /// The account it joins (this device's own).
+    pub account_id: String,
+    /// RFC 3339 expiry.
+    pub expires_at: String,
+    /// Whether it is pinned to one device's public key.
+    pub pinned: bool,
+}
+
+/// An OPEN invite in a listing: the PUBLIC handle and metadata, never the secret
+/// and never its digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenInvite {
+    /// The PUBLIC handle.
+    pub invite_id: String,
+    /// Which member device minted it.
+    pub created_by_device_id: String,
+    /// RFC 3339 creation time.
+    pub created_at: String,
+    /// RFC 3339 expiry.
+    pub expires_at: String,
+    /// Whether it is pinned to one device's public key.
+    pub pinned: bool,
 }
 
 /// One sealed container pulled back from the op-log.
@@ -736,6 +817,123 @@ impl DeviceConfig {
         let key = unwrap_vault_key(&secret, &envelope)?;
         keyring_put(&self.keyring_path(), vault_id, &key)?;
         Ok(vault_key_fingerprint(&key))
+    }
+
+    // -- accounts (Phase 52) ----------------------------------------------
+    //
+    // An ACCOUNT groups one person's own devices. It is what a subscription and
+    // a vault's OWNERSHIP belong to, so paying on one device entitles the rest
+    // and revoking the device that first wrote a vault no longer orphans it.
+    //
+    // SAME RULE AS EVERYWHERE ELSE IN THIS FILE: no protocol is implemented
+    // here. These four methods call the `sigil-cli` LIBRARY functions the CLI
+    // itself calls, so a desktop request and a `sigil account …` request are the
+    // same bytes, and there is no fourth copy of anything canonical.
+    //
+    // NO CALL NAMES AN ACCOUNT — the server reads it off the device row of the
+    // signature it just verified. That is why none of these takes an account id.
+
+    /// READ this device's account: which account it is in, and who else is in it.
+    ///
+    /// Requires an ENROLLED identity: the account is derived from the signature,
+    /// so an un-enrolled key cannot name one.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::Unauthenticated`] (401) when revoked or refused.
+    /// - [`DesktopError::NotEnabled`] (501) when the server's account model is off.
+    /// - [`DesktopError::Unreachable`] when the server cannot be reached.
+    pub fn account(&self) -> Result<AccountView> {
+        let identity = self.enrolled_identity()?;
+        let me = identity.device_id.clone().unwrap_or_default();
+        let info = get_account(&self.server, &identity.auth())
+            .map_err(|e| net_error(e, &self.server, "reading this device's account"))?;
+        Ok(AccountView {
+            account_id: info.account_id,
+            created_at: info.created_at,
+            device_count: info.device_count,
+            revoked_device_count: info.revoked_device_count,
+            device_limit: info.device_limit,
+            members: info
+                .devices
+                .into_iter()
+                .map(|d| AccountMember {
+                    is_this_device: d.device_id == me,
+                    device_id: d.device_id,
+                    label: d.label,
+                    status: d.status,
+                    created_at: d.created_at,
+                    revoked_at: d.revoked_at.unwrap_or_default(),
+                })
+                .collect(),
+        })
+    }
+
+    /// MINT a single-use invite letting ONE more device join this account.
+    ///
+    /// ⚠️ [`MintedInvite::invite`] is a BEARER SECRET returned exactly once. It is
+    /// the ONE secret this module deliberately hands back to a UI, because the
+    /// human has to carry it to the other device — the same way an enrollment
+    /// token travels IN. Show it once, never write it to disk, never log it. The
+    /// joining device redeems it as its ordinary enrollment token
+    /// ([`DeviceConfig::enroll`], unchanged).
+    ///
+    /// `ttl_seconds` may only SHORTEN the invite's life; the server clamps it.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`], [`DesktopError::Unauthenticated`],
+    ///   [`DesktopError::NotEnabled`], [`DesktopError::Unreachable`]; and
+    ///   [`DesktopError::Server`] with status 409 when the account is at its
+    ///   device limit or already has the maximum number of open invites.
+    pub fn create_invite(&self, ttl_seconds: Option<u64>) -> Result<MintedInvite> {
+        let identity = self.enrolled_identity()?;
+        // No pinning from the desktop yet: it needs the invitee's public key,
+        // which this UI has no way to obtain. An UNPINNED invite is a bearer
+        // secret for its whole TTL — that limit is real and is not papered over.
+        let inv = create_account_invite(&self.server, &identity.auth(), ttl_seconds, None)
+            .map_err(|e| net_error(e, &self.server, "minting an account invite"))?;
+        Ok(MintedInvite {
+            invite_id: inv.invite_id,
+            invite: inv.invite,
+            account_id: inv.account_id,
+            expires_at: inv.expires_at,
+            pinned: inv.pinned,
+        })
+    }
+
+    /// LIST this account's OPEN invites. METADATA ONLY — a minted invite secret
+    /// can never be recovered, from the server or from here.
+    ///
+    /// # Errors
+    /// As [`DeviceConfig::account`].
+    pub fn list_invites(&self) -> Result<Vec<OpenInvite>> {
+        let identity = self.enrolled_identity()?;
+        let invites = list_account_invites(&self.server, &identity.auth())
+            .map_err(|e| net_error(e, &self.server, "listing account invites"))?;
+        Ok(invites
+            .into_iter()
+            .map(|i| OpenInvite {
+                invite_id: i.invite_id,
+                created_by_device_id: i.created_by_device_id,
+                created_at: i.created_at,
+                expires_at: i.expires_at,
+                pinned: i.pinned,
+            })
+            .collect())
+    }
+
+    /// REVOKE an unredeemed invite by its PUBLIC handle.
+    ///
+    /// A handle belonging to ANOTHER account and one that never existed are
+    /// deliberately indistinguishable — both surface as
+    /// [`DesktopError::MissingOnServer`] — so this cannot enumerate invites.
+    ///
+    /// # Errors
+    /// As [`DeviceConfig::account`], plus [`DesktopError::MissingOnServer`] (404).
+    pub fn revoke_invite(&self, invite_id: &str) -> Result<()> {
+        let identity = self.enrolled_identity()?;
+        revoke_account_invite(&self.server, &identity.auth(), invite_id.trim())
+            .map_err(|e| net_error(e, &self.server, "revoking an account invite"))
     }
 
     // -- status -----------------------------------------------------------

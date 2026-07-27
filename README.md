@@ -116,9 +116,10 @@ audited; see the status note below.)
   concurrency-safe per-vault sequencing) — the first real store adapter, and the
   reason `sigild` now has **its first third-party dependency (`pgx`)** and a
   `go.sum`; the core server + the in-memory / file backends stay stdlib-only. All
-  three are **dev-only, NOT a finished production store** (no CRDT / merge, and no
-  account model — device enrollment and per-vault authorization now exist, but only as
-  the dev-gated, unaudited opt-in model described below; the Postgres backend has managed
+  three are **dev-only, NOT a finished production store** (no CRDT / merge; device
+  enrollment, per-vault authorization and an **account model** now exist, but only as
+  the dev-gated, unaudited opt-in model described below — and an account is auth
+  metadata, **not an identity**; the Postgres backend has managed
   migrations and a chain-verified backup runbook (below), but no PITR / replication).
   Op-log requests
   are **unauthenticated by default**, but
@@ -189,16 +190,39 @@ audited; see the status note below.)
   (`X-Sigil-Device`), a revoked device is refused on its next request, and "authenticated
   but not allowed" is a distinct `403` rather than a blanket `401`. It stores **auth
   metadata only** (a new `0002_devices.sql` migration; `sigild_schema_version` → `2`, and
-  `3` once the billing migration below is applied) —
+  `3`/`4`/`5` once the billing, key-sharing and account migrations below are applied) —
   the opaque blob, its hash chain, and the zero-knowledge boundary are unchanged, and it
   adds no new dependency. **Dev-gated and off by default** (every device route returns
-  `501` unless `SIGILD_ENABLE_DEV_OPS` is set), **UNAUDITED**, and **not an account
-  model**: no user accounts, no session/JWT issuance, no key rotation, no rate limiting on
-  enrollment attempts, a per-process replay cache, and trust-on-first-write ownership that
-  orphans a vault if its owner is revoked. Do not expose it publicly or use it for real
+  `501` unless `SIGILD_ENABLE_DEV_OPS` is set), **UNAUDITED**, no session/JWT issuance, no
+  key rotation, no rate limiting on enrollment attempts, and a per-process replay cache.
+  Do not expose it publicly or use it for real
   secrets. See [`docs/api.md`](docs/api.md) and
   [ADR 0031](docs/decisions/0031-multi-device-auth-model.md). Ships a distroless
   `Dockerfile`.
+  **An ACCOUNT — not a device — is now what owns a vault and what a subscription belongs
+  to.** Before this, paying on your phone did not entitle your laptop, and revoking the
+  device that first wrote a vault **orphaned that vault forever**. An account is a
+  **server-assigned id on the device row**; a **single-use invite** minted by a device
+  already in the account is the only way another device joins, and it rides the
+  **unchanged** enrollment path (`sigil device enroll --token <invite>`), so no client
+  needed a new wire format. Ownership keys off the account, so a sibling device inherits
+  it; entitlement keys off the account, so paying once covers your devices. ⭐ **No
+  request anywhere names an account** — the server always reads it off the signature it
+  just verified, which makes a cross-account request unconstructible rather than merely
+  rejected. New: `GET /v1/account` + three invite routes, `sigil account status | invite |
+  invites | revoke-invite`, migration `0005_accounts.sql` (`sigild_schema_version` → `5`).
+  Be clear about what it is **not**: an account is **auth metadata only — not an identity
+  system**. There is **no email, no password, and NO RECOVERY**: lose or revoke *every*
+  device in an account and the account, its vaults and its subscription are permanently
+  unreachable, by you and by us. Membership is **flat** (any member may invite, revoke
+  every other member and run checkout) and **immutable** (no transfer, merge or deletion);
+  membership grants **authorization, never decryption** (a joined device reads nothing
+  until an existing member shares a vault key to it); an unpinned invite is a **bearer
+  secret** over plain HTTP; trust-on-first-write moved up a level rather than going away;
+  and every device enrolled before the migration was adopted into its **own** account, so
+  an existing two-device setup becomes two accounts. Dev-gated, `501` by default,
+  **UNAUDITED**. See [`docs/api.md`](docs/api.md) and
+  [ADR 0040](docs/decisions/0040-account-model.md).
   **Payment / subscription support exists in code — and only in code.** Because
   Sigil is a paid product, `sigild` carries a provider-agnostic **billing seam**
   with three adapters — **Stripe** (international), **Razorpay** and **Juspay**
@@ -211,9 +235,13 @@ audited; see the status note below.)
   that is **not**: it is **UNAUDITED**, **dev-gated and `501` by default**, and
   it has **never been run against a live provider account** — every test drives a
   local fake server with fake credentials, and the **Juspay** scheme in
-  particular is explicitly unverified against a real dashboard. There is no
-  account model (a subscription keys off an enrolled device), no entitlement
-  enforcement, no fraud/chargeback/refund/tax handling, and no PCI attestation.
+  particular is explicitly unverified against a real dashboard. A subscription
+  now keys off the buying device's **account** (above) rather than the device —
+  but an account is **not an identity** (no email, no password, no recovery), and
+  every device enrolled before the account migration was adopted into its **own**
+  account, so an existing two-device setup has two billing subjects. There is no
+  entitlement enforcement, no fraud/chargeback/refund/tax handling, and no PCI
+  attestation.
   **Nobody has been charged anything.** See
   [`docs/api.md`](docs/api.md#billing--subscriptions-dev-gated-opt-in--phase-45),
   [`docs/deployment.md`](docs/deployment.md) §13 and
@@ -287,9 +315,13 @@ audited; see the status note below.)
   (an un-enrolled key still signs the legacy contract, and no key is still unsigned —
   nothing existing changed). `sigil device grant <deviceID> --vault <id> --permission
   read|write` shares one of your vaults with another device, `sigil device list` and
-  `sigil device revoke` (self, or operator with `--admin-token`) manage the registry.
-  **Dev / localhost / plain HTTP, no TLS, UNAUDITED** — trust-on-first-write ownership,
-  no account model, no session issuance, no key rotation.
+  `sigil device revoke` (self, a **sibling in your account**, or operator with
+  `--admin-token`) manage the registry, and `sigil account status | invite | invites |
+  revoke-invite` manages **which devices are yours** — an invite is redeemed by the
+  ordinary `sigil device enroll --token <invite>`, so there is no join command and no
+  `--account` flag anywhere.
+  **Dev / localhost / plain HTTP, no TLS, UNAUDITED** — trust-on-first-write ownership
+  (by account), no identity layer, **no recovery**, no session issuance, no key rotation.
   The CLI is also the **reference client for sharing a vault between devices** (the
   webapp and the extension do the same thing from the browser) —
   `sigil device hybrid-publish` publishes this device's hybrid public key, `sigil

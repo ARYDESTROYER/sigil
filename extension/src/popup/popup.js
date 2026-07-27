@@ -48,6 +48,7 @@ import {
   sealDeviceIdentity,
   openDeviceIdentity,
   explainAuthStatus,
+  getAccount,
 } from "../../vendor/device-auth.mjs";
 import {
   generateHybridIdentity,
@@ -211,8 +212,64 @@ function renderDevice() {
     state.textContent = "Not enrolled — sync requests are unauthenticated.";
     fields.hidden = false;
     forget.hidden = true;
+    account = null;
   }
+  const showBtn = $("account-show");
+  if (showBtn) showBtn.hidden = !device;
+  renderAccount();
   renderSharing();
+}
+
+// ── account membership (Phase 52) ────────────────────────────────────────────
+//
+// THE STATE THIS EXISTS TO SHOW. An account invite pastes straight into the
+// enrollment-token field, so this browser can JOIN an account with no wire
+// change at all. Joining confers AUTHORIZATION, never DECRYPTION: the joined
+// device authenticates and can see the account and its entitlement, and can
+// decrypt NOTHING until an existing member wraps a vault key to its hybrid
+// public key (Sharing → Share to this device id, then Accept here).
+//
+// The CLI and the desktop app surface that step. Until now the browsers did not,
+// so a freshly joined extension showed an account beside an empty vault with no
+// explanation — which reads as a bug rather than as work still outstanding.
+
+/** The last /v1/account response, or null. Never persisted. */
+let account = null;
+
+/** Render the account summary and, when it applies, the waiting-for-a-key state. */
+function renderAccount() {
+  const state = $("account-state");
+  const waiting = $("account-awaiting-key");
+  if (!state || !waiting) return;
+  if (!device || !account) {
+    if (!device) state.textContent = "";
+    waiting.hidden = true;
+    return;
+  }
+  const revoked = account.revoked_device_count
+    ? ` (${account.revoked_device_count} revoked — revoked devices do not use a seat)`
+    : "";
+  state.textContent =
+    `Account ${account.account_id} — ${account.device_count} of ${account.device_limit} ` +
+    `devices in use${revoked}. No recovery: an account is reachable only through a ` +
+    `member device's private key, and membership is flat (any member may invite, and ` +
+    `may revoke any other member).`;
+
+  const id = $("sync-vault").value.trim();
+  const holdsKey = Boolean(device.vaultKeys?.[id]);
+  // Only meaningful once there IS another member who could send a key.
+  const hasSiblings = (account.device_count ?? 0) > 1;
+  if (hasSiblings && !holdsKey) {
+    waiting.textContent =
+      `Joined — waiting for a key from another device. This device is a member of ` +
+      `the account and its requests are authorized, but membership does not hand over ` +
+      `any encryption key. It cannot decrypt vault "${id || "(none)"}" until an ` +
+      `existing member shares it here (on that device: Sharing → Share to ` +
+      `${device.deviceId}). Then use Accept below.`;
+    waiting.hidden = false;
+  } else {
+    waiting.hidden = true;
+  }
 }
 
 /** Reflect the device / hybrid / shared-vault state in the Sharing panel. */
@@ -654,6 +711,24 @@ $("device-enroll").addEventListener("click", async () => {
 $("device-forget").addEventListener("click", async () => {
   await persistDevice(null);
   say("Device identity deleted. Sync is unauthenticated again.");
+});
+
+$("account-show").addEventListener("click", async () => {
+  if (!device) return;
+  try {
+    say("Reading account…");
+    const baseUrl = $("sync-url").value.trim();
+    account = await getAccount(wasm, { ...device, baseUrl }, baseUrl);
+    renderAccount();
+    say(`Account ${account.account_id}.`);
+  } catch (e) {
+    account = null;
+    renderAccount();
+    // A 403 here is the server refusing a device whose account row is missing —
+    // a real, repairable data state (`sigild migrate adopt`), not a crash.
+    $("account-state").textContent = `Account unavailable: ${authErr(e)}`;
+    say(`Account unavailable: ${authErr(e)}`, "error");
+  }
 });
 
 $("sync-push").addEventListener("click", async () => {

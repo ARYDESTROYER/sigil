@@ -323,6 +323,12 @@ export function enrollDevice(
   label: string;
   status: string;
   createdAt: string;
+  /**
+   * The ACCOUNT this device now belongs to (Phase 52). An OPERATOR token founds
+   * a new account; an account INVITE passed as `token` JOINS the inviter's.
+   * `""` against a server without the account model.
+   */
+  accountId: string;
 }>;
 
 export function signedFetch(
@@ -385,6 +391,90 @@ export function revokeDeviceAdmin(args: {
 }): Promise<unknown>;
 
 export function listDevices(args: { baseUrl: string; adminToken: string }): Promise<unknown>;
+
+// ── accounts (Phase 52) ─────────────────────────────────────────────────────
+//
+// An account groups one person's own devices; it is what a subscription and a
+// vault's ownership belong to. NO call here names an account — the server reads
+// it off the verified signature. A second device JOINS by passing an invite to
+// the UNCHANGED `enrollDevice` as its `token`.
+//
+// ⚠️ Membership grants AUTHORIZATION, never DECRYPTION: a joined device reads
+// nothing until a member wraps the vault key to it (see the sharing helpers).
+// There is NO RECOVERY — lose every device and the account is unreachable.
+
+/** One member device as reported by `GET /v1/account`. Metadata only. */
+export interface AccountMember {
+  device_id: string;
+  label?: string;
+  status?: string;
+  created_at?: string;
+  revoked_at?: string;
+  account_id?: string;
+}
+
+/** The caller's own account. There is no route that reads another. */
+export interface AccountInfo {
+  account_id: string;
+  created_at?: string;
+  /**
+   * ACTIVE devices only — this is what `device_limit` bounds. The cap is on
+   * CONCURRENT devices, so a revoked device frees its seat.
+   */
+  device_count: number;
+  /** Revoked members, reported separately rather than folded into the limit. */
+  revoked_device_count?: number;
+  device_limit: number;
+  /** Every member, ACTIVE AND REVOKED — history is listed, it just does not count. */
+  devices: AccountMember[];
+}
+
+/** An OPEN invite in a listing: the PUBLIC handle and metadata, never a secret. */
+export interface AccountInviteInfo {
+  invite_id: string;
+  created_by_device_id?: string;
+  created_at?: string;
+  expires_at?: string;
+  pinned?: boolean;
+}
+
+/**
+ * A freshly minted invite. ⚠️ `invite` is a BEARER SECRET returned exactly ONCE:
+ * show it, do not persist it, clear it after use.
+ */
+export interface CreatedAccountInvite {
+  invite_id: string;
+  invite: string;
+  account_id?: string;
+  expires_at?: string;
+  pinned?: boolean;
+}
+
+export function getAccount(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+): Promise<AccountInfo>;
+
+export function createAccountInvite(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+  opts?: { ttlSeconds?: number; inviteePublicKey?: Uint8Array | null },
+): Promise<CreatedAccountInvite>;
+
+export function listAccountInvites(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+): Promise<{ invites: AccountInviteInfo[] }>;
+
+export function revokeAccountInvite(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  identity: DeviceIdentity,
+  baseUrl: string,
+  inviteId: string,
+): Promise<{ invite_id: string; revoked: boolean }>;
 
 /** Seal a device identity into a password-protected SIGILcli container. */
 export function sealDeviceIdentity(

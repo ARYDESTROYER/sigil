@@ -560,21 +560,74 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   **`0002_devices.sql`** (`sigil_devices`, `sigil_enrollment_tokens`,
   `sigil_device_grants`) — so `sigild_schema_version` reports **2** at that point
   (**3** once the billing migration below is applied, **4** once the vault-sharing
-  migration is). That
+  migration is, **5** once the account migration is). That
   migration adds **AUTH METADATA ONLY** (public keys, IDs, labels, permissions,
   timestamps, a token digest) and touches **nothing** in `sigil_vault_ops`: the
   **opaque blob, its tamper-evidence hash chain, and the zero-knowledge boundary
   are completely unchanged**, and the server still does no cryptography on vault
   contents. All five device routes are dev-gated exactly like the ops routes
   (`501` when off, never `404`). Honest scope: **dev-gated, opt-in, UNAUDITED** —
-  trust-on-first-write is a dev ownership model rather than an account model,
-  revoking a vault's owner **orphans** it (no ownership transfer), an enrollment
+  trust-on-first-write is a dev ownership heuristic (Phase 52 moved it from the
+  device to the **account**, it did not remove it), revoking a vault's owner
+  **no longer orphans it** now that siblings inherit ownership from the account
+  (⚠️ losing *every* device in an account still does, permanently), an enrollment
   token is single-*attempt* (spent before the device row is created), the replay
   cache is still **per-process**, the in-memory registry is non-durable (a spent
   token becomes reusable after a restart) and the **file backend was not
-  extended**, and there is still no account/session model, no key rotation and no
+  extended**, and there is still no session model, no key rotation and no
   enrollment rate limiting (see
   [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md)).
+  ⚠️ Two of those limits were **revised by the account model below**: ownership is
+  no longer per-device, and revoking a vault's claimant no longer orphans it.
+  **Account model (same dev gate, no separate switch):** the subject of
+  **entitlement** and the **owner of vaults** is an **account**, not a device
+  ([ADR 0040](decisions/0040-account-model.md)). An account is a
+  **server-assigned id on the device row** (`sigil_accounts` +
+  `sigil_devices.account_id`) and nothing else that could identify a human —
+  **auth metadata only**: no email, no password, no session, no PII, no key
+  material, **no recovery**. It exists because a device was too small a subject
+  twice over: a subscription bought on a phone did not entitle a laptop, and a
+  vault owned by a device was **orphaned** when that device was revoked.
+  Four parts:
+  (1) **membership** — an operator enrollment token always founds a **new**
+  account; every later device joins with a **single-use invite** minted by a
+  member, presented in the **existing `X-Sigil-Enroll-Token` header under the
+  existing enrollment challenge** (which already binds the credential's SHA-256
+  digest), so there is **no new header, no new signed-message domain and no
+  fourth canonical message** — the three-implementation count of ADR 0031 is
+  unchanged and today's shipped clients can already join;
+  (2) **ownership** — `sigil_vault_owners` (`vault_id` PRIMARY KEY → `account_id`)
+  is the authority; trust-on-first-write **moved up one level** (the first
+  *account* to write an unclaimed vault owns it), every device of the owning
+  account has full access **without a grant row**, and `needOwner` is satisfied
+  **only** by account ownership — a legacy `is_owner` grant never satisfies it,
+  though the flag is retained as the per-device *view* so `GET …/grants` is
+  byte-identical for existing clients;
+  (3) **entitlement** — the billing subject is `dev.AccountID`, still
+  server-derived and never a body field; and
+  (4) **four dev-gated routes** (`GET /v1/account`, `POST`/`GET
+  /v1/account/invites`, `POST /v1/account/invites/{inviteID}/revoke`) reusing the
+  **same `authenticateDevice` choke point** — no new auth path.
+  ⭐ **The structural rule: NO REQUEST ANYWHERE NAMES AN ACCOUNT.** Every handler
+  takes it from the device row of the signature it just verified, so a
+  cross-account request is **unconstructible**, not merely rejected. Storage is
+  migration **`0005_accounts.sql`** (`sigil_accounts`, `sigil_account_invites`
+  storing an invite only as a SHA-256 **digest**, `sigil_vault_owners`, plus an
+  **adoption backfill** giving every pre-existing device its own singleton
+  account) ⇒ **`sigild_schema_version` reports 5**; it names `sigil_vault_ops`
+  nowhere, so the opaque blob and its hash chain are byte-for-byte unchanged.
+  Honest scope: **dev-gated, `501` by default, UNAUDITED, and NOT an identity
+  system** — ⚠️ **there is NO RECOVERY** (lose or revoke every device in an
+  account and it is permanently unreachable; the orphan failure was *narrowed*,
+  not eliminated), membership is **FLAT** (any member may invite, revoke every
+  sibling, run checkout and administer every account-owned vault) and
+  **immutable** (no transfer, merge, split or deletion), **there is no account
+  merge across the cutover** (a pre-0005 two-device customer ends up with two
+  accounts and two billing subjects), entitlement is **reported, never enforced**,
+  and a **rolled-back pre-0005 binary** writes `account_id NULL` rows that are
+  refused with a coarse `403` until an operator runs the explicit, idempotent
+  **`sigild migrate adopt`** (warned at boot; adoption **never** happens
+  implicitly on the authentication path).
   **Vault-sharing relay (same dev gate, same auth choke points):** on top of that
   model `sigild` acts as a **mailbox** for device-to-device key distribution —
   `PUT`/`GET /v1/devices/{deviceID}/hybrid-key` (a device's **public** X25519 +
@@ -615,8 +668,14 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   (`none`/`trialing`/`active`/`past_due`/`canceled`, written as an explicit
   transition table), and three routes: `POST /v1/billing/checkout` +
   `GET /v1/billing/subscription` (**device auth v3**, the same choke point as the
-  ops routes — the subject is the **authenticated device ID**, never a body
-  field) and `POST /v1/billing/webhook/{provider}` (authenticated **only** by the
+  ops routes — the subject is the authenticated device's **ACCOUNT ID** since
+  Phase 52, still server-derived and never a body field, so paying on one device
+  entitles the others and a cancellation demotes the account at once; a device
+  carrying no account is refused with a coarse `403` **before** the provider or
+  the store is touched, never falling back to the device id, and a
+  provider-echoed **pre-0005 device subject** is *resolved* onto an account
+  rather than trusted, or blanked so it can never invent a subscription row)
+  and `POST /v1/billing/webhook/{provider}` (authenticated **only** by the
   provider's own signature over the **raw** body, because a payment provider has
   no device key). Webhook handling is **idempotent on `(provider, dedup key)`**,
   where ⭐ **the dedup key is derived only from bytes the provider's signature
@@ -647,8 +706,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   and database, its own blast radius, its own compliance surface) and have
   `sigild` consume an entitlement, not compute one. Nothing here has been run
   against a live provider account, the Juspay scheme is explicitly
-  **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, there is **no account model** (a
-  subscription keys off the enrolled device), and there is no
+  **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, the account that is now the subject is
+  **not an identity** (no email, no password, **no recovery**, and every pre-0005
+  device was adopted into its own singleton account, so an existing two-device
+  customer has two billing subjects), and there is no
   fraud/chargeback/refund/proration/tax handling and no PCI attestation (see
   [`decisions/0034-billing-provider-seam.md`](decisions/0034-billing-provider-seam.md)).
   Billing touches **nothing** in `sigil_vault_ops` and performs no cryptography
@@ -1250,6 +1311,60 @@ not. On the browser clients, converting a personal vault into a shared one is a
 secret are **not zeroized** while the vault is unlocked (JS gives no reliable way to
 do so).
 
+### 2b′. Who owns the vault, and who is entitled — the account boundary
+
+§2b's step 4 ("B authorized") hides a question the device model got wrong twice:
+**what is the subject that owns a vault, and what is the subject that pays?**
+Until Phase 52 both were a **device**, which meant paying on a phone did not
+entitle a laptop, and revoking the device that first wrote a vault **orphaned**
+that vault forever. The subject is now an **account**
+([ADR 0040](decisions/0040-account-model.md)).
+
+```
+  OPERATOR TOKEN                    ACCOUNT  (server-assigned id, auth metadata only)
+  ──────────────                    ───────────────────────────────────────────────
+  sigil device enroll --token <op>  ──▶  founds a NEW account, device A is member #1
+                                          │
+  sigil account invite  (on A)            │  single-use invite  join_…  (bearer secret,
+        └── POST /v1/account/invites      │   256-bit, TTL-bounded, optionally PINNED
+            201 { "invite": "join_…" }    │   to one Ed25519 key; shown exactly ONCE)
+                                          ▼
+  sigil device enroll --token join_…  ──▶  device B JOINS THE SAME account
+        (the ORDINARY enroll route: the invite rides the EXISTING
+         X-Sigil-Enroll-Token header under the EXISTING challenge, so
+         there is NO fourth canonical message and no client change)
+                                          │
+                    ┌─────────────────────┴─────────────────────┐
+                    ▼                                           ▼
+   VAULT OWNERSHIP keys off the account            ENTITLEMENT keys off the account
+   sigil_vault_owners: vault_id → account_id       billing subject = dev.AccountID
+   · first ACCOUNT to write an unclaimed           · pay on the phone, entitled on
+     vault owns it (TOFW, one level up)              the laptop
+   · every sibling device has full access          · a cancel/refund demotes the
+     with NO grant row of its own                    WHOLE account at once
+   · revoking A no longer orphans A's vaults
+```
+
+⭐ **No request anywhere names an account.** Every handler derives it from
+`dev.AccountID` on the device row of the signature it just verified, so a
+cross-account request is **unconstructible**, not merely rejected.
+
+⚠️ **Membership is AUTHORIZATION, never DECRYPTION — and that is the seam back to
+§2b.** Joining tells the server B may act on the account's vaults; it hands B
+**no key**. B still reads nothing until an existing member performs §2b's wrap to
+B's hybrid public key. The consequence cuts both ways: a **hostile server can
+insert a device into any account** (it writes the registry) and **still cannot
+decrypt anything** — its only remaining move is to substitute a hybrid public key
+at §2b step 1, which is what §2c defends.
+
+⚠️ **And the failure that did not go away: there is NO RECOVERY.** An account is
+reachable only through a member device's private key. The orphan failure
+**narrowed** from "revoke one device" to "**lose every device**"; lose them all
+and the account, its vaults and its subscription are permanently unreachable — by
+the customer and by us. Membership is also **flat** (any member may invite,
+revoke every sibling and run checkout) and **immutable** (no transfer, merge,
+split or deletion). Full list: [ADR 0040](decisions/0040-account-model.md).
+
 ### 2c. Trust in a fetched public key — the client-side pin store
 
 §2b has one structural weakness: step 1 fetches the recipient's hybrid public key
@@ -1526,9 +1641,11 @@ authoritative list, with rationale, is the **defer ledger** in
   the auth story is closed across **all four** client surfaces. But the enrollment UI in
   both browser clients is **not** covered by a Playwright test, the desktop's GUI is
   build-and-launch verified rather than visually verified (its behaviour is proven in the
-  headless core), and none of this is TLS, an account model, or audited.
-- **Auth and authorization now exist for the dev op-log, but no account model
-  does.** The op-log is still **wide open by default**. Two opt-in contracts
+  headless core), and none of this is TLS or audited. The **account** commands are
+  also uneven: the CLI and the desktop app can mint, list and revoke invites; the
+  webapp and the MV3 extension can only **join** and **read** the account.
+- **Auth, authorization and a minimal account model now exist for the dev op-log
+  — an IDENTITY system does not.** The op-log is still **wide open by default**. Two opt-in contracts
   change that: legacy `SIGILD_OPLOG_PUBKEY` (a **single static** Ed25519 dev key,
   contract v2, no authorization at all —
   [ADR 0008](decisions/0008-device-key-request-auth.md),
@@ -1538,14 +1655,20 @@ authoritative list, with rationale, is the **defer ledger** in
   ([ADR 0031](decisions/0031-multi-device-auth-model.md)), now extended with a
   **vault-sharing relay** that distributes wrapped vault keys between authorized
   devices without the server being able to read them
-  ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)). What is still missing
-  is the **product** layer: no user/account model, no session or JWT token
+  ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)) and an **account
+  model** that makes entitlement and vault ownership survive a device change
+  ([ADR 0040](decisions/0040-account-model.md)). What is still missing
+  is the **product** layer: ⚠️ **no identity and NO RECOVERY of any kind** (an
+  account is reachable only through a member device's private key — lose them all
+  and it is gone), no roles inside an account (membership is **flat**: any member
+  may invite, revoke every sibling and run checkout), no account transfer, merge,
+  split or deletion, no session or JWT token
   issuance ([`../sigild/internal/auth/`](../sigild/internal/auth/) is still a
-  placeholder), no key rotation or re-enrollment, no recovery, no rate limiting on
-  enrollment attempts, a replay cache that is still **per-process** (a
-  multi-instance deploy needs a shared store), and an ownership rule
-  (trust-on-first-write) that is a dev heuristic rather than an identity. All of
-  it is **dev-gated and UNAUDITED**.
+  placeholder), no key rotation or re-enrollment, no rate limiting on
+  enrollment attempts or invite minting, a replay cache that is still
+  **per-process** (a multi-instance deploy needs a shared store), and an ownership
+  rule (trust-on-first-write, now by account) that is a dev heuristic rather than
+  an identity. All of it is **dev-gated and UNAUDITED**.
 - **Billing exists in code but has never taken a payment, and lives in the wrong
   place on purpose.** `sigild` has a real **provider-agnostic billing seam**
   (Stripe / Razorpay / Juspay adapters, hosted checkout only, raw-body HMAC
@@ -1558,8 +1681,11 @@ authoritative list, with rationale, is the **defer ledger** in
   with fake credentials), the **Juspay** scheme is explicitly
   **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, recurring *subscription creation* is
   unimplemented for the two India adapters (their webhook sides map the events,
-  but checkout creates a one-time hosted page), there is **no account model** — a
-  subscription keys off the enrolled **device** — no entitlement enforcement
+  but checkout creates a one-time hosted page), the subject is now an **account**
+  but that account is **not an identity** (no email, no password, no recovery —
+  and every pre-`0005` device was adopted into its own singleton account, so an
+  existing two-device customer has two billing subjects), there is no entitlement
+  enforcement
   anywhere, and no fraud, chargeback, refund, proration, tax, dunning or
   reconciliation handling, and **no PCI attestation** (hosted checkout keeps
   scope minimal; it certifies nothing). **Billing living inside the sync server
@@ -1575,10 +1701,11 @@ authoritative list, with rationale, is the **defer ledger** in
   backup runbook whose restore integrity is proved by the op-log hash chain**
   ([ADR 0018](decisions/0018-managed-oplog-migrations-and-backup-integrity.md)) —
   but that is **still not a production store**: no PITR / replication, no
-  Redis / object store, and no CRDT around it. (Device enrollment and per-vault
-  authorization *do* now exist as an opt-in dev model,
-  [ADR 0031](decisions/0031-multi-device-auth-model.md) — but they are dev-gated,
-  unaudited, and not an account model.)
+  Redis / object store, and no CRDT around it. (Device enrollment, per-vault
+  authorization and account membership *do* now exist as an opt-in dev model,
+  [ADR 0031](decisions/0031-multi-device-auth-model.md) +
+  [ADR 0040](decisions/0040-account-model.md) — but they are dev-gated,
+  unaudited, and an account is auth metadata, not an identity.)
 - **Both hybrid constructions are assembled; the KEM is now load-bearing, the
   signature is still used by nothing, and neither is in the suite frame.** For key
   agreement, the **combined hybrid KEM exists**

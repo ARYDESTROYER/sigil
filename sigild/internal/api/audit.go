@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"time"
 
 	"github.com/ARYDESTROYER/sigil/sigild/internal/billing"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
@@ -36,6 +37,14 @@ const (
 	auditEventDeviceRevoked      = "device.revoked"
 	auditEventVaultClaimed       = "vault.claimed"
 	auditEventVaultGranted       = "vault.granted"
+	// Account-model events (Phase 52). METADATA ONLY: account IDs, device IDs,
+	// a PUBLIC invite handle, an expiry, and a fixed reason enum. They NEVER
+	// carry an invite SECRET, an invite DIGEST, an enrollment token, a key, a
+	// signature, a nonce or blob content.
+	auditEventAccountCreated       = "account.created"
+	auditEventAccountInviteCreated = "account.invite_created"
+	auditEventAccountInviteRevoked = "account.invite_revoked"
+	auditEventAccountDeviceJoined  = "account.device_joined"
 	// Vault-sharing events (Phase 46). METADATA ONLY: device IDs, a vault ID, a
 	// size, and a hex SHA-256 FINGERPRINT of the opaque envelope. They NEVER
 	// carry the envelope bytes (which are ciphertext the server cannot read),
@@ -130,49 +139,113 @@ func (h *handlers) auditAuthDenied(r *http.Request, vaultID, deviceID string, re
 }
 
 // auditEnrolled logs a SUCCESSFUL device enrollment. It records the assigned
-// device ID and label only — never the enrolled PUBLIC KEY, never the
-// enrollment token or its digest, never the proof signature.
+// device ID, its account and the label only — never the enrolled PUBLIC KEY,
+// never the enrollment token or invite (or either digest), never the proof
+// signature.
 func (h *handlers) auditEnrolled(r *http.Request, d store.Device) {
 	h.cfg.Logger.Info(auditEventDeviceEnrolled,
 		"event", auditEventDeviceEnrolled,
 		"request_id", RequestIDFromContext(r.Context()),
 		"device_id", d.ID,
+		"account_id", d.AccountID,
 		"label", d.Label,
 	)
 }
 
 // auditEnrollDenied logs a REJECTED enrollment attempt. reason is the fixed enum
-// naming the failed check; no device ID exists yet, and no token/key/signature
-// is ever logged.
-func (h *handlers) auditEnrollDenied(r *http.Request, reason authReason) {
+// naming the failed check; inviteReason carries the FINE-GRAINED account-invite
+// cause (empty on the operator-token path).
+//
+// inviteReason is deliberately audit-log-ONLY: it must never become a /metrics
+// label (that endpoint is always-on and unauthenticated, so a per-reason counter
+// there is a correlatable oracle) and never reach a response body.
+func (h *handlers) auditEnrollDenied(r *http.Request, reason authReason, inviteReason string) {
 	h.cfg.Logger.Warn(auditEventDeviceEnrollDenied,
 		"event", auditEventDeviceEnrollDenied,
 		"request_id", RequestIDFromContext(r.Context()),
 		"reason", string(reason),
+		"invite_reason", inviteReason,
 	)
 }
 
-// auditDeviceRevoked logs a device revocation. revokedBy is either "admin" (the
-// operator token path) or the revoking device's own ID (self-revocation) — never
-// the token itself.
-func (h *handlers) auditDeviceRevoked(r *http.Request, deviceID, revokedBy string) {
+// auditDeviceRevoked logs a device revocation. revokedBy is "admin" (the
+// operator token path), the revoking device's own ID (self-revocation), or a
+// SIBLING device's ID (same-account revocation) — never the token itself.
+func (h *handlers) auditDeviceRevoked(r *http.Request, deviceID, revokedBy, accountID string) {
 	h.cfg.Logger.Warn(auditEventDeviceRevoked,
 		"event", auditEventDeviceRevoked,
 		"request_id", RequestIDFromContext(r.Context()),
 		"device_id", deviceID,
+		"account_id", accountID,
 		"revoked_by", revokedBy,
 	)
 }
 
-// auditVaultClaimed logs a trust-on-first-write ownership claim: this device is
+// auditVaultClaimed logs a trust-on-first-write ownership claim: this ACCOUNT is
 // now the vault's owner. It is the security-relevant moment when a vault ID
-// becomes bound to a device, so it is logged at Info with both IDs.
-func (h *handlers) auditVaultClaimed(r *http.Request, vaultID, deviceID string) {
+// becomes bound to a subject, so it is logged at Info with all three IDs (the
+// device is recorded because it is who performed the claim, not because it
+// confers anything).
+func (h *handlers) auditVaultClaimed(r *http.Request, vaultID, deviceID, accountID string) {
 	h.cfg.Logger.Info(auditEventVaultClaimed,
 		"event", auditEventVaultClaimed,
 		"request_id", RequestIDFromContext(r.Context()),
 		"vault_id", vaultID,
 		"device_id", deviceID,
+		"account_id", accountID,
+	)
+}
+
+// auditAccountCreated logs a new account founded by an operator-token
+// enrollment. created_by_device_id is audit metadata: membership is flat, so the
+// founder holds no extra power.
+func (h *handlers) auditAccountCreated(r *http.Request, accountID, deviceID string) {
+	h.cfg.Logger.Info(auditEventAccountCreated,
+		"event", auditEventAccountCreated,
+		"request_id", RequestIDFromContext(r.Context()),
+		"account_id", accountID,
+		"created_by_device_id", deviceID,
+	)
+}
+
+// auditAccountInviteCreated logs a minted invite. It records the PUBLIC handle,
+// the account, who minted it, when it expires and whether it is pinned —
+// NEVER the invite secret and NEVER its digest. Those two are the credential;
+// an audit line is not a credential-distribution channel.
+func (h *handlers) auditAccountInviteCreated(r *http.Request, inviteID, accountID, deviceID string, expiresAt time.Time, pinned bool) {
+	h.cfg.Logger.Info(auditEventAccountInviteCreated,
+		"event", auditEventAccountInviteCreated,
+		"request_id", RequestIDFromContext(r.Context()),
+		"invite_id", inviteID,
+		"account_id", accountID,
+		"device_id", deviceID,
+		"expires_at", expiresAt.UTC().Format(time.RFC3339),
+		"pinned", pinned,
+	)
+}
+
+// auditAccountInviteRevoked logs an invite revoked before use.
+func (h *handlers) auditAccountInviteRevoked(r *http.Request, inviteID, accountID, deviceID string) {
+	h.cfg.Logger.Warn(auditEventAccountInviteRevoked,
+		"event", auditEventAccountInviteRevoked,
+		"request_id", RequestIDFromContext(r.Context()),
+		"invite_id", inviteID,
+		"account_id", accountID,
+		"device_id", deviceID,
+	)
+}
+
+// auditAccountDeviceJoined logs a device joining an EXISTING account by invite.
+// It names the inviter, which is what makes a planted device VISIBLE after the
+// fact — flat membership means it is not PREVENTED.
+func (h *handlers) auditAccountDeviceJoined(r *http.Request, accountID, deviceID, invitedBy, inviteID string) {
+	h.cfg.Logger.Info(auditEventAccountDeviceJoined,
+		"event", auditEventAccountDeviceJoined,
+		"request_id", RequestIDFromContext(r.Context()),
+		"account_id", accountID,
+		"device_id", deviceID,
+		"invited_by", invitedBy,
+		"invite_id", inviteID,
 	)
 }
 
@@ -181,12 +254,16 @@ func (h *handlers) auditVaultClaimed(r *http.Request, vaultID, deviceID string) 
 // against the provider dashboard, and useless for charging anyone. No amount, no
 // customer contact detail, and no payment-instrument field is recorded (none
 // exists).
-func (h *handlers) auditCheckoutCreated(r *http.Request, provider, subject, sessionID string) {
+// The subject is the buying device's ACCOUNT (Phase 52); device_id records WHICH
+// device ran the checkout, so an operator can still see that without the account
+// ceasing to be the subject of entitlement.
+func (h *handlers) auditCheckoutCreated(r *http.Request, provider, subject, deviceID, sessionID string) {
 	h.cfg.Logger.Info(auditEventBillingCheckout,
 		"event", auditEventBillingCheckout,
 		"request_id", RequestIDFromContext(r.Context()),
 		"provider", provider,
 		"subject", subject,
+		"device_id", deviceID,
 		"session_id", sessionID,
 	)
 }
@@ -195,12 +272,13 @@ func (h *handlers) auditCheckoutCreated(r *http.Request, provider, subject, sess
 // billing.ProviderError (provider + operation + HTTP status) or a transport
 // error — deliberately never the provider's response BODY, which can echo
 // customer data, and never a credential (keys travel in headers, not URLs).
-func (h *handlers) auditCheckoutFailed(r *http.Request, provider, subject string, err error) {
+func (h *handlers) auditCheckoutFailed(r *http.Request, provider, subject, deviceID string, err error) {
 	h.cfg.Logger.Error(auditEventBillingCheckoutError,
 		"event", auditEventBillingCheckoutError,
 		"request_id", RequestIDFromContext(r.Context()),
 		"provider", provider,
 		"subject", subject,
+		"device_id", deviceID,
 		"err", err.Error(),
 	)
 }

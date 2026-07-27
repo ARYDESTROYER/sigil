@@ -59,43 +59,59 @@ func isUniqueViolation(err error) bool {
 }
 
 // CreateDevice inserts a device row. A duplicate device_id or public_key trips a
-// unique constraint and is reported as ErrDeviceExists.
+// unique constraint and is reported as ErrDeviceExists; an account_id that names
+// no account trips the foreign key and is reported as ErrAccountNotFound; an
+// EMPTY account_id is refused outright (the invariant fails closed here, so no
+// authorization path ever has to guess).
+//
+// Production enrollment does not use this: it goes through
+// CreateAccountWithFounder or JoinAccountWithInvite, which insert the device
+// ATOMICALLY with the account decision.
 func (s *PostgresDeviceStore) CreateDevice(ctx context.Context, d Device) error {
+	if d.AccountID == "" {
+		return errAccountRequired
+	}
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO sigil_devices (device_id, public_key, label, status, created_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		d.ID, d.PublicKey, d.Label, string(d.Status), d.CreatedAt)
+		`INSERT INTO sigil_devices (device_id, account_id, public_key, label, status, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		d.ID, d.AccountID, d.PublicKey, d.Label, string(d.Status), d.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ErrDeviceExists
+		}
+		if isForeignKeyViolation(err) {
+			return ErrAccountNotFound
 		}
 		return fmt.Errorf("create device: %w", err)
 	}
 	return nil
 }
 
-// GetDevice reads one device by ID, or ErrDeviceNotFound.
-func (s *PostgresDeviceStore) GetDevice(ctx context.Context, deviceID string) (Device, error) {
-	ctx, cancel := context.WithTimeout(ctx, opTimeout)
-	defer cancel()
+// deviceRowScanner is the minimal surface shared by pgx.Row and pgx.Rows so one
+// scan helper serves both the single-row and multi-row device reads.
+type deviceRowScanner interface {
+	Scan(dest ...any) error
+}
 
+// scanDeviceRow decodes one sigil_devices row. account_id is NULLABLE in the
+// schema (deliberately — see migration 0005) so a rolled-back pre-0005 binary
+// can still INSERT; a NULL here decodes to the empty string, which every
+// authorization path treats as a fail-closed invariant violation.
+func scanDeviceRow(row deviceRowScanner) (Device, error) {
 	var (
 		d         Device
+		accountID *string
 		status    string
 		revokedAt *time.Time
 	)
-	err := s.pool.QueryRow(ctx,
-		`SELECT device_id, public_key, label, status, created_at, revoked_at
-		   FROM sigil_devices WHERE device_id = $1`, deviceID).
-		Scan(&d.ID, &d.PublicKey, &d.Label, &status, &d.CreatedAt, &revokedAt)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return Device{}, ErrDeviceNotFound
-		}
-		return Device{}, fmt.Errorf("get device: %w", err)
+	if err := row.Scan(&d.ID, &accountID, &d.PublicKey, &d.Label, &status, &d.CreatedAt, &revokedAt); err != nil {
+		return Device{}, err
+	}
+	if accountID != nil {
+		d.AccountID = *accountID
 	}
 	d.Status = DeviceStatus(status)
 	if revokedAt != nil {
@@ -104,14 +120,41 @@ func (s *PostgresDeviceStore) GetDevice(ctx context.Context, deviceID string) (D
 	return d, nil
 }
 
+// GetDevice reads one device by ID, or ErrDeviceNotFound.
+func (s *PostgresDeviceStore) GetDevice(ctx context.Context, deviceID string) (Device, error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	d, err := scanDeviceRow(s.pool.QueryRow(ctx,
+		`SELECT device_id, account_id, public_key, label, status, created_at, revoked_at
+		   FROM sigil_devices WHERE device_id = $1`, deviceID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Device{}, ErrDeviceNotFound
+		}
+		return Device{}, fmt.Errorf("get device: %w", err)
+	}
+	return d, nil
+}
+
 // ListDevices returns every device ordered by created_at then device_id.
+//
+// ORDERING IS BYTE-WISE, NOT LOCALE-WISE. Every text ORDER BY in this package
+// carries COLLATE "C" so the SQL sort is the SAME sort Go's `<` performs on the
+// same strings. Without it the order depends on the DATABASE's collation: under
+// en_US.utf8 (the official postgres image, and the CI service container) the
+// base64url device IDs — which mix case and contain '-' and '_' — sort
+// differently from byte order, which made the ordering contract, and the tests
+// that assert it, intermittently wrong. COLLATE "C" is the whole fix: identical
+// results on every database regardless of how the cluster was initialised.
 func (s *PostgresDeviceStore) ListDevices(ctx context.Context) ([]Device, error) {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT device_id, public_key, label, status, created_at, revoked_at
-		   FROM sigil_devices ORDER BY created_at ASC, device_id ASC`)
+		`SELECT device_id, account_id, public_key, label, status, created_at, revoked_at
+		   FROM sigil_devices
+		  ORDER BY created_at ASC, device_id COLLATE "C" ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list devices: %w", err)
 	}
@@ -119,17 +162,9 @@ func (s *PostgresDeviceStore) ListDevices(ctx context.Context) ([]Device, error)
 
 	out := make([]Device, 0)
 	for rows.Next() {
-		var (
-			d         Device
-			status    string
-			revokedAt *time.Time
-		)
-		if err := rows.Scan(&d.ID, &d.PublicKey, &d.Label, &status, &d.CreatedAt, &revokedAt); err != nil {
+		d, err := scanDeviceRow(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan device: %w", err)
-		}
-		d.Status = DeviceStatus(status)
-		if revokedAt != nil {
-			d.RevokedAt = *revokedAt
 		}
 		out = append(out, d)
 	}
@@ -275,14 +310,17 @@ func (s *PostgresDeviceStore) PutGrant(ctx context.Context, vaultID, deviceID st
 	return nil
 }
 
-// ListGrants returns every grant on a vault, ordered by device ID.
+// ListGrants returns every grant on a vault, ordered by device ID — BYTE-WISE
+// (COLLATE "C"), so the order matches Go's own string comparison on every
+// database. See ListDevices for why.
 func (s *PostgresDeviceStore) ListGrants(ctx context.Context, vaultID string) ([]Grant, error) {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT vault_id, device_id, permission, is_owner, created_at
-		   FROM sigil_device_grants WHERE vault_id = $1 ORDER BY device_id ASC`, vaultID)
+		   FROM sigil_device_grants WHERE vault_id = $1
+		  ORDER BY device_id COLLATE "C" ASC`, vaultID)
 	if err != nil {
 		return nil, fmt.Errorf("list grants: %w", err)
 	}
@@ -304,24 +342,4 @@ func (s *PostgresDeviceStore) ListGrants(ctx context.Context, vaultID string) ([
 		return nil, fmt.Errorf("iterate grants: %w", err)
 	}
 	return out, nil
-}
-
-// ClaimVaultOwner atomically claims an unowned vault. The partial unique index
-// sigil_device_grants_one_owner (vault_id) WHERE is_owner means at most one owner
-// row can exist per vault; ON CONFLICT DO NOTHING turns a losing race into
-// rowsAffected == 0 rather than an error. A device that already holds a
-// non-owner grant on the vault likewise fails to claim (primary-key conflict),
-// which is correct — the vault is already owned by whoever claimed it.
-func (s *PostgresDeviceStore) ClaimVaultOwner(ctx context.Context, vaultID, deviceID string, at time.Time) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, opTimeout)
-	defer cancel()
-
-	tag, err := s.pool.Exec(ctx,
-		`INSERT INTO sigil_device_grants (vault_id, device_id, permission, is_owner, created_at)
-		 VALUES ($1, $2, $3, true, $4) ON CONFLICT DO NOTHING`,
-		vaultID, deviceID, string(PermWrite), at)
-	if err != nil {
-		return false, fmt.Errorf("claim vault owner: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
 }

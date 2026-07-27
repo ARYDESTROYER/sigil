@@ -10,6 +10,7 @@ import (
 	"crypto/ed25519"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
 )
@@ -99,6 +100,27 @@ type Config struct {
 	// NO CARD DATA passes through this configuration or the handlers behind it:
 	// every provider is used through its HOSTED checkout flow.
 	Billing BillingConfig
+	// ---- Account model (Phase 52). Rides Devices; no separate flag. ----
+	//
+	// There is deliberately NO SIGILD_ACCOUNTS switch: a binary that could run
+	// either ownership model would have two ownership truths at once. Accounts
+	// are active exactly when the v3 device model is (which already requires the
+	// dev-ops gate).
+
+	// AccountMaxDevices caps how many devices one account may hold. 0 => the
+	// package default (defaultAccountMaxDevices). It is ANTI-FREELOADING, not
+	// anti-fraud: ten devices in one account is indistinguishable from household
+	// sharing versus a small business, and there is no per-seat model.
+	AccountMaxDevices int
+	// AccountMaxInvites caps how many OPEN (unused, unexpired, unrevoked)
+	// invites one account may hold. 0 => the package default. It bounds stored
+	// STATE, not request volume — there is no rate limit on invite minting.
+	AccountMaxInvites int
+	// AccountInviteTTL is how long a freshly minted invite stays redeemable.
+	// 0 => the package default. A client may request a SHORTER life, never a
+	// longer one.
+	AccountInviteTTL time.Duration
+
 	// AdminToken is the OPTIONAL operator token (SIGILD_ADMIN_TOKEN) that
 	// authorizes the operator-only device routes (list all devices, revoke any
 	// device). Empty (the default) means those operator paths are permanently
@@ -203,6 +225,16 @@ func NewRouter(cfg Config) http.Handler {
 		// auth path. The list route returns METADATA only, never a blob.
 		mux.Handle("GET /v1/vaults/{vaultID}/keys", http.HandlerFunc(h.keyEnvelopeList))
 		mux.Handle("DELETE /v1/vaults/{vaultID}/keys/{deviceID}", http.HandlerFunc(h.keyEnvelopeDelete))
+		// Account model (Phase 52): membership and single-use invites. Same dev
+		// gate and the same authenticateDevice choke point — no new auth path.
+		// NOTHING here names an account: every one of them derives it from the
+		// verified signer's device row.
+		mux.Handle("GET /v1/account", http.HandlerFunc(h.accountGet))
+		mux.Handle("POST /v1/account/invites",
+			limitBody(maxAccountBodyBytes, http.HandlerFunc(h.accountInviteCreate)))
+		mux.Handle("GET /v1/account/invites", http.HandlerFunc(h.accountInviteList))
+		mux.Handle("POST /v1/account/invites/{inviteID}/revoke",
+			limitBody(maxAccountBodyBytes, http.HandlerFunc(h.accountInviteRevoke)))
 	} else {
 		stub := http.HandlerFunc(h.deviceNotImplemented)
 		mux.Handle("POST /v1/devices/enroll", stub)
@@ -217,6 +249,15 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("GET /v1/vaults/{vaultID}/keys/{deviceID}", stub)
 		mux.Handle("GET /v1/vaults/{vaultID}/keys", stub)
 		mux.Handle("DELETE /v1/vaults/{vaultID}/keys/{deviceID}", stub)
+		// The account routes get their OWN 501 stub (not the device one), so its
+		// detail string names this surface and the device stub's text — which
+		// existing tests assert — is untouched.
+		acct := http.HandlerFunc(h.accountNotImplemented)
+		mux.Handle("GET /v1/account", acct)
+		mux.Handle("POST /v1/account/invites", limitBody(maxAccountBodyBytes, acct))
+		mux.Handle("GET /v1/account/invites", acct)
+		mux.Handle("POST /v1/account/invites/{inviteID}/revoke",
+			limitBody(maxAccountBodyBytes, acct))
 	}
 
 	// Billing routes (hosted checkout, provider webhooks, subscription status).

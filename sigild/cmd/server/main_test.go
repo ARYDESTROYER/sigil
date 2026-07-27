@@ -105,18 +105,25 @@ func TestEffectiveBurst(t *testing.T) {
 }
 
 // TestParseMigrateArgs covers the (DB-free) migrate argument parsing: no args =>
-// apply, "status" => report-only, anything else => error.
+// apply, "status" => report-only, "adopt" => re-run the account backfill,
+// anything else => error.
 func TestParseMigrateArgs(t *testing.T) {
-	if statusOnly, err := parseMigrateArgs(nil); err != nil || statusOnly {
-		t.Errorf("parseMigrateArgs(nil) = (%v, %v), want (false, nil)", statusOnly, err)
+	good := []struct {
+		args []string
+		want migrateMode
+	}{
+		{nil, migrateApply},
+		{[]string{}, migrateApply},
+		{[]string{"status"}, migrateStatus},
+		{[]string{"adopt"}, migrateAdopt},
 	}
-	if statusOnly, err := parseMigrateArgs([]string{}); err != nil || statusOnly {
-		t.Errorf("parseMigrateArgs([]) = (%v, %v), want (false, nil)", statusOnly, err)
+	for _, c := range good {
+		got, err := parseMigrateArgs(c.args)
+		if err != nil || got != c.want {
+			t.Errorf("parseMigrateArgs(%v) = (%v, %v), want (%v, nil)", c.args, got, err, c.want)
+		}
 	}
-	if statusOnly, err := parseMigrateArgs([]string{"status"}); err != nil || !statusOnly {
-		t.Errorf("parseMigrateArgs([status]) = (%v, %v), want (true, nil)", statusOnly, err)
-	}
-	for _, bad := range [][]string{{"bogus"}, {"status", "extra"}, {"up"}} {
+	for _, bad := range [][]string{{"bogus"}, {"status", "extra"}, {"up"}, {"adopt", "extra"}} {
 		if _, err := parseMigrateArgs(bad); err == nil {
 			t.Errorf("parseMigrateArgs(%v) = nil error, want error", bad)
 		}

@@ -50,8 +50,9 @@
 pub mod net;
 
 pub use net::{
-    pull_and_adopt, DeviceConfig, DeviceStatus, PulledVault, ServerCheck, VaultKeyInfo,
-    DEVICE_IDENTITY_FILE, HYBRID_PUBLIC_FILE, HYBRID_SECRET_FILE,
+    pull_and_adopt, AccountMember, AccountView, DeviceConfig, DeviceStatus, MintedInvite,
+    OpenInvite, PulledVault, ServerCheck, VaultKeyInfo, DEVICE_IDENTITY_FILE, HYBRID_PUBLIC_FILE,
+    HYBRID_SECRET_FILE,
 };
 
 use std::path::{Path, PathBuf};

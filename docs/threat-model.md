@@ -61,16 +61,22 @@ production security claim.
 
 **What this surface does NOT defend (be explicit):**
 
-- **Trust-on-first-write ownership is a dev heuristic, not identity.** The first
-  device to authenticate a *write* to an **unclaimed** vault becomes its owner.
-  An attacker who guesses or learns an unclaimed vault ID and writes to it first
-  **becomes the owner** and locks the legitimate owner out with a `403`. This is
-  tolerable pre-audit only because vault IDs are client-chosen high-entropy
-  identifiers; it is **not** an account model and **not** sufficient for
-  production.
-- **No ownership transfer — revoking a vault's owner ORPHANS the vault.** After
-  the owner is revoked nobody can grant on that vault; existing grantees keep
-  only what they already hold. There is no recovery path.
+- **Trust-on-first-write ownership is a dev heuristic, not identity.** ⚠️ **Phase
+  52 moved it up one level — it did not remove it** (see
+  [Account boundary](#account-boundary-dev-gated--see-adr-0040) below): the first
+  **account** to authenticate a *write* to an **unclaimed** vault becomes its
+  owner. An attacker who guesses or learns an unclaimed vault ID and writes to it
+  first **becomes the owner** and locks the legitimate owner out with a `403`.
+  This is tolerable pre-audit only because vault IDs are client-chosen
+  high-entropy identifiers; there is now an account model, but it is **not an
+  identity system** and **not** sufficient for production.
+- **~~No ownership transfer — revoking a vault's owner ORPHANS the vault.~~**
+  ⚠️ **Retired at the device level by Phase 52.** Ownership belongs to an
+  **account**, so every sibling device inherits it: revoking the device that
+  claimed a vault no longer strands it. **The failure was narrowed, not
+  eliminated** — lose or revoke *every* device in an account and the account, its
+  vaults and its subscription are permanently unreachable, with **no recovery of
+  any kind**. Ownership still never transfers *between accounts*.
 - **No rate limiting on enrollment attempts.** The per-vault op-log rate limiter
   does not cover `POST /v1/devices/enroll`, so token guessing is bounded only by
   the ≥ 16-character minimum and the constant-time digest comparison.
@@ -80,10 +86,12 @@ production security claim.
 - **A token is single-ATTEMPT, not single-SUCCESS.** It is spent before the
   device row is created, so a failed enrollment burns it (fail-closed by design;
   the operator must issue a new one).
-- **No key rotation, re-enrollment, or recovery**, no hardware attestation, no
-  account/session/JWT layer, and the in-memory registry is **non-durable** — a
-  spent token becomes reusable after a restart (warned loudly at boot), and the
-  file backend was not extended.
+- **No key rotation, re-enrollment, or recovery**, no hardware attestation, and
+  no session/JWT layer. Since Phase 52 there **is** an account layer — but it is
+  auth metadata only, with **no identity and no recovery** (see
+  [Account boundary](#account-boundary-dev-gated--see-adr-0040)). The in-memory
+  registry is **non-durable** — a spent token becomes reusable after a restart
+  (warned loudly at boot), and the file backend was not extended.
 - **Plain HTTP in dev.** Nothing here substitutes for transport security.
 
 ### Browser clients holding a device identity (webapp + MV3 extension)
@@ -267,8 +275,10 @@ host now holds bearer secrets:
 
 **Zero-knowledge is unaffected by the auth model — or by sharing.** The registry
 stores **auth metadata only** — Ed25519 **public** keys, server-assigned IDs,
-labels, permissions, timestamps, and a bearer token's SHA-256 digest. Migrations
-`0002_devices.sql` and `0004_key_sharing.sql` touch **nothing** in the op-log
+labels, permissions, timestamps, a bearer token's SHA-256 digest, and (since
+Phase 52) account ids, memberships, invite **digests** and vault-owner rows.
+Migrations `0002_devices.sql`, `0004_key_sharing.sql` and `0005_accounts.sql`
+touch **nothing** in the op-log
 table, so the opaque blob and its tamper-evidence hash chain are byte-for-byte
 unchanged, and the server still performs **no cryptography on vault contents**.
 Adding authentication did **not** give the server any ability to decrypt, and
@@ -316,6 +326,87 @@ that actually resists a hostile server is **client-side**: a client re-derives
 the chain from the per-op hashes it receives and compares against its own
 remembered tip. Server-side verification only catches accidental corruption and a
 non-adversarial operator's storage faults.
+
+## Account boundary (dev-gated — see [ADR 0040](decisions/0040-account-model.md))
+
+Phase 52 made an **account** — not a device — the subject of **entitlement** and
+the **owner of vaults**. An account is a **server-assigned id on the device row**;
+a **single-use invite** minted by a member device is the only way a second device
+joins. It is **auth metadata only**: no email, no password, no session, no PII,
+no key material, and **no recovery**.
+
+**The invariant that shapes this boundary:** ⭐ **no request anywhere names an
+account.** Every handler derives it from `dev.AccountID` on the device row of the
+signature it just verified. There is no path segment, no query parameter and no
+body field that names an account, so a cross-account request is
+**unconstructible**, not merely rejected. That is stronger than a filter, and it
+is the whole of the cross-account access-control story.
+
+**The line an auditor should be able to check:** an account is auth metadata
+only; the server still never sees a vault key, a password or a plaintext; no
+request anywhere names an account; entitlement and vault ownership derive
+**solely** from the account on the verified signer's device row; and **membership
+grants ciphertext access, never plaintext**.
+
+| # | Adversary | Capability | Defense as implemented | Layer |
+| --- | --- | --- | --- | --- |
+| Y | **Cross-account prober** | Wants to read or mutate another account's membership, invites or vaults | **Structural:** no request names an account. `GET /v1/account` and the three invite routes all resolve `dev.AccountID` from the verified signature; invite revocation is scoped by `(account_id, invite_id)` in the store, so a **foreign** invite handle and a **missing** one are both `404` — no enumeration oracle. A vault owned by another account answers the same coarse `403` as a vault owned by nobody | `sigild` API surface |
+| Z | **Invite interceptor** | Reads an invite in transit, in a chat log, or over the shoulder | ⚠️ **Only partially defended.** An **unpinned** invite is a **bearer secret** for its whole TTL, and the dev transport is **plain HTTP with no TLS**. Defenses that do exist: 256 bits of `crypto/rand`, a short default TTL (15 min), a per-account **open-invite cap**, **single-SUCCESS** redemption (consumption and the device insert are one atomic operation), revocation before use, and an optional **pin** (`invitee_public_key`) binding the invite to exactly one Ed25519 key. **Nothing forces pinning** | `sigild` enrollment + operator practice |
+| AA | **Invite-state prober** | Probes to learn whether an invite exists, is used, expired, or revoked | Every invite failure collapses onto an **existing coarse** enrollment reason (`bad_enrollment_token` / `enrollment_token_used` / `enrollment_token_expired` / `bad_proof`) and the **same 401 body**. The fine-grained cause reaches the **audit log only** — never a response, never a `/metrics` label. The one new distinct status, `409 account_full`, is reachable **only after** a credential and a valid proof have been accepted | `sigild` API surface |
+| AB | **Compromised member device** | Holds a valid key inside an account | ⚠️ **Largely undefended, by design of a flat model.** It may **invite** new devices, **revoke every other member**, run checkout, and **administer every account-owned vault**. It still **cannot decrypt** a vault it has not been sent an envelope for. What exists is **visibility, not prevention**: `account.device_joined` names the **inviter**, `device.revoked` names the revoker and the account. **Revoking a compromised device does NOT revoke the devices it invited** | Audit / operational |
+| AC | **Hostile or compromised server** | Owns the device registry | ⚠️ **It can insert a device into any account** — it writes the registry, so membership is not a client-verified claim. ⭐ **And it still cannot decrypt anything**, because membership confers **AUTHORIZATION, never DECRYPTION**: a joined device reads nothing until an existing member **wraps the vault key to its hybrid public key**, a deliberate client-side act. The follow-on move — serving the attacker's hybrid key when a member goes to wrap — is the key-substitution attack, defended **client-side only** by pinning + safety numbers (adversary **X** below), which **cannot protect first contact** | Architecture + client |
+| AD | **Rolled-back binary / stranded rows** | A pre-Phase-52 `sigild` writes to an already-migrated database | Devices enrolled that way carry `account_id NULL`, and vaults claimed that way carry a legacy `is_owner` grant and no owner row. Both **fail CLOSED** — refused everywhere with a coarse `403` (`missing_account` / `vault_owner_unresolved`), and the server **never falls back to the device id**, which would silently resurrect the model accounts replaced. Because the refusal is deliberately indistinguishable from any other, the server **warns at boot** with the counts and the repair command; the repair is the explicit, idempotent **`sigild migrate adopt`**. **Adoption never happens implicitly on the authentication path** — an unauthenticated request must never be able to mint an account | `sigild` boot + operator |
+
+**What this boundary does NOT defend (be explicit):**
+
+- ⚠️ **THERE IS NO RECOVERY, AND THIS IS NOT AN IDENTITY SYSTEM.** No email, no
+  password, no recovery code, no operator break-glass. An account is reachable
+  only through a member device's private key. **Lose or revoke every device and
+  the account is permanently unreachable, its vaults permanently unreadable by
+  the customer AND by us, and its subscription stranded.** Compared with the
+  device model this **narrowed** the orphan failure (from "revoke one device" to
+  "lose every device"); it did **not eliminate** it. The guidance — *keep two
+  devices enrolled* — is a **mitigation, not a fix**, and it must be written down
+  before anyone charges real money.
+- **Trust-on-first-write did not go away; it moved up one level.** The first
+  *account* to write an unclaimed, high-entropy vault id owns it, and an attacker
+  who gets there first still locks the legitimate owner out with a `403`.
+- **Ownership never moves between accounts and membership is immutable** — no
+  transfer, merge, split, or account deletion. A device in the wrong account can
+  only be revoked and re-enrolled.
+- **No account merge across the cutover.** Every device enrolled before migration
+  `0005` was adopted into its **own singleton account**, so an existing two-device
+  customer has **two accounts and two billing subjects**; the remedy is manual and
+  leaves a second subscription row for an operator to reconcile.
+- **Entitlement is reported, never enforced** — no route refuses service to an
+  unentitled account — and **the billing trust assumption's blast radius grew with
+  the subject**: a compromised provider webhook secret now moves an *account's*
+  status rather than one device's.
+- **No rate limiting** on `POST /v1/devices/enroll` or
+  `POST /v1/account/invites`. The device and invite caps bound stored **state**,
+  not request volume, and there is no sweep job for expired invites.
+  `SIGILD_ACCOUNT_MAX_DEVICES` is **anti-freeloading, not anti-fraud**.
+- **`/metrics` remains always-on and unauthenticated**, and its per-reason
+  counters are a weak correlatable oracle (pre-existing). This surface
+  deliberately does **not** widen it.
+- **The replay nonce cache is still per-process and in-memory.** Invite
+  consumption is DB-atomic and therefore multi-instance safe; **signed requests
+  are not**.
+- **The in-memory registry is non-durable** — accounts, memberships, invites and
+  vault-owner rows all vanish on restart (warned at boot) — and the **file op-log
+  backend was still not extended**.
+- **Plain HTTP in dev, `501` by default, UNAUDITED.** A real authorization model,
+  **not a reviewed one**.
+
+**Zero-knowledge is unchanged.** Migration `0005_accounts.sql` is pure DDL plus a
+metadata backfill: **no column it creates can hold a vault key, a password, a
+plaintext, a card detail, an email, a phone number, a display name, a bearer
+token, a signature or a nonce**; an invite exists only as a lowercase-hex SHA-256
+**digest** (the secret is returned exactly once and never stored, logged or
+re-served); and `sigil_vault_ops` is not named anywhere in it, so the opaque blob
+and its tamper-evidence hash chain are byte-for-byte unchanged and
+`GET …/ops/verify` returns the same `tip_hash` before and after. Adversary
+classes 4 and 5 are unaffected.
 
 ## Device-to-device vault sharing (opt-in, dev-gated — see [ADR 0035](decisions/0035-device-to-device-vault-sharing.md))
 

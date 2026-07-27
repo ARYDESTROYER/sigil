@@ -464,6 +464,85 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
     say(&format!("the real sigil CLI enrolled as {cli_id}"));
 
     // -----------------------------------------------------------------
+    // 4b. ACCOUNTS (Phase 52). The desktop can read its own account and mint an
+    //     invite, and a device that redeems that invite with the ORDINARY
+    //     `sigil device enroll` lands in the desktop's account. Two devices that
+    //     each used an OPERATOR token are in two DIFFERENT accounts.
+    // -----------------------------------------------------------------
+    {
+        let mine = desktop.account().expect("desktop account");
+        assert!(
+            mine.account_id.starts_with("acct_"),
+            "expected an acct_ id, got {}",
+            mine.account_id
+        );
+        assert_eq!(mine.device_count, 1, "the desktop should be alone so far");
+        assert!(
+            mine.members.iter().any(|m| m.is_this_device),
+            "the desktop must recognise its own row"
+        );
+        assert!(
+            !mine.members.iter().any(|m| m.device_id == cli_id),
+            "an OPERATOR token must found a NEW account, never join one"
+        );
+
+        // Mint an invite and redeem it with the REAL CLI binary — no new command
+        // and no new wire format: an invite IS an enrollment token.
+        let invite = desktop.create_invite(Some(300)).expect("mint invite");
+        assert!(
+            invite.invite.starts_with("join_"),
+            "expected a join_ secret"
+        );
+        assert_eq!(invite.account_id, mine.account_id);
+        let open = desktop.list_invites().expect("list invites");
+        assert_eq!(open.len(), 1, "the open invite should be listed");
+        assert_eq!(open[0].invite_id, invite.invite_id);
+        // The listing is METADATA ONLY: a minted secret is unrecoverable.
+        assert!(
+            !format!("{open:?}").contains(&invite.invite),
+            "the invite listing echoed the secret"
+        );
+
+        let joiner_home = h.tmp.join("account-joiner");
+        std::fs::create_dir_all(&joiner_home).expect("joiner home");
+        let joiner_id = device_id_in(&h.cli(
+            &joiner_home,
+            CLI_PASSWORD,
+            &[
+                "device",
+                "enroll",
+                "--token",
+                &invite.invite,
+                "--label",
+                "joined-by-invite",
+            ],
+        ));
+        let after = desktop.account().expect("account after join");
+        assert_eq!(after.account_id, mine.account_id);
+        assert_eq!(after.device_count, 2, "the joiner should be a member");
+        assert!(
+            after.members.iter().any(|m| m.device_id == joiner_id),
+            "the joiner is missing from the member list"
+        );
+        assert!(
+            desktop.list_invites().expect("invites").is_empty(),
+            "a redeemed invite must not stay open"
+        );
+
+        // A handle that does not exist (or belongs to someone else) is the SAME
+        // answer — there is no enumeration oracle.
+        match desktop.revoke_invite("inv_doesNotExist") {
+            Err(DesktopError::MissingOnServer(_)) => {}
+            other => panic!("expected MissingOnServer for an unknown invite, got {other:?}"),
+        }
+        say(&format!(
+            "accounts: the desktop owns {} and a CLI device joined it by invite ({joiner_id}); \
+             the operator-token CLI device is in a different account",
+            mine.account_id
+        ));
+    }
+
+    // -----------------------------------------------------------------
     // 5. (a) DESKTOP SHARES TO THE CLI -> the CLI prints 94287082.
     // -----------------------------------------------------------------
     let share_fp = desktop

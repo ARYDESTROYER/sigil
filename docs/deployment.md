@@ -282,8 +282,13 @@ To avoid any over-claim, the honest gaps:
   the subscription state machine and the idempotency ledger are **real code that
   really runs** — but they are **opt-in, dev-gated (`501` by default),
   UNAUDITED**, and **have never been run against a live provider account**; the
-  Juspay scheme is explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD**. There is no
-  account model (a subscription keys off the enrolled device), no entitlement
+  Juspay scheme is explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD**. A
+  subscription now keys off the buying device's **ACCOUNT**
+  ([§14](#14-account-model-operator-guide--dev-gated)) rather than the device —
+  but an account is **not an identity**: no email, no password, **no recovery**,
+  and every device enrolled before migration `0005` was adopted into its **own**
+  account, so an existing two-device customer has **two** billing subjects. There
+  is no entitlement
   enforcement, no recurring-subscription creation for the India adapters, no
   fraud/chargeback/refund/proration/tax handling, and **no PCI attestation**
   (hosted checkout keeps card data out of the process entirely, which minimizes
@@ -459,9 +464,10 @@ backends have no database and no migrations, and the whole thing is inert unless
 - **Embedded + versioned in the binary.** Each migration is an embedded
   `NNNN_description.sql` file (`go:embed`, `sigild/internal/store/migrations/`);
   the zero-padded leading integer is the version and migrations apply in ascending
-  the current set is **`0001_init.sql`**, **`0002_devices.sql`**, **`0003_billing.sql`**
-and **`0004_key_sharing.sql`** (version `4`),
-  which creates the `sigil_vault_ops` table (opaque `bytea` `blob` + `bytea`
+  order; the current set is **`0001_init.sql`**, **`0002_devices.sql`**,
+  **`0003_billing.sql`**, **`0004_key_sharing.sql`** and **`0005_accounts.sql`**
+  (version `5`).
+  `0001` creates the `sigil_vault_ops` table (opaque `bytea` `blob` + `bytea`
   `hash` + `(vault_id, seq)` primary key). A **`schema_migrations`** tracking
   table (`version`, `name`, `applied_at`) records what has been applied, so a run
   is idempotent and auditable.
@@ -475,8 +481,9 @@ and **`0004_key_sharing.sql`** (version `4`),
   for a controlled deploy where migrations run as a separate, gated step.
 - **Operator CLI (not an HTTP endpoint).** `sigild migrate` applies all pending
   migrations; `sigild migrate status` prints each known migration as `[applied]`
-  (with its `applied_at`) or `[pending]` and applies nothing. Both read the DSN
-  from `SIGILD_OPLOG_POSTGRES` and error clearly if it is unset.
+  (with its `applied_at`) or `[pending]` and applies nothing; **`sigild migrate
+  adopt`** re-runs the account backfill (§11.1). All three read the DSN from
+  `SIGILD_OPLOG_POSTGRES` and error clearly if it is unset.
 - **Safe concurrent boots.** The whole migration run is serialized across
   instances by a **session-level `pg_advisory_lock`** on a fixed key, and each
   pending migration commits in its **own transaction**, so two `sigild` instances
@@ -492,6 +499,100 @@ and **`0004_key_sharing.sql`** (version `4`),
 > intact). This is a real, ordered, tracked migration system for the **dev**
 > Postgres backend; it is **not** a production change-management pipeline (no
 > down-migrations, no online/zero-downtime rewrites, no managed rollout tooling).
+
+### 11.1 `sigild migrate adopt` — the account backfill, and when you need it
+
+`0005_accounts.sql` does more than DDL: it **adopts** existing rows into the
+account model (see [ADR 0040](decisions/0040-account-model.md)). Inside the
+migration's single transaction it
+
+1. mints an `acct_mig_<device_id>` account for every device that has none, active
+   **and** revoked, and stamps it onto the device row;
+2. records vault ownership for every vault holding a legacy `is_owner` grant; and
+3. re-keys any subscription whose `subject` is a **device** id onto that device's
+   account.
+
+⚠️ **`sigil_devices.account_id` is deliberately NULLABLE.** A `NOT NULL` column
+would stop a **rolled-back** pre-account binary enrolling at all. The cost of
+that choice is the whole of this section:
+
+> **A pre-Phase-52 `sigild` running against an already-migrated database enrolls
+> devices with `account_id NULL` and claims vaults by writing an `is_owner` grant
+> and no owner row.** Roll forward and those rows are **stranded**: the new binary
+> refuses them everywhere with a coarse `403` (`missing_account` /
+> `vault_owner_unresolved`, deliberately indistinguishable from any other
+> refusal), and **`sigild migrate` will NOT fix it** — `0005` is already recorded
+> in `schema_migrations`, so it never runs again.
+
+**The accurate rollback story, therefore:** a rollback **is survivable** — an old
+binary keeps running and keeps enrolling — **but any device enrolled during the
+rollback window needs `sigild migrate adopt` after you roll forward**, and the
+**boot warning below is how you know**.
+
+**How an operator finds out.** Because the refusal is deliberately coarse,
+traffic tells you nothing. At boot (Postgres registry only) `sigild` counts both
+states and, if either is non-zero, logs:
+
+```
+WARN ACCOUNT BACKFILL INCOMPLETE: this database holds rows written by a
+     PRE-ACCOUNT-MODEL binary after migration 0005 was applied. … `sigild
+     migrate` will NOT fix this — 0005 is already recorded as applied. Run
+     `sigild migrate adopt` (idempotent) to repair it
+     devices_without_account=N  vaults_with_owner_grant_but_no_owner_row=M
+```
+
+The check never blocks a boot: a read failure, or a schema older than the account
+model, is logged at debug and ignored.
+
+**The repair.** Idempotent, one transaction, and a no-op when there is nothing to
+do:
+
+```bash
+SIGILD_OPLOG_POSTGRES="$DSN" sigild migrate adopt
+# nothing to adopt: every device has an account and every owner grant has an owner row
+#   — or —
+# adopted 3 device(s) into 3 new account(s)
+# recorded ownership for 1 vault(s) from existing owner grants
+# re-keyed 0 subscription(s) from a device subject to its account
+```
+
+**Post-apply verification** (read-only; all three should be `0`):
+
+```sql
+-- devices with no account
+SELECT count(*) FROM sigil_devices WHERE account_id IS NULL;
+
+-- vaults whose only ownership record is a legacy owner grant
+SELECT count(*) FROM sigil_device_grants g
+ WHERE g.is_owner
+   AND NOT EXISTS (SELECT 1 FROM sigil_vault_owners o WHERE o.vault_id = g.vault_id);
+
+-- subscriptions still keyed to a device id rather than an account
+SELECT count(*) FROM sigil_subscriptions s
+  JOIN sigil_devices d ON d.device_id = s.subject;
+```
+
+And confirm the schema version moved:
+
+```bash
+curl -s localhost:8080/metrics | grep sigild_schema_version   # → 5
+```
+
+> **Adoption is NEVER implicit.** It does not happen on the authentication path,
+> because that would let an **unauthenticated request mint an account**. It is an
+> explicit operator command, and that is the only way it runs.
+
+⚠️ **Two consequences to plan around, not work around:**
+>
+> - **NO ACCOUNT MERGE.** Every pre-0005 device is adopted into its **own
+>   singleton account**, so an existing two-device customer ends up with **two
+>   accounts and two billing subjects**. The remedy is manual — revoke one device,
+>   re-join it by invite, re-share the vault, rotate — and it **leaves a second
+>   subscription row for an operator to reconcile**.
+> - **`sigil_billing_processed_events.subject` deliberately keeps pre-0005 DEVICE
+>   ids.** It is an append-only record of what was processed at the time, read by
+>   no logic; rewriting it to look retroactively consistent would falsify history.
+>   **Cross-cutover reconciliation needs BOTH ids.**
 
 ---
 
@@ -762,11 +863,111 @@ carry no secret, but the endpoint is still not meant for the public internet.
   `/v1/payment_links` and Juspay's `/session` create a **one-time hosted page**.
   Their webhook sides map subscription/mandate events, so a subscription created
   out-of-band in the dashboard drives the state machine correctly.
-- **No account model** — a subscription keys off the **enrolled device** that ran
-  checkout, so one human with two devices is two subjects.
+- **An ACCOUNT is the subject since Phase 52 — but it is not an identity.** A
+  subscription keys off the **account** of the device that ran checkout (§14), so
+  one human's devices share one subject. There is still no user record, no email,
+  no seat model, no transfer and **no recovery**; ⚠️ every device enrolled before
+  migration `0005` was adopted into its **own** account, so an existing two-device
+  customer has **two** subjects (§11.1).
 - **No entitlement enforcement** — `entitled` is reported by
   `GET /v1/billing/subscription` and consulted by nothing.
 - **No fraud, chargeback, refund, proration, tax, dunning or reconciliation
   handling**, no billing admin surface, and no rate limiting on the webhook
   endpoint (only the 64 KiB body cap).
 - **No PCI attestation** — hosted checkout minimizes scope; it certifies nothing.
+
+---
+
+## 14. Account model (operator guide — dev-gated)
+
+> **Dev-gated and UNAUDITED.** An account is **auth metadata only**: no email, no
+> password, no session, no PII, and **NO RECOVERY**. See
+> [`api.md` → Account model](api.md#account-model-dev-gated--phase-52) and
+> [ADR 0040](decisions/0040-account-model.md).
+
+Since Phase 52 the subject of **entitlement** and the **owner of vaults** is an
+**account**, not a device: paying on one device covers the others, and revoking
+the device that claimed a vault no longer orphans it. A second device joins with
+a **single-use invite** minted by a device already in the account.
+
+### 14.1 Turning it on (there is no switch)
+
+**There is deliberately no `SIGILD_ACCOUNTS` variable.** Accounts are active
+exactly when the v3 device model is — a binary that could run either ownership
+model would hold **two ownership truths at once**. Setting any `SIGILD_ACCOUNT_*`
+value **without `SIGILD_DEVICE_AUTH` is a boot error**, not a silently ignored
+knob.
+
+| Variable | Default | Range | Notes |
+|----------|---------|-------|-------|
+| `SIGILD_ACCOUNT_MAX_DEVICES` | `10` | `[1, 1000]` | **Active** devices only — a revoked device **frees its seat**. Anti-freeloading, **not** anti-fraud |
+| `SIGILD_ACCOUNT_MAX_INVITES` | `5` | `[1, 100]` | **Open** invites per account. Bounds stored **state**, not request volume |
+| `SIGILD_ACCOUNT_INVITE_TTL` | `15m` | `(0, 24h]` | Go duration. A client may request a **shorter** life, never a longer one |
+
+All three are validated **fail-fast before the listener binds**, and an
+out-of-range value is an **error, never a silent clamp**. At boot with device auth
+on, `sigild` logs a WARN naming the active model, the caps, and the two
+properties an operator must know: **membership is flat** and **there is no
+recovery**.
+
+Storage is migration `0005_accounts.sql` (§11), so **`sigild_schema_version`
+reports `5`**. With **no Postgres backend** the registry — accounts, memberships,
+invites and vault-owner rows included — is **in-memory and non-durable** and is
+lost on every restart (warned at boot); the **file op-log backend was not
+extended**.
+
+### 14.2 Provisioning a customer
+
+```bash
+# 1) the FIRST device of an account uses an OPERATOR token, which always
+#    founds a NEW account:
+sigil device enroll --token "$SIGILD_ENROLL_TOKEN_VALUE" --label laptop
+
+# 2) every LATER device joins by invite, minted on a device already in it:
+sigil account invite --pin-key "<the joining device's Ed25519 public key, b64>"
+#    -> prints the invite secret ONCE, on stdout
+
+# 3) the joining device runs the ORDINARY enroll command:
+sigil device enroll --token "join_…" --label phone
+
+# 4) inspect / clean up:
+sigil account status
+sigil account invites
+sigil account revoke-invite inv_…
+```
+
+An invite rides the **existing** `X-Sigil-Enroll-Token` header under the
+**existing** enrollment challenge, so **no client change was needed** — the
+webapp and the MV3 extension can join today by pasting an invite into their
+enrollment-token field (neither can *mint* one; the CLI and the desktop app can).
+
+### 14.3 Operational cautions
+
+- ⚠️ **An unpinned invite is a BEARER SECRET** for its whole TTL, over a
+  **plain-HTTP** dev transport. Use `--pin-key` where you can; **nothing forces
+  it**. It is shown **once** and can never be re-served.
+- ⚠️ **Membership is FLAT.** Any member may invite, **revoke every other member**,
+  run checkout, and administer every account-owned vault. Revoking a compromised
+  device does **not** revoke the devices it invited — the audit log names the
+  inviter (`account.device_joined`), but nothing prevents it.
+- ⚠️ **THERE IS NO RECOVERY.** Lose or revoke **every** device in an account and
+  the account, its vaults and its subscription are permanently unreachable — by
+  the customer and by us. Tell customers to **keep two devices enrolled**. This is
+  a mitigation, not a fix, and **it must be settled before anyone charges real
+  money**.
+- **Membership is immutable**: no transfer, no merge, no split, no account
+  deletion. A device in the wrong account can only be revoked and re-enrolled.
+- **No rate limiting** on `POST /v1/devices/enroll` or
+  `POST /v1/account/invites`, and **no sweep job** for expired invite rows.
+- **Nothing here is enforced against payment.** Entitlement is reported, never
+  enforced.
+
+### 14.4 What to watch
+
+| Signal | Where |
+|--------|-------|
+| `sigild_accounts_created_total`, `sigild_account_invites_created_total`, `sigild_account_invites_revoked_total`, `sigild_account_joins_total` | `GET /metrics` — counts only, **no id label ever** |
+| `sigild_device_enroll_denied_total{reason="account_full"}` | `GET /metrics` — the one new denial label |
+| `sigild_oplog_auth_denied_total{reason="missing_account"\|"vault_owner_unresolved"}` | `GET /metrics` — **non-zero means run `sigild migrate adopt`** (§11.1) |
+| `account.created` / `account.device_joined` / `account.invite_created` / `account.invite_revoked` | the structured audit log — metadata only, **never** an invite secret or digest |
+| `ACCOUNT BACKFILL INCOMPLETE` | a boot WARN — the only signal that stranded rows exist (§11.1) |

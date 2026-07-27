@@ -59,7 +59,7 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 	t.Run("HybridKeyPublishFetchRepublish", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "laptop")
-		if err := s.CreateDevice(ctx, d); err != nil {
+		if err := createDevice(ctx, s, d); err != nil {
 			t.Fatalf("CreateDevice: %v", err)
 		}
 
@@ -103,7 +103,7 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 	t.Run("HybridKeyRejectsMalformedAndUnknownDevice", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "laptop")
-		if err := s.CreateDevice(ctx, d); err != nil {
+		if err := createDevice(ctx, s, d); err != nil {
 			t.Fatalf("CreateDevice: %v", err)
 		}
 
@@ -130,7 +130,7 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		sender := newTestDevice(t, "A")
 		recipient := newTestDevice(t, "B")
 		for _, d := range []Device{sender, recipient} {
-			if err := s.CreateDevice(ctx, d); err != nil {
+			if err := createDevice(ctx, s, d); err != nil {
 				t.Fatalf("CreateDevice: %v", err)
 			}
 		}
@@ -199,7 +199,7 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		b := newTestDevice(t, "B")
 		c := newTestDevice(t, "C")
 		for _, d := range []Device{sender, b, c} {
-			if err := s.CreateDevice(ctx, d); err != nil {
+			if err := createDevice(ctx, s, d); err != nil {
 				t.Fatalf("CreateDevice: %v", err)
 			}
 		}
@@ -273,7 +273,7 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 	t.Run("KeyEnvelopeRejectsBadSizeAndUnknownRecipient", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "B")
-		if err := s.CreateDevice(ctx, d); err != nil {
+		if err := createDevice(ctx, s, d); err != nil {
 			t.Fatalf("CreateDevice: %v", err)
 		}
 		vault := "vault-bad-" + uniqueTag()
@@ -313,7 +313,7 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 			go func() {
 				defer wg.Done()
 				d := newTestDevice(t, "conc")
-				if err := s.CreateDevice(ctx, d); err != nil {
+				if err := createDevice(ctx, s, d); err != nil {
 					t.Errorf("CreateDevice: %v", err)
 					return
 				}
@@ -371,7 +371,7 @@ func TestMemKeySharingDefensiveCopy(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemDeviceStore()
 	d := newTestDevice(t, "laptop")
-	if err := s.CreateDevice(ctx, d); err != nil {
+	if err := createDevice(ctx, s, d); err != nil {
 		t.Fatalf("CreateDevice: %v", err)
 	}
 

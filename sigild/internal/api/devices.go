@@ -62,7 +62,11 @@ type enrollRequest struct {
 // (the client already has it) so the registry never echoes key material back out
 // of an endpoint that is not strictly required to.
 type deviceJSON struct {
-	DeviceID  string `json:"device_id"`
+	DeviceID string `json:"device_id"`
+	// AccountID is ADDITIVE (Phase 52). Existing clients ignore unknown fields,
+	// so adding it breaks nothing; it is omitted when empty so a device row
+	// written by a rolled-back pre-0005 binary renders the shape it always did.
+	AccountID string `json:"account_id,omitempty"`
 	Label     string `json:"label"`
 	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`
@@ -73,6 +77,7 @@ type deviceJSON struct {
 func toDeviceJSON(d store.Device) deviceJSON {
 	out := deviceJSON{
 		DeviceID:  d.ID,
+		AccountID: d.AccountID,
 		Label:     d.Label,
 		Status:    string(d.Status),
 		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
@@ -85,9 +90,17 @@ func toDeviceJSON(d store.Device) deviceJSON {
 
 // denyEnroll records an enrollment denial (audit + metric) and writes the coarse
 // response. Every credential failure — bad token, spent token, expired token,
-// bad proof — returns the SAME 401 body, so a prober cannot distinguish them.
+// bad proof, and every account-invite failure — returns the SAME 401 body, so a
+// prober cannot distinguish them.
 func (h *handlers) denyEnroll(w http.ResponseWriter, r *http.Request, reason authReason) {
-	h.auditEnrollDenied(r, reason)
+	h.denyEnrollWithCause(w, r, reason, "")
+}
+
+// denyEnrollWithCause is denyEnroll plus a FINE-GRAINED account-invite cause for
+// the audit log ONLY. inviteReason never reaches the response body and never
+// becomes a metric label: the coarse reason enum is what /metrics counts.
+func (h *handlers) denyEnrollWithCause(w http.ResponseWriter, r *http.Request, reason authReason, inviteReason string) {
+	h.auditEnrollDenied(r, reason, inviteReason)
 	h.metrics.incEnrollDenied(reason)
 	switch reason {
 	case reasonMalformedKey:
@@ -96,6 +109,12 @@ func (h *handlers) denyEnroll(w http.ResponseWriter, r *http.Request, reason aut
 	case reasonDeviceExists:
 		writeError(w, http.StatusConflict, "device_exists",
 			"that public key is already enrolled")
+	case reasonAccountFull:
+		// Reachable ONLY after a resolved credential AND a valid proof of
+		// possession, exactly like device_exists — so a distinct status leaks
+		// nothing the caller did not already hold.
+		writeError(w, http.StatusConflict, "account_full",
+			"that account has reached its device limit")
 	case reasonStoreUnavailable:
 		writeError(w, http.StatusInternalServerError, "internal", "")
 	default:
@@ -124,6 +143,22 @@ func (h *handlers) denyEnroll(w http.ResponseWriter, r *http.Request, reason aut
 // even if the subsequent insert conflicts. That is deliberate: single-use means
 // single-ATTEMPT, and an operator issues a new token rather than the server
 // silently allowing a retry.
+//
+// TWO CREDENTIAL CLASSES SHARE ONE HEADER (Phase 52). X-Sigil-Enroll-Token may
+// carry either an OPERATOR token (which always founds a NEW account) or an
+// ACCOUNT INVITE (which joins the inviter's EXISTING account). Nothing about the
+// wire changed to make that work — no new header, no new signed-message domain,
+// no fourth canonical layout to keep byte-identical across Go/Rust/JS — because
+// the enrollment challenge ALREADY binds the token's SHA-256 digest, and the
+// digest already binds WHICH credential was presented. `sigil device enroll
+// --token <invite>` therefore works with today's shipped client binaries.
+//
+// The check ORDER is unchanged. Step 5 resolves only whether this is an operator
+// token, WITHOUT an early return and WITHOUT looking up invites: an advisory
+// invite lookup there would cost a database round trip on the unauthenticated
+// path and open a timing side channel on invite-hash existence. Steps 6 (proof)
+// and 7 (nonce) are byte-identical, and the branch happens at step 8, where a
+// SINGLE atomic store operation is the only authority.
 func (h *handlers) devicesEnroll(w http.ResponseWriter, r *http.Request) {
 	// 1) Contract headers must all be present.
 	tokenHeader := r.Header.Get(headerEnrollToken)
@@ -165,14 +200,17 @@ func (h *handlers) devicesEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5) The enrollment token must be one this server was provisioned with.
-	//    Compared in constant time against the configured DIGESTS; the plaintext
-	//    token is never stored or logged.
+	// 5) Classify the credential: is this one of the OPERATOR tokens this server
+	//    was provisioned with? Compared in constant time against the configured
+	//    DIGESTS; the plaintext token is never stored or logged.
+	//
+	//    NOTE THE ABSENCE OF AN EARLY RETURN. A non-matching digest is NOT
+	//    rejected here — it may be an account invite, which is resolved only by
+	//    the atomic write at step 8. Deliberately no invite lookup happens at
+	//    this point: it would be a database round trip on the unauthenticated
+	//    path and a timing side channel on invite-hash existence.
 	tokenHash := hashEnrollToken(tokenHeader)
-	if !matchesConfiguredToken(h.cfg.EnrollTokenHashes, tokenHash) {
-		h.denyEnroll(w, r, reasonBadEnrollToken)
-		return
-	}
+	isOperator := matchesConfiguredToken(h.cfg.EnrollTokenHashes, tokenHash)
 
 	// 6) PROOF OF POSSESSION — verify the signature with the SUBMITTED key.
 	msg := canonicalEnrollMessage(tokenHash, tsHeader, nonceHeader, req.PublicKey, req.Label)
@@ -188,14 +226,39 @@ func (h *handlers) devicesEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 8) Spend the token ATOMICALLY, then create the device.
+	// 8) Resolve the credential ATOMICALLY and create the device.
 	deviceID, err := store.NewDeviceID()
 	if err != nil {
 		h.denyEnroll(w, r, reasonStoreUnavailable)
 		return
 	}
 	nowT := time.Now().UTC()
-	switch err := h.devices.ConsumeEnrollmentToken(r.Context(), tokenHash, deviceID, nowT); {
+	dev := store.Device{
+		ID:        deviceID,
+		PublicKey: pub,
+		Label:     req.Label,
+		Status:    store.DeviceActive,
+		CreatedAt: nowT,
+	}
+
+	if isOperator {
+		h.enrollFoundingAccount(w, r, tokenHash, dev)
+		return
+	}
+	h.enrollByAccountInvite(w, r, tokenHash, dev)
+}
+
+// enrollFoundingAccount is the OPERATOR-token path: an operator token ALWAYS
+// founds a NEW account. There is no operator route that inserts a device into an
+// existing account — that would be a real trust-model expansion smuggled in as
+// convenience.
+//
+// The token-spending semantics are UNCHANGED from Phase 41 and deliberately so:
+// the token is consumed BEFORE the device row is created, so it is single-
+// ATTEMPT. An operator re-mints a token from a shell; a customer mid-flow on a
+// phone cannot, which is why INVITES are single-SUCCESS instead.
+func (h *handlers) enrollFoundingAccount(w http.ResponseWriter, r *http.Request, tokenHash string, dev store.Device) {
+	switch err := h.devices.ConsumeEnrollmentToken(r.Context(), tokenHash, dev.ID, dev.CreatedAt); {
 	case err == nil:
 	case errors.Is(err, store.ErrEnrollTokenUsed):
 		h.denyEnroll(w, r, reasonEnrollTokenUsed)
@@ -211,14 +274,18 @@ func (h *handlers) devicesEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dev := store.Device{
-		ID:        deviceID,
-		PublicKey: pub,
-		Label:     req.Label,
-		Status:    store.DeviceActive,
-		CreatedAt: nowT,
+	accountID, err := store.NewAccountID()
+	if err != nil {
+		h.denyEnroll(w, r, reasonStoreUnavailable)
+		return
 	}
-	if err := h.devices.CreateDevice(r.Context(), dev); err != nil {
+	dev.AccountID = accountID
+	account := store.Account{
+		ID:                accountID,
+		CreatedAt:         dev.CreatedAt,
+		CreatedByDeviceID: dev.ID,
+	}
+	if err := h.devices.CreateAccountWithFounder(r.Context(), account, dev); err != nil {
 		if errors.Is(err, store.ErrDeviceExists) {
 			h.denyEnroll(w, r, reasonDeviceExists)
 			return
@@ -227,9 +294,68 @@ func (h *handlers) devicesEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.auditAccountCreated(r, accountID, dev.ID)
+	h.metrics.incAccountCreated()
 	h.auditEnrolled(r, dev)
 	h.metrics.incEnrollment()
 	writeJSON(w, http.StatusCreated, toDeviceJSON(dev))
+}
+
+// enrollByAccountInvite is the INVITE path: the presented credential was not an
+// operator token, so it can only be an account invite. ONE atomic store call
+// consumes the invite, checks the inviter is still active, enforces the member
+// cap and inserts the device — there is no window in which any of those could
+// disagree.
+//
+// Every failure maps onto an EXISTING coarse reason so /metrics gains no new
+// oracle label; the fine-grained cause goes to the audit log alone.
+func (h *handlers) enrollByAccountInvite(w http.ResponseWriter, r *http.Request, inviteHash string, dev store.Device) {
+	redeemed, err := h.devices.JoinAccountWithInvite(
+		r.Context(), inviteHash, dev, h.accountMaxDevices(), dev.CreatedAt)
+	if err != nil {
+		reason, cause := inviteDenial(err)
+		h.denyEnrollWithCause(w, r, reason, cause)
+		return
+	}
+	dev.AccountID = redeemed.AccountID
+
+	h.auditAccountDeviceJoined(r, redeemed.AccountID, dev.ID,
+		redeemed.CreatedByDeviceID, redeemed.InviteID)
+	h.metrics.incAccountJoin()
+	h.auditEnrolled(r, dev)
+	h.metrics.incEnrollment()
+	writeJSON(w, http.StatusCreated, toDeviceJSON(dev))
+}
+
+// inviteDenial maps an invite-redemption error onto (coarse reason, fine cause).
+//
+// THE MAPPING IS DELIBERATELY LOSSY at the metric/response layer: unknown,
+// revoked and inviter-revoked all collapse to bad_enrollment_token; used to
+// enrollment_token_used; expired to enrollment_token_expired; a pinned-key
+// mismatch to bad_proof. A caller therefore cannot distinguish "no such invite"
+// from "already used", "expired", "revoked" or "the inviter was revoked" — all
+// are the same coarse 401.
+func inviteDenial(err error) (authReason, string) {
+	switch {
+	case errors.Is(err, store.ErrInviteUnknown):
+		return reasonBadEnrollToken, "invite_unknown"
+	case errors.Is(err, store.ErrInviteRevoked):
+		return reasonBadEnrollToken, "invite_revoked"
+	case errors.Is(err, store.ErrInviterInactive):
+		return reasonBadEnrollToken, "inviter_inactive"
+	case errors.Is(err, store.ErrInviteUsed):
+		return reasonEnrollTokenUsed, "invite_used"
+	case errors.Is(err, store.ErrInviteExpired):
+		return reasonEnrollTokenExpired, "invite_expired"
+	case errors.Is(err, store.ErrInviteKeyMismatch):
+		return reasonBadProof, "invite_key_mismatch"
+	case errors.Is(err, store.ErrAccountFull):
+		return reasonAccountFull, "account_full"
+	case errors.Is(err, store.ErrDeviceExists):
+		return reasonDeviceExists, "device_exists"
+	default:
+		return reasonStoreUnavailable, "store_unavailable"
+	}
 }
 
 // devicesList returns every registered device. It requires the OPERATOR admin
@@ -258,13 +384,21 @@ func (h *handlers) devicesList(w http.ResponseWriter, r *http.Request) {
 // devicesRevoke revokes a device. A revoked device is rejected on its very next
 // request (authenticateDevice checks status before verifying the signature).
 //
-// TWO authorized paths, both real, neither a bypass:
+// THREE authorized paths, all real, none a bypass:
 //
 //   - the OPERATOR admin token (X-Sigil-Admin-Token), which may revoke ANY
 //     device — this is the break-glass path for a lost/stolen device; or
 //   - SELF-REVOCATION: a valid v3-signed request whose signing device IS the
-//     device being revoked. A device may retire itself; it may NOT revoke
-//     another device.
+//     device being revoked; or
+//   - SIBLING REVOCATION (Phase 52): a member of an account may revoke another
+//     device of the SAME account. Membership is FLAT, so this is symmetric —
+//     which also means one compromised member device can revoke every other
+//     device in its account. That is written down, not papered over.
+//
+// NO EXISTENCE ORACLE ON THE NON-ADMIN PATH: an unknown device and a device
+// belonging to another account both answer 403, never 404. Only the ADMIN path
+// keeps its 404 for an unknown device (an operator holding the admin token can
+// already enumerate the registry via GET /v1/devices).
 //
 // Revocation is idempotent: revoking an already-revoked device succeeds without
 // changing its original revoked_at.
@@ -282,30 +416,59 @@ func (h *handlers) devicesRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	revokedBy := "admin"
-	if !h.checkAdminToken(r) {
-		// Not the operator: require a valid v3 signature from the target device.
+	accountID := ""
+	adminPath := h.checkAdminToken(r)
+	if !adminPath {
+		// Not the operator: require a valid v3 signature, then either self or a
+		// same-account sibling.
 		dev, out := h.authenticateDevice(r, body)
 		if !out.allowed() {
 			h.denyOps(w, r, "", out)
 			return
 		}
 		if dev.ID != targetID {
-			// Authenticated, but not permitted to revoke someone else -> 403.
-			h.denyOps(w, r, "", authOutcome{Reason: reasonForbiddenDevice, DeviceID: dev.ID})
-			return
+			if dev.AccountID == "" {
+				// No account: fail closed at 403, never fall back to the
+				// device id. Repairable with `sigild migrate adopt`.
+				h.denyOps(w, r, "", authOutcome{Reason: reasonMissingAccount, DeviceID: dev.ID})
+				return
+			}
+			target, terr := h.devices.GetDevice(r.Context(), targetID)
+			switch {
+			case terr == nil:
+			case errors.Is(terr, store.ErrDeviceNotFound):
+				// 403, NOT 404: unknown and foreign must be indistinguishable.
+				h.denyOps(w, r, "", authOutcome{Reason: reasonForbiddenDevice, DeviceID: dev.ID})
+				return
+			default:
+				h.denyOps(w, r, "", authOutcome{Reason: reasonStoreUnavailable, DeviceID: dev.ID})
+				return
+			}
+			if target.AccountID != dev.AccountID {
+				h.denyOps(w, r, "", authOutcome{Reason: reasonForbiddenDevice, DeviceID: dev.ID})
+				return
+			}
 		}
 		revokedBy = dev.ID
+		accountID = dev.AccountID
 	}
 
 	if err := h.devices.RevokeDevice(r.Context(), targetID, time.Now().UTC()); err != nil {
 		if errors.Is(err, store.ErrDeviceNotFound) {
+			// Only reachable on the admin path (the sibling path already resolved
+			// the target, and the self path is the authenticated device itself).
 			writeError(w, http.StatusNotFound, "device_not_found", "no such device")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal", "")
 		return
 	}
-	h.auditDeviceRevoked(r, targetID, revokedBy)
+	if adminPath {
+		if target, terr := h.devices.GetDevice(r.Context(), targetID); terr == nil {
+			accountID = target.AccountID
+		}
+	}
+	h.auditDeviceRevoked(r, targetID, revokedBy, accountID)
 	h.metrics.incRevocation()
 	writeJSON(w, http.StatusOK, struct {
 		DeviceID string `json:"device_id"`
@@ -395,6 +558,11 @@ func (h *handlers) vaultGrantCreate(w http.ResponseWriter, r *http.Request) {
 
 // vaultGrantList lists a vault's grants. Any device with READ access to the
 // vault may see who else can reach it.
+//
+// owner_account_id (Phase 52) is ADDITIVE and load-bearing for comprehension:
+// every device of the OWNING ACCOUNT holds full access WITHOUT appearing in a
+// grant row, so without this field the response would read as "nobody owns this
+// vault" for an account-owned vault. It is omitted when the vault is unclaimed.
 func (h *handlers) vaultGrantList(w http.ResponseWriter, r *http.Request) {
 	vaultID := r.PathValue("vaultID")
 	if vaultID == "" {
@@ -419,8 +587,13 @@ func (h *handlers) vaultGrantList(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:  g.CreatedAt.UTC().Format(time.RFC3339),
 		})
 	}
+	ownerAccountID := ""
+	if owner, oerr := h.devices.GetVaultOwner(r.Context(), vaultID); oerr == nil {
+		ownerAccountID = owner.AccountID
+	}
 	writeJSON(w, http.StatusOK, struct {
-		VaultID string      `json:"vaultID"`
-		Grants  []grantJSON `json:"grants"`
-	}{VaultID: vaultID, Grants: out})
+		VaultID        string      `json:"vaultID"`
+		OwnerAccountID string      `json:"owner_account_id,omitempty"`
+		Grants         []grantJSON `json:"grants"`
+	}{VaultID: vaultID, OwnerAccountID: ownerAccountID, Grants: out})
 }

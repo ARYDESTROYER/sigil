@@ -170,6 +170,21 @@
           Forget device
         </button>
 
+        <!--
+          Account membership (Phase 52). An invite pastes straight into the
+          enrollment-token field above — the wire format is unchanged — so this
+          browser can JOIN an account today. Joining confers AUTHORIZATION, never
+          DECRYPTION: the joined device authenticates and sees the account, and
+          can decrypt NOTHING until an existing member wraps a vault key to its
+          hybrid public key. The CLI and desktop already say so; without this the
+          extension showed an account beside an empty vault and no explanation.
+        -->
+        <button type="button" id="account-show" hidden data-testid="account-show">
+          Show account
+        </button>
+        <p id="account-state" class="hint" data-testid="account-state"></p>
+        <p id="account-awaiting-key" class="warn" role="status" hidden data-testid="account-awaiting-key"></p>
+
         <div class="row">
           <button type="button" id="sync-push" data-testid="sync-push">Push</button>
           <button type="button" id="sync-pull" data-testid="sync-pull">Pull</button>

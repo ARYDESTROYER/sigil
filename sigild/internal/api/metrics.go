@@ -55,6 +55,16 @@ type Metrics struct {
 	vaultClaimsTotal       atomic.Int64
 	authzDeniedTotal       atomic.Int64
 
+	// Account-model counters (Phase 52). Counts ONLY. No account, device, vault
+	// or invite ID may EVER become a label here — /metrics is always-on and
+	// unauthenticated, so an ID label would let a scrape enumerate the registry,
+	// and a fine-grained invite-failure label would be a correlatable oracle.
+	// Invite-failure fidelity goes to the audit log alone.
+	accountsCreatedTotal       atomic.Int64
+	accountInvitesCreatedTotal atomic.Int64
+	accountInvitesRevokedTotal atomic.Int64
+	accountJoinsTotal          atomic.Int64
+
 	// Vault-sharing counters (Phase 46). Counts ONLY — never an envelope byte,
 	// a hybrid public key, a vault key, or a vault/device ID as a label.
 	hybridKeyPublishesTotal atomic.Int64
@@ -101,11 +111,21 @@ var authDenyReasons = []authReason{
 	reasonForbiddenDevice,
 	reasonBadAdminToken,
 	reasonStoreUnavailable,
+	reasonMissingAccount,
+	reasonForbiddenAccount,
+	reasonVaultOwnerUnresolved,
 }
 
 // enrollDenyReasons is the fixed set of enrollment-denial reasons, in a stable
 // order. It deliberately does NOT distinguish anything the client is told: the
 // split exists only for the operator's metrics.
+//
+// Phase 52 adds exactly ONE label (account_full) and no more. Every account-
+// invite failure collapses onto an EXISTING label — unknown/revoked/inactive
+// inviter -> bad_enrollment_token, used -> enrollment_token_used, expired ->
+// enrollment_token_expired, pinned-key mismatch -> bad_proof — because /metrics
+// is unauthenticated and a per-cause counter there would be a weak oracle on
+// invite state. The fine-grained cause goes to the audit log only.
 var enrollDenyReasons = []authReason{
 	reasonMissingHeaders,
 	reasonStaleTimestamp,
@@ -116,6 +136,7 @@ var enrollDenyReasons = []authReason{
 	reasonMalformedKey,
 	reasonDeviceExists,
 	reasonReplayed,
+	reasonAccountFull,
 	reasonStoreUnavailable,
 }
 
@@ -259,8 +280,21 @@ func (m *Metrics) incRevocation() { m.deviceRevocationsTotal.Add(1) }
 // incGrant records one per-vault access grant.
 func (m *Metrics) incGrant() { m.vaultGrantsTotal.Add(1) }
 
-// incVaultClaim records one trust-on-first-write vault ownership claim.
+// incVaultClaim records one trust-on-first-write vault ownership claim (now by
+// ACCOUNT, Phase 52).
 func (m *Metrics) incVaultClaim() { m.vaultClaimsTotal.Add(1) }
+
+// incAccountCreated records one account founded by an operator-token enrollment.
+func (m *Metrics) incAccountCreated() { m.accountsCreatedTotal.Add(1) }
+
+// incAccountInviteCreated records one minted account invite.
+func (m *Metrics) incAccountInviteCreated() { m.accountInvitesCreatedTotal.Add(1) }
+
+// incAccountInviteRevoked records one invite revoked before use.
+func (m *Metrics) incAccountInviteRevoked() { m.accountInvitesRevokedTotal.Add(1) }
+
+// incAccountJoin records one device joining an EXISTING account by invite.
+func (m *Metrics) incAccountJoin() { m.accountJoinsTotal.Add(1) }
 
 // incHybridKeyPublish records one device hybrid public key publish/republish.
 func (m *Metrics) incHybridKeyPublish() { m.hybridKeyPublishesTotal.Add(1) }
@@ -322,6 +356,14 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 		"Total per-vault access grants created.", m.vaultGrantsTotal.Load())
 	writeCounter(&b, "sigild_vault_claims_total",
 		"Total vault ownership claims (trust on first write).", m.vaultClaimsTotal.Load())
+	writeCounter(&b, "sigild_accounts_created_total",
+		"Total accounts created (operator-token enrollments).", m.accountsCreatedTotal.Load())
+	writeCounter(&b, "sigild_account_invites_created_total",
+		"Total account invites minted.", m.accountInvitesCreatedTotal.Load())
+	writeCounter(&b, "sigild_account_invites_revoked_total",
+		"Total account invites revoked before use.", m.accountInvitesRevokedTotal.Load())
+	writeCounter(&b, "sigild_account_joins_total",
+		"Total devices that joined an existing account by invite.", m.accountJoinsTotal.Load())
 	writeCounter(&b, "sigild_device_hybrid_keys_published_total",
 		"Total device hybrid public key publishes (including re-publishes).", m.hybridKeyPublishesTotal.Load())
 	writeCounter(&b, "sigild_vault_key_envelopes_total",

@@ -98,8 +98,17 @@ func ValidPermission(p Permission) bool {
 //
 // PublicKey is a raw 32-byte Ed25519 public key. It is PUBLIC by construction —
 // but it is still never emitted to logs or metrics (see the api audit layer).
+//
+// AccountID (Phase 52) names the account this device belongs to. It is assigned
+// ONCE at enrollment — by founding a new account (operator token) or by
+// redeeming an invite into an existing one — and is NEVER updated afterwards:
+// there is no transfer route, no "switch account", and no lazy adoption on a
+// read path. Entitlement and vault ownership are derived from it, so an empty
+// AccountID on an authenticated device is an INVARIANT VIOLATION that fails
+// closed with a 500 at the API layer, never a silent fallback to the device ID.
 type Device struct {
 	ID        string
+	AccountID string
 	PublicKey []byte
 	Label     string
 	Status    DeviceStatus
@@ -119,9 +128,15 @@ func (d Device) clone() Device {
 	return d
 }
 
-// Grant authorizes one device on one vault. Owner marks the device that claimed
-// the vault (see ClaimVaultOwner) — the only device allowed to grant others
-// access.
+// Grant authorizes one device on one vault. Owner marks the device that
+// performed the claim (see Accounts.ClaimVault).
+//
+// SINCE PHASE 52 THE OWNER FLAG IS A VIEW, NOT AN AUTHORITY: sigil_vault_owners
+// (account-scoped) is what every authorization decision reads. This flag is
+// retained so GET /v1/vaults/{id}/grants stays byte-identical for existing data
+// and existing clients, and so the partial unique index
+// sigil_device_grants_one_owner keeps working as a backstop. NOTHING authorizes
+// off it — in particular a legacy is_owner grant does NOT satisfy needOwner.
 type Grant struct {
 	VaultID   string
 	DeviceID  string
@@ -154,14 +169,22 @@ func NewDeviceID() (string, error) {
 // seam: context-aware, concurrency-safe, with interchangeable backends
 // (MemDeviceStore for dev/tests, PostgresDeviceStore for durability).
 //
-// Implementations MUST be safe for concurrent use, and the two atomic
-// operations below (ConsumeEnrollmentToken, ClaimVaultOwner) MUST be atomic
-// across concurrent callers AND across processes for a shared backend — they are
-// the single-use and single-owner guarantees.
+// Implementations MUST be safe for concurrent use, and the atomic operations
+// (ConsumeEnrollmentToken here, JoinAccountWithInvite and ClaimVault in the
+// embedded Accounts seam) MUST be atomic across concurrent callers AND across
+// processes for a shared backend — they are the single-use, single-success and
+// single-owner guarantees.
 type DeviceStore interface {
-	// CreateDevice registers d (ID, PublicKey, Label, Status, CreatedAt already
-	// set by the caller). It returns ErrDeviceExists if the public key — or the
-	// ID — is already registered.
+	// CreateDevice registers d (ID, AccountID, PublicKey, Label, Status,
+	// CreatedAt already set by the caller). It returns ErrDeviceExists if the
+	// public key — or the ID — is already registered, ErrAccountNotFound if the
+	// named account does not exist, and an error for an EMPTY AccountID: a device
+	// with no account could never be entitled or own a vault, so it fails closed
+	// at creation rather than at authorization time.
+	//
+	// Production enrollment does NOT call this directly — it goes through
+	// Accounts.CreateAccountWithFounder or Accounts.JoinAccountWithInvite, both
+	// of which insert the device ATOMICALLY with the account decision.
 	CreateDevice(ctx context.Context, d Device) error
 	// GetDevice returns the device with the given ID, or ErrDeviceNotFound.
 	GetDevice(ctx context.Context, deviceID string) (Device, error)
@@ -192,11 +215,13 @@ type DeviceStore interface {
 	PutGrant(ctx context.Context, vaultID, deviceID string, perm Permission, at time.Time) error
 	// ListGrants returns every grant on a vault, ordered by DeviceID.
 	ListGrants(ctx context.Context, vaultID string) ([]Grant, error)
-	// ClaimVaultOwner atomically makes deviceID the owner of vaultID (with
-	// PermWrite) IF and ONLY IF the vault has no owner yet. It returns true when
-	// this call performed the claim, false when the vault was already owned (by
-	// this or any other device). This is the trust-on-first-write rule.
-	ClaimVaultOwner(ctx context.Context, vaultID, deviceID string, at time.Time) (bool, error)
+
+	// Accounts adds the account model (Phase 52): account membership, invites,
+	// and ACCOUNT-scoped vault ownership. It is embedded here rather than kept as
+	// a separate seam because it lives in the same auth-metadata store and shares
+	// its backends. It replaced the old device-scoped ClaimVaultOwner with
+	// ClaimVault.
+	Accounts
 
 	// KeySharing adds device hybrid PUBLIC keys and the opaque key-envelope
 	// relay that back device-to-device vault sharing (Phase 46, see
@@ -211,12 +236,18 @@ type DeviceStore interface {
 // restart, which for enrollment tokens means a spent token becomes usable again
 // after a restart. Use the Postgres backend when that matters.
 type MemDeviceStore struct {
-	mu        sync.Mutex
-	devices   map[string]Device            // device ID -> device
-	byKey     map[string]string            // base64(pubkey) -> device ID
-	tokens    map[string]*enrollTokenState // token SHA-256 hex -> state
-	grants    map[string]map[string]Grant  // vault ID -> device ID -> grant
-	vaultOwnr map[string]string            // vault ID -> owning device ID
+	mu      sync.Mutex
+	devices map[string]Device            // device ID -> device
+	byKey   map[string]string            // base64(pubkey) -> device ID
+	tokens  map[string]*enrollTokenState // token SHA-256 hex -> state
+	grants  map[string]map[string]Grant  // vault ID -> device ID -> grant
+	// accounts holds the account model (Phase 52): accounts, the invite ledger
+	// keyed by the invite's SHA-256 hex DIGEST (never the secret), and
+	// ACCOUNT-scoped vault ownership — the authority every authorization
+	// decision reads.
+	accounts    map[string]Account
+	invites     map[string]*AccountInvite // invite SHA-256 hex -> invite
+	vaultOwners map[string]VaultOwner     // vault ID -> owning account
 	// hybridKeys holds each device's PUBLISHED hybrid public key (opaque public
 	// bytes; see keysharing.go), keyed by device ID.
 	hybridKeys map[string]HybridPublicKey
@@ -237,28 +268,53 @@ type enrollTokenState struct {
 // NewMemDeviceStore returns an empty, ready-to-use in-memory device store.
 func NewMemDeviceStore() *MemDeviceStore {
 	return &MemDeviceStore{
-		devices:    make(map[string]Device),
-		byKey:      make(map[string]string),
-		tokens:     make(map[string]*enrollTokenState),
-		grants:     make(map[string]map[string]Grant),
-		vaultOwnr:  make(map[string]string),
-		hybridKeys: make(map[string]HybridPublicKey),
-		envelopes:  make(map[envelopeKey]KeyEnvelope),
+		devices:     make(map[string]Device),
+		byKey:       make(map[string]string),
+		tokens:      make(map[string]*enrollTokenState),
+		grants:      make(map[string]map[string]Grant),
+		accounts:    make(map[string]Account),
+		invites:     make(map[string]*AccountInvite),
+		vaultOwners: make(map[string]VaultOwner),
+		hybridKeys:  make(map[string]HybridPublicKey),
+		envelopes:   make(map[envelopeKey]KeyEnvelope),
 	}
 }
 
 // compile-time check that MemDeviceStore satisfies DeviceStore.
 var _ DeviceStore = (*MemDeviceStore)(nil)
 
-// CreateDevice registers a device, rejecting a duplicate ID or public key.
+// CreateDevice registers a device, rejecting a duplicate ID or public key, an
+// empty account, and an account that does not exist.
 func (s *MemDeviceStore) CreateDevice(ctx context.Context, d Device) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	keyID := base64.StdEncoding.EncodeToString(d.PublicKey)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.accounts[d.AccountID]; !ok {
+		if d.AccountID == "" {
+			return errAccountRequired
+		}
+		return ErrAccountNotFound
+	}
+	return s.insertDeviceLocked(d)
+}
+
+// errAccountRequired is the fail-closed refusal to store a device with no
+// account. A device with no account could never be entitled or own a vault, so
+// the invariant is enforced at creation — the API layer NEVER falls back to the
+// device ID.
+var errAccountRequired = errors.New("store: device requires an account id")
+
+// insertDeviceLocked inserts a device assuming s.mu is held and the account has
+// already been validated. It is the shared tail of CreateDevice,
+// CreateAccountWithFounder and JoinAccountWithInvite so all three enforce the
+// same uniqueness rules.
+func (s *MemDeviceStore) insertDeviceLocked(d Device) error {
+	if d.AccountID == "" {
+		return errAccountRequired
+	}
+	keyID := base64.StdEncoding.EncodeToString(d.PublicKey)
 	if _, ok := s.devices[d.ID]; ok {
 		return ErrDeviceExists
 	}
@@ -412,25 +468,4 @@ func (s *MemDeviceStore) ListGrants(ctx context.Context, vaultID string) ([]Gran
 
 	sort.Slice(out, func(i, j int) bool { return out[i].DeviceID < out[j].DeviceID })
 	return out, nil
-}
-
-// ClaimVaultOwner atomically claims an unowned vault. The whole check-and-set
-// runs under the single mutex, so exactly one of N concurrent claimants wins.
-func (s *MemDeviceStore) ClaimVaultOwner(ctx context.Context, vaultID, deviceID string, at time.Time) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, owned := s.vaultOwnr[vaultID]; owned {
-		return false, nil
-	}
-	s.vaultOwnr[vaultID] = deviceID
-	if s.grants[vaultID] == nil {
-		s.grants[vaultID] = make(map[string]Grant)
-	}
-	s.grants[vaultID][deviceID] = Grant{
-		VaultID: vaultID, DeviceID: deviceID, Perm: PermWrite, Owner: true, CreatedAt: at,
-	}
-	return true, nil
 }

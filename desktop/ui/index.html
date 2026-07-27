@@ -178,6 +178,41 @@
         </div>
       </details>
 
+      <details id="account-block" hidden>
+        <summary>Your account (which devices are yours)</summary>
+        <p class="hint">
+          An account is the group of <em>your own</em> devices. It is what a
+          subscription and a vault&rsquo;s ownership belong to, so paying on one
+          device covers the others and revoking one device does not orphan the
+          vaults it created. It holds no email, no password and no key.
+        </p>
+        <div class="row">
+          <button id="account-status-btn" class="ghost">Who is in my account?</button>
+          <button id="account-invite-btn" class="ghost">Invite another device</button>
+          <button id="account-invites-btn" class="ghost">Open invites</button>
+        </div>
+        <dl class="kv" id="account-facts"></dl>
+        <p class="warn" id="account-invite-warning" hidden>
+          Shown once. Anyone who reads this before it expires can join your
+          account. The dev transport is plain HTTP &mdash; treat it like a
+          password and paste it straight into the other device&rsquo;s
+          <strong>enrollment token</strong> field.
+        </p>
+        <pre id="account-invite-out" hidden></pre>
+        <p class="hint">
+          Joining grants <strong>authorization only</strong>. A device that has
+          just joined can sign in, but it reads nothing until you share a vault
+          key to it below. There is <strong>no recovery</strong>: if you lose
+          every device in an account, the account and its vaults are gone.
+          Any member can invite and can revoke any other member.
+        </p>
+        <form id="account-revoke-form" autocomplete="off">
+          <label for="account-invite-id">Revoke an invite <span class="opt">(public handle)</span></label>
+          <input id="account-invite-id" spellcheck="false" placeholder="inv_…" required />
+          <button type="submit" class="ghost">Revoke invite</button>
+        </form>
+      </details>
+
       <details id="vault-block" hidden>
         <summary>This vault on the server</summary>
         <label for="sync-vault-id">Vault id</label>

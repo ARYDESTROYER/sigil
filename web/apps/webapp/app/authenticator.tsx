@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { DeviceIdentity, TotpEntry, TotpVault } from "@sigil/wasm";
+import type { AccountInfo, DeviceIdentity, TotpEntry, TotpVault } from "@sigil/wasm";
 
 // The full @sigil/wasm module surface (wasm bindings + the proven JS helpers).
 // Imported dynamically in the browser only (inside an effect) so the wasm never
@@ -1112,6 +1112,133 @@ function ExportPanel({ wasm, vault }: { wasm: Wasm; vault: TotpVault }) {
 // crypto.getRandomValues and is persisted ONLY inside a password-sealed
 // container (see DEVICE_KEY) — never in plaintext.
 
+// ── Account membership (Phase 52) ────────────────────────────────────────────
+//
+// THE STATE THIS EXISTS TO SHOW. An invite pastes straight into the enrollment
+// token field — the wire format is unchanged — so this browser can JOIN an
+// account today. Joining confers AUTHORIZATION, never DECRYPTION: the joined
+// device authenticates, sees the account and its entitlement, and can still
+// decrypt NOTHING until an existing member wraps a vault key to its hybrid
+// public key (Sharing → Share to this device id).
+//
+// The CLI and the desktop app already say so. Without this block the browsers
+// showed an account and an entitlement beside an empty vault and no explanation,
+// which reads as a bug rather than as a step that is still outstanding.
+function AccountBlock({
+  wasm,
+  device,
+  url,
+  vaultId,
+}: {
+  wasm: Wasm;
+  device: DeviceIdentity;
+  url: string;
+  vaultId: string;
+}) {
+  const [account, setAccount] = useState<AccountInfo | null>(null);
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // This device can DECRYPT the named vault only once it holds that vault's key.
+  const holdsKey = Boolean(device.vaultKeys?.[vaultId.trim()]);
+  // A single-device account is just this browser; the waiting state is only
+  // meaningful once there IS another member who could send a key.
+  const hasSiblings = (account?.device_count ?? 0) > 1;
+
+  async function refresh() {
+    setBusy(true);
+    setStatus("Reading account…");
+    try {
+      const info = await wasm.getAccount(wasm, { ...device, baseUrl: url.trim() }, url.trim());
+      setAccount(info);
+      setStatus("");
+    } catch (e) {
+      setAccount(null);
+      const code = (e as { status?: number } | null)?.status;
+      // 403 here is the server refusing a device whose account row is missing —
+      // a real, repairable data state (`sigild migrate adopt`), not a crash.
+      setStatus(
+        typeof code === "number" && code >= 400
+          ? `Account unavailable: ${wasm.explainAuthStatus(code)}`
+          : `Account unavailable: ${msg(e)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 border-t border-neutral-200 pt-3 dark:border-neutral-800">
+      <div className="flex items-center gap-2">
+        <h5 className="text-xs font-semibold">Account</h5>
+        <button
+          data-testid="account-refresh"
+          className={btnGhost}
+          type="button"
+          onClick={refresh}
+          disabled={busy}
+        >
+          {account ? "Refresh" : "Show account"}
+        </button>
+      </div>
+
+      {status && (
+        <p data-testid="account-status" className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+          {status}
+        </p>
+      )}
+
+      {account && (
+        <>
+          <p data-testid="account-id" className="mt-2 break-all font-mono text-xs">
+            {account.account_id}
+          </p>
+          <p className="mt-1 text-xs text-neutral-600 dark:text-neutral-400">
+            {account.device_count} of {account.device_limit} device
+            {account.device_limit === 1 ? "" : "s"} in use
+            {account.revoked_device_count
+              ? ` (${account.revoked_device_count} revoked — revoked devices do not use a seat)`
+              : ""}
+            .
+          </p>
+
+          {hasSiblings && !holdsKey && (
+            // ⭐ THE HONEST STATE. Not an error, not a spinner: a step that has
+            // not happened yet, named plainly, with who has to do it.
+            <p
+              data-testid="account-awaiting-key"
+              role="status"
+              className="mt-2 rounded border border-amber-500 bg-amber-50 p-2 text-xs text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+            >
+              <strong>Joined — waiting for a key from another device.</strong> This
+              device is a member of the account and its requests are authorized, but
+              membership does not hand over any encryption key. It cannot decrypt
+              vault <span className="font-mono">{vaultId.trim() || "(none)"}</span>{" "}
+              until an existing member shares it here (on that device: Sharing →
+              Share to <span className="font-mono">{device.deviceId}</span>). Then
+              use Accept below.
+            </p>
+          )}
+          {hasSiblings && holdsKey && (
+            <p
+              data-testid="account-has-key"
+              className="mt-2 text-xs text-neutral-600 dark:text-neutral-400"
+            >
+              This device holds the key for vault{" "}
+              <span className="font-mono">{vaultId.trim()}</span> and can decrypt it.
+            </p>
+          )}
+          <p className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+            No recovery: an account is reachable only through a member device&rsquo;s
+            private key. Membership is flat — any member may invite, and may revoke
+            any other member.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SyncPanel({
   wasm,
   device,
@@ -1269,6 +1396,7 @@ function SyncPanel({
             >
               Forget device
             </button>
+            <AccountBlock wasm={wasm} device={device} url={url} vaultId={vaultId} />
           </>
         ) : (
           <>

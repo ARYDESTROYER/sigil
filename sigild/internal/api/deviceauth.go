@@ -106,6 +106,40 @@ const (
 	// is NOT an authentication verdict — it maps to 500 so an infrastructure
 	// fault is never mistaken for a credential failure.
 	reasonStoreUnavailable authReason = "store_unavailable"
+
+	// ---- Account model (Phase 52) ----
+
+	// reasonMissingAccount: an authenticated device carries no account ID.
+	//
+	// It is an INVARIANT VIOLATION rather than a credential verdict, but it maps
+	// to a COARSE 403 — never a 500. A 500 is for a fault the server cannot see;
+	// this is a data state it can read plainly, and it is REACHABLE: a pre-0005
+	// binary rolled forward onto an applied 0005 schema enrolls devices with
+	// account_id NULL, and every route those devices touch would otherwise answer
+	// an opaque `{"error":"internal"}` forever (0005 is recorded in
+	// schema_migrations, so the backfill never re-runs on its own).
+	//
+	// It still FAILS CLOSED — the device is refused everywhere, and the server
+	// NEVER falls back to the device ID, which would silently resurrect the model
+	// this phase replaced. The response is byte-identical to any other 403, so no
+	// oracle is created; the typed reason goes only to the audit log, which is how
+	// an operator finds these rows. The repair is `sigild migrate adopt`.
+	reasonMissingAccount authReason = "missing_account"
+	// reasonVaultOwnerUnresolved: the vault carries a legacy is_owner GRANT but no
+	// owner row, and the granted device cannot be resolved to an account — the
+	// same NULL-account data state as reasonMissingAccount, seen from the vault
+	// side. Coarse 403, repaired by `sigild migrate adopt`.
+	reasonVaultOwnerUnresolved authReason = "vault_owner_unresolved"
+	// reasonForbiddenAccount: the vault is owned by ANOTHER account and the
+	// calling device holds no per-device grant on it. Client-visibly identical to
+	// unauthorized_vault (both are a coarse 403); the split exists so the audit
+	// log can distinguish "someone else's vault" from "nobody's vault yet".
+	reasonForbiddenAccount authReason = "forbidden_account"
+	// reasonAccountFull: enrollment resolved a valid invite and a valid proof of
+	// possession, but the target account is already at its device limit. Like
+	// device_exists it is reachable ONLY after a credential has been accepted, so
+	// its distinct 409 leaks nothing a prober did not already hold.
+	reasonAccountFull authReason = "account_full"
 )
 
 // accessNeed is the authorization level an ops route requires.
@@ -156,9 +190,15 @@ func (o authOutcome) allowed() bool { return o.Reason == reasonOK }
 // 403 (authenticated, but not permitted); everything else that is a credential
 // verdict is 401; a registry fault is 500 so it is never read as a credential
 // failure.
+//
+// ONLY A GENUINE FAULT IS 500. A data state the server can read — a device with
+// no account, a vault whose owner grant names no account — is a 403: it is a
+// refusal, not a malfunction, and answering 500 hid a reachable, repairable
+// condition behind a code that means "the server broke".
 func authStatus(reason authReason) int {
 	switch reason {
-	case reasonUnauthorizedVault, reasonNotVaultOwner, reasonForbiddenDevice:
+	case reasonUnauthorizedVault, reasonNotVaultOwner, reasonForbiddenDevice, reasonForbiddenAccount,
+		reasonMissingAccount, reasonVaultOwnerUnresolved:
 		return http.StatusForbidden
 	case reasonStoreUnavailable:
 		return http.StatusInternalServerError
@@ -288,55 +328,129 @@ func (h *handlers) authenticateDevice(r *http.Request, body []byte) (store.Devic
 }
 
 // authorizeVault performs the AUTHORIZATION half: it checks that an already-
-// authenticated device holds a sufficient grant on vaultID.
+// authenticated device may act on vaultID at the required level.
 //
-// OWNERSHIP RULE — TRUST ON FIRST WRITE (TOFU): a vault with no owner is claimed
-// by the FIRST device that successfully authenticates a WRITE (append) to it;
-// that device becomes the owner with write permission. The claim is atomic in
-// every backend (a mutex in memory, a partial UNIQUE index in Postgres), so
-// exactly one of N concurrent first-writers wins and the losers get 403. Reads
-// never claim: reading an unowned vault is 403.
+// OWNERSHIP RULE — TRUST ON FIRST WRITE, ONE LEVEL UP (Phase 52): a vault with
+// no owner is claimed by the first ACCOUNT that successfully authenticates a
+// WRITE to it. Every device of the owning account then has full access to that
+// vault WITHOUT a per-device grant row, which is precisely the fix for the
+// orphaning defect: revoking the device that happened to claim a vault no longer
+// strands the vault, because its siblings inherit ownership from the account.
 //
-// This rule is deliberately simple and is a DEV model. It is not an account
-// model: it assumes the first writer of a vault ID is its legitimate owner, so
-// an attacker who reaches an unclaimed vault ID BEFORE the real owner claims it
-// as their own — and the real owner is then locked out of their own vault ID.
-// Vault IDs are client-chosen high-entropy identifiers, which is what makes that
-// tolerable pre-audit — it is NOT sufficient for production.
+// The claim is atomic in every backend (a mutex in memory, a PRIMARY KEY on
+// sigil_vault_owners in Postgres), so exactly one of N concurrent first-writers
+// wins. A loser that belongs to the WINNING account is allowed through — two
+// siblings racing a legitimate first write must both succeed.
+//
+// LOOKUP ORDER is owner-first, and it costs nothing: a member of the owning
+// account resolves in ONE query (GetVaultOwner), replacing the ONE query
+// (GetGrant) the previous implementation made.
+//
+// needOwner IS SATISFIED ONLY BY ACCOUNT OWNERSHIP. A legacy is_owner grant row
+// never satisfies it, so data drift can never hand ownership powers to a
+// non-owning account. One rule, checkable in one sentence.
+//
+// READS AND needWriteNoClaim NEVER CLAIM (the Phase 51 fix, preserved verbatim):
+// only needWrite may reach ClaimVault.
+//
+// ORPHANED OWNERSHIP IS RECONCILED, NOT FAULTED. A vault claimed by a pre-0005
+// binary has an is_owner grant and no owner row; ClaimVault adopts the grant
+// holder's account and reports claimed=false, so this function then treats it as
+// any other pre-owned vault — a sibling passes, a stranger falls to the grant
+// check (and a legitimately granted writer is allowed, where it previously got
+// an opaque 500). When the grant holder has no account at all the state is named
+// (vault_owner_unresolved -> coarse 403) rather than reported as a fault.
+//
+// HONEST LIMIT, unchanged in kind: this is still trust-on-first-write. An
+// attacker who reaches an unclaimed vault ID before its legitimate owner still
+// wins it and still locks them out with a 403. Tolerable only because vault IDs
+// are client-chosen high-entropy identifiers; still NOT sufficient for
+// production.
 func (h *handlers) authorizeVault(r *http.Request, dev store.Device, vaultID string, need accessNeed) authOutcome {
 	out := authOutcome{DeviceID: dev.ID}
+
+	if dev.AccountID == "" {
+		// Fail CLOSED. Never fall back to the device ID: that would silently
+		// restore the device-scoped ownership model this phase exists to replace.
+		out.Reason = reasonMissingAccount
+		return out
+	}
+
+	owner, err := h.devices.GetVaultOwner(r.Context(), vaultID)
+	switch {
+	case err == nil && owner.AccountID == dev.AccountID:
+		// The caller's account owns the vault: every need level is satisfied,
+		// including needOwner, and no grant row is required.
+		return out
+	case err == nil:
+		// Owned by ANOTHER account. A cross-account share is expressed as a
+		// per-DEVICE grant (key envelopes are addressed to a device's hybrid
+		// identity, so an account-wide grant would authorize devices holding no
+		// envelope — authorization and knowledge would drift apart).
+		return h.authorizeByGrant(r, dev, vaultID, need, true)
+	case errors.Is(err, store.ErrVaultOwnerNotFound):
+		if need != needWrite {
+			// Reads — and needWriteNoClaim — never claim.
+			return h.authorizeByGrant(r, dev, vaultID, need, false)
+		}
+		claimed, winner, cerr := h.devices.ClaimVault(r.Context(), vaultID, dev.AccountID, dev.ID, time.Now().UTC())
+		if cerr != nil {
+			if errors.Is(cerr, store.ErrVaultOwnerUnresolved) {
+				// The vault has a legacy is_owner grant whose device has no account.
+				// A knowable, repairable data state — name it, do not report a fault.
+				out.Reason = reasonVaultOwnerUnresolved
+				return out
+			}
+			out.Reason = reasonStoreUnavailable
+			return out
+		}
+		if claimed {
+			h.auditVaultClaimed(r, vaultID, dev.ID, dev.AccountID)
+			h.metrics.incVaultClaim()
+			return out
+		}
+		if winner.AccountID == dev.AccountID {
+			// A SIBLING won the race. Legitimate: allow.
+			return out
+		}
+		return h.authorizeByGrant(r, dev, vaultID, need, true)
+	default:
+		out.Reason = reasonStoreUnavailable
+		return out
+	}
+}
+
+// authorizeByGrant is the per-DEVICE grant check: the pre-account logic, minus
+// the claim branch (claiming lives in authorizeVault, which is the only place
+// that knows whether the vault is unowned).
+//
+// foreignOwner distinguishes "this vault belongs to another account" from "this
+// vault belongs to nobody yet" for the AUDIT LOG only — both answer the client
+// with the identical coarse 403, so there is no oracle.
+func (h *handlers) authorizeByGrant(r *http.Request, dev store.Device, vaultID string, need accessNeed, foreignOwner bool) authOutcome {
+	out := authOutcome{DeviceID: dev.ID}
+
+	if need == needOwner {
+		// Ownership is an ACCOUNT property, full stop. A grant — even a legacy
+		// is_owner grant — can never confer it.
+		out.Reason = reasonNotVaultOwner
+		return out
+	}
+
+	noGrant := reasonUnauthorizedVault
+	if foreignOwner {
+		noGrant = reasonForbiddenAccount
+	}
 
 	grant, err := h.devices.GetGrant(r.Context(), vaultID, dev.ID)
 	switch {
 	case err == nil:
-		// Have a grant: does it cover what this route needs?
-		if need == needOwner && !grant.Owner {
-			out.Reason = reasonNotVaultOwner
-			return out
-		}
 		if !grant.Perm.Allows(need.permission()) {
 			out.Reason = reasonUnauthorizedVault
-			return out
 		}
 		return out
 	case errors.Is(err, store.ErrGrantNotFound):
-		// No grant. Only a WRITE may claim an unowned vault.
-		if need != needWrite {
-			out.Reason = reasonUnauthorizedVault
-			return out
-		}
-		claimed, cerr := h.devices.ClaimVaultOwner(r.Context(), vaultID, dev.ID, time.Now().UTC())
-		if cerr != nil {
-			out.Reason = reasonStoreUnavailable
-			return out
-		}
-		if !claimed {
-			// The vault is already owned by another device.
-			out.Reason = reasonUnauthorizedVault
-			return out
-		}
-		h.auditVaultClaimed(r, vaultID, dev.ID)
-		h.metrics.incVaultClaim()
+		out.Reason = noGrant
 		return out
 	default:
 		out.Reason = reasonStoreUnavailable

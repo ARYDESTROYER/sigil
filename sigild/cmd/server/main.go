@@ -91,6 +91,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Account-model config, validated BEFORE binding too. There is deliberately
+	// NO on/off switch: accounts ride SIGILD_DEVICE_AUTH (which already requires
+	// the dev-ops gate), because a binary that could run either ownership model
+	// would have two ownership truths at once. Setting any of these WITHOUT
+	// device auth is a BOOT ERROR, consistent with the billing-without-device-auth
+	// refusal — a knob that silently does nothing is worse than a refusal.
+	accountCfg, err := validateAccountConfig(accountEnv{
+		DeviceAuth: os.Getenv("SIGILD_DEVICE_AUTH"),
+		MaxDevices: os.Getenv("SIGILD_ACCOUNT_MAX_DEVICES"),
+		MaxInvites: os.Getenv("SIGILD_ACCOUNT_MAX_INVITES"),
+		InviteTTL:  os.Getenv("SIGILD_ACCOUNT_INVITE_TTL"),
+	})
+	if err != nil {
+		logger.Error("invalid account configuration", "err", err)
+		os.Exit(1)
+	}
+
 	// Billing config, validated BEFORE binding too. Entirely OPT-IN: with
 	// SIGILD_BILLING_PROVIDERS unset billing is OFF and the /v1/billing routes
 	// stay at their 501 stub. Enabling a provider without its credentials is a
@@ -233,11 +250,15 @@ func main() {
 		if deviceAuth.Enabled {
 			if pgPool != nil {
 				cfg.Devices = store.NewPostgresDeviceStore(pgPool)
+				warnUnadoptedRows(logger, pgPool)
 			} else {
 				cfg.Devices = store.NewMemDeviceStore()
-				logger.Warn("DEVICE AUTH: registry is IN-MEMORY and NON-DURABLE — devices, grants and spent enrollment tokens are lost on restart; use the Postgres op-log backend for durability")
+				logger.Warn("DEVICE AUTH: registry is IN-MEMORY and NON-DURABLE — devices, grants, ACCOUNTS, account MEMBERSHIPS, account INVITES and VAULT-OWNER rows are all lost on restart (which also means a spent enrollment token or a spent invite becomes reusable); use the Postgres op-log backend for durability")
 			}
 			cfg.AdminToken = deviceAuth.AdminToken
+			cfg.AccountMaxDevices = accountCfg.MaxDevices
+			cfg.AccountMaxInvites = accountCfg.MaxInvites
+			cfg.AccountInviteTTL = accountCfg.InviteTTL
 
 			// Register the operator-provisioned enrollment tokens by DIGEST. This
 			// is idempotent, so a restart never resurrects a token that has already
@@ -264,6 +285,13 @@ func main() {
 				"token_ttl", deviceAuth.TokenTTL.String(),
 				"admin_token_configured", cfg.AdminToken != "",
 				"registry", map[bool]string{true: "postgres", false: "memory"}[pgPool != nil])
+
+			// Accounts are ON whenever device auth is. Named at boot because it
+			// changes who owns a vault and who is entitled.
+			logger.Warn("ACCOUNT MODEL ACTIVE: entitlement and vault ownership key off the ACCOUNT of the signing device, not the device. Membership is FLAT (any member may invite, revoke any sibling, run checkout and administer every account-owned vault) and there is NO RECOVERY — lose or revoke every device in an account and it is permanently unreachable. Dev-only, UNAUDITED",
+				"max_devices_per_account", cfg.AccountMaxDevices,
+				"max_open_invites_per_account", cfg.AccountMaxInvites,
+				"invite_ttl", cfg.AccountInviteTTL.String())
 		}
 
 		// Billing. validateBillingConfig has already required dev-ops AND device
@@ -345,12 +373,54 @@ func main() {
 	}
 }
 
+// warnUnadoptedRows warns at boot when the database holds device rows with no
+// account, or vaults whose only ownership record is a legacy is_owner grant.
+//
+// THIS IS THE ONLY SIGNAL AN OPERATOR GETS. Both states are produced by a
+// PRE-0005 BINARY writing to an already-migrated database (a rolling deploy, or
+// a rollback window): 0005's account_id column is deliberately nullable so an
+// old binary can still enroll, and 0005's backfill is recorded in
+// schema_migrations so `sigild migrate` reports "already up to date" forever
+// after. Requests from those devices are refused with the same coarse 403 every
+// other refusal uses — by design, so there is no oracle — which means the
+// refusal itself tells an operator nothing.
+//
+// It NEVER blocks the boot: a read failure, or a schema that predates the
+// account model, is logged at debug and ignored.
+func warnUnadoptedRows(logger *slog.Logger, pool *pgxpool.Pool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	devices, err := store.CountUnadoptedDevices(ctx, pool)
+	if err != nil {
+		logger.Debug("could not count unadopted devices", "err", err)
+		return
+	}
+	vaults, err := store.CountOrphanVaultOwnerGrants(ctx, pool)
+	if err != nil {
+		logger.Debug("could not count orphan owner grants", "err", err)
+		return
+	}
+	if devices == 0 && vaults == 0 {
+		return
+	}
+	logger.Warn("ACCOUNT BACKFILL INCOMPLETE: this database holds rows written by a PRE-ACCOUNT-MODEL binary after migration 0005 was applied. Devices with no account are refused on EVERY route (a coarse 403, indistinguishable from any other refusal), and a vault whose only ownership record is a legacy owner grant cannot be claimed. `sigild migrate` will NOT fix this — 0005 is already recorded as applied. Run `sigild migrate adopt` (idempotent) to repair it",
+		"devices_without_account", devices,
+		"vaults_with_owner_grant_but_no_owner_row", vaults)
+}
+
 // usageText documents the (few) sigild invocations. Printed on an unknown
 // subcommand.
 const usageText = `usage:
   sigild                 run the sync server (config via environment)
   sigild migrate         apply pending op-log database migrations
-  sigild migrate status  show migration status (applies nothing)`
+  sigild migrate status  show migration status (applies nothing)
+  sigild migrate adopt   re-run the account backfill: give every device without
+                         an account its own singleton account, record ownership
+                         for vaults holding a legacy owner grant, and re-key
+                         device-subject subscriptions. Idempotent; a no-op when
+                         there is nothing to adopt. Needed after a pre-0005
+                         binary wrote to an already-migrated database.`
 
 // runSubcommand dispatches a sigild subcommand. args is os.Args[1:]. It writes
 // human output to out and returns an error (main maps that to a non-zero exit).
@@ -364,18 +434,32 @@ func runSubcommand(ctx context.Context, args []string, out io.Writer) error {
 	}
 }
 
+// migrateMode is what `sigild migrate ...` was asked to do.
+type migrateMode int
+
+const (
+	// migrateApply applies pending migrations (`sigild migrate`).
+	migrateApply migrateMode = iota
+	// migrateStatus reports and applies nothing (`sigild migrate status`).
+	migrateStatus
+	// migrateAdopt re-runs the account backfill (`sigild migrate adopt`).
+	migrateAdopt
+)
+
 // parseMigrateArgs interprets the arguments after `migrate`. No args => apply
-// pending (statusOnly=false); the single arg "status" => report only
-// (statusOnly=true). Anything else is an error. Kept separate so arg parsing is
-// unit-testable without a database.
-func parseMigrateArgs(args []string) (statusOnly bool, err error) {
+// pending; "status" => report only; "adopt" => re-run the account backfill.
+// Anything else is an error. Kept separate so arg parsing is unit-testable
+// without a database.
+func parseMigrateArgs(args []string) (migrateMode, error) {
 	switch {
 	case len(args) == 0:
-		return false, nil
+		return migrateApply, nil
 	case len(args) == 1 && args[0] == "status":
-		return true, nil
+		return migrateStatus, nil
+	case len(args) == 1 && args[0] == "adopt":
+		return migrateAdopt, nil
 	default:
-		return false, fmt.Errorf("unknown migrate argument %q (want: `sigild migrate` or `sigild migrate status`)",
+		return migrateApply, fmt.Errorf("unknown migrate argument %q (want: `sigild migrate`, `sigild migrate status` or `sigild migrate adopt`)",
 			strings.Join(args, " "))
 	}
 }
@@ -386,7 +470,7 @@ func parseMigrateArgs(args []string) (statusOnly bool, err error) {
 // missing-DSN check happen BEFORE any connection, so those paths are unit-
 // testable without a database.
 func runMigrate(ctx context.Context, args []string, out io.Writer) error {
-	statusOnly, err := parseMigrateArgs(args)
+	mode, err := parseMigrateArgs(args)
 	if err != nil {
 		return err
 	}
@@ -403,7 +487,8 @@ func runMigrate(ctx context.Context, args []string, out io.Writer) error {
 	}
 	defer pool.Close()
 
-	if statusOnly {
+	switch mode {
+	case migrateStatus:
 		statuses, err := store.Status(ctx, pool)
 		if err != nil {
 			return fmt.Errorf("read migration status: %w", err)
@@ -415,6 +500,29 @@ func runMigrate(ctx context.Context, args []string, out io.Writer) error {
 				fmt.Fprintf(out, "[pending] %s\n", s.Name)
 			}
 		}
+		return nil
+
+	case migrateAdopt:
+		// The account backfill, re-run against whatever state the database is in.
+		// This is the ONLY repair for device rows written by a pre-0005 binary
+		// after 0005 was applied: schema_migrations already records 0005, so
+		// `sigild migrate` will never re-run it. Adoption is deliberately NOT
+		// automatic on the authentication path — an unauthenticated request must
+		// never be able to mint an account.
+		rep, err := store.AdoptOrphanAccounts(ctx, pool)
+		if err != nil {
+			return fmt.Errorf("adopt orphan accounts: %w", err)
+		}
+		if rep.Empty() {
+			fmt.Fprintln(out, "nothing to adopt: every device has an account and every owner grant has an owner row")
+			return nil
+		}
+		fmt.Fprintf(out, "adopted %d device(s) into %d new account(s)\n",
+			rep.DevicesAdopted, rep.AccountsCreated)
+		fmt.Fprintf(out, "recorded ownership for %d vault(s) from existing owner grants\n",
+			rep.VaultOwnersBackfilled)
+		fmt.Fprintf(out, "re-keyed %d subscription(s) from a device subject to its account\n",
+			rep.SubscriptionsRekeyed)
 		return nil
 	}
 
@@ -640,6 +748,116 @@ func parseTokenTTL(s string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("must be positive, got %s", d)
+	}
+	return d, nil
+}
+
+// ---- Account model configuration (Phase 52) ----
+//
+// Environment, ALL optional; unset => the package defaults apply:
+//
+//	SIGILD_ACCOUNT_MAX_DEVICES  member devices per account. Default 10, range
+//	                            [1, 1000]. Anti-freeloading, NOT anti-fraud.
+//	SIGILD_ACCOUNT_MAX_INVITES  OPEN (unused/unexpired/unrevoked) invites per
+//	                            account. Default 5, range [1, 100]. It bounds
+//	                            stored STATE, not request volume — there is no
+//	                            rate limit on invite minting.
+//	SIGILD_ACCOUNT_INVITE_TTL   Go duration. Default 15m, must be > 0 and <= 24h.
+//
+// There is NO SIGILD_ACCOUNTS flag: accounts ride SIGILD_DEVICE_AUTH. Setting
+// any of the three WITHOUT device auth is a boot error rather than a silently
+// ignored knob.
+
+// Account-model bounds. They mirror the api package's defaults; validation lives
+// here so a malformed value is a startup failure, not a request-time surprise.
+const (
+	defaultAccountMaxDevices = 10
+	minAccountMaxDevices     = 1
+	maxAccountMaxDevices     = 1000
+	defaultAccountMaxInvites = 5
+	minAccountMaxInvites     = 1
+	maxAccountMaxInvites     = 100
+	defaultAccountInviteTTL  = 15 * time.Minute
+	maxAccountInviteTTL      = 24 * time.Hour
+)
+
+// accountEnv is the raw environment for the account model, injected so
+// validation is unit-testable without touching the process environment.
+type accountEnv struct {
+	DeviceAuth string
+	MaxDevices string
+	MaxInvites string
+	InviteTTL  string
+}
+
+// accountConfig is the validated result.
+type accountConfig struct {
+	MaxDevices int
+	MaxInvites int
+	InviteTTL  time.Duration
+}
+
+// validateAccountConfig parses + validates the account-model environment and
+// fails fast on any misconfiguration, BEFORE the listener binds. It performs no
+// network I/O and never calls os.Exit, so it is unit-testable.
+func validateAccountConfig(env accountEnv) (accountConfig, error) {
+	set := strings.TrimSpace(env.MaxDevices) != "" ||
+		strings.TrimSpace(env.MaxInvites) != "" ||
+		strings.TrimSpace(env.InviteTTL) != ""
+	if set && !truthy(env.DeviceAuth) {
+		return accountConfig{}, errors.New("the SIGILD_ACCOUNT_* settings require SIGILD_DEVICE_AUTH: the account model rides the multi-device auth contract and has no separate switch")
+	}
+
+	maxDevices, err := parseBoundedInt(env.MaxDevices, defaultAccountMaxDevices, minAccountMaxDevices, maxAccountMaxDevices)
+	if err != nil {
+		return accountConfig{}, fmt.Errorf("SIGILD_ACCOUNT_MAX_DEVICES: %w", err)
+	}
+	maxInvites, err := parseBoundedInt(env.MaxInvites, defaultAccountMaxInvites, minAccountMaxInvites, maxAccountMaxInvites)
+	if err != nil {
+		return accountConfig{}, fmt.Errorf("SIGILD_ACCOUNT_MAX_INVITES: %w", err)
+	}
+	ttl, err := parseBoundedDuration(env.InviteTTL, defaultAccountInviteTTL, maxAccountInviteTTL)
+	if err != nil {
+		return accountConfig{}, fmt.Errorf("SIGILD_ACCOUNT_INVITE_TTL: %w", err)
+	}
+	return accountConfig{MaxDevices: maxDevices, MaxInvites: maxInvites, InviteTTL: ttl}, nil
+}
+
+// parseBoundedInt parses an optional integer env value into [min, max]. An empty
+// value yields def; an out-of-range or unparseable value is an ERROR, never a
+// silent clamp — an operator who typed 10000 meant something, and quietly
+// serving 1000 hides it.
+func parseBoundedInt(s string, def, minValue, maxValue int) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("must be an integer: %w", err)
+	}
+	if v < minValue || v > maxValue {
+		return 0, fmt.Errorf("must be between %d and %d, got %d", minValue, maxValue, v)
+	}
+	return v, nil
+}
+
+// parseBoundedDuration parses an optional Go duration into (0, max]. Empty =>
+// def; zero, negative, over the ceiling, or unparseable is an error.
+func parseBoundedDuration(s string, def, maxValue time.Duration) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("must be a Go duration such as \"15m\": %w", err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive, got %s", d)
+	}
+	if d > maxValue {
+		return 0, fmt.Errorf("must be at most %s, got %s", maxValue, d)
 	}
 	return d, nil
 }

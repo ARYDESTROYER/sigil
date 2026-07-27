@@ -38,20 +38,56 @@ func testPubKey(t *testing.T) []byte {
 	return pub
 }
 
-// newTestDevice builds an unsaved Device with a fresh ID and key.
+// newTestDevice builds an unsaved Device with a fresh ID, key and its OWN fresh
+// account. Every device gets a distinct account unless a test deliberately joins
+// one (see joinAccount), which mirrors production: an operator token always
+// founds a new account.
 func newTestDevice(t *testing.T, label string) Device {
 	t.Helper()
 	id, err := NewDeviceID()
 	if err != nil {
 		t.Fatalf("NewDeviceID: %v", err)
 	}
+	accountID, err := NewAccountID()
+	if err != nil {
+		t.Fatalf("NewAccountID: %v", err)
+	}
 	return Device{
 		ID:        id,
+		AccountID: accountID,
 		PublicKey: testPubKey(t),
 		Label:     label,
 		Status:    DeviceActive,
 		CreatedAt: time.Now().UTC().Truncate(time.Millisecond),
 	}
+}
+
+// createDevice registers d together with its own singleton account, which is
+// exactly what operator-token enrollment does. Since Phase 52 a device cannot
+// exist without an account, so this is the only sensible way for a test to seed
+// one.
+func createDevice(ctx context.Context, s DeviceStore, d Device) error {
+	return s.CreateAccountWithFounder(ctx, Account{
+		ID:                d.AccountID,
+		CreatedAt:         d.CreatedAt,
+		CreatedByDeviceID: d.ID,
+	}, d)
+}
+
+// claimVaultOwner keeps the two-value shape of the removed ClaimVaultOwner so the
+// pre-existing single-owner assertions read unchanged. Ownership is now an
+// ACCOUNT property, so it claims on behalf of d's account.
+func claimVaultOwner(ctx context.Context, s DeviceStore, vaultID string, d Device, at time.Time) (bool, error) {
+	claimed, _, err := s.ClaimVault(ctx, vaultID, d.AccountID, d.ID, at)
+	return claimed, err
+}
+
+// joinAccount registers d as a SIBLING of an existing account, bypassing the
+// invite flow. It exists so a test can build a multi-device account directly;
+// production has no such path (the only way in is an invite).
+func joinAccount(ctx context.Context, s DeviceStore, accountID string, d Device) error {
+	d.AccountID = accountID
+	return s.CreateDevice(ctx, d)
 }
 
 func TestMemDeviceStoreSuite(t *testing.T) {
@@ -75,7 +111,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		d2.CreatedAt = d1.CreatedAt.Add(time.Second)
 
 		for _, d := range []Device{d1, d2} {
-			if err := s.CreateDevice(ctx, d); err != nil {
+			if err := createDevice(ctx, s, d); err != nil {
 				t.Fatalf("CreateDevice(%s): %v", d.Label, err)
 			}
 		}
@@ -124,20 +160,20 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 	t.Run("DuplicatePublicKeyRejected", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "first")
-		if err := s.CreateDevice(ctx, d); err != nil {
+		if err := createDevice(ctx, s, d); err != nil {
 			t.Fatalf("CreateDevice: %v", err)
 		}
 		// A DIFFERENT device ID but the SAME public key must be rejected: a key
 		// identifies at most one device.
 		dup := newTestDevice(t, "second")
 		dup.PublicKey = d.PublicKey
-		if err := s.CreateDevice(ctx, dup); !errors.Is(err, ErrDeviceExists) {
+		if err := createDevice(ctx, s, dup); !errors.Is(err, ErrDeviceExists) {
 			t.Fatalf("CreateDevice(duplicate key) err = %v, want ErrDeviceExists", err)
 		}
 		// The same ID must also be rejected.
 		again := d
 		again.PublicKey = testPubKey(t)
-		if err := s.CreateDevice(ctx, again); !errors.Is(err, ErrDeviceExists) {
+		if err := createDevice(ctx, s, again); !errors.Is(err, ErrDeviceExists) {
 			t.Fatalf("CreateDevice(duplicate id) err = %v, want ErrDeviceExists", err)
 		}
 	})
@@ -145,7 +181,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 	t.Run("RevokeIsIdempotentAndSticky", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "to-revoke")
-		if err := s.CreateDevice(ctx, d); err != nil {
+		if err := createDevice(ctx, s, d); err != nil {
 			t.Fatalf("CreateDevice: %v", err)
 		}
 
@@ -276,7 +312,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		owner := newTestDevice(t, "owner")
 		other := newTestDevice(t, "other")
 		for _, d := range []Device{owner, other} {
-			if err := s.CreateDevice(ctx, d); err != nil {
+			if err := createDevice(ctx, s, d); err != nil {
 				t.Fatalf("CreateDevice: %v", err)
 			}
 		}
@@ -287,7 +323,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 			t.Fatalf("GetGrant(fresh vault) err = %v, want ErrGrantNotFound", err)
 		}
 
-		claimed, err := s.ClaimVaultOwner(ctx, vault, owner.ID, at)
+		claimed, err := claimVaultOwner(ctx, s, vault, owner, at)
 		if err != nil {
 			t.Fatalf("ClaimVaultOwner: %v", err)
 		}
@@ -295,7 +331,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 			t.Fatal("first ClaimVaultOwner returned false, want true")
 		}
 		// A second device cannot claim an owned vault.
-		claimed, err = s.ClaimVaultOwner(ctx, vault, other.ID, at)
+		claimed, err = claimVaultOwner(ctx, s, vault, other, at)
 		if err != nil {
 			t.Fatalf("second ClaimVaultOwner: %v", err)
 		}
@@ -363,7 +399,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		devs := make([]Device, workers)
 		for i := range devs {
 			devs[i] = newTestDevice(t, fmt.Sprintf("racer-%d", i))
-			if err := s.CreateDevice(ctx, devs[i]); err != nil {
+			if err := createDevice(ctx, s, devs[i]); err != nil {
 				t.Fatalf("CreateDevice: %v", err)
 			}
 		}
@@ -374,7 +410,7 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				ok, err := s.ClaimVaultOwner(ctx, vault, devs[i].ID, at)
+				ok, err := claimVaultOwner(ctx, s, vault, devs[i], at)
 				if err != nil {
 					t.Errorf("ClaimVaultOwner: %v", err)
 					return
@@ -418,14 +454,14 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 			go func(i int) {
 				defer wg.Done()
 				d := newTestDevice(t, fmt.Sprintf("mixed-%d", i))
-				if err := s.CreateDevice(ctx, d); err != nil {
+				if err := createDevice(ctx, s, d); err != nil {
 					t.Errorf("CreateDevice: %v", err)
 					return
 				}
 				if _, err := s.GetDevice(ctx, d.ID); err != nil {
 					t.Errorf("GetDevice: %v", err)
 				}
-				if _, err := s.ClaimVaultOwner(ctx, vault, d.ID, at); err != nil {
+				if _, err := claimVaultOwner(ctx, s, vault, d, at); err != nil {
 					t.Errorf("ClaimVaultOwner: %v", err)
 				}
 				if _, err := s.ListDevices(ctx); err != nil {
@@ -446,6 +482,9 @@ func runDeviceStoreSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 	// part of the SAME conformance suite, so mem and Postgres are held to
 	// identical behaviour here too.
 	runKeySharingSuite(t, newStore)
+	// The account model (Phase 52) likewise: accounts, invites and ACCOUNT-scoped
+	// vault ownership are one contract across both backends.
+	runAccountsSuite(t, newStore)
 }
 
 // TestPermissionAllows pins the permission lattice: write implies read, read
@@ -504,7 +543,7 @@ func TestMemDeviceStoreDefensiveCopy(t *testing.T) {
 	original := make([]byte, len(d.PublicKey))
 	copy(original, d.PublicKey)
 
-	if err := s.CreateDevice(ctx, d); err != nil {
+	if err := createDevice(ctx, s, d); err != nil {
 		t.Fatalf("CreateDevice: %v", err)
 	}
 	d.PublicKey[0] ^= 0xff // mutate the caller's slice after storing

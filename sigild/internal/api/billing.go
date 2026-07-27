@@ -22,9 +22,18 @@ package api
 //     this endpoint exists outside the device model, and it is why it can create
 //     no session, read no vault, and name no subject of its own choosing.
 //
-// THE SUBJECT IS SERVER-DERIVED. A checkout's subject is the AUTHENTICATED
-// DEVICE ID; it is never read from the request body. A client therefore cannot
-// buy — or query — a subscription on another subject's behalf.
+// THE SUBJECT IS SERVER-DERIVED, AND SINCE PHASE 52 IT IS THE AUTHENTICATED
+// DEVICE'S ACCOUNT ID — never the device, and never read from the request body.
+// That is the whole point of the account model on this route: a customer who
+// pays on their phone is entitled on their laptop, and a cancel/refund/chargeback
+// demotes the account at once instead of one device. A client cannot buy — or
+// query — a subscription on another subject's behalf, because there is no body,
+// query or path field anywhere that names a subject.
+//
+// ENTITLEMENT IS REPORTED, NEVER ENFORCED. No route here (or anywhere in sigild)
+// refuses service to an unentitled account; gating the op-log on payment status
+// would lock a customer out of their own 2FA codes over a failed card, and needs
+// grace periods and dunning it does not have. That is a deliberate deferral.
 //
 // NO CARD DATA CROSSES THIS FILE. Checkout returns a provider-hosted URL; the
 // customer's card details go to the provider, never here. No handler, struct or
@@ -148,6 +157,15 @@ func (h *handlers) billingCheckout(w http.ResponseWriter, r *http.Request) {
 		h.denyOps(w, r, "", out)
 		return
 	}
+	subject := dev.AccountID
+	if subject == "" {
+		// An invariant violation after migration 0005, and NEVER a silent
+		// fallback to dev.ID: charging (or reporting) against a device would
+		// re-create the very defect accounts exist to fix. Fail closed at 500
+		// before the provider or the store is touched.
+		h.denyOps(w, r, "", authOutcome{Reason: reasonMissingAccount, DeviceID: dev.ID})
+		return
+	}
 
 	var req checkoutRequestBody
 	if len(body) > 0 {
@@ -176,7 +194,7 @@ func (h *handlers) billingCheckout(w http.ResponseWriter, r *http.Request) {
 
 	// Bind subject -> provider BEFORE calling out, so a webhook that races the
 	// HTTP response still has a row to resolve against.
-	if err := h.cfg.Billing.Subscriptions.StartCheckout(r.Context(), dev.ID, name, time.Now().UTC()); err != nil {
+	if err := h.cfg.Billing.Subscriptions.StartCheckout(r.Context(), subject, name, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "")
 		return
 	}
@@ -184,7 +202,8 @@ func (h *handlers) billingCheckout(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), billingProviderTimeout)
 	defer cancel()
 	session, err := provider.CreateCheckout(ctx, billing.CheckoutRequest{
-		Subject:    dev.ID, // SERVER-DERIVED, never from the body
+		// The AUTHENTICATED DEVICE'S ACCOUNT — SERVER-DERIVED, never from the body.
+		Subject:    subject,
 		Reference:  reference,
 		PlanRef:    req.Plan,
 		SuccessURL: h.cfg.Billing.SuccessURL,
@@ -193,7 +212,7 @@ func (h *handlers) billingCheckout(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The error may name the provider and an HTTP status, never a secret
 		// (see billing.ProviderError). It is logged, not returned.
-		h.auditCheckoutFailed(r, name, dev.ID, err)
+		h.auditCheckoutFailed(r, name, subject, dev.ID, err)
 		if errors.Is(err, billing.ErrNotConfigured) {
 			writeError(w, http.StatusInternalServerError, "internal", "")
 			return
@@ -203,7 +222,7 @@ func (h *handlers) billingCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.auditCheckoutCreated(r, name, dev.ID, session.SessionID)
+	h.auditCheckoutCreated(r, name, subject, dev.ID, session.SessionID)
 	h.metrics.incBillingCheckout(name)
 
 	resp := checkoutResponse{
@@ -215,6 +234,41 @@ func (h *handlers) billingCheckout(w http.ResponseWriter, r *http.Request) {
 		resp.ExpiresAt = session.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// resolveBillingSubject maps a provider-echoed subject onto an ACCOUNT id.
+//
+// WHY THIS EXISTS AT ALL: a hosted checkout started before migration 0005 put
+// the DEVICE id into the provider's metadata, and a provider echoes that back
+// forever. ApplyWebhookEvent CREATES a subscription row for whatever subject it
+// is handed, so without this an in-flight payment would land on an orphan row
+// after the cutover — money-relevant state attached to a subject nothing reads.
+//
+// The rules, in order:
+//
+//	""                         -> ""  (nothing to resolve)
+//	names a known ACCOUNT      -> unchanged
+//	names an enrolled DEVICE   -> that device's account
+//	names neither              -> "" (BLANKED)
+//
+// Blanking is the hardening: it makes the store fall back to its
+// (provider, subscription_ref) lookup and, failing that, answer "unresolved"
+// (a 200 that changes nothing). A provider-supplied string must never INVENT a
+// subscription row for a subject that does not exist.
+//
+// This is a LOOKUP on an already-signature-verified value, so it adds no new
+// trust: it can only narrow what the event is allowed to touch, never widen it.
+func (h *handlers) resolveBillingSubject(ctx context.Context, subject string) string {
+	if subject == "" || h.devices == nil {
+		return subject
+	}
+	if _, err := h.devices.GetAccount(ctx, subject); err == nil {
+		return subject
+	}
+	if dev, err := h.devices.GetDevice(ctx, subject); err == nil && dev.AccountID != "" {
+		return dev.AccountID
+	}
+	return ""
 }
 
 // webhookResponse is the acknowledgement body. Status is the store's verdict
@@ -307,9 +361,12 @@ func (h *handlers) billingWebhook(w http.ResponseWriter, r *http.Request) {
 		// NOT ev.ID: the idempotency key must come from bytes the provider's
 		// signature covers, or a replay with a fresh (unsigned) event-id header
 		// would be processed as a new event. See billing.Event.DedupKey.
-		EventID:          ev.IdempotencyKey(),
-		EventType:        string(ev.Type),
-		Subject:          ev.Subject,
+		EventID:   ev.IdempotencyKey(),
+		EventType: string(ev.Type),
+		// A checkout started BEFORE migration 0005 carries the DEVICE id in the
+		// provider's metadata forever, so the echoed subject is mapped onto an
+		// account here rather than taken at face value.
+		Subject:          h.resolveBillingSubject(r.Context(), ev.Subject),
 		CustomerRef:      ev.CustomerRef,
 		SubscriptionRef:  ev.SubscriptionRef,
 		Target:           target,
@@ -349,22 +406,30 @@ type subscriptionResponse struct {
 	UpdatedAt        string `json:"updated_at,omitempty"`
 }
 
-// billingSubscription returns the AUTHENTICATED DEVICE's subscription status.
-// The subject is taken from the verified signature, never from a query
-// parameter, so this endpoint cannot be used to enumerate other subjects.
+// billingSubscription returns the AUTHENTICATED DEVICE'S ACCOUNT's subscription
+// status. The subject is derived from the verified signature, never from a query
+// parameter, so this endpoint cannot be used to enumerate other subjects — and
+// because the subject is the ACCOUNT, a sibling device that never ran checkout
+// still sees the account's entitlement.
 func (h *handlers) billingSubscription(w http.ResponseWriter, r *http.Request) {
 	dev, out := h.authenticateDevice(r, nil)
 	if !out.allowed() {
 		h.denyOps(w, r, "", out)
 		return
 	}
+	subject := dev.AccountID
+	if subject == "" {
+		// Invariant violation; never fall back to the device ID.
+		h.denyOps(w, r, "", authOutcome{Reason: reasonMissingAccount, DeviceID: dev.ID})
+		return
+	}
 
-	sub, err := h.cfg.Billing.Subscriptions.GetSubscription(r.Context(), dev.ID)
+	sub, err := h.cfg.Billing.Subscriptions.GetSubscription(r.Context(), subject)
 	if err != nil {
 		if errors.Is(err, store.ErrSubscriptionNotFound) {
 			// "Never subscribed" is a valid answer, not a fault.
 			writeJSON(w, http.StatusOK, subscriptionResponse{
-				Subject: dev.ID, Status: string(billing.StatusNone), Entitled: false,
+				Subject: subject, Status: string(billing.StatusNone), Entitled: false,
 			})
 			return
 		}

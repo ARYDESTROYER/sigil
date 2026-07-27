@@ -300,6 +300,51 @@ rotation. The MV3 extension additionally required a **loopback-only** host permi
 cross-origin otherwise. See
 [`../api.md` → Client support (the browser + Node clients)](../api.md#client-support-the-browser--node-clients).
 
+## Two limitations revised by the account model (added Phase 52, 2026-07-28)
+
+[ADR 0040](0040-account-model.md) makes an **account** — not a device — the
+subject of entitlement and the owner of vaults. Two of the honest limitations
+recorded above are therefore **no longer accurate as written**. Per this repo's
+addendum rule the text above is left untouched; this section records what
+changed.
+
+- **Limitation 1 ("trust-on-first-write is a DEV ownership model, not an account
+  model") — partly revised.** There is now an account model, and ownership keys
+  off it: the first **account** to authenticate a write to an unclaimed vault
+  owns it, and every device of that account then has full access **without a
+  per-device grant row**. ⚠️ **Trust-on-first-write itself did not go away — it
+  moved up one level.** An attacker who reaches an unclaimed vault id before its
+  legitimate owner still wins it and still locks them out with a `403`.
+- **Limitation 4 ("Revoking a vault's owner ORPHANS the vault") — retired at the
+  device level, narrowed at the account level.** A revoked device's siblings
+  inherit ownership from the account, so revoking the device that happened to
+  claim a vault no longer strands it: a sibling that was granted nothing still
+  reads, writes, grants on and rotates that vault's key. ⚠️ **The failure was
+  narrowed, not eliminated:** lose or revoke **every** device in an account and
+  the account, its vaults and its subscription are permanently unreachable —
+  there is **no recovery** of any kind.
+
+Two clarifications, because they touch text above rather than replace it:
+
+- **Limitation 6's "no user/account model" now means "no IDENTITY system".**
+  There is still no email, no password, no session or token issuance, no key
+  rotation, no recovery and no operator break-glass; an account is auth metadata
+  only. Everything else in limitation 6 — including **no rate limiting on
+  enrollment attempts** — is unchanged.
+- **§2's enrollment path is unchanged on the wire.** An account **invite** is
+  presented in the *existing* `X-Sigil-Enroll-Token` header under the *existing*
+  `canonical enrollment challenge`, because that challenge already binds the
+  token's SHA-256 **digest** and therefore already binds which credential is in
+  play. There is **no fourth canonical message**, and §3's "the canonical layout
+  lives in THREE implementations" still holds exactly as written. What did change
+  is the *classification*: a configured **operator token founds a NEW account**,
+  anything else is resolved as an **invite** by a single atomic store operation —
+  and invites are single-**SUCCESS**, while operator tokens keep the
+  single-**ATTEMPT** semantics limitation 2 describes.
+
+See [ADR 0040](0040-account-model.md) for the full decision and its nineteen
+honest limitations.
+
 ## References
 
 - Code: [`../../sigild/internal/api/deviceauth.go`](../../sigild/internal/api/deviceauth.go),

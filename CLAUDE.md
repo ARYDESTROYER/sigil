@@ -291,13 +291,19 @@ public, make no security claims, until the audit completes and trademark clears.
   model**; an enrollment token is **single-ATTEMPT not single-SUCCESS** (spent before the
   device row is created, so a duplicate-key enrollment burns it — fail-closed, issue a new
   token); the **replay nonce cache is per-process/in-memory** (multi-instance needs a shared
-  store; enrollment nonces are prefix-separated in the shared namespace); **revoking a
-  vault's owner ORPHANS the vault** (no ownership transfer); the **in-memory registry is
+  store; enrollment nonces are prefix-separated in the shared namespace); ~~**revoking a
+  vault's owner ORPHANS the vault**~~ ⚠️ **RETIRED at the device level by Phase 52** —
+  ownership belongs to an **ACCOUNT** and siblings inherit it, so revoking a vault's
+  claimant no longer strands it (losing **every** device in an account still does,
+  permanently — see the account bullet below); the **in-memory registry is
   non-durable** (a spent token becomes reusable after restart — warned at boot) and the
   **file backend was NOT extended** (device auth + `SIGILD_OPLOG_DIR` falls back to the
   in-memory registry, warned at boot); and it is still **dev-gated, pre-audit, UNAUDITED** —
-  no user/account model, no session/token issuance, **no rate limiting on enrollment
-  attempts**, no key rotation. Contract in [`docs/api.md`](docs/api.md); ADR 0031.
+  ⚠️ **TOFU is no longer "not an account model"** (Phase 52 added one; it is auth metadata,
+  **not an identity system**, and TOFW simply moved up one level), but there is still no
+  session/token issuance, **no rate limiting on enrollment attempts**, no key rotation and
+  **no recovery of any kind**. Contract in [`docs/api.md`](docs/api.md); ADR 0031, and
+  **ADR 0040** (which revises limitations 1 and 4).
   **A BILLING / SUBSCRIPTION LAYER (Phase 45, ADR 0034) — opt-in + dev-gated, UNAUDITED,
   NEVER RUN AGAINST A LIVE PROVIDER ACCOUNT:** Sigil is a PAID product, so `sigild` now has
   a **provider-agnostic billing seam** (`internal/billing/`): ONE `billing.Provider`
@@ -315,8 +321,12 @@ public, make no security claims, until the audit completes and trademark clears.
   the client, so **NO CARD DATA EVER ENTERS THIS PROCESS** — no struct field, log line, metric
   or column could hold a PAN/CVV/expiry (PCI scope SAQ-A; **not** an attestation).
   **THREE ROUTES, TWO AUTHS:** `POST /v1/billing/checkout` + `GET /v1/billing/subscription`
-  reuse the **device-auth v3** choke point (`authenticateDevice`) and the **subject is the
-  AUTHENTICATED DEVICE ID, never a body field**; `POST /v1/billing/webhook/{provider}` is
+  reuse the **device-auth v3** choke point (`authenticateDevice`) and the **subject is
+  SERVER-DERIVED, never a body field** (⚠️ since Phase 52 it is the authenticated device's
+  **ACCOUNT ID** — `dev.AccountID` — not the device; a device with no account is a coarse
+  403 before the provider or store is touched, and a provider-echoed **pre-0005 DEVICE
+  subject** is *resolved* onto an account or **blanked**, never trusted to invent a row);
+  `POST /v1/billing/webhook/{provider}` is
   authenticated **ONLY by the provider's own signature over the RAW body** (a provider has no
   device key). Verification is **real**: Stripe `HMAC-SHA256("<t>.<raw body>")` from
   `Stripe-Signature` (5-minute tolerance both directions, EVERY `v1` element compared, legacy
@@ -373,7 +383,10 @@ public, make no security claims, until the audit completes and trademark clears.
   account** (all tests drive a local `httptest` server); the **Juspay** adapter is explicitly
   **UNVERIFIED-AGAINST-LIVE-DASHBOARD** (header names / signed message / endpoint / event
   vocabulary must be confirmed first) and Razorpay's surrounding details are MEDIUM
-  confidence; **no account model** (a subscription keys off the enrolled DEVICE); recurring
+  confidence; ⚠️ **the subject is an ACCOUNT since Phase 52 (ADR 0040), not a device — but
+  an account is NOT an identity** (no email/password/recovery), and every pre-`0005` device
+  was adopted into its OWN singleton account, so an existing two-device customer has TWO
+  billing subjects; recurring
   subscription CREATION is unimplemented for the India adapters (one-time hosted page; their
   webhook sides do map subscription/mandate events); no entitlement enforcement, no
   fraud/chargeback/refund/proration/tax/dunning; **no PCI attestation**; the in-memory store
@@ -433,6 +446,140 @@ public, make no security claims, until the audit completes and trademark clears.
   **classical Ed25519** (the wrap is hybrid, the auth is not). Contract in
   [`docs/api.md`](docs/api.md); key hierarchy + the safety-number construction in
   [`docs/crypto-spec.md`](docs/crypto-spec.md).
+- `sigild/` **THE ACCOUNT MODEL (Phase 52, ADR 0040) — an ACCOUNT is now the subject of
+  ENTITLEMENT and the OWNER of vaults**, in `internal/api/accounts.go` +
+  `internal/store/accounts.go` + `postgresaccounts.go` + `adopt.go`. **WHY:** a DEVICE was
+  the only subject, and two verified defects followed — `billing.go` set `Subject: dev.ID`
+  so a customer who paid on their phone was **NOT entitled on their laptop**, and vault
+  ownership was trust-on-first-write by DEVICE so **revoking a vault's owner ORPHANED the
+  vault** (a limitation this repo recorded in ADR 0031, CLAUDE.md and the threat model).
+  **THE MODEL IN ONE SENTENCE:** an account is a **server-assigned id on the device row**
+  (`acct_` + b64url of 16 CSPRNG bytes); a **single-use INVITE** minted by a member device
+  is the only way a second device joins; and ⭐ **NO REQUEST ANYWHERE NAMES AN ACCOUNT** —
+  it is always `dev.AccountID` taken from the verified signature, which is the
+  **structural** closure of every cross-account IDOR (there is nowhere to put an id, so
+  such a request is unconstructible, not merely rejected). ⭐ **THE KEY DESIGN CHOICE: an
+  invite rides the EXISTING `X-Sigil-Enroll-Token` header under the EXISTING
+  `canonicalEnrollMessage`**, because that challenge already binds the token DIGEST and
+  therefore already binds WHICH credential is in play — so there is **NO fourth canonical
+  message and NO new Go/Rust/JS mirror** (still THREE), and **today's shipped clients can
+  already join** (`sigil device enroll --token <invite>`; the browsers paste it into their
+  existing enrollment-token field). A dedicated `sigil-account-join-v1` domain was
+  considered and **REJECTED**: clearer, zero extra security, one more silent-drift surface.
+  Classification happens **at the atomic write, not on the unauthenticated path** —
+  enroll step 5 only asks "is this digest a configured OPERATOR token?", with **no early
+  return and no invite lookup** (a DB round trip + a timing side channel on invite-hash
+  existence); an **operator token ALWAYS founds a NEW account**, anything else is resolved
+  as an invite at step 8. **Invites are single-SUCCESS** (redeem + insert are ONE atomic
+  op) while operator tokens stay **single-ATTEMPT**. **FOUR ROUTES** (dev-gated, `501` by
+  default with their OWN stub text, never 404; all reuse `authenticateDevice` verbatim):
+  **`GET /v1/account`**, **`POST /v1/account/invites`**, **`GET /v1/account/invites`**,
+  **`POST /v1/account/invites/{inviteID}/revoke`**. **OWNERSHIP:** `sigil_vault_owners`
+  (`vault_id` PK → `account_id`) is the authority; TOFW **moved up one level** (first
+  ACCOUNT to write an unclaimed vault owns it); **every sibling device has full access
+  with NO grant row**; **`needOwner` is satisfied ONLY by account ownership** (a legacy
+  `is_owner` grant NEVER satisfies it, though the flag is retained as the per-device VIEW
+  so `GET …/grants` stays byte-identical — it gains an additive `owner_account_id`); a
+  cross-account share is still a per-DEVICE grant (envelopes are addressed to a device).
+  **REVOCATION gained a third path:** a member may revoke a **SIBLING** — and an unknown
+  device and a foreign one both answer **403, never 404** (only the admin path keeps 404).
+  **ENV** (validated fail-fast before the listener binds; out-of-range is an ERROR, never
+  a clamp): **`SIGILD_ACCOUNT_MAX_DEVICES`** (default 10, `[1,1000]`),
+  **`SIGILD_ACCOUNT_MAX_INVITES`** (default 5, `[1,100]`), **`SIGILD_ACCOUNT_INVITE_TTL`**
+  (default 15m, `(0,24h]`). ⚠️ **There is deliberately NO `SIGILD_ACCOUNTS` switch** —
+  accounts ride `SIGILD_DEVICE_AUTH` (a binary able to run either ownership model would
+  have TWO ownership truths at once); setting any of the three WITHOUT device auth is a
+  **BOOT ERROR**. **STORAGE:** migration **`0005_accounts.sql`** (0001–0004 untouched) adds
+  `sigil_accounts` / `sigil_devices.account_id` (**deliberately NULLABLE**, so a rolled-back
+  pre-0005 binary can still enroll) / `sigil_account_invites` (PK = the lowercase-hex
+  **SHA-256 digest**; the secret is returned ONCE and never stored/logged/re-served; a
+  separate PUBLIC `inv_` handle exists for listing + revocation) / `sigil_vault_owners`,
+  plus an **adoption backfill** ⇒ **`sigild_schema_version` now reports 5**. **METRICS:**
+  `sigild_accounts_created_total`, `sigild_account_invites_created_total`,
+  `sigild_account_invites_revoked_total`, `sigild_account_joins_total` (counts only, **no
+  id label ever**), one new enroll-deny label `account_full`, and three new auth-deny
+  labels `missing_account`/`forbidden_account`/`vault_owner_unresolved`. **AUDIT:**
+  `account.created`, `account.device_joined` (names the **inviter** — visibility, not
+  prevention), `account.invite_created`, `account.invite_revoked`; `device.enrolled` /
+  `device.revoked` / `vault.claimed` gain `account_id`; `device.enroll_denied` gains a
+  fine-grained `invite_reason` that is **audit-log-ONLY** (never a body, never a metric
+  label — every invite failure collapses onto an EXISTING coarse reason, so `/metrics`
+  gains no oracle). **CLI:** `sigil account status | invite [--ttl N] [--pin-key <b64>] |
+  invites | revoke-invite <inviteID>` — **no join subcommand**, by design.
+  ⚠️ **FOUR THINGS THE FIX ROUND CHANGED — document the OUTCOME, not the first cut:**
+  **(1) SEATS COUNT ACTIVE DEVICES ONLY** in all four sites; `device_count` on
+  `GET /v1/account` **CHANGED MEANING** (active only) and a new **`revoked_device_count`**
+  reports the rest, while `devices[]` still lists both. Counting revoked rows made the cap
+  a **LIFETIME** limit that no operation could reverse, bricking an account under exactly
+  the "revoke and re-enroll" remedy this model prescribes — and it was reachable as an
+  attack. **(2) A device with NO account is 403, NOT 500** (`missing_account`) — a NULL
+  account is a data state the server can see, not a fault; the body is byte-identical to
+  every other 403 so no oracle appears. A new reason `vault_owner_unresolved` joined the
+  same closed set. **(3) NEW OPERATOR COMMAND `sigild migrate adopt`** — re-runs 0005's
+  backfill (mint `acct_mig_<device_id>` accounts for NULL-account devices, record ownership
+  for vaults holding a legacy `is_owner` grant, re-key device-subject subscriptions),
+  **idempotent, one transaction**, "nothing to adopt" when clean; **adoption is NEVER
+  implicit on the authentication path** (an unauthenticated request must never mint an
+  account), and sigild logs a **boot WARNING** ("ACCOUNT BACKFILL INCOMPLETE … `sigild
+  migrate` will NOT fix this — 0005 is already recorded as applied. Run `sigild migrate
+  adopt`") when unadopted rows exist. **(4) AN ORPHAN OWNER GRANT IS RECONCILED** inside
+  `ClaimVault` (it writes **only the owner row** — not one grant row is created or
+  re-permissioned), so a legitimately write-granted device gets **201** instead of the
+  opaque 500 it used to get; unresolvable ⇒ coarse **403 `vault_owner_unresolved`**, never
+  a 5xx. Also fixed a pre-existing **Postgres COLLATION flake** (`ORDER BY device_id` under
+  `en_US.utf8` vs Go byte order → **`COLLATE "C"`** on every text `ORDER BY` in the store
+  package), which made the only gate exercising 0005 red ~4 runs in 12.
+  ⚠️ **HONEST LIMITS — the essentials (all 19 in ADR 0040):** ⭐ **THIS IS NOT AN IDENTITY
+  SYSTEM AND THERE IS NO RECOVERY** — no email, no password, no recovery code, no operator
+  break-glass; **lose or revoke EVERY device and the account is permanently unreachable,
+  its vaults permanently unreadable by the customer AND by us, and its subscription
+  stranded.** The orphan failure **NARROWED** (from "revoke one device" to "lose every
+  device"); it was **NOT eliminated**, and "keep two devices enrolled" is a **mitigation,
+  not a fix** — this must be written down before anyone charges real money. **Membership
+  confers AUTHORIZATION, never DECRYPTION** (a joined device reads nothing until a member
+  wraps the vault key to its hybrid public key, ADR 0035/0038) — corollary: **a hostile
+  server can insert a device into any account and STILL cannot decrypt anything**; the only
+  defence against the follow-on key-substitution attack is client-side pinning + safety
+  numbers, which cannot protect first contact. **Membership is FLAT** (any member may
+  invite, revoke every sibling, run checkout and administer every account-owned vault;
+  revoking a compromised device does **NOT** revoke the devices it invited — visible in the
+  audit log, not prevented) and **IMMUTABLE** (no transfer, merge, split or deletion).
+  An **UNPINNED invite is a BEARER SECRET** over plain HTTP. **TOFW did not go away, it
+  moved up one level.** **NO ACCOUNT MERGE:** every pre-0005 device is adopted into its OWN
+  singleton account, so an existing two-device customer ends up with **TWO accounts and TWO
+  billing subjects** (manual remedy, leaves a second subscription row to reconcile).
+  **Entitlement is REPORTED, never ENFORCED.** `SIGILD_ACCOUNT_MAX_DEVICES` is
+  anti-freeloading, not anti-fraud. A compromised provider webhook secret now moves an
+  **ACCOUNT's** status. `/metrics` is still always-on/unauthenticated and its per-reason
+  counters a weak correlatable oracle (**pre-existing; deliberately not widened**). **NO
+  rate limiting** on `POST /v1/devices/enroll` or `POST /v1/account/invites` (the caps bound
+  stored STATE, not request volume) and **no sweep job** for expired invites. The replay
+  nonce cache is **still per-process/in-memory** (invite consumption is DB-atomic and
+  therefore multi-instance safe; **signed requests are not**). The in-memory registry is
+  **still non-durable** and the **file backend was still not extended**. ⚠️ **ROLLBACK:** a
+  pre-Phase-52 binary run after 0005 **enrolls devices with `account_id` NULL**; rollback
+  is **survivable BUT any device enrolled during the rollback window needs `sigild migrate
+  adopt` after rolling forward**, and the boot warning is how an operator knows. (The first
+  design claimed "the one real breakage is billing" — **a verifier DISPROVED that on real
+  Postgres**; do not repeat it.) `sigil_billing_processed_events.subject` **deliberately
+  retains pre-0005 DEVICE ids** — cross-cutover reconciliation needs BOTH ids. Billing has
+  still **never been run against a live provider account**; Juspay remains
+  UNVERIFIED-AGAINST-LIVE-DASHBOARD. ⚠️ **CLIENT COVERAGE IS PARTIAL BY DESIGN:** the
+  **CLI** and the **native desktop** got the full flow (show/mint/list/revoke); the
+  **webapp** and **MV3 extension** can **JOIN** (the wire is unchanged) and **READ** the
+  account and render the honest *"joined — waiting for a key from another device"* state,
+  but have **no UI to MINT, list or revoke** an invite. Everything stays **dev-gated behind
+  `SIGILD_ENABLE_DEV_OPS` + `SIGILD_DEVICE_AUTH`, `501` by default, plain HTTP, pre-audit,
+  UNAUDITED — a real authorization model, not a reviewed one.** ⭐ **THE SENTENCE AN
+  AUDITOR SHOULD BE ABLE TO CHECK:** an account is **auth metadata only**; the server still
+  **never sees a vault key, a password or a plaintext**; **no request anywhere names an
+  account**; entitlement and vault ownership derive **solely** from the account on the
+  **verified signer's device row**; and **membership grants ciphertext access, never
+  plaintext**. Contract in [`docs/api.md`](docs/api.md), operator guide in
+  [`docs/deployment.md`](docs/deployment.md) §11.1 + §14; ADR 0040. Proofs:
+  `cli/tests/e2e-accounts.sh` (real sigild + real CLI, four devices, four HOMEs) and
+  `sigil-wasm/test/accounts-interop.mjs` (a JS client and the real Rust binary landing in
+  ONE account).
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
@@ -616,7 +763,12 @@ public, make no security claims, until the audit completes and trademark clears.
   [--admin-token <t>] [--key <file>]` (POST `/v1/devices/{deviceID}/revoke` — self
   via `--key`, or operator via `--admin-token`), and `device grant <deviceID>
   --vault <id> --permission read|write [--key <file>]` (POST
-  `/v1/vaults/{vaultID}/grants`, owner-only). `GET …/grants` has no subcommand yet.
+  `/v1/vaults/{vaultID}/grants`, **owning-ACCOUNT-only since Phase 52**). `GET …/grants`
+  has no subcommand yet. ⚠️ **`device revoke` no longer refuses a non-self target
+  client-side** — a device may revoke a **SIBLING** in its own account, and only the
+  server's registry knows whether the target is one, so it decides and answers 403 if not
+  (the CLI still insists the identity be enrolled, since an unsigned request could only
+  ever be 401).
   The **identity file is the EXISTING `sigil keygen` key file EXTENDED** with an
   OPTIONAL `device_id` (serde `default` + `skip_serializing_if`), so an old key file
   parses unchanged. **Contract selection is additive and driven by the identity**
@@ -635,8 +787,27 @@ public, make no security claims, until the audit completes and trademark clears.
   admin token are NEVER printed. One new dependency EDGE only (`sha2`, for the
   enrollment-token digest — already in `cli/Cargo.lock` transitively, so no new package).
   Same honest scope as the server side: **dev op-log over PLAIN HTTP, no TLS,
-  dev-gated + UNAUDITED**, trust-on-first-write ownership, single-ATTEMPT enrollment
-  tokens, no account model / session issuance / key rotation, per-process replay cache.
+  dev-gated + UNAUDITED**, trust-on-first-write ownership (by ACCOUNT since Phase 52),
+  single-ATTEMPT enrollment tokens, no identity / session issuance / key rotation /
+  recovery, per-process replay cache.
+  Also **`sigil account status | invite [--ttl <seconds>] [--pin-key <b64>] | invites |
+  revoke-invite <inviteID>`** — the CLIENT half of the ACCOUNT model (Phase 52, ADR 0040),
+  over `get_account` / `create_account_invite` / `list_account_invites` /
+  `revoke_account_invite` in `cli/src/lib.rs`. ⭐ **There is NO join subcommand and NO
+  `--account` flag anywhere, both by design:** joining is the ORDINARY `sigil device enroll
+  --token <invite>` (an invite rides the EXISTING enroll header under the EXISTING
+  challenge), and the server reads your account off the signature it just verified, so a
+  request cannot name one. `account status` prints the account, its members, `N/limit
+  active` **plus any revoked count with "a revoked device does not use a seat"**, marks
+  `<- this device`, and — when the account has ONE device — prints a **NO RECOVERY** notice
+  telling the user to enroll a second. `account invite` warns on **stderr BEFORE** printing
+  the secret to stdout (bearer-secret vs pinned wording), prints the redeem command and the
+  reminder that joining grants **AUTHORIZATION only** ("the new device reads nothing until
+  you `sigil vault share` to it"). The secret is **never written to a file, never logged**,
+  and `CreatedAccountInvite`'s `Debug` is **REDACTED** so a stray `{:?}` cannot leak it.
+  `explain_account_error` renders 401/403/404/409/500/501 plainly — including that a 403
+  may mean the device carries **NO ACCOUNT** (a pre-0005 enrollment), repaired with
+  `sigild migrate adopt`. Every `sigil totp`/`vault`/`push`/`pull` invocation is unchanged.
   Also **`sigil device hybrid-publish`** and **`sigil vault rekey|share|accept|list`** —
   **DEVICE-TO-DEVICE VAULT SHARING** (Phase 46, ADR 0035), the FIRST load-bearing use of
   the PQ-hybrid primitives. ⚠️ **THE KEY HIERARCHY:** the human password seals a
@@ -1018,11 +1189,16 @@ public, make no security claims, until the audit completes and trademark clears.
   constants, **plus the whole server-facing half in `desktop/core/src/net.rs`**
   (below); **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
   an `AppState { session: Mutex<Option<VaultSession>>, sync: Mutex<Option<DeviceConfig>> }`,
-  and **twenty-one `#[tauri::command]`s**: the ten offline ones (`status`, `unlock`,
+  and **thirty-one `#[tauri::command]`s** (count verified against
+  `desktop/src-tauri/src/main.rs`; this line previously said "twenty-one", which was
+  already stale before Phase 52): the ten offline ones (`status`, `unlock`,
   `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`, `export_uris`,
-  `export_migration`) **plus ELEVEN added in Phase 49** (`unlock_shared`, `set_server`,
+  `export_migration`), **ELEVEN added in Phase 49** (`unlock_shared`, `set_server`,
   `sync_status`, `enroll`, `publish_hybrid`, `check_server`, `convert_to_shared`,
-  `push`, `pull`, `share`, `accept`), each cloning the `DeviceConfig` out of the mutex
+  `push`, `pull`, `share`, `accept`), the Phase 50 key-trust ones (safety numbers,
+  pins, re-pin, rotate) and **FOUR added in Phase 52** (`account_status`,
+  `account_invite`, `account_invites`, `account_revoke_invite` — so the desktop has the
+  **full** account flow, unlike the webapp and extension), each cloning the `DeviceConfig` out of the mutex
   **before** any network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI can't be clicked by a
   test runner, so all behaviour lives where tests can drive it. **REUSE, NOT
@@ -1208,22 +1384,36 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 # Optional: run the identical proof against the durable Postgres backend (also
 # exercises migration 0004): SIGILD_OPLOG_POSTGRES=<dsn> ./cli/tests/e2e-sharing.sh
 
+# ACCOUNTS — the Phase 52 end-to-end proof (ADR 0040). Same shape: real sigild +
+# real CLI, FOUR devices with four separate HOMEs, no mocks. Proves BOTH defects
+# the account model exists to fix: (1) a device that JOINS by invite lands in the
+# SAME account (the entitlement half), and (2) device A claims a vault, A is
+# REVOKED, and its sibling B — granted NOTHING — still reads, writes, GRANTS on
+# and ROTATES it (the orphaned-vault half; every one of those was a 403 before).
+# Plus the boundary: an invite is SINGLE-USE, a device enrolled with its own
+# OPERATOR token lands in a DIFFERENT account and is 403 three ways, a member may
+# revoke a SIBLING but not a foreigner, and no invite secret is ever re-served.
+./cli/tests/e2e-accounts.sh                       # prints PASS
+# Optional, and the only gate that exercises migration 0005:
+# SIGILD_OPLOG_POSTGRES=<dsn> ./cli/tests/e2e-accounts.sh
+
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (26 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the NINE Node tests below must all PASS.
+# pkg-web/pkg-node (needs wasm-pack); then the TEN Node tests below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/9 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/9 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/9 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/9 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/9 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/9 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/9 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/9 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
-node sigil-wasm/test/pinning-interop.mjs            # 9/9 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/10 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/10 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/10 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/10 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/10 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/10 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/10 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/10 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/10 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/accounts-interop.mjs            # 10/10 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build
@@ -1333,7 +1523,7 @@ list of `.github/workflows/` (ten files):
   fmt/clippy/test** — which had no CI gate either, and which includes the golden
   `SIGILcli` / `SIGILhyb` header tests guarding the constants that MUST stay
   byte-identical with `cli/src/lib.rs` — builds the bindings and the real `sigil`
-  binary, runs **all NINE Node interop tests** (roundtrip, interop, hybrid-interop,
+  binary, runs the Node interop tests (roundtrip, interop, hybrid-interop,
   sync-interop, totp-interop, migration-interop, device-auth-interop, sharing-interop,
   pinning-interop), and re-asserts `getrandom`==0 in both lockfiles. Job 2
   (`e2e-sharing`, Phase 51) runs **`cli/tests/e2e-sharing.sh`** — the tenth
@@ -1341,6 +1531,12 @@ list of `.github/workflows/` (ten files):
   nothing. It needs Go + Rust + bash + curl + python3 and no wasm, so it is a separate,
   parallel job. `e2e-sharing.sh` now resolves its Go as `$GO` → Homebrew → PATH (it
   hardcoded the macOS Homebrew path), and the job sets `GO: go`.
+  ⚠️ **KNOWN CI GAP after Phase 52 — the workflow was NOT updated** (that phase's brief was
+  code + docs, and a workflow is neither): job 1's Node-test list does **not** include the
+  new **`sigil-wasm/test/accounts-interop.mjs`** (now 10/10 locally), and there is no job
+  running the new **`cli/tests/e2e-accounts.sh`**. Both pass locally; both are currently run
+  by nothing in CI. Adding them is a one-line step each (`accounts-interop.mjs` beside the
+  other nine in `interop`; `e2e-accounts.sh` beside `e2e-sharing.sh`, same `GO: go` env).
 - **`security.yml`** — gitleaks (full history) + govulncheck + **cargo-audit across a
   matrix of ALL FOUR Rust workspaces** (`libsigil`, `cli`, `sigil-wasm`, `desktop`;
   Phase 51 — it audited `libsigil` only, which says nothing about the other three, and

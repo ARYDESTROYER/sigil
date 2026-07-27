@@ -26,13 +26,7 @@ package billing
 // BOTH behind a small internal seam (juspayWebhookVerifier) and selects one by
 // configuration:
 //
-//	scheme=basic (default)
-//	    Authorization: Basic base64(username ":" password)
-//	    Both halves compared in CONSTANT TIME against the configured pair.
-//	    CONFIDENCE: MEDIUM-HIGH that this is a supported mode; it is the mode
-//	    described in Juspay's webhook setup material.
-//
-//	scheme=hmac
+//	scheme=hmac (DEFAULT)
 //	    <configurable header>: <hex HMAC-SHA256 of the RAW REQUEST BODY,
 //	                            keyed by the configured webhook secret>
 //	    Header name defaults to X-Juspay-Signature and is CONFIGURABLE precisely
@@ -41,6 +35,18 @@ package billing
 //	    the bare body (as implemented) or a body-with-timestamp construction like
 //	    Stripe's. If the merchant's dashboard documents a timestamped message,
 //	    THIS MUST BE CHANGED before use.
+//	    It is the DEFAULT because it is the only one of the two that BINDS THE
+//	    PAYLOAD — see the asymmetry note below. Uncertainty about a header name
+//	    is a configuration problem; getting connection-only authentication by
+//	    accident is a security problem.
+//
+//	scheme=basic (EXPLICIT OPT-IN ONLY)
+//	    Authorization: Basic base64(username ":" password)
+//	    Both halves compared in CONSTANT TIME against the configured pair.
+//	    CONFIDENCE: MEDIUM-HIGH that this is a supported mode; it is the mode
+//	    described in Juspay's webhook setup material.
+//	    You now have to ASK for it (SIGILD_JUSPAY_WEBHOOK_SCHEME=basic), and
+//	    cmd/server logs the limitation at boot.
 //
 // The seam exists so the scheme can be swapped — or a third one added — WITHOUT
 // touching the Provider interface, the state machine, the store, or any HTTP
@@ -50,9 +56,12 @@ package billing
 // Note the security asymmetry, stated plainly: Basic auth authenticates the
 // CONNECTION, not the BODY. It proves the caller knows a shared password; it
 // does NOT prove the payload was not modified by anything sitting between
-// Juspay and us. The HMAC scheme does bind the body. Where the choice exists,
-// prefer hmac; where only basic is available, the endpoint MUST be TLS-only and
-// the credential treated as a bearer secret.
+// Juspay and us, and anyone who holds the credential can post ANY body. The
+// HMAC scheme does bind the body. That asymmetry is why the DEFAULT is hmac:
+// the weaker scheme must be something an operator chooses on purpose, never
+// something they get by leaving a variable unset. Where only basic is
+// available, the endpoint MUST be TLS-only and the credential treated as a
+// bearer secret.
 //
 // CHECKOUT: POST {base}/session (JSON) with the merchant ID header and the API
 // key as HTTP Basic auth, action=paymentPage. The response's payment_links.web
@@ -107,8 +116,8 @@ type JuspayConfig struct {
 	// ClientID is the payment-page client identifier used when creating a
 	// session. CheckoutRequest.PlanRef overrides it per request.
 	ClientID string
-	// WebhookScheme selects the verifier: JuspaySchemeBasic (default) or
-	// JuspaySchemeHMAC.
+	// WebhookScheme selects the verifier: JuspaySchemeHMAC (the default, and the
+	// only one that binds the body) or JuspaySchemeBasic (explicit opt-in).
 	WebhookScheme string
 	// WebhookUsername / WebhookPassword are the credentials for the basic
 	// scheme.
@@ -243,10 +252,13 @@ func ValidJuspayScheme(s string) bool {
 }
 
 // NewJuspay builds the adapter, selecting the webhook verifier from the
-// configured scheme. No network I/O at construction. An unknown scheme selects
-// the basic verifier with empty credentials, which fails closed (accepts
-// nothing) — cmd/server rejects an unknown scheme at boot, so this is only ever
-// a defensive default.
+// configured scheme. No network I/O at construction.
+//
+// An empty or unknown scheme selects the HMAC verifier — the body-binding one —
+// and with no secret configured that verifier accepts NOTHING, so an unset
+// configuration fails closed rather than silently degrading to connection-only
+// authentication. cmd/server rejects an unknown scheme at boot, so the unknown
+// case is only ever a defensive default.
 func NewJuspay(cfg JuspayConfig) *JuspayProvider {
 	client := cfg.HTTPClient
 	if client == nil {
@@ -259,10 +271,12 @@ func NewJuspay(cfg JuspayConfig) *JuspayProvider {
 
 	var verifier juspayWebhookVerifier
 	switch cfg.WebhookScheme {
-	case JuspaySchemeHMAC:
-		verifier = &juspayHMACVerifier{secret: cfg.WebhookSecret, header: sigHeader}
-	default:
+	case JuspaySchemeBasic:
+		// Only ever by explicit request: it authenticates the connection, not
+		// the payload.
 		verifier = &juspayBasicVerifier{username: cfg.WebhookUsername, password: cfg.WebhookPassword}
+	default:
+		verifier = &juspayHMACVerifier{secret: cfg.WebhookSecret, header: sigHeader}
 	}
 
 	return &JuspayProvider{
@@ -464,6 +478,11 @@ func (p *JuspayProvider) parseEvent(rawBody []byte) (Event, error) {
 		sum := sha256.Sum256(rawBody)
 		eventID = "body-" + hex.EncodeToString(sum[:])
 	}
+	// Both forms come out of the BODY, never a header — so under the hmac scheme
+	// the idempotency key is covered by the signature. Under the basic scheme
+	// nothing at all is covered (it authenticates the connection); that is the
+	// scheme's documented limitation, and it is why hmac is now the default.
+	dedupKey := eventID
 
 	occurred := p.now().UTC()
 	if env.DateCreated != "" {
@@ -475,6 +494,7 @@ func (p *JuspayProvider) parseEvent(rawBody []byte) (Event, error) {
 	ev := Event{
 		Provider:   ProviderJuspay,
 		ID:         eventID,
+		DedupKey:   dedupKey,
 		Type:       EventIgnored,
 		OccurredAt: occurred,
 	}

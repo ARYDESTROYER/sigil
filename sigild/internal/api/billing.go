@@ -303,8 +303,11 @@ func (h *handlers) billingWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outcome, err := h.cfg.Billing.Subscriptions.ApplyWebhookEvent(r.Context(), store.SubscriptionEvent{
-		Provider:         ev.Provider,
-		EventID:          ev.ID,
+		Provider: ev.Provider,
+		// NOT ev.ID: the idempotency key must come from bytes the provider's
+		// signature covers, or a replay with a fresh (unsigned) event-id header
+		// would be processed as a new event. See billing.Event.DedupKey.
+		EventID:          ev.IdempotencyKey(),
 		EventType:        string(ev.Type),
 		Subject:          ev.Subject,
 		CustomerRef:      ev.CustomerRef,

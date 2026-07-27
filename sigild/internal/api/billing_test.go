@@ -462,6 +462,57 @@ func TestWebhookIdempotency(t *testing.T) {
 	}
 }
 
+// TestWebhookRazorpayReplayWithFreshHeaderIDIsOneEvent: Razorpay's signature
+// covers the BODY ONLY, so a captured delivery replayed with a brand-new
+// X-Razorpay-Event-Id header still verifies. It must still be ONE event —
+// otherwise an attacker with a single captured webhook could grow the
+// processed-events ledger without bound, one forged header at a time.
+func TestWebhookRazorpayReplayWithFreshHeaderIDIsOneEvent(t *testing.T) {
+	env := newBillingEnv(t)
+	dev := enrollDevice(t, env.deviceEnv, testEnrollToken, "buyer")
+
+	body := []byte(`{"event":"subscription.activated","created_at":1700000000,` +
+		`"payload":{"subscription":{"entity":{"id":"sub_replay","status":"active",` +
+		`"customer_id":"cus_replay","notes":{"sigil_subject":"` + dev.ID + `"}}}}}`)
+	mac := hmac.New(sha256.New, []byte(apiTestRazorpayHookSec))
+	mac.Write(body)
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	post := func(eventID string) webhookResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/billing/webhook/razorpay", bytes.NewReader(body))
+		req.Header.Set("X-Razorpay-Signature", sig)
+		req.Header.Set("X-Razorpay-Event-Id", eventID)
+		rec := serve(env.router, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", rec.Code, rec.Body.String())
+		}
+		var resp webhookResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp
+	}
+
+	if got := post("evt_rzp_genuine").Status; got != "accepted" {
+		t.Fatalf("first status = %q, want accepted", got)
+	}
+	// Same bytes, same (valid) signature, attacker-chosen id.
+	if got := post("evt_rzp_forged_1").Status; got != "duplicate" {
+		t.Fatalf("replay status = %q, want duplicate — the dedup key is outside the signature", got)
+	}
+	if got := post("evt_rzp_forged_2").Status; got != "duplicate" {
+		t.Fatalf("second replay status = %q, want duplicate", got)
+	}
+	// ...and with NO id header at all.
+	req := httptest.NewRequest(http.MethodPost, "/v1/billing/webhook/razorpay", bytes.NewReader(body))
+	req.Header.Set("X-Razorpay-Signature", sig)
+	rec := serve(env.router, req)
+	var resp webhookResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.Status != "duplicate" {
+		t.Fatalf("header-less replay status = %q, want duplicate", resp.Status)
+	}
+}
+
 // TestWebhookRazorpaySignedOverRawBody exercises the second provider end to end
 // through the router, including the raw-byte requirement.
 func TestWebhookRazorpaySignedOverRawBody(t *testing.T) {

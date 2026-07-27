@@ -40,10 +40,13 @@ package main
 //	SIGILD_JUSPAY_MERCHANT_ID                REQUIRED when juspay is enabled
 //	SIGILD_JUSPAY_API_KEY                    REQUIRED when juspay is enabled
 //	SIGILD_JUSPAY_CLIENT_ID         payment-page client id
-//	SIGILD_JUSPAY_WEBHOOK_SCHEME    basic (default) | hmac
+//	SIGILD_JUSPAY_WEBHOOK_SCHEME    hmac (DEFAULT) | basic. hmac binds the BODY;
+//	                                basic authenticates only the CONNECTION, so
+//	                                it is an EXPLICIT opt-in and the boot log
+//	                                names the limitation every start.
+//	SIGILD_JUSPAY_WEBHOOK_SECRET             REQUIRED for scheme=hmac (default)
 //	SIGILD_JUSPAY_WEBHOOK_USERNAME           REQUIRED for scheme=basic
 //	SIGILD_JUSPAY_WEBHOOK_PASSWORD           REQUIRED for scheme=basic
-//	SIGILD_JUSPAY_WEBHOOK_SECRET             REQUIRED for scheme=hmac
 //	SIGILD_JUSPAY_WEBHOOK_SIG_HEADER optional header-name override (the real name
 //	                                 is UNVERIFIED — see internal/billing/juspay.go)
 //	SIGILD_JUSPAY_AMOUNT_MINOR      default amount in paise
@@ -375,10 +378,13 @@ func buildJuspay(env billingEnv) (billing.Provider, string, error) {
 	scheme := strings.ToLower(strings.TrimSpace(env.JuspayWebhookScheme))
 	if !billing.ValidJuspayScheme(scheme) {
 		return nil, "", fmt.Errorf("SIGILD_JUSPAY_WEBHOOK_SCHEME: must be %q or %q",
-			billing.JuspaySchemeBasic, billing.JuspaySchemeHMAC)
+			billing.JuspaySchemeHMAC, billing.JuspaySchemeBasic)
 	}
 	if scheme == "" {
-		scheme = billing.JuspaySchemeBasic
+		// DEFAULT = hmac: the scheme that binds the BODY. basic authenticates
+		// only the connection, so it must be asked for by name rather than
+		// arrived at by leaving a variable unset.
+		scheme = billing.JuspaySchemeHMAC
 	}
 
 	cfg := billing.JuspayConfig{
@@ -390,23 +396,26 @@ func buildJuspay(env billingEnv) (billing.Provider, string, error) {
 		Currency:               strings.TrimSpace(env.JuspayCurrency),
 	}
 	switch scheme {
-	case billing.JuspaySchemeHMAC:
+	case billing.JuspaySchemeBasic:
+		// The weaker scheme, and therefore the one that has to be asked for.
+		// The error text below states the limitation so an operator who set the
+		// variable without the credentials learns what they opted into.
+		user, err := requireSecret("SIGILD_JUSPAY_WEBHOOK_USERNAME", env.JuspayWebhookUsername)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w (scheme=basic authenticates the CONNECTION, not the payload; SIGILD_JUSPAY_WEBHOOK_SCHEME=hmac is the default and binds the body)", err)
+		}
+		pass, err := requireSecret("SIGILD_JUSPAY_WEBHOOK_PASSWORD", env.JuspayWebhookPassword)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w (scheme=basic authenticates the CONNECTION, not the payload; SIGILD_JUSPAY_WEBHOOK_SCHEME=hmac is the default and binds the body)", err)
+		}
+		cfg.WebhookUsername = user
+		cfg.WebhookPassword = pass
+	default:
 		secret, err := requireSecret("SIGILD_JUSPAY_WEBHOOK_SECRET", env.JuspayWebhookSecret)
 		if err != nil {
 			return nil, "", err
 		}
 		cfg.WebhookSecret = secret
-	default:
-		user, err := requireSecret("SIGILD_JUSPAY_WEBHOOK_USERNAME", env.JuspayWebhookUsername)
-		if err != nil {
-			return nil, "", err
-		}
-		pass, err := requireSecret("SIGILD_JUSPAY_WEBHOOK_PASSWORD", env.JuspayWebhookPassword)
-		if err != nil {
-			return nil, "", err
-		}
-		cfg.WebhookUsername = user
-		cfg.WebhookPassword = pass
 	}
 
 	amount, err := parseAmountMinor("SIGILD_JUSPAY_AMOUNT_MINOR", env.JuspayAmountMinor)

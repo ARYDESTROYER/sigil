@@ -196,6 +196,65 @@ func TestRazorpayEventIDFallback(t *testing.T) {
 	}
 }
 
+// TestRazorpayDedupKeyIsSignatureCovered is the replay proof.
+//
+// Razorpay signs the BODY and nothing else — no timestamp, no headers. So a
+// captured, valid delivery can be replayed with ANY X-Razorpay-Event-Id and it
+// will still verify. The idempotency key must therefore be derived from the
+// SIGNED body: a byte-identical replay has to be ONE event no matter what the
+// header says. (The header value is still reported as Event.ID for dashboard
+// correlation — a label, never a security decision.)
+func TestRazorpayDedupKeyIsSignatureCovered(t *testing.T) {
+	p := newTestRazorpay()
+	body := razorpayBody()
+	sig := razorpaySignature(fakeRazorpayWebhookSe, body)
+
+	genuine := http.Header{}
+	genuine.Set(razorpaySignatureHeader, sig)
+	genuine.Set(razorpayEventIDHeader, "evt_rzp_1")
+
+	// The attacker keeps the captured body + signature and invents a new id.
+	replay := http.Header{}
+	replay.Set(razorpaySignatureHeader, sig)
+	replay.Set(razorpayEventIDHeader, "evt_rzp_ATTACKER_CHOSEN")
+
+	first, err := p.VerifyWebhook(genuine, body)
+	if err != nil {
+		t.Fatalf("genuine: %v", err)
+	}
+	second, err := p.VerifyWebhook(replay, body)
+	if err != nil {
+		t.Fatalf("replay still verifies (it must — the body is authentic): %v", err)
+	}
+
+	if first.IdempotencyKey() != second.IdempotencyKey() {
+		t.Fatalf("a byte-identical body deduped as TWO events: %q vs %q",
+			first.IdempotencyKey(), second.IdempotencyKey())
+	}
+	if !strings.HasPrefix(first.IdempotencyKey(), "body-") {
+		t.Fatalf("dedup key = %q, want a body-derived key", first.IdempotencyKey())
+	}
+	if first.IdempotencyKey() == first.ID || second.IdempotencyKey() == second.ID {
+		t.Fatal("the dedup key is the (unsigned) header id — that is the bug this test exists for")
+	}
+	// The header id survives, but only as a label.
+	if first.ID != "evt_rzp_1" || second.ID != "evt_rzp_ATTACKER_CHOSEN" {
+		t.Fatalf("ids = %q / %q, want the header values preserved for correlation", first.ID, second.ID)
+	}
+	// A DIFFERENT body is a different event.
+	other := []byte(strings.Replace(string(body), "sub_rzp_1", "sub_rzp_2", 1))
+	oh := http.Header{}
+	oh.Set(razorpaySignatureHeader, razorpaySignature(fakeRazorpayWebhookSe, other))
+	oh.Set(razorpayEventIDHeader, "evt_rzp_1") // same header id as the first
+	third, err := p.VerifyWebhook(oh, other)
+	if err != nil {
+		t.Fatalf("other: %v", err)
+	}
+	if third.IdempotencyKey() == first.IdempotencyKey() {
+		t.Fatal("two DIFFERENT bodies collapsed to one dedup key")
+	}
+}
+
 func TestRazorpayEventMapping(t *testing.T) {
 	p := newTestRazorpay()
 	tests := []struct {

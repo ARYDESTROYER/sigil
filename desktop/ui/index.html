@@ -237,6 +237,30 @@
           <button id="pins-btn" class="ghost">Keys this device trusts</button>
         </div>
 
+        <!-- ⭐ THE ALARM. A share/rotate refused because a device's hybrid
+             public key CHANGED is neither an auth failure nor a server error:
+             it is either a key-substitution attack or a legitimate
+             re-enrolment, and only a human can tell which. It is shown here,
+             loudly, with BOTH safety numbers — and the only way past it is the
+             deliberate re-pin button, which says exactly what it means. -->
+        <div id="pin-mismatch" class="alarm" role="alert" hidden>
+          <strong id="pin-mismatch-title">REFUSED — that device&rsquo;s key has CHANGED.</strong>
+          <p id="pin-mismatch-text"></p>
+          <pre id="pin-mismatch-numbers"></pre>
+          <p class="hint">
+            Nothing was shared and no key was wrapped. Read the
+            <em>presented</em> digits to that device&rsquo;s owner over a channel
+            the server does not control. Re-pin ONLY if they match what the owner
+            reads back.
+          </p>
+          <div class="row">
+            <button id="repin-btn" class="danger-btn">
+              ⚠ I verified the presented number out of band — re-pin this device
+            </button>
+            <button id="pin-mismatch-dismiss" class="link">Keep refusing</button>
+          </div>
+        </div>
+
         <hr />
         <p class="hint">
           <strong>Rotate.</strong> Draws a fresh vault key, re-seals this vault under it,

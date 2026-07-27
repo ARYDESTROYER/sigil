@@ -253,6 +253,46 @@ func TestJuspayHMACCustomHeaderName(t *testing.T) {
 	}
 }
 
+// TestJuspayDefaultSchemeBindsTheBody: with NO scheme configured the adapter
+// selects the HMAC verifier, not basic. Basic authenticates the CONNECTION and
+// not the PAYLOAD, so it must never be what an operator gets by leaving a
+// variable unset — and an unconfigured default still fails closed.
+func TestJuspayDefaultSchemeBindsTheBody(t *testing.T) {
+	p := NewJuspay(JuspayConfig{MerchantID: "m", APIKey: "k"}) // no WebhookScheme
+	if p.WebhookScheme() != JuspaySchemeHMAC {
+		t.Fatalf("default scheme = %q, want %q (the body-binding one)",
+			p.WebhookScheme(), JuspaySchemeHMAC)
+	}
+
+	body := juspayBody("ORDER_SUCCEEDED")
+	// Fails closed with no secret: valid-looking basic credentials get nowhere,
+	// and so does any signature.
+	creds := http.Header{}
+	creds.Set("Authorization", basicHeader(fakeJuspayWebhookUsr, fakeJuspayWebhookPwd))
+	if _, err := p.VerifyWebhook(creds, body); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("unconfigured default accepted basic credentials: %v", err)
+	}
+	sig := http.Header{}
+	sig.Set(juspayDefaultSignatureHeader, juspayHMACSignature(fakeJuspayWebhookSec, body))
+	if _, err := p.VerifyWebhook(sig, body); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("unconfigured default accepted a signature: %v", err)
+	}
+
+	// Basic remains available — by name only.
+	explicit := NewJuspay(JuspayConfig{
+		MerchantID: "m", APIKey: "k",
+		WebhookScheme:   JuspaySchemeBasic,
+		WebhookUsername: fakeJuspayWebhookUsr,
+		WebhookPassword: fakeJuspayWebhookPwd,
+	})
+	if explicit.WebhookScheme() != JuspaySchemeBasic {
+		t.Fatalf("explicit scheme = %q, want basic", explicit.WebhookScheme())
+	}
+	if _, err := explicit.VerifyWebhook(creds, body); err != nil {
+		t.Fatalf("explicit basic must still work: %v", err)
+	}
+}
+
 // TestJuspayVerifierSeamIsSwappable is the structural claim made in the file
 // banner: the scheme is one small type, selected at construction, and swapping
 // it changes nothing about the Provider interface.

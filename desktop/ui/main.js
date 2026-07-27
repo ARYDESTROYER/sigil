@@ -25,12 +25,25 @@ function toast(message, isError = false) {
   }, isError ? 7000 : 3500);
 }
 
-/** Call a command, surfacing any Rust-side error as a toast. */
+/**
+ * The text of a Rust-side error. Errors cross the IPC as {kind, message,
+ * key_change?}; older/unexpected shapes still stringify sensibly.
+ */
+function errText(err) {
+  if (err && typeof err === "object" && typeof err.message === "string") return err.message;
+  return String(err);
+}
+
+/**
+ * Call a command, surfacing any Rust-side error as a toast — EXCEPT a changed
+ * hybrid key, which gets the loud, blocking alarm instead of a toast that
+ * disappears in seven seconds.
+ */
 async function call(cmd, args = {}) {
   try {
     return await invoke(cmd, args);
   } catch (err) {
-    toast(String(err), true);
+    if (!showKeyAlarm(err)) toast(errText(err), true);
     throw err;
   }
 }
@@ -366,7 +379,16 @@ $("peer-safety-btn").addEventListener("click", async () => {
   if (!to) return toast("enter the recipient device id first");
   const [sn, state] = await call("peer_safety_number", { deviceId: to });
   showSafety(`${to}: ${sn}`);
-  toast(`Pin state: ${state}. Confirm the digits with that device's owner out of band.`);
+  // A number that DIFFERS from the pin is the same fact the alarm reports, just
+  // reached read-only — so it is an error-level message, not a note.
+  const differs = state.startsWith("DIFFERS");
+  toast(
+    differs
+      ? `Pin state: ${state}. Sharing with ${to} will be REFUSED. Do NOT re-pin unless its ` +
+          "owner reads you the presented digits over a channel the server does not control."
+      : `Pin state: ${state}. Confirm the digits with that device's owner out of band.`,
+    differs
+  );
 });
 
 $("pairwise-safety-btn").addEventListener("click", async () => {
@@ -395,6 +417,93 @@ $("pins-btn").addEventListener("click", async () => {
       )
       .join("  |  ")
   );
+});
+
+// ── THE KEY-SUBSTITUTION ALARM ──────────────────────────────────────────────
+//
+// A share or a rotation refused because a device's hybrid PUBLIC key changed is
+// the one error in this app that must not scroll past as a toast. The native
+// side tags it `kind: "key changed"` and hands over BOTH safety numbers; this is
+// where the user sees them side by side and decides. Nothing re-pins by itself.
+
+/** The device whose key changed, awaiting a DELIBERATE re-pin. */
+let pendingRepin = null;
+
+/** The actions the alarm BLOCKS while it is up. */
+function blockedButtons() {
+  return [
+    $("share-form").querySelector('button[type="submit"]'),
+    $("rotate-form").querySelector('button[type="submit"]'),
+  ];
+}
+
+/**
+ * ⭐ Show the alarm for a `key changed` IPC error. Returns true when it handled
+ * the error (so the caller does not also toast it), false for anything else.
+ */
+function showKeyAlarm(err) {
+  const kc = err && typeof err === "object" ? err.key_change : null;
+  if (!kc) return false;
+  pendingRepin = kc;
+
+  $("pin-mismatch-title").textContent =
+    `REFUSED — the hybrid public key for ${kc.device_id} has CHANGED.`;
+  $("pin-mismatch-text").textContent =
+    "Nothing was shared and no key was wrapped. This is either a KEY-SUBSTITUTION " +
+    "ATTACK (a hostile or compromised server swapping in a key it can decrypt with, " +
+    "so it would receive this vault's key) or a LEGITIMATE RE-ENROLMENT of that " +
+    "device. Only you can tell, by reading the new digits to its owner over a " +
+    "channel the server does not control.";
+  $("pin-mismatch-numbers").textContent =
+    `pinned:    ${kc.pinned_safety_number}\npresented: ${kc.presented_safety_number}`;
+  $("pin-mismatch").hidden = false;
+  for (const b of blockedButtons()) if (b) b.disabled = true;
+  $("pin-mismatch").scrollIntoView({ block: "nearest" });
+  toast(`REFUSED: ${kc.device_id}'s key changed. Nothing was shared.`, true);
+  return true;
+}
+
+/** Take the alarm down. Sharing stays refused until this happens. */
+function hideKeyAlarm() {
+  pendingRepin = null;
+  $("pin-mismatch").hidden = true;
+  for (const b of blockedButtons()) if (b) b.disabled = false;
+}
+
+$("pin-mismatch-dismiss").addEventListener("click", () => {
+  hideKeyAlarm();
+  toast(
+    "Alarm cleared WITHOUT re-pinning: this device still refuses that key, which is the " +
+      "safe outcome. Verify the safety number out of band before sharing again."
+  );
+});
+
+// ⚠️ The deliberate escape hatch. Only reachable after a mismatch BLOCKED a
+// share, only by an explicit click, and only after a confirmation that names the
+// risk. `expected` is sent so the native side re-checks that the number the user
+// says they verified is still the one the server presents.
+$("repin-btn").addEventListener("click", async () => {
+  if (!pendingRepin) return;
+  const { device_id: deviceId, presented_safety_number: presented } = pendingRepin;
+  if (
+    !window.confirm(
+      `DANGEROUS — re-pin ${deviceId}?\n\n` +
+        `Only continue if that device's owner read you EXACTLY:\n\n  ${presented}\n\n` +
+        "over a channel the server does not control (a phone call, in person). If you " +
+        "have not done that, a hostile server may be substituting a key it can decrypt " +
+        "with, and re-pinning would hand it this vault's key."
+    )
+  )
+    return;
+  const [previous, current] = await call("repin", { deviceId, expected: presented });
+  hideKeyAlarm();
+  showSafety(`${deviceId}: ${current}`);
+  toast(
+    `Re-pinned ${deviceId}: ${previous ?? "(nothing pinned)"} -> ${current}. This device now ` +
+      "trusts that key. If you did not verify those digits with its owner out of band, that " +
+      "was a mistake — re-enroll to undo it."
+  );
+  await refreshSync();
 });
 
 $("rotate-form").addEventListener("submit", async (e) => {

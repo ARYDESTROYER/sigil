@@ -16,10 +16,17 @@ package billing
 //
 // There is NO timestamp element in this scheme, so there is no in-scheme replay
 // bound; replay protection comes from our own idempotency layer instead (dedupe
-// on (provider, event_id), see internal/store). The event id is taken from the
-// X-Razorpay-Event-Id header, which Razorpay sends alongside the signature; when
-// it is absent we fall back to a SHA-256 of the raw body, which is deterministic
-// and therefore still deduplicates a byte-identical redelivery.
+// on (provider, dedup key), see internal/store).
+//
+// THE DEDUP KEY IS DERIVED FROM THE SIGNED BODY, NEVER FROM A HEADER. Because
+// the signature covers the body and nothing else, a captured valid delivery can
+// be replayed with ANY headers — including a fresh X-Razorpay-Event-Id — and it
+// will still verify. Keying idempotency on that header would make every replay
+// look like a new event and let an attacker grow the processed-events ledger at
+// will. So Event.DedupKey is ALWAYS "body-" + SHA-256(raw body): a byte-identical
+// body is exactly ONE event, whatever the headers say. The X-Razorpay-Event-Id
+// value is still carried on Event.ID for dashboard correlation and the audit
+// log — as a provider-reported LABEL, never as a security decision.
 //
 // CHECKOUT: POST {base}/v1/payment_links (JSON), HTTP Basic auth with
 // key_id:key_secret. The response's `short_url` is Razorpay's HOSTED payment
@@ -282,9 +289,11 @@ func razorpayEntityFrom(payload map[string]json.RawMessage, name string) (razorp
 
 // parseEvent maps an AUTHENTIC Razorpay payload onto the normalized Event.
 //
-// eventIDHeader is the X-Razorpay-Event-Id value. When it is absent we derive a
-// DETERMINISTIC id from the body hash so redelivery of the identical body is
-// still deduplicated — documented above as part of the unverified surface.
+// eventIDHeader is the X-Razorpay-Event-Id value. It is used ONLY as the
+// display/correlation id (Event.ID) and NEVER for idempotency: the header is
+// outside the signature, so it is attacker-chosen on a replay. Event.DedupKey is
+// always derived from the SIGNED body, and Event.ID falls back to it when the
+// header is absent.
 func (p *RazorpayProvider) parseEvent(eventIDHeader string, rawBody []byte) (Event, error) {
 	var env razorpayEnvelope
 	if err := json.Unmarshal(rawBody, &env); err != nil {
@@ -294,10 +303,15 @@ func (p *RazorpayProvider) parseEvent(eventIDHeader string, rawBody []byte) (Eve
 		return Event{}, ErrMalformedWebhook
 	}
 
+	// The idempotency key: a hash of the bytes the signature actually covers.
+	sum := sha256.Sum256(rawBody)
+	dedupKey := "body-" + hex.EncodeToString(sum[:])
+
+	// The correlation id: whatever the (unsigned) header said, or the same
+	// body-derived value when it said nothing.
 	eventID := eventIDHeader
 	if eventID == "" {
-		sum := sha256.Sum256(rawBody)
-		eventID = "body-" + hex.EncodeToString(sum[:])
+		eventID = dedupKey
 	}
 
 	occurred := unixTime(env.CreatedAt)
@@ -308,6 +322,7 @@ func (p *RazorpayProvider) parseEvent(eventIDHeader string, rawBody []byte) (Eve
 	ev := Event{
 		Provider:   ProviderRazorpay,
 		ID:         eventID,
+		DedupKey:   dedupKey,
 		Type:       EventIgnored,
 		OccurredAt: occurred,
 	}

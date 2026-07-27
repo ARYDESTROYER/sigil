@@ -3,6 +3,12 @@ name: security
 # Pre-audit security scanning: secret detection, Go vuln scanning, and Rust
 # advisory auditing. Runs on every push/PR plus a weekly scheduled sweep so
 # advisories that land between commits still get surfaced.
+#
+# HONESTY NOTE: like the repo's other CI mirrors, this workflow is validated
+# locally (YAML-parsed, and each job mirrors a tool that has been run by hand)
+# but has NOT been run on real GitHub Actions from the build machine. The
+# cargo-audit matrix in particular has only been reasoned about, not observed:
+# each of the four workspaces has its own Cargo.lock at the path given.
 
 on:
   push:
@@ -47,12 +53,26 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   cargo-audit:
-    name: cargo-audit (libsigil)
+    # EVERY Rust lockfile in the repo, not just the core's.
+    #
+    # There are four independent cargo workspaces here, each with its OWN
+    # Cargo.lock, deliberately kept apart so the wasm-pure core can never inherit
+    # a native-only dependency. The consequence for scanning is that auditing
+    # libsigil/ says NOTHING about the other three: cli/ pulls ureq/serde/base64,
+    # sigil-wasm/ pulls wasm-bindgen, and desktop/ pulls the whole Tauri tree —
+    # by far the largest dependency surface in the repository, and the one most
+    # likely to be the subject of an advisory. Auditing only the smallest, most
+    # conservative lockfile was the least useful choice available.
+    name: cargo-audit (${{ matrix.workspace }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [libsigil, cli, sigil-wasm, desktop]
     steps:
       - uses: actions/checkout@v4
       - name: cargo audit
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: libsigil
+          working-directory: ${{ matrix.workspace }}

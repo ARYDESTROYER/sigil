@@ -113,9 +113,26 @@ type Event struct {
 	// Provider is the adapter that produced this event (one of the Provider*
 	// constants).
 	Provider string
-	// ID is the PROVIDER's event identifier. Together with Provider it is the
-	// idempotency key: a provider WILL deliver the same event more than once.
+	// ID is the PROVIDER's event identifier, for correlation with the provider
+	// dashboard and the audit log. It is NOT the idempotency key: on some
+	// providers it arrives in a header that the signature does not cover, so it
+	// is attacker-controlled on a replayed delivery. Use IdempotencyKey().
 	ID string
+	// DedupKey is the idempotency key, and it MUST be derived only from material
+	// COVERED BY THE PROVIDER'S SIGNATURE.
+	//
+	// WHY THIS EXISTS: Razorpay signs the BODY ONLY — no timestamp, no headers.
+	// A captured, valid delivery replayed with a fresh X-Razorpay-Event-Id header
+	// therefore verifies, and if the header id were the dedup key each replay
+	// would look like a NEW event. The state machine bounds the damage (it is
+	// idempotent and OccurredAt-ordered), but the processed-events ledger would
+	// grow without limit on demand. Keying on the SIGNED body closes it: a
+	// byte-identical body is ONE event no matter what the headers say.
+	//
+	// Empty means "no separate key" and callers fall back to ID (see
+	// IdempotencyKey), which is correct for providers whose event id is inside
+	// the signed payload (Stripe, Juspay).
+	DedupKey string
 	// Type is the normalized type. EventIgnored means "understood, not modeled".
 	Type EventType
 	// Subject is OUR subject reference (the enrolled device ID that initiated
@@ -140,6 +157,20 @@ type Event struct {
 	// CurrentPeriodEnd is when the paid period ends, when the provider reports
 	// it. Zero means unknown.
 	CurrentPeriodEnd time.Time
+}
+
+// IdempotencyKey returns the key the store must dedupe on: DedupKey when the
+// adapter set one, otherwise ID. Together with Provider it forms the
+// processed-events ledger key.
+//
+// The invariant every adapter upholds: whatever this returns is a function of
+// bytes the provider's signature covers. Nothing that an attacker can vary while
+// keeping a captured signature valid may feed it.
+func (e Event) IdempotencyKey() string {
+	if e.DedupKey != "" {
+		return e.DedupKey
+	}
+	return e.ID
 }
 
 // CheckoutRequest asks a provider for a HOSTED checkout session.

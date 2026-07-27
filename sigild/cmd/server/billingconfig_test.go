@@ -178,13 +178,40 @@ func TestJuspaySchemeSelection(t *testing.T) {
 		}
 	})
 
-	t.Run("default scheme is basic", func(t *testing.T) {
+	// The default is the scheme that BINDS THE BODY. basic authenticates only
+	// the connection, so nobody may arrive at it by leaving a variable unset:
+	// with no scheme set, hmac is selected and its secret becomes required.
+	t.Run("default scheme is hmac, the body-binding one", func(t *testing.T) {
 		e := base()
+		e.JuspayWebhookUsername = cfgJuspayHookUsr
+		e.JuspayWebhookPassword = cfgJuspayHookPwd
+		if _, err := validateBillingConfig(e); err == nil ||
+			!strings.Contains(err.Error(), "SIGILD_JUSPAY_WEBHOOK_SECRET") {
+			t.Fatalf("unset scheme must default to hmac and demand its secret; err = %v", err)
+		}
+		e.JuspayWebhookSecret = cfgJuspayHookSec
+		cfg, err := validateBillingConfig(e)
+		if err != nil {
+			t.Fatalf("default scheme: %v", err)
+		}
+		if cfg.JuspayScheme != billing.JuspaySchemeHMAC {
+			t.Fatalf("scheme = %q, want hmac", cfg.JuspayScheme)
+		}
+	})
+
+	// ...and basic is still reachable, but only by naming it.
+	t.Run("basic is an explicit opt-in that names its limitation", func(t *testing.T) {
+		e := base()
+		e.JuspayWebhookScheme = billing.JuspaySchemeBasic
+		_, err := validateBillingConfig(e)
+		if err == nil || !strings.Contains(err.Error(), "authenticates the CONNECTION") {
+			t.Fatalf("the basic opt-in must state its limitation; err = %v", err)
+		}
 		e.JuspayWebhookUsername = cfgJuspayHookUsr
 		e.JuspayWebhookPassword = cfgJuspayHookPwd
 		cfg, err := validateBillingConfig(e)
 		if err != nil {
-			t.Fatalf("default scheme: %v", err)
+			t.Fatalf("explicit basic: %v", err)
 		}
 		if cfg.JuspayScheme != billing.JuspaySchemeBasic {
 			t.Fatalf("scheme = %q, want basic", cfg.JuspayScheme)

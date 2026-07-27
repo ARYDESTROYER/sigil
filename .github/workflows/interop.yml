@@ -18,6 +18,9 @@ name: interop
 # A test nobody runs is a test that rots, and these guard the invariants that
 # three separate implementations (Go, Rust, JS) have to agree on.
 #
+# A SECOND JOB (e2e-sharing) runs cli/tests/e2e-sharing.sh, which was in the same
+# position: the end-to-end device-to-device vault-sharing proof, run by nothing.
+#
 # It is a heavier job than the others because it genuinely needs all three
 # toolchains at once: Rust + wasm to build the bindings, Cargo to build the real
 # `sigil` binary, Go to build the real `sigild`, and Node to drive them.
@@ -130,3 +133,42 @@ jobs:
             echo "$lock getrandom entries: $count"
             test "$count" -eq 0
           done
+
+  # The tenth cross-component proof, and the only one that is a shell script
+  # rather than a Node test — which is exactly why it, too, was running in NO
+  # workflow. It boots a REAL sigild with dev-ops + device auth v3 on a free
+  # loopback port and drives the REAL sigil binary as three separate devices to
+  # prove device-to-device vault sharing end to end, including the negative half
+  # (a third device gets 403s, a revoked device gets 401s) and the zero-knowledge
+  # half (the stored bytes are the opaque envelope, and the server logs never
+  # contain it). Nothing here is mocked, so nothing here can quietly stop being
+  # true without this failing.
+  #
+  # It needs Go + Rust + bash + curl + python3 (for a free port) and NO wasm, so
+  # it is a separate job from the Node suite above and runs in parallel with it.
+  #
+  # HONESTY NOTE: as above — validated locally (the script is a known-green local
+  # command and this job mirrors it) but never run on real GitHub Actions.
+  e2e-sharing:
+    name: end-to-end vault sharing (real sigild + real CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: sigild/go.sum
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      # The script resolves the Go toolchain from $GO, then Homebrew, then PATH;
+      # naming it here keeps the runner off the macOS-only path entirely.
+      - name: device-to-device vault sharing, end to end
+        env:
+          GO: go
+        run: ./cli/tests/e2e-sharing.sh

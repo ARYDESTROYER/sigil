@@ -166,6 +166,27 @@ details > summary:focus-visible { outline: 2px solid var(--accent); outline-offs
 .kv dd { margin: 0; font-family: var(--mono); font-size: 11px; word-break: break-all; }
 .kv dd.off { font-family: inherit; color: var(--ink-dim); }
 
+/* --- The key-substitution alarm ------------------------------------------
+   Deliberately the loudest thing in the window after the pre-audit banner: a
+   changed hybrid key means a share was REFUSED, and the user has to decide
+   between "attack" and "that device re-enrolled". It must not read like a
+   toast. */
+.alarm {
+  margin-top: 12px; padding: 12px;
+  border: 2px solid var(--danger); border-radius: 8px;
+  background: var(--danger-bg);
+}
+.alarm strong { display: block; color: var(--danger); font-size: 13px; letter-spacing: 0.02em; }
+.alarm p { margin: 8px 0 0; font-size: 12px; }
+.alarm pre {
+  margin: 8px 0 0; padding: 8px 10px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-all;
+}
+button.danger-btn {
+  border-color: var(--danger); color: var(--danger); font-weight: 600;
+}
+
 /* --- Toast + footer ------------------------------------------------------- */
 .toast {
   position: fixed; left: 16px; right: 16px; bottom: 16px;

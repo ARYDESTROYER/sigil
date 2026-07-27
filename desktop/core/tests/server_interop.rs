@@ -141,8 +141,16 @@ fn resolve_go() -> String {
 impl Harness {
     fn start() -> Harness {
         let root = repo_root();
+        // The per-harness suffix MUST include a counter, not just pid+seconds.
+        // `cargo test` runs the tests in this file in PARALLEL threads of ONE
+        // process, so two harnesses starting in the same second produced the
+        // SAME path — and the second one's `remove_dir_all` deleted the first
+        // one's state from under it. That surfaced the moment a second test was
+        // added, as a baffling "No such file or directory" in the OTHER test.
+        static NTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
-            "sigil-desktop-net-{}-{}",
+            "sigil-desktop-net-{}-{}-{nth}",
             std::process::id(),
             now_unix()
         ));
@@ -679,4 +687,150 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
     say("with the server unreachable: a clear Unreachable error, and the offline flow still generates codes");
 
     println!("\nPASS — the desktop enrolls, publishes, pushes, pulls, shares and accepts against a real sigild, and interoperates with the real sigil CLI in BOTH directions.\n");
+}
+
+// ---------------------------------------------------------------------------
+// The key-substitution alarm
+// ---------------------------------------------------------------------------
+
+/// Phase 51 gave the desktop UI a blocking alarm for a changed hybrid key.
+/// Nothing tested the path that RAISES it, which made the desktop the only
+/// client whose key-substitution defence had no regression test — the browser
+/// side is covered by `sigil-wasm/test/pinning-interop.mjs`.
+///
+/// The trigger here is faithful rather than simulated: a device that already
+/// published key K1 publishes a BRAND-NEW K2 under the SAME device id. That is
+/// byte-for-byte what a hostile server does when it substitutes a key it can
+/// decrypt with — and it is deliberately indistinguishable from a legitimate
+/// re-enrolment, which is exactly why the decision has to reach a human.
+///
+/// Asserted: the refusal is [`DesktopError::KeyPinMismatch`] (not a generic
+/// failure), it carries BOTH safety numbers in the shape the UI prints, the
+/// rotation path is guarded too, a re-pin with the WRONG number is refused, and
+/// only a re-pin with the presented number lets sharing resume.
+#[test]
+fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
+    let h = Harness::start();
+    println!("\n=== sigild up at {} (key-substitution alarm)", h.server);
+
+    let desktop_dir = h.tmp.join("alarm-desktop/.sigil");
+    let cli_home = h.tmp.join("alarm-cli");
+    std::fs::create_dir_all(&cli_home).expect("cli home");
+    let desktop = DeviceConfig::new(&h.server, &desktop_dir);
+
+    desktop
+        .enroll(TOKEN_DESKTOP, "alarm desktop")
+        .expect("desktop enrollment");
+    desktop.publish_hybrid().expect("publish hybrid");
+
+    let vault_path = desktop_dir.join("totp-vault.sigil");
+    let mut session = VaultSession::create(&vault_path, DESKTOP_PASSWORD.as_bytes())
+        .expect("create vault")
+        .with_params(FAST);
+    session
+        .add_secret_base32("rfc-30", None, RFC_SEED_B32, "sha1", Some(8), Some(30))
+        .expect("add entry");
+    session
+        .convert_to_shared(&desktop, VAULT_FROM_DESKTOP)
+        .expect("convert to shared");
+
+    // A real peer publishes its first hybrid key, K1.
+    let cli_id = device_id_in(&h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &["device", "enroll", "--token", TOKEN_CLI, "--label", "cli"],
+    ));
+    h.cli(&cli_home, CLI_PASSWORD, &["device", "hybrid-publish"]);
+
+    // The first share is what PINS K1. It must succeed.
+    desktop
+        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read")
+        .expect("the first share pins the key and succeeds");
+    let (k1, state) = desktop.peer_safety_number(&cli_id).expect("safety number");
+    assert_eq!(state, "matches the pinned key", "K1 should be pinned now");
+    say(&format!("{cli_id} pinned at {k1}"));
+
+    // ⚡ THE SUBSTITUTION. Same device id, a completely different hybrid key.
+    h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &["device", "hybrid-publish", "--regenerate"],
+    );
+    say("that device now presents a DIFFERENT hybrid public key under the same id");
+
+    // The share must REFUSE, and refuse as the alarm — not as a generic error.
+    let presented = match desktop.share_vault(VAULT_FROM_DESKTOP, &cli_id, "read") {
+        Err(DesktopError::KeyPinMismatch {
+            device_id,
+            pinned_safety_number,
+            presented_safety_number,
+        }) => {
+            assert_eq!(device_id, cli_id);
+            assert_eq!(
+                pinned_safety_number, k1,
+                "the alarm must show the key we actually pinned"
+            );
+            assert_ne!(
+                pinned_safety_number, presented_safety_number,
+                "a mismatch with equal numbers would be a bug in the comparison"
+            );
+            // The shape the UI prints: 6 groups of 5 digits.
+            for n in [&pinned_safety_number, &presented_safety_number] {
+                let groups: Vec<&str> = n.split_whitespace().collect();
+                assert_eq!(groups.len(), 6, "safety number shape: {n}");
+                assert!(
+                    groups
+                        .iter()
+                        .all(|g| g.len() == 5 && g.chars().all(|c| c.is_ascii_digit())),
+                    "safety number shape: {n}"
+                );
+            }
+            presented_safety_number
+        }
+        Err(other) => panic!("expected the key-substitution alarm, got: {other}"),
+        Ok(_) => panic!("SHARED TO A SUBSTITUTED KEY — the pin check did not fire"),
+    };
+    say("the share was REFUSED with both safety numbers (nothing was wrapped)");
+
+    // Rotation runs the same check before it touches anything.
+    assert!(
+        matches!(
+            desktop.rotate_vault(
+                VAULT_FROM_DESKTOP,
+                &vault_path,
+                std::slice::from_ref(&cli_id)
+            ),
+            Err(DesktopError::KeyPinMismatch { .. })
+        ),
+        "rotation must refuse a substituted recipient key too"
+    );
+
+    // The escape hatch is guarded: a stale or mistyped number does NOT re-pin.
+    assert!(
+        desktop
+            .repin_device(&cli_id, Some("11111 22222 33333 44444 55555 66666"))
+            .is_err(),
+        "re-pinning to a number the server is not presenting must be refused"
+    );
+    assert!(
+        matches!(
+            desktop.share_vault(VAULT_FROM_DESKTOP, &cli_id, "read"),
+            Err(DesktopError::KeyPinMismatch { .. })
+        ),
+        "a refused re-pin must leave the old pin in place"
+    );
+    say("a re-pin to the wrong number is refused, and the alarm still stands");
+
+    // Only a DELIBERATE re-pin to the presented number clears it.
+    let (previous, current) = desktop
+        .repin_device(&cli_id, Some(&presented))
+        .expect("deliberate re-pin");
+    assert_eq!(previous.as_deref(), Some(k1.as_str()));
+    assert_eq!(current, presented);
+    desktop
+        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read")
+        .expect("sharing resumes once the new key is deliberately pinned");
+    say("after a deliberate re-pin to the presented number, sharing resumes");
+
+    println!("\nPASS — a substituted hybrid key is detected, refused with both safety numbers, blocks rotation, survives a wrong-number re-pin, and clears only on a deliberate one.\n");
 }

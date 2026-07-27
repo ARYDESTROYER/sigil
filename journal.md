@@ -11,7 +11,79 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 50, `main` @ origin, clean tree).** Phase 50 **CLOSED THE
+**Where we are (through Phase 51; Phase 51 is complete and gated but UNCOMMITTED in the
+working tree — `main` @ origin is at Phase 50 + two fix commits).**
+
+**Phase 51 closed the third full-repo audit's findings.** No new feature; two of the
+findings shared one shape — ⭐ **a control that exists in the code but does not reach the
+place it has to act is not a control.** (1) ⭐ **The desktop's key-substitution ALARM is
+now VISIBLE.** It always *refused* correctly, but `desktop/ui/main.js` had no handler and
+no re-pin control, so a refused share showed as a **7-second toast** (the webapp and
+extension both blocked and explained). IPC errors now cross as a **STRUCTURED** value —
+`CmdResult<T> = Result<T, IpcError>`, `IpcError { kind, message, key_change? }` — with
+`key_change` populated for **exactly one kind** (`"key changed"`) carrying `device_id` +
+both safety numbers, **PUBLIC material only, no key bytes and no seed**;
+`From<String> for IpcError` left every `?` site unchanged. The UI gained a `#pin-mismatch`
+`role="alert"` block that **BLOCKS share + rotate**, prints both numbers, and puts a
+`window.confirm`-guarded re-pin behind them sending `expected` = the presented number so
+the native side re-checks it — reached from the single central `call()` error path.
+⚠️ **The REFUSAL did not change, only its visibility.** ⚠️ **Premise correction: the
+finding also claimed the desktop lacked safety-number / pinned-key views — WRONG, they
+already existed.** **NEW TEST** (`desktop/core/tests/server_interop.rs`
+`a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders`): the desktop was the
+ONLY client whose key-substitution defence had no regression test. Real sigild + real CLI;
+CLI publishes K1, a share PINS it, then `sigil device hybrid-publish --regenerate` makes
+the SAME device id present a DIFFERENT key — what a hostile server does, and deliberately
+indistinguishable from a legitimate re-enrolment. Asserts `DesktopError::KeyPinMismatch`
+with both numbers in the 6×5-digit shape, **rotation refused too**, a WRONG-number re-pin
+refused **leaving the old pin standing**, and only a deliberate re-pin resuming sharing.
+✅ **MUTATION-TESTED**: with the pin check in `cli/src/lib.rs` failing open it fails with
+*"SHARED TO A SUBSTITUTED KEY — the pin check did not fire"*. ⚠️ It also exposed a LATENT
+harness bug — `Harness::start()` keyed its temp dir on pid + `now_unix()` in **SECONDS**,
+and cargo runs a file's tests in **parallel threads of ONE process**, so two harnesses in
+the same second shared a path and one `remove_dir_all`'d the other's state (surfacing in
+the OTHER test); fixed with an `AtomicUsize`. (2) ⭐ **WEBHOOK DEDUP MOVED INSIDE THE
+SIGNATURE (ADR 0039, revising §4 of ADR 0034).** Razorpay signs the **BODY ONLY**, but the
+dedup id came from the **`X-Razorpay-Event-Id` HEADER**, which a replayer picks freely — so
+a captured valid delivery replayed with a fresh header verified and counted as a **NEW
+event** (attacker-driven unbounded growth of the processed-events ledger; the state machine
+bounded the rest). The invariant now: **an idempotency key MUST be a function of bytes the
+provider's SIGNATURE COVERS.** `billing.Event` gained `DedupKey` + `Event.IdempotencyKey()`;
+Razorpay **always** uses `"body-" + hex(SHA-256(rawBody))` and the header is demoted to a
+correlation LABEL on `Event.ID`; Stripe uses `env.ID` (inside the signed payload); Juspay
+derives from the body. ✅ **MUTATION-TESTED**: reverting to `ev.ID` makes the replay return
+`"accepted"` and `TestWebhookRazorpayReplayWithFreshHeaderIDIsOneEvent` catches it; live
+forgery set is 401/401/401 (wrong secret / tampered body / missing header). ⚠️ **VACUOUS
+under Juspay `scheme=basic`** — it authenticates the connection, not any bytes. (3)
+**Juspay's default webhook scheme is now `hmac`** (`NewJuspay`'s switch inverted; `default`
+= HMAC, so an unset scheme fails CLOSED rather than degrading to connection-only auth):
+`SIGILD_JUSPAY_WEBHOOK_SECRET` required when unset, `basic` is a boot failure without its
+credentials and logs a **WARN naming the limitation every start**. Both schemes still work.
+(4) **The marketing security page stopped under-claiming** — it said nothing was
+implemented and called ML-KEM-768 / ML-DSA-65 "planned", which was **false in the safe
+direction**. Now Argon2id / XChaCha20-Poly1305 / X25519 / Ed25519 / ML-KEM-768 / ML-DSA-65
+are **"Implemented; unaudited"**, ML-KEM-768 additionally **load-bearing**, ML-DSA-65
+**"not yet in the authentication path"**, TLS X25519MLKEM768 still "Designed; planned",
+with a defined vocabulary (**"implemented" = the code exists in the pre-release repo and
+its own tests pass — NOT released, NOT reviewed**) and a paragraph stating that
+implementing ML-KEM/ML-DSA does **NOT** make a system "post-quantum secure". ⚠️ **PREMISE
+CORRECTION + STANDING INVARIANT: the finding claimed these are "tested against FIPS
+vectors" — FALSE HERE.** `mlkem.rs:332` / `mldsa.rs:335` state that **NO official FIPS 203
+/ FIPS 204 / NIST ACVP known-answer vector is embedded**; the **UPSTREAM RustCrypto crates**
+are ACVP-validated. **Never write that we verify against FIPS/ACVP vectors.** (5) **CI:**
+`sigild.yml` now runs **`go test -race ./...`** (the local gate always did — CI was the
+weaker one), `security.yml`'s cargo-audit covers **all four Rust workspaces** (it audited
+only `libsigil`, the smallest lockfile; `desktop/` carries the whole Tauri tree), and
+`cli/tests/e2e-sharing.sh` **finally runs in a workflow** (a second job in `interop.yml`;
+it also stopped hardcoding the macOS Homebrew Go). ⚠️ Two doc corrections found while
+writing the CI list out file-by-file: the "desktop CI cannot find Go" warning described a
+gap **already closed inside Phase 49**; and CLAUDE.md wrongly claimed `libsigil.yml` /
+`cli.yml` run the **`getrandom`==0 guard** — they do NOT (only `desktop.yml` and
+`interop.yml` do; coverage survives because `interop.yml` triggers on `cli/**` and
+`libsigil/**`, but do not assume the crate's own job checks it).
+**NEW ADR 0039**; docs synced in the same change. Details in the Phase 51 entry below.
+
+**Phase 50** **CLOSED THE
 HOLE THIS REPO HAD BEEN DOCUMENTING AS OPEN** — the one the threat model called *"the
 single largest gap in the design"* and ADR 0035 recorded verbatim: **no out-of-band
 verification of a published hybrid public key**, so a hostile/compromised server could
@@ -6200,3 +6272,374 @@ Results:
   nothing; all request auth, including these routes, is classical Ed25519.
 - **UI-driven coverage** for the new key-trust surfaces: the protocol claims are proven
   headlessly, but no test clicks the safety-number, re-pin or rotate buttons.
+
+---
+
+## 2026-07-27 — Phase 51 (closing the third full-repo audit: the desktop's key-substitution ALARM becomes visible, webhook dedup moves inside the signature, and the security page stops lying in the safe direction)
+
+### Why this phase
+This was not a feature phase. A third full-repo audit produced a short list of open
+findings, and this phase closed them. The two that mattered share a shape worth naming,
+because it is a recurring failure mode here rather than two unrelated bugs:
+
+> **A control that exists in the code but does not reach the place it has to act is not a
+> control.** The desktop's key-substitution defence *refused* correctly and then told the
+> user about it in a toast that vanished in seven seconds. The billing idempotency ledger
+> *deduplicated* correctly and then keyed itself on a value the attacker picks.
+
+Both were real code, both passed their own tests, and both were documented as working.
+
+---
+
+### 1. ⭐ THE DESKTOP KEY-SUBSTITUTION ALARM — raised for four phases, barely shown
+
+**Before.** `desktop/src-tauri/src/main.rs` already tagged a pin mismatch `"key changed"`
+(Phase 50, ADR 0038). But `desktop/ui/main.js` had **no handler for it and no re-pin
+control**, so the single most important refusal in the product — *a hostile server tried
+to substitute a key and we did not wrap to it* — rendered as a **7-second toast**,
+identical in weight to "enter the recipient device id first". The webapp and the MV3
+extension both did this properly: block, explain, offer a deliberate re-pin. The desktop
+was the odd one out.
+
+**What changed — structure across the IPC.** Errors used to cross as plain strings, which
+is precisely why the UI could not do better than print one. Now:
+
+```rust
+type CmdResult<T> = Result<T, IpcError>;
+
+struct IpcError { kind: &'static str, message: String, key_change: Option<KeyChange> }
+struct KeyChange { device_id, pinned_safety_number, presented_safety_number }
+```
+
+`key_change` is populated for **exactly one `kind`** (`"key changed"`) and carries
+**PUBLIC material only** — a device id and two safety numbers. **No key bytes, no seed,
+nothing secret gained a route across the trust boundary**; that was the constraint the
+shape had to satisfy before anything else. `From<String> for IpcError` keeps **every
+existing `?` site unchanged**, so this is additive rather than a 21-command rewrite.
+
+**The UI half.** `desktop/ui/{index.html,styles.css,main.js}` gained a `#pin-mismatch`
+`role="alert"` block that:
+
+- **BLOCKS the share and rotate submit buttons** while it is up;
+- prints the **pinned** and **presented** safety numbers side by side in a monospace
+  block, with instructions to read the *presented* digits to that device's owner **over a
+  channel the server does not control**;
+- offers a `window.confirm`-guarded re-pin that sends **`expected` = the presented
+  number**, so the native side re-checks that what the user says they verified is still
+  what the server is serving *right now*;
+- offers "Keep refusing" as the other exit, which says plainly that refusing is the safe
+  outcome.
+
+Wording matches the webapp and the extension deliberately — three clients describing the
+same event three different ways is its own problem. It is reached from the **single
+central `call()` error path**, so every command's errors route through it and no command
+can bypass it; non-key-change errors still toast exactly as before. The read-only
+`peer_safety_number` button also now reports a `DIFFERS` pin state at **error** level
+rather than as a note, because that is the same fact reached read-only.
+
+⚠️ **What did NOT change: the refusal itself.** The client refused before and refuses now.
+This phase changed **visibility**, not behaviour — worth stating precisely so nobody reads
+it as a security fix to the wrap path.
+
+⚠️ **PREMISE CORRECTION.** The audit finding also claimed the desktop did not surface
+safety-number / pinned-key views. **That clause was wrong** — `device safety-number`,
+the pairwise form and `device pins` all already had buttons and commands there since
+Phase 50. They were not added, and nothing in the docs should say they were.
+
+---
+
+### 2. A REGRESSION TEST FOR THE PATH THAT RAISES IT (added by me, not the build agent)
+
+The desktop was the **only** client whose key-substitution defence had no test at all —
+the browser side has had `sigil-wasm/test/pinning-interop.mjs` since Phase 50. Given that
+the whole point of this phase was "an unexercised control is not a control", shipping the
+UI without one would have been the same mistake in a new place.
+
+`desktop/core/tests/server_interop.rs` gained
+**`a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders`**. It boots a real
+`sigild` and builds the real `sigil` binary (no mocks), has the CLI publish key **K1**,
+performs a share — **which is what PINS K1** and must succeed — and then runs:
+
+```
+sigil device hybrid-publish --regenerate
+```
+
+so the **SAME device id now presents a DIFFERENT hybrid public key**. ⭐ That trigger is
+chosen for faithfulness, not convenience: it is byte-for-byte what a hostile server does
+when it substitutes a key it can decrypt with, and it is **deliberately indistinguishable
+from a legitimate re-enrolment** — which is the entire reason the decision has to reach a
+human instead of being resolved in code.
+
+It asserts:
+
+- the share is refused as **`DesktopError::KeyPinMismatch`** — not a generic error, which
+  is what the UI branches on;
+- the alarm carries **both** safety numbers, the pinned one equals what was actually
+  pinned, they differ, and both are in the **6 groups × 5 digits** shape the UI prints
+  (the test parses the shape, so a rendering change that broke the panel would fail here);
+- **rotation is refused too** — the other wrap path;
+- a re-pin to a **WRONG** number is refused **and leaves the old pin standing** (checked by
+  re-attempting the share and still getting the alarm);
+- only a **deliberate** re-pin to the presented number lets sharing resume, and the
+  returned `(previous, current)` pair matches.
+
+✅ **MUTATION-TESTED.** With the pin check in `cli/src/lib.rs` neutered to fail open, the
+test fails with **`SHARED TO A SUBSTITUTED KEY — the pin check did not fire`**. Restored,
+it passes. A test that has never been observed failing is a hypothesis.
+
+---
+
+### 3. ⚠️ A LATENT TEST-HARNESS BUG the new test exposed
+
+`Harness::start()` built its temp directory from **pid + `now_unix()` in SECONDS**. That
+was fine while the file held one test. `cargo` runs the tests in a file in **parallel
+threads of ONE process**, so pid is shared — and two harnesses starting in the same second
+produced the **same path**, where the second one's `remove_dir_all` deleted the first
+one's state out from under it. It surfaced as a baffling **"No such file or directory" in
+the OTHER test**, which had done nothing wrong.
+
+Fixed with an `AtomicUsize` counter in the directory name. Recording it because the
+symptom pointed at entirely the wrong test, and because it had been latent since Phase 49
+waiting for a second test to exist.
+
+---
+
+### 4. ⭐ RAZORPAY WEBHOOK DEDUP MOVED INSIDE THE SIGNATURE (ADR 0039)
+
+**The defect.** Razorpay signs the **body and nothing else** — no timestamp, no headers.
+The adapter nevertheless took its event id from the **`X-Razorpay-Event-Id` header**, and
+that id was the idempotency key. A captured, genuinely-signed delivery replayed with **any
+headers the attacker likes** still verifies, so changing one header changed the key and
+the delivery was processed as a **NEW event**.
+
+The blast radius was bounded but the guarantee was false. The state machine is idempotent,
+legality-checked and `OccurredAt`-ordered, so a replay could not walk a subscription
+anywhere it had not already been — but the **processed-events ledger could be grown
+without limit on demand**, from an endpoint with no rate limiting. And the documented
+promise ("a duplicate delivery is a no-op") held only for duplicates the attacker chose
+not to relabel.
+
+**The fix, stated as an invariant rather than a patch:**
+
+> **An idempotency key MUST be a function of bytes the provider's signature covers.**
+
+`billing.Event` gained **`DedupKey`** plus **`Event.IdempotencyKey()`** (falls back to
+`ID`), and `sigild/internal/api/billing.go` now passes `EventID: ev.IdempotencyKey()` —
+one place where the ledger key is chosen, so it cannot silently drift back to the header.
+
+- **Razorpay** always sets `DedupKey = "body-" + hex(SHA-256(rawBody))`. A byte-identical
+  body is exactly **one** event whatever the headers say. The header id is **demoted to a
+  correlation LABEL** on `Event.ID`, for the dashboard and the audit log, documented as
+  not a security value. (The body hash already existed — as a *fallback* used only when
+  the header was missing. The fix is that it is now the **only** thing that keys the
+  ledger.)
+- **Stripe** sets `DedupKey = env.ID`: its event id is **inside** the signed payload
+  (`"<t>.<body>"`), so it is already covered. Set explicitly rather than left to the `ID`
+  fallback, so the guarantee is visible at the call site.
+- **Juspay** uses a body-derived id.
+
+✅ **VERIFIED FIRST-HAND, BY MUTATION.** Reverting to `EventID: ev.ID` makes the replay
+return **`"accepted"`** — i.e. the attack works — and
+**`TestWebhookRazorpayReplayWithFreshHeaderIDIsOneEvent`** catches it. Restored, the
+`sigild` suite is green under `go test -race`. Against a live local server the forgery set
+behaves: **wrong secret → 401, tampered body → 401, missing signature header → 401**.
+
+⚠️ **SCOPE NOTE, now recorded in the threat model.** The invariant holds for **Stripe**,
+**Razorpay**, and **Juspay under `scheme=hmac`**. Under **Juspay `scheme=basic` it is
+VACUOUS** — basic authenticates the *connection*, not any bytes, so there is nothing for a
+dedup key to be derived from and adversaries K/L are simply not defended there. No key
+derivation fixes an authentication scheme that signs nothing.
+
+---
+
+### 5. JUSPAY'S DEFAULT WEBHOOK SCHEME IS NOW `hmac`
+
+`NewJuspay`'s switch was **inverted**: `case JuspaySchemeBasic` selects connection auth,
+and **`default` selects HMAC** — so an empty or unrecognized scheme lands on the
+body-binding verifier with no secret configured, which **accepts nothing**. It fails
+closed instead of silently degrading to connection-only authentication.
+
+The rationale is recorded in the file, and it is the whole argument in one line:
+**uncertainty about a header name is a configuration problem; getting connection-only
+authentication by accident is a security problem.** The old default traded the second away
+to avoid the first.
+
+`cmd/server/billingconfig.go` follows: `SIGILD_JUSPAY_WEBHOOK_SECRET` is **required when
+the scheme is unset**; choosing `basic` without its credentials is a **boot failure** whose
+message names what was opted into; and a `basic` boot logs a **WARN every start** stating
+that the scheme authenticates the connection and not the payload, that anyone holding the
+credential can post any body, and that the endpoint must then be TLS-only. **Both schemes
+still work; both still fail closed on an unset secret.** `basic` is still available —
+reportedly some merchant accounts only offer it — it just has to be **asked for by name**.
+
+⚠️ This is a **breaking configuration change** for anyone relying on the old default.
+There is nobody: **nothing here has ever run against a live provider account.** Called out
+anyway, rather than discovered at boot.
+
+---
+
+### 6. THE MARKETING SECURITY PAGE WAS UNDER-CLAIMING — AND THEREFORE STILL FALSE
+
+`web/apps/marketing/app/security/page.tsx` said *"nothing below is implemented, shipped,
+or independently audited yet"* and listed **ML-KEM-768** and **ML-DSA-65** as *"planned"*.
+Every one of those primitives is real code in this repo with passing tests. This is an
+unusual correction to have to make — the page erred **toward** modesty — but a false
+statement about our own cryptography is a false statement, and an auditor reading it
+against the code would rightly ask which other claims are unreliable.
+
+Corrected, without tipping into the opposite error:
+
+- Argon2id, XChaCha20-Poly1305, X25519, Ed25519, **ML-KEM-768** and **ML-DSA-65** now read
+  **"Implemented; unaudited"**, each with a one-line note saying what it actually does.
+- **ML-KEM-768** is additionally marked **load-bearing** — it is combined with X25519 into
+  the hybrid KEM that wraps a vault key when a vault is shared, which is real product code.
+- **ML-DSA-65** reads **"implemented; not yet in the authentication path"**: it exists and
+  round-trips, including as a hybrid Ed25519 + ML-DSA-65 signature, and **device
+  authentication is still Ed25519 alone**.
+- **TLS `X25519MLKEM768`** stays **"Designed; planned"** — nothing is deployed.
+- A **defined status vocabulary** pins the words down: **"implemented" means the code
+  exists in the pre-release repository and its own tests pass — not released, not
+  reviewed**; "load-bearing" means a product flow already depends on it.
+- A dedicated paragraph states outright that **implementing ML-KEM/ML-DSA does NOT make a
+  system "post-quantum secure", and we do not claim that it does** — the hybrid
+  construction is the honest response to a young standard, and the surrounding protocol,
+  key management and transport are still being built.
+
+`MARKETING-CLAIMS.md` still holds: no "audited", no "SOC 2", no "post-quantum secure", no
+unqualified present-tense "end-to-end encrypted", and nothing described as shipped.
+
+⚠️ **PREMISE CORRECTION — and an invariant for anyone writing about the PQ primitives.**
+The audit finding said these are *"tested against FIPS vectors"*. **THAT IS FALSE IN THIS
+REPO, and the page does not say it.** `libsigil/core/src/mlkem.rs:332` and
+`mldsa.rs:335` state plainly that **no official FIPS 203 / FIPS 204 / NIST ACVP
+known-answer vector is embedded** — reproducing one needs exact byte tuples, and
+fabricating them would be worse than not having them. The **upstream RustCrypto `ml-kem` /
+`ml-dsa` crates** are the ACVP-validated ones; our correctness rests on round-trip,
+determinism, implicit-rejection and negative tests **plus** that upstream vetting. The
+page therefore says the primitives are **"covered by their own tests"**. I also added an
+explicit note to `docs/crypto-spec.md` so the accurate version is written down somewhere
+authoritative, contrasting it with the classical/OTP primitives, which **do** carry
+official RFC vectors (RFC 7748, RFC 8032, RFC 4226/6238). **Never write that we verify
+against FIPS/ACVP vectors.**
+
+---
+
+### 7. CI COVERAGE
+
+- **`sigild.yml` now runs `go test -race ./...`.** The local gate has always run `-race`,
+  so CI was the **weaker** of the two on a concurrent server whose op-log, nonce cache,
+  rate limiter and subscription store are all shared mutable state with concurrency tests
+  aimed straight at them. Without the detector those tests pass while the race they exist
+  to catch is still there.
+- **`security.yml`'s cargo-audit now covers all four Rust workspaces** (`libsigil`, `cli`,
+  `sigil-wasm`, `desktop`) via a `fail-fast: false` matrix. It audited `libsigil` only —
+  the **smallest and most conservative** lockfile, which says nothing about the other
+  three. `desktop/` pulls the entire Tauri tree, by far the largest dependency surface in
+  the repository and the one most likely to be the subject of an advisory.
+- **`cli/tests/e2e-sharing.sh` now runs in a workflow** — a second `e2e-sharing` job in
+  `interop.yml`. It is the tenth cross-component proof and the only shell one, and it was
+  in exactly the position the nine Node tests were in before commit `5735f80`: **run by
+  nothing**. The script also stopped hardcoding the macOS Homebrew Go: it resolves
+  **`$GO` → `/opt/homebrew/bin/go` → `go` on PATH** and errors clearly if none exists.
+- All workflows still parse.
+
+---
+
+### 📄 Docs updated in the same change (the docs-stay-in-sync rule)
+
+- **`docs/decisions/0039-webhook-idempotency-from-signed-bytes.md` — NEW ADR 0039**, for
+  the load-bearing rule: *webhook idempotency keys MUST be derived from bytes the
+  provider's signature covers*. It carries the per-provider table, the Juspay-`basic`
+  vacuity caveat, the mutation-test verification, the accepted costs (a body-derived key
+  is not human-recognizable; a provider that redelivers a semantically-identical event
+  with a different body would count as two), and the alternatives rejected (rate-limit
+  instead, uniform body hashing, drop `basic` entirely, police the header). It **revises
+  §4 of ADR 0034** rather than superseding it — 0034's body is untouched, per the ADR
+  immutability rule; the index row for 0034 now says so, exactly as 0005 already flags its
+  partial supersession by 0014.
+- **`docs/decisions/README.md`** — the 0039 index row, the 0034 revision note, and the
+  banner's stale "idempotency keyed on the provider event id" clause.
+- **`docs/api.md`** — the idempotency section now leads with the signature-coverage rule
+  and a per-provider key table; the webhook contract table puts **Juspay `hmac` first as
+  the default** and marks `basic` explicit-opt-in; the Razorpay bullet is rewritten around
+  the header being a correlation label; the env table marks `SIGILD_JUSPAY_WEBHOOK_SECRET`
+  required when the scheme is unset; the `billing.webhook` audit row notes `event_id` is
+  **not** the idempotency key. ⚠️ Also fixed a stale count left from Phase 50: *"the three
+  vault-sharing counters"* — there are **FOUR** (`..._hybrid_keys_published_total`,
+  `..._vault_key_envelopes_total`, `..._vault_key_envelope_fetches_total`,
+  `..._key_envelope_deletes_total`), verified against `internal/api/metrics.go`; they are
+  now named rather than counted.
+- **`docs/threat-model.md`** — the desktop subsection gains the "the alarm is now
+  rendered, not just raised" entry (with the explicit note that the *refusal* did not
+  change) and the new regression test; adversary **K** (replayer) is rewritten around the
+  signature-covered dedup key; adversary **L**'s Juspay exception notes the default flip;
+  and the billing "does NOT defend" list gains the **scope note** that the invariant is
+  **vacuous under `scheme=basic`**.
+- **`docs/architecture.md`** — the `desktop` component description now documents the
+  structured `IpcError` (and that `key_change` carries public material only); §2c gains a
+  paragraph that **all four client surfaces now SHOW the alarm**, not just raise it; the
+  billing paragraph carries the dedup-key rule and the Juspay default.
+- **`docs/deployment.md`** — §13.1 gains the ⚠️ block explaining that the Juspay scheme
+  defaults to `hmac`, that `SIGILD_JUSPAY_WEBHOOK_SECRET` is therefore required when
+  unset, that `basic` fails fast without its credentials and logs a WARN every start; the
+  env sample reordered to match; §13.2's verification checklist adds "redeliver the
+  identical body with a *different* `X-Razorpay-Event-Id` and confirm `duplicate`"; §13.4
+  notes the invariant is vacuous under `basic`.
+- **`docs/crypto-spec.md`** — the explicit, accurate note on what "tested" means for
+  ML-KEM-768 / ML-DSA-65 (no embedded FIPS/ACVP KAT here; upstream RustCrypto is the
+  ACVP-validated part), contrasted with the RFC-vectored classical and OTP primitives.
+- **`CLAUDE.md`** — the billing paragraph (the `DedupKey` invariant, the Razorpay replay
+  reasoning, the Juspay default + boot behaviour), the `desktop/` bullet (the structured
+  `IpcError`, the UI alarm, the new test and its mutation check, the harness bug, and the
+  premise correction about safety-number views), the marketing bullet (the security-page
+  correction **and** the never-claim-FIPS-vectors invariant), the Go gate now `-race`, the
+  desktop test count (**15 unit + 3 integration across 2 files**), and the **CI job list
+  rewritten** — it claimed "every surface now has a CI job" while omitting `interop.yml`,
+  `security.yml` and `release.yml` entirely.
+- **`README.md`** — reviewed and **left unchanged**: nothing in it was made inaccurate by
+  this phase (its billing paragraph says only "duplicate deliveries are idempotent", which
+  is now more true than before; its pinning paragraph is client-agnostic).
+
+### ⚠️ Two stale/wrong doc items found beyond the audit list, and corrected
+
+**(a) `CLAUDE.md` claimed `libsigil.yml` and `cli.yml` run the `getrandom`==0 guard. They
+do not.** Writing the CI list out file-by-file — rather than repeating the old summary
+sentence — is what surfaced it. The guard exists in **`desktop.yml`** and **`interop.yml`**
+only. The invariant is still covered in practice, because a `cli/**` or `libsigil/**`
+change triggers `interop.yml`, which asserts `getrandom`==0 for **both**
+`libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock` — but the crate's *own* job does not
+check it, which is exactly the sort of thing you would assume wrongly under time pressure.
+`CLAUDE.md` now says so explicitly and points back at the local `grep -c` command. **The
+workflows were not edited** (this phase's brief was documentation only); adding the guard
+to `libsigil.yml` / `cli.yml` is a one-line follow-up.
+
+**(b)** `CLAUDE.md` carried a **"Known CI gap after Phase 49"** warning saying `desktop.yml` would
+fail on a GitHub runner because `server_interop` looks for Go at `/opt/homebrew/bin/go`.
+**That gap was already closed inside Phase 49 itself**, after the journal entry that
+flagged it: `desktop.yml` installs Go with `actions/setup-go@v5`, and `resolve_go()`
+resolves **`$GO` → `go` on PATH → Homebrew**, and **panics rather than skipping** when Go
+is genuinely absent. The warning had simply never been retired. Now corrected to record
+that it is closed — and to point out that the Phase 51 Go-resolver work was in
+`cli/tests/e2e-sharing.sh`, a different file with the same old hardcoded path.
+
+### ➡️ Still open (honest, and mostly unchanged — this phase closed findings, not gaps)
+- ⭐ **Cross-sign the hybrid public key with the device's enrolled Ed25519 identity** (sign
+  at publish, verify at wrap) — still the one change that would protect **first contact**
+  without a human in the loop, and still the highest-value follow-up.
+- **Key transparency / gossip**, so a pin can be checked against something other than one
+  device's memory.
+- **Automatic re-wrap on revoke** and some rotation policy — remediation is still manual.
+- **Zeroization** of key material on every client — still nothing, anywhere.
+- **Wire the hybrid SIGNATURE into something** — still the only hybrid construction used
+  by nothing; all request auth, including the sharing routes, is classical Ed25519.
+- **UI-driven coverage.** Phase 51 tested the path that *raises* the desktop alarm, in the
+  headless core. **No test clicks the alarm's re-pin button, or the safety-number and
+  rotate buttons, on any client.** The gap narrowed; it did not close.
+- **No rate limiting on `/v1/billing/webhook/{provider}`.** ADR 0039 closed the
+  unbounded-ledger-growth path that ran *through* the idempotency key; it does not bound
+  request volume.
+- **Add the `getrandom`==0 guard to `libsigil.yml` and `cli.yml`** — see the finding
+  above. One step each; not done here because this phase's brief was documentation only.
+- **Billing has still never been run against a live provider account**, Juspay remains
+  UNVERIFIED-AGAINST-LIVE-DASHBOARD, and the whole repo remains **pre-audit and
+  UNAUDITED**. Do not store real secrets.

@@ -52,10 +52,17 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test
+        # -race, because the local gate always runs -race and CI must not be the
+        # WEAKER of the two. sigild is a concurrent server whose op-log, nonce
+        # cache, rate limiter and subscription store are all shared mutable state
+        # with concurrency tests aimed straight at them; without the detector
+        # those tests can pass while the data race they exist to catch is still
+        # there.
+        #
         # SIGILD_TEST_POSTGRES points the integration tests at the service
         # container above; without it they skip.
         env:
           SIGILD_TEST_POSTGRES: postgres://postgres:postgres@localhost:5432/sigild_test?sslmode=disable
-        run: go test ./...
+        run: go test -race ./...
       - name: build
         run: go build ./...

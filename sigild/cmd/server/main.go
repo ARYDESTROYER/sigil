@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ARYDESTROYER/sigil/sigild/internal/api"
+	"github.com/ARYDESTROYER/sigil/sigild/internal/billing"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/buildinfo"
 	"github.com/ARYDESTROYER/sigil/sigild/internal/store"
 )
@@ -291,6 +292,12 @@ func main() {
 				"store", map[bool]string{true: "postgres", false: "memory"}[pgPool != nil])
 			if billingCfg.JuspayScheme != "" {
 				logger.Warn("BILLING: the Juspay webhook scheme is UNVERIFIED-AGAINST-LIVE-DASHBOARD — confirm it before accepting real payments",
+					"juspay_webhook_scheme", billingCfg.JuspayScheme)
+			}
+			if billingCfg.JuspayScheme == billing.JuspaySchemeBasic {
+				// It is an explicit opt-in, so this is not a boot failure — but
+				// the limitation is named every single time the server starts.
+				logger.Warn("BILLING: the Juspay webhook scheme is BASIC, which authenticates the CONNECTION and NOT the PAYLOAD — anyone holding the credential can post any body, and a modified body cannot be detected; prefer SIGILD_JUSPAY_WEBHOOK_SCHEME=hmac (the default), and if basic is unavoidable serve this endpoint over TLS only and treat the credential as a bearer secret",
 					"juspay_webhook_scheme", billingCfg.JuspayScheme)
 			}
 		}

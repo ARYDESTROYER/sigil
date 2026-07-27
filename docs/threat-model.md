@@ -227,6 +227,39 @@ host now holds bearer secrets:
   trust-on-first-use unless the user compares the safety number**, and **revocation
   cannot un-learn a vault key this device already accepted** — rotation protects only
   what is written afterwards.
+- ⭐ **The alarm is now rendered, not just raised (Phase 51).** Until Phase 51 the
+  desktop was the one client where the key-substitution control existed in the core
+  but the user could barely see it: `main.rs` tagged the error `"key changed"` and
+  `desktop/ui/main.js` had no handler and no re-pin control, so a refused share
+  showed as a toast that vanished in seven seconds — while the webapp and the
+  extension both blocked and explained. A control the user cannot see is, in
+  practice, a control that is not there. IPC errors now cross as a **structured
+  value** (`IpcError { kind, message, key_change? }`), where `key_change` is
+  populated for exactly the `"key changed"` kind and carries the device id and
+  **both safety numbers** — **public material only**, no key bytes and no seed. The
+  UI shows a blocking `role="alert"` panel that **disables the share and rotate
+  buttons**, prints the pinned and presented numbers side by side, and puts a
+  `window.confirm`-guarded re-pin behind them which sends the presented number back
+  as `expected` so the native side re-checks it against what the server is serving
+  *now*. It is reached from the single central `call()` error path, so every
+  command routes through it. **This changes what the user sees, not what the client
+  refuses** — the refusal itself was already correct, and is unchanged.
+- ⭐ **The path that raises it now has a regression test.** The desktop was also
+  the only client whose key-substitution defence had none (the browser side is
+  covered by `sigil-wasm/test/pinning-interop.mjs`).
+  `desktop/core/tests/server_interop.rs` gained
+  `a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders`, which boots a
+  real `sigild` and the real `sigil` binary, has the CLI publish key K1, shares
+  (which **pins** K1), then runs `sigil device hybrid-publish --regenerate` so the
+  **same device id presents a different key** — exactly what a hostile server does,
+  and deliberately indistinguishable from a legitimate re-enrolment. It asserts the
+  share is refused as `DesktopError::KeyPinMismatch` carrying both numbers in the
+  six-groups-of-five-digits shape the UI prints, that **rotation is refused too**,
+  that a re-pin to a **wrong** number is refused and leaves the old pin standing,
+  and that only a deliberate re-pin to the presented number lets sharing resume.
+  The test was **mutation-checked**: with the pin check in `cli/src/lib.rs` neutered
+  to fail open it fails with *"SHARED TO A SUBSTITUTED KEY — the pin check did not
+  fire"*.
 - **Dev-gated, loopback, plain HTTP, UNAUDITED**, and the GUI itself is build-and-launch
   verified rather than visually verified — all the behaviour above lives in the headless
   core that `desktop/core/tests/server_interop.rs` drives against a real `sigild` and the
@@ -416,8 +449,8 @@ security claim, and none of it is a PCI attestation.
 | # | Adversary | Capability | Defense as implemented | Layer |
 | --- | --- | --- | --- | --- |
 | J | **Webhook forger** | Sends a plausible provider-shaped event (e.g. "subscription activated") with no valid signature | **Real HMAC verification over the exact raw body bytes**, computed *before* the JSON is parsed: Stripe `HMAC-SHA256("<t>.<raw body>")` keyed by the endpoint signing secret, Razorpay `HMAC-SHA256(raw body)` keyed by the dashboard webhook secret, Juspay `hmac` scheme likewise (or a constant-time Basic-credential check for the `basic` scheme). Comparison is **constant time** (`hmac.Equal` / `subtle.ConstantTimeCompare`); an undecodable hex signature is simply "not equal", not a distinct error. An **unconfigured** verifier **fails closed** — it accepts nothing. Verdict: `401` with a coarse body | `sigild` webhook auth |
-| K | **Replayer** | Captures a genuine, validly-signed webhook and re-sends it | Two independent bounds. **In-scheme (Stripe only):** the signed message includes the timestamp `t` and the delivery is rejected when `abs(now − t) > 5 min`, checked in **both** directions (a far-future timestamp is as suspect as a stale one). **Cross-provider:** the **idempotency ledger** keyed on `(provider, event_id)` makes a replay a **no-op that still answers `200`** — the state change and the ledger claim are one atomic operation (one mutex in memory; one transaction with `INSERT … ON CONFLICT DO NOTHING` + `SELECT … FOR UPDATE` in Postgres), so a replay cannot double-apply even under concurrency. Razorpay and Juspay carry **no timestamp element**, so for them the ledger is the *only* replay bound — and it is why a redelivery *inside* a restart of the **non-durable in-memory** store could still be applied twice | `sigild` webhook auth + store |
-| L | **Body tamperer** | Man-in-the-middle mutates the JSON (amount, subject, status) of an otherwise genuine delivery | The MAC is computed over the **exact bytes read off the wire**, never over re-serialized JSON — a re-encode changes key order and whitespace and would either break verification or, if "fixed" by re-signing, let an attacker mutate the body freely. Any mutation therefore fails verification → `401`. Tests assert this explicitly (a semantically-equal re-encode is rejected). **Exception, stated plainly:** Juspay's `basic` scheme authenticates the **connection**, not the body — it does **not** defend against this adversary; use `hmac` where available and require TLS unconditionally | `sigild` webhook auth |
+| K | **Replayer** | Captures a genuine, validly-signed webhook and re-sends it | Two independent bounds. **In-scheme (Stripe only):** the signed message includes the timestamp `t` and the delivery is rejected when `abs(now − t) > 5 min`, checked in **both** directions (a far-future timestamp is as suspect as a stale one). **Cross-provider:** the **idempotency ledger** makes a replay a **no-op that still answers `200`** — the state change and the ledger claim are one atomic operation (one mutex in memory; one transaction with `INSERT … ON CONFLICT DO NOTHING` + `SELECT … FOR UPDATE` in Postgres), so a replay cannot double-apply even under concurrency. ⭐ **The ledger key is derived only from bytes the provider's signature covers** ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)) — Stripe's event id sits inside the signed payload; **Razorpay's key is always `SHA-256(raw body)`**, never the `X-Razorpay-Event-Id` header, because Razorpay signs the body and nothing else, so a captured delivery replayed with a fresh header would otherwise have been processed as a **new** event and grown the processed-events ledger on demand; Juspay's comes out of the body too. Razorpay and Juspay carry **no timestamp element**, so for them the ledger is the *only* replay bound — and it is why a redelivery *inside* a restart of the **non-durable in-memory** store could still be applied twice | `sigild` webhook auth + store |
+| L | **Body tamperer** | Man-in-the-middle mutates the JSON (amount, subject, status) of an otherwise genuine delivery | The MAC is computed over the **exact bytes read off the wire**, never over re-serialized JSON — a re-encode changes key order and whitespace and would either break verification or, if "fixed" by re-signing, let an attacker mutate the body freely. Any mutation therefore fails verification → `401`. Tests assert this explicitly (a semantically-equal re-encode is rejected). **Exception, stated plainly:** Juspay's `basic` scheme authenticates the **connection**, not the body — it does **not** defend against this adversary. That is why `hmac` is now the **default** and `basic` must be requested by name and is warned about at every boot ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)); where only `basic` is available, TLS is unconditional | `sigild` webhook auth |
 | M | **Unknown-provider prober** | POSTs provider-shaped payloads to `/v1/billing/webhook/anything`, or to a provider path that exists in code but is not enabled here | Only providers named in `SIGILD_BILLING_PROVIDERS` get a live route; anything else is `404 unknown_provider` with the body **drained and discarded**, audited as `unknown_provider` and counted in `sigild_billing_webhook_rejected_total{reason="unknown_provider"}`. The adapter map is fixed at boot, so a request cannot cause an adapter to be constructed, a credential to be read, or an outbound call to be made. With billing off entirely, the route is `501` — never `404`-vs-`501` leakage about *which* providers exist | `sigild` API surface |
 | N | **Webhook-secret thief** | Obtains a webhook signing secret (`whsec_…`, the Razorpay webhook secret, the Juspay credentials) | **Not defended beyond the secret itself** — the holder can mint authentic-looking events. What *bounds* the damage: the webhook can only drive the **state machine** (it can make a subject look subscribed; it cannot read a vault, mint a session, enroll a device, or move money), the state machine **rejects illegal transitions**, the staleness guard rejects out-of-order events, and every applied transition is audit-logged with `from`/`to`. What is missing: **no rotation runbook beyond replacing the env var and restarting**, and (Stripe aside) **no timestamp bound**. The webhook secret is a **different secret from the API key**, so leaking one does not leak the other | Operational |
 | O | **API-key thief** | Obtains `SIGILD_STRIPE_SECRET_KEY` / `SIGILD_RAZORPAY_KEY_SECRET` / `SIGILD_JUSPAY_API_KEY` | **Not defended.** A live API key is a provider-side credential: the holder can act against the merchant account directly, outside `sigild` entirely, and no server-side control here can stop that — response is provider-side revocation. `sigild` limits only its *own* exposure: keys arrive from the environment (never the repo), live only inside an adapter struct, travel in an `Authorization` header rather than a URL, and are **never logged, never returned in an error, and never exported on `/metrics`** — provider failures surface as a `ProviderError` carrying **only** provider + operation + HTTP status, deliberately never the response body (which can echo customer data) | Operational |
@@ -457,6 +490,15 @@ security claim, and none of it is a PCI attestation.
 - **Transport.** In any real deployment the webhook endpoint **must** be reachable
   only over TLS. The dev server speaks plain HTTP, and Juspay's `basic` scheme in
   particular is a bearer credential with no body binding.
+- ⚠️ **Scope of the "idempotency key comes from signature-covered bytes"
+  invariant.** It holds for **Stripe**, **Razorpay**, and **Juspay under
+  `scheme=hmac`**. Under **Juspay `scheme=basic` it is vacuous**: that scheme
+  authenticates the connection and covers **no bytes at all**, so there is nothing
+  for a dedup key to be derived *from*, and adversaries K and L are simply not
+  defended against there. No amount of key derivation fixes an authentication
+  scheme that signs nothing — which is the reason the default was moved to `hmac`
+  ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)) rather than
+  the reason it is safe to leave on `basic`.
 
 **Status note for this repo:** almost none of the defenses in the **first** table
 (adversary classes 1–12, the *intended product* design) is implemented yet — the

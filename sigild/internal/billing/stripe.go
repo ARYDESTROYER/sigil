@@ -345,8 +345,13 @@ func parseStripeEvent(rawBody []byte) (Event, error) {
 	}
 
 	ev := Event{
-		Provider:   ProviderStripe,
-		ID:         env.ID,
+		Provider: ProviderStripe,
+		ID:       env.ID,
+		// Stripe's event id lives INSIDE the signed payload (and the signed
+		// message is "<timestamp>.<body>"), so the id is already covered by the
+		// signature and is a safe idempotency key. Set explicitly rather than
+		// left to the ID fallback so the guarantee is visible at the call site.
+		DedupKey:   env.ID,
 		Type:       EventIgnored,
 		OccurredAt: unixTime(env.Created),
 	}

@@ -38,7 +38,17 @@ set -euo pipefail
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-GO="${GO:-/opt/homebrew/bin/go}"
+# $GO wins; then the local machine's Homebrew Go; then whatever `go` is on PATH
+# (which is what a Linux CI runner has). Resolved here rather than hardcoded so
+# this script can run somewhere other than the build machine.
+if [[ -n "${GO:-}" ]]; then
+	:
+elif [[ -x /opt/homebrew/bin/go ]]; then
+	GO=/opt/homebrew/bin/go
+else
+	GO=go
+fi
+command -v "$GO" >/dev/null || { echo "no Go toolchain found (set \$GO)" >&2; exit 1; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sigil-share-e2e.XXXXXX")"
 SERVER_PID=""

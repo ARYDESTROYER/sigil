@@ -47,9 +47,9 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > the dev-gated **billing / subscription layer** in `sigild` (a provider-agnostic
 > seam with **stdlib-only** Stripe / Razorpay / Juspay adapters — no vendor SDKs —
 > hosted checkout only so the server never touches card data, real raw-body HMAC
-> webhook verification with constant-time comparison, and idempotency keyed on the
-> provider event id; opt-in, `501` by default, UNAUDITED, and **never run against a
-> live provider account**),
+> webhook verification with constant-time comparison, and idempotency keyed on
+> material the provider's signature actually covers; opt-in, `501` by default,
+> UNAUDITED, and **never run against a live provider account**),
 > **device-to-device vault sharing** (a shared vault sealed under a random 32-byte
 > **vault key** — the same `SIGILcli` container, no format change — that key **wrapped
 > per recipient device** with the PQ-hybrid `hybrid_seal` path (X25519 + ML-KEM-768) and
@@ -146,8 +146,9 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0031](0031-multi-device-auth-model.md) | Multi-device auth model for the dev op-log (contract v3: device registry, enrollment with proof of possession, per-vault grants, revocation) | Accepted (2026-07) |
 | [0032](0032-native-desktop-client.md) | Native desktop client — Tauri v2 shell over a headless core crate, `sigil-core` linked natively (no wasm), re-using `cli/`'s container/vault/migration logic and sharing the CLI's vault file | Accepted (2026-07) |
 | [0033](0033-browser-device-identity-storage.md) | Browser device-identity storage — seal the Ed25519 device seed in a second `SIGILcli` container under the vault password (never plaintext web storage, never a `TotpVault` field) | Accepted (2026-07) |
-| [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07) |
+| [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07); §4's idempotency key revised by [0039](0039-webhook-idempotency-from-signed-bytes.md) |
 | [0035](0035-device-to-device-vault-sharing.md) | Device-to-device vault sharing — random per-vault key sealed into the unchanged `SIGILcli` container, wrapped per device with `hybrid_seal` (X25519 + ML-KEM-768), relayed as an opaque envelope, authorized by the existing v3 grants | Accepted (2026-07) |
 | [0036](0036-browser-sharing-secret-storage.md) | Browser sharing-secret storage — keep the hybrid secret identity and the vault keyring inside the existing sealed device-identity container (schema bumped to v2, v1 still readable) rather than adding a new store | Accepted (2026-07) |
 | [0037](0037-desktop-reuses-cli-library-for-protocol.md) | The desktop client drives the `sigil-cli` library instead of reimplementing the wire protocol — no fourth copy of the canonical contract-v3 message, and the CLI's own state files | Accepted (2026-07) |
 | [0038](0038-key-pinning-safety-numbers-and-vault-rotation.md) | Key pinning (pin on first sight, **hard-refuse** on change), a human-comparable safety number as the out-of-band check, and vault key rotation with re-wrap — the client-side answer to a key-substituting server, retiring two limitations recorded in [0035](0035-device-to-device-vault-sharing.md) | Accepted (2026-07) |
+| [0039](0039-webhook-idempotency-from-signed-bytes.md) | Webhook idempotency keys must be derived from bytes the provider's signature covers (`Event.DedupKey`; Razorpay keys on the signed body, not the `X-Razorpay-Event-Id` header), and Juspay's default webhook scheme becomes `hmac` — revising §4 of [0034](0034-billing-provider-seam.md) | Accepted (2026-07) |

@@ -569,7 +569,10 @@ real backup/restore round-trip.
 > attestation. See [`api.md`](api.md#billing--subscriptions-dev-gated-opt-in--phase-45)
 > for the wire contract and
 > [`decisions/0034-billing-provider-seam.md`](decisions/0034-billing-provider-seam.md)
-> for the decision.
+> for the decision, as revised by
+> [`decisions/0039-webhook-idempotency-from-signed-bytes.md`](decisions/0039-webhook-idempotency-from-signed-bytes.md)
+> (the idempotency key now comes from signature-covered bytes, and Juspay's
+> default webhook scheme is `hmac`).
 
 `sigild` carries a provider-agnostic billing seam with three **stdlib-only**
 adapters — **Stripe** (international), **Razorpay** and **Juspay** (India). It
@@ -616,10 +619,10 @@ SIGILD_RAZORPAY_API_BASE_URL=                 # optional host override
 SIGILD_JUSPAY_MERCHANT_ID=...
 SIGILD_JUSPAY_API_KEY=...
 SIGILD_JUSPAY_CLIENT_ID=...                   # payment-page client id
-SIGILD_JUSPAY_WEBHOOK_SCHEME=basic            # basic (default) | hmac
+SIGILD_JUSPAY_WEBHOOK_SCHEME=                 # hmac (DEFAULT when unset) | basic
+SIGILD_JUSPAY_WEBHOOK_SECRET=...              # REQUIRED for scheme=hmac, i.e. whenever the scheme is unset
 SIGILD_JUSPAY_WEBHOOK_USERNAME=...            # REQUIRED for scheme=basic
 SIGILD_JUSPAY_WEBHOOK_PASSWORD=...            # REQUIRED for scheme=basic
-SIGILD_JUSPAY_WEBHOOK_SECRET=...              # REQUIRED for scheme=hmac
 SIGILD_JUSPAY_WEBHOOK_SIG_HEADER=             # optional; default X-Juspay-Signature (name UNVERIFIED)
 SIGILD_JUSPAY_AMOUNT_MINOR=49900              # optional default, in paise
 SIGILD_JUSPAY_CURRENCY=INR                    # optional
@@ -636,10 +639,26 @@ scheme makes `sigild` **exit non-zero with a clear message**. Validation perform
 start — which is the point: a server that started half-configured would reject
 real webhooks it could not authenticate, or offer checkouts it could not create.
 
+**⚠️ The Juspay webhook scheme defaults to `hmac`, and that default is
+load-bearing** ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)).
+`hmac` binds the **body**; `basic` authenticates only the **connection**, so
+anyone holding the credential can post any body and a modified body cannot be
+detected. Leaving `SIGILD_JUSPAY_WEBHOOK_SCHEME` unset therefore selects `hmac`
+and makes **`SIGILD_JUSPAY_WEBHOOK_SECRET` required** — enabling Juspay without
+it is a boot failure, not a silent downgrade. Choosing `basic` is an **explicit
+opt-in**: it is still supported, still fails fast without
+`SIGILD_JUSPAY_WEBHOOK_USERNAME` / `_PASSWORD` (with an error message that names
+what `basic` gives up), and both schemes fail **closed** when their secret is
+unset — an unconfigured verifier accepts nothing.
+
 The boot log records **which** providers are enabled and **which** Juspay scheme
-is active — a mechanism name, never a credential — plus two loud warnings: that
-billing is unaudited and must be verified against live dashboards, and (when
-Postgres is not configured) that the subscription store is in-memory.
+is active — a mechanism name, never a credential — plus the loud warnings: that
+billing is unaudited and must be verified against live dashboards, (when Postgres
+is not configured) that the subscription store is in-memory, and **on every start
+under `scheme=basic`, a `WARN` stating that the scheme authenticates the
+connection and not the payload**, that anyone holding the credential can post any
+body, and that the endpoint must then be TLS-only with the credential treated as
+a bearer secret.
 
 ### 13.2 Configuring the provider webhook endpoints
 
@@ -661,11 +680,14 @@ entirely every billing path returns `501`.
    --forward-to …`, or a dashboard "send test webhook") and confirm a `200` with
    the expected `status` in the JSON body.
 2. Confirm the **exact** signature header name and signed message against the
-   dashboard's own documentation for that account — especially for **Juspay**,
-   and for Razorpay's **`X-Razorpay-Event-Id`** header (absent, the adapter falls
-   back to a deterministic body hash as the event ID).
+   dashboard's own documentation for that account — especially for **Juspay**.
+   Razorpay's **`X-Razorpay-Event-Id`** header no longer affects behaviour beyond
+   what appears in the audit log: the idempotency key is derived from the **signed
+   body** regardless ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)).
 3. Deliver the **same** event twice and confirm the second answers `200` with
-   `"status":"duplicate"` and changes nothing.
+   `"status":"duplicate"` and changes nothing. For Razorpay, also redeliver the
+   identical body with a **different** `X-Razorpay-Event-Id`: that must also be a
+   `duplicate`, because the header is not the key.
 4. Confirm the plan/price/amount parameters against the account's real product
    catalogue — the adapters send what you configure and invent nothing.
 5. Confirm `sigild_billing_*` counters move as expected on `GET /metrics`.
@@ -673,7 +695,7 @@ entirely every billing path returns `501`.
 **Durability matters here.** Without `SIGILD_OPLOG_POSTGRES` the subscription
 store is **in-memory and non-durable**: subscriptions *and* the processed-event
 ledger are lost on restart, so a webhook redelivered across a restart **would be
-applied twice**. Only the Postgres backend enforces the `(provider, event_id)`
+applied twice**. Only the Postgres backend enforces the `(provider, dedup key)`
 idempotency key in the database, across processes and restarts. Configure
 Postgres before pointing any real provider at the endpoint. Billing adds **no
 second connection pool and no new dependency** — it reuses the op-log's existing
@@ -717,8 +739,13 @@ that carries a signature in a header. In any real deployment it **must** reach
   **confidentiality and endpoint authenticity**, not integrity of the payload.
 - **Juspay's `basic` scheme does NOT bind the body** — it is a shared credential
   in an `Authorization` header. Over plain HTTP it is both interceptable and
-  replayable with an arbitrary body. If you must use `basic`, the endpoint has to
-  be TLS-only; prefer `hmac` when the merchant dashboard offers it.
+  replayable with an arbitrary body. This is why `hmac` is the **default** and
+  `basic` is an explicit opt-in warned about at every boot; if you must use
+  `basic`, the endpoint has to be TLS-only. Note also that the
+  "idempotency key comes from signature-covered bytes" property
+  ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)) is
+  **vacuous under `basic`**: that scheme covers no bytes, so there is nothing for
+  it to be derived from.
 - The dev server speaks **plain HTTP**, and the local compose topology
   ([§9](#9-local-topology-check)) has **no real TLS** — so the dev configuration
   is for loopback experimentation only. Do not register a provider webhook

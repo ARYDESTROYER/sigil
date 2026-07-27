@@ -124,7 +124,24 @@ key material and no coins — see
 rejection** shared secret (a deterministic pseudo-random value derived from the
 private key, never an error), so decaps never leaks a distinguishable failure.
 
-Both primitives are **real but NOT YET AUDITED**. The **combined hybrid KEM
+Both primitives are **real but NOT YET AUDITED**.
+
+⚠️ **What "tested" means for the two post-quantum primitives — state this
+accurately, because it is easy to overstate.** **No official FIPS 203 / FIPS 204 /
+NIST ACVP known-answer vector is embedded in this repository** (see the closing
+notes in [`../libsigil/core/src/mlkem.rs`](../libsigil/core/src/mlkem.rs) and
+[`../libsigil/core/src/mldsa.rs`](../libsigil/core/src/mldsa.rs)): reproducing one
+requires the exact byte tuples, and fabricating them would be worse than not having
+them. What exists here is **round-trip, determinism, implicit-rejection and
+negative testing**; the **upstream RustCrypto `ml-kem` / `ml-dsa` crates** are the
+ones validated against the ACVP KATs. So correctness rests on those local tests
+**plus** that upstream vetting — **not** on our own FIPS/ACVP vector verification,
+and this is not a claim of NIST validation or certification, which has been neither
+sought nor granted. (Contrast the classical primitives and the OTP primitive, which
+**do** carry official RFC known-answer vectors: RFC 7748 for X25519, RFC 8032 for
+Ed25519, RFC 4226/6238 for HOTP/TOTP.)
+
+The **combined hybrid KEM
 `ss_combined` is now IMPLEMENTED** in
 [`libsigil/core/src/hybrid.rs`](../libsigil/core/src/hybrid.rs) as
 `hybrid_encapsulate` / `hybrid_decapsulate`, the combiner that composes the two

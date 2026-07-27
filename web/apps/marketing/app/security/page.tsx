@@ -5,58 +5,78 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 };
 
-// PRE-LAUNCH / PRE-AUDIT design note. This page documents the *intended*
-// cryptographic design, not a shipped or verified implementation. Every status
-// is qualified (designed / in development / pre-audit / unaudited / planned) so
-// nothing here reads as a present-tense security guarantee. See
+// PRE-LAUNCH / PRE-AUDIT engineering note. Several of these primitives are now
+// REALLY IMPLEMENTED in the pre-release codebase, so the old blanket "nothing is
+// implemented" line was false — an under-claim, but still false. Correcting it
+// must not tip into an over-claim, so every row keeps an explicit UNAUDITED
+// qualifier, nothing is described as shipped (no client is released), and the
+// page states outright that the system is NOT "post-quantum secure". See
 // MARKETING-CLAIMS.md: no "audited", no "SOC 2", no "post-quantum secure", no
-// unqualified "end-to-end encrypted".
+// unqualified "end-to-end encrypted" as a present-tense product claim.
 
 type Posture = {
   layer: string;
   primitive: string;
   status: string;
+  note: string;
 };
 
-// Intended design only. Order mirrors the layered design: secret derivation,
-// data encryption, key exchange (classical + PQ), signatures (classical + PQ),
-// then transport.
+// Order mirrors the layered design: secret derivation, data encryption, key
+// exchange (classical + PQ), signatures (classical + PQ), then transport.
+//
+// "Implemented" means exactly one thing here: the code exists in the pre-release
+// repository and its own test suite passes. It does NOT mean reviewed, released,
+// or certified.
 const rows: Posture[] = [
-  { layer: "KDF", primitive: "Argon2id", status: "Designed; in development; unaudited" },
+  {
+    layer: "KDF",
+    primitive: "Argon2id",
+    status: "Implemented; unaudited",
+    note: "Derives the vault key from a password.",
+  },
   {
     layer: "AEAD",
     primitive: "XChaCha20-Poly1305",
-    status: "Designed; in development; unaudited",
+    status: "Implemented; unaudited",
+    note: "Encrypts the vault. Every stored record is sealed with it.",
   },
   {
     layer: "Classical key exchange",
     primitive: "X25519",
-    status: "Designed; in development; unaudited",
+    status: "Implemented; unaudited",
+    note: "The classical half of the hybrid KEM below.",
   },
   {
     layer: "Post-quantum KEM",
     primitive: "ML-KEM-768 (FIPS 203)",
-    status: "Designed; planned; pre-audit",
+    status: "Implemented; unaudited; load-bearing",
+    note:
+      "Combined with X25519 into a hybrid KEM that wraps a vault key when a vault is shared to another device, so that path is designed to hold if either half survives.",
   },
   {
     layer: "Classical signature",
     primitive: "Ed25519",
-    status: "Designed; in development; unaudited",
+    status: "Implemented; unaudited",
+    note: "Authenticates a device's requests to the sync server.",
   },
   {
     layer: "Post-quantum signature",
     primitive: "ML-DSA-65 (FIPS 204)",
-    status: "Designed; planned; pre-audit",
+    status: "Implemented; unaudited; not yet in the authentication path",
+    note:
+      "Exists and round-trips, including as a hybrid Ed25519 + ML-DSA-65 signature. Device authentication still uses Ed25519 alone.",
   },
   {
     layer: "Transport",
     primitive: "TLS 1.3 (X25519MLKEM768)",
     status: "Designed; planned; unaudited",
+    note: "Not deployed — nothing is publicly hosted yet.",
   },
   {
     layer: "Current suite byte",
     primitive: "0x12",
-    status: "Designed; provisional; pre-audit",
+    status: "Implemented; provisional",
+    note: "The on-disk suite identifier may still change before launch.",
   },
 ];
 
@@ -67,28 +87,40 @@ export default function Security() {
         Cryptographic posture
       </h1>
       <p className="text-neutral-500">
-        Pre-launch design note, 2 June 2026. This describes the cryptographic
-        design we are <em>building toward</em>.
+        Pre-launch engineering note, updated 27 July 2026. This describes what
+        the code does today and what is still design intent.
       </p>
 
       <p>
-        Nothing below is implemented, shipped, or independently audited yet.
-        These are design intentions for a post-quantum-ready authenticator
-        (unaudited). Each primitive is listed with its current status; an
-        independent security audit is planned. Treat this as a roadmap, not a
-        guarantee.
+        Most of the primitives below are <strong>implemented</strong> in the
+        pre-release codebase and covered by its own tests, including the
+        post-quantum ones. That is the whole claim. None of it has been{" "}
+        <strong>independently reviewed</strong>, and none of it has shipped:
+        there is no released client, no public server, and no production data.
+        An independent security audit is planned, and until it completes nothing
+        here should be relied on. Do not store real two-factor secrets in a
+        pre-release build.
+      </p>
+
+      <p>
+        In particular: implementing ML-KEM-768 and ML-DSA-65 does{" "}
+        <em>not</em> make a system &ldquo;post-quantum secure&rdquo;, and we do
+        not claim that it does. The post-quantum KEM is used in hybrid with
+        X25519 precisely because a hybrid construction is the honest response to
+        a young standard — and the surrounding protocol, key management and
+        transport are still being built.
       </p>
 
       <section className="space-y-3">
         <h2 className="font-semibold text-neutral-900 dark:text-neutral-100">
-          Intended primitives and their status
+          Primitives and their status
         </h2>
         <div className="overflow-x-auto">
           <table className="w-full border-collapse text-left">
             <thead>
               <tr className="border-b border-neutral-300 text-xs uppercase tracking-wide text-neutral-500 dark:border-neutral-700">
                 <th className="py-2 pr-4 font-medium">Layer</th>
-                <th className="py-2 pr-4 font-medium">Intended primitive</th>
+                <th className="py-2 pr-4 font-medium">Primitive</th>
                 <th className="py-2 font-medium">Status</th>
               </tr>
             </thead>
@@ -104,7 +136,10 @@ export default function Security() {
                   <td className="py-2 pr-4 font-mono text-neutral-900 dark:text-neutral-100">
                     {row.primitive}
                   </td>
-                  <td className="py-2 text-neutral-500">{row.status}</td>
+                  <td className="py-2 text-neutral-500">
+                    {row.status}
+                    <span className="mt-1 block text-xs text-neutral-400">{row.note}</span>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -113,15 +148,17 @@ export default function Security() {
       </section>
 
       <p className="text-xs text-neutral-400">
-        Status vocabulary: <span className="font-medium">designed</span> (the
-        choice is made on paper),{" "}
-        <span className="font-medium">in development</span> (code is being
-        written), <span className="font-medium">planned</span> (not yet
-        started), <span className="font-medium">pre-audit</span> and{" "}
-        <span className="font-medium">unaudited</span> (no independent review has
-        confirmed any of it). Names like FIPS 203 / FIPS 204 identify the
-        standardized algorithm we intend to use; they are not a claim of
-        certification.
+        Status vocabulary:{" "}
+        <span className="font-medium">implemented</span> (the code exists in the
+        pre-release repository and its own tests pass — not that it is released
+        or reviewed), <span className="font-medium">load-bearing</span> (a
+        product flow already depends on it),{" "}
+        <span className="font-medium">designed</span> (the choice is made on
+        paper), <span className="font-medium">planned</span> (not yet started),
+        and <span className="font-medium">unaudited</span> (no independent review
+        has confirmed any of it). Names like FIPS 203 / FIPS 204 identify the
+        standardized algorithm implemented; they are not a claim of
+        certification, and no NIST validation has been sought or granted.
       </p>
     </main>
   );

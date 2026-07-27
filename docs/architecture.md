@@ -618,7 +618,15 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   ops routes — the subject is the **authenticated device ID**, never a body
   field) and `POST /v1/billing/webhook/{provider}` (authenticated **only** by the
   provider's own signature over the **raw** body, because a payment provider has
-  no device key). Webhook handling is **idempotent on `(provider, event_id)`**,
+  no device key). Webhook handling is **idempotent on `(provider, dedup key)`**,
+  where ⭐ **the dedup key is derived only from bytes the provider's signature
+  covers** — Stripe's event id is inside the signed payload, Razorpay's is
+  `SHA-256(raw body)` rather than the unsigned `X-Razorpay-Event-Id` header, and
+  Juspay's comes out of the body
+  ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md), which
+  revises §4 of [ADR 0034](decisions/0034-billing-provider-seam.md); Juspay's
+  default webhook scheme is `hmac` for the same reason, since `basic` binds no
+  bytes). It is
   fused with the state change into **one atomic operation** (a mutex in memory, a
   transaction in Postgres over migration **`0003_billing.sql`** —
   `sigil_subscriptions`, `sigil_billing_processed_events`; `sigild_schema_version`
@@ -867,6 +875,20 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI cannot be clicked by
   a test runner, so everything that could be wrong lives where a test can drive it.
+  ⭐ **Errors cross the IPC as a structured value, not a string (Phase 51):**
+  `CmdResult<T> = Result<T, IpcError>` where `IpcError { kind, message,
+  key_change? }`. `kind` is the coarse tag the webview branches on
+  (`unauthenticated` / `not authorized` / `route disabled` / `nothing there` /
+  `server unreachable` / `not enrolled` / `already enrolled` / `not a shared vault`
+  / `key changed`), and `key_change` is populated for **exactly one** kind —
+  `"key changed"` — carrying the device id and **both safety numbers** so the UI
+  can render the key-substitution alarm properly. It is **public material only**:
+  no key bytes, no seed, nothing secret gained a route across the boundary.
+  `From<String> for IpcError` keeps every existing `?` site unchanged. The
+  corresponding UI half is a blocking `role="alert"` panel in `desktop/ui` that
+  **disables share and rotate** and puts a confirm-guarded re-pin behind both
+  numbers — matching what the webapp and the extension already did, and reached
+  from the single central `call()` error path so no command can bypass it.
   It **reimplements nothing**: `sigil-desktop-core` path-depends on `sigil-core` **and
   on the `sigil-cli` library target**, taking the `SIGILcli` container
   (`seal_vault`/`open_vault`), the `TotpVault`/`TotpEntry` schema and
@@ -1308,6 +1330,19 @@ a mismatch aborts before any local or remote state is touched. The full step ord
 its crash-safety reasoning are in
 [`crypto-spec.md`](crypto-spec.md#vault-key-rotation--the-key-lifecycle).
 
+**All four client surfaces now SHOW the alarm, not just raise it (Phase 51).** The
+refusal always happened in the shared library; what differed was whether a user could
+see it. The webapp and the extension already blocked and explained; the desktop
+tagged the error and then let it expire as a seven-second toast, which is a control
+the user effectively does not have. It now renders a blocking `role="alert"` panel
+with both safety numbers and a confirm-guarded re-pin, fed by the structured
+`IpcError.key_change` described in the `desktop` component above. The refusal itself
+did not change — only its visibility — and the path that raises it gained its first
+regression test
+([`../desktop/core/tests/server_interop.rs`](../desktop/core/tests/server_interop.rs),
+which republishes a different hybrid key under the same device id against a real
+`sigild`).
+
 ⚠️ **Honest scope, because this is the security story people will read fastest:**
 pinning **cannot** protect first contact — if the server lies the very first time, the
 lie is what gets pinned, and only a human comparing the safety number out of band
@@ -1514,7 +1549,8 @@ authoritative list, with rationale, is the **defer ledger** in
 - **Billing exists in code but has never taken a payment, and lives in the wrong
   place on purpose.** `sigild` has a real **provider-agnostic billing seam**
   (Stripe / Razorpay / Juspay adapters, hosted checkout only, raw-body HMAC
-  webhook verification, an idempotent `(provider, event_id)` ledger, a
+  webhook verification, an idempotent ledger keyed on signature-covered bytes
+  ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)), a
   subscription state machine, migration `0003_billing.sql`;
   [ADR 0034](decisions/0034-billing-provider-seam.md)) — **opt-in, dev-gated,
   `501` by default, and UNAUDITED**. What it is **not**: it has **never been run

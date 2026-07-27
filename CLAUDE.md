@@ -320,12 +320,27 @@ public, make no security claims, until the audit completes and trademark clears.
   authenticated **ONLY by the provider's own signature over the RAW body** (a provider has no
   device key). Verification is **real**: Stripe `HMAC-SHA256("<t>.<raw body>")` from
   `Stripe-Signature` (5-minute tolerance both directions, EVERY `v1` element compared, legacy
-  `v0` ignored), Razorpay `HMAC-SHA256(raw body)` from `X-Razorpay-Signature` (+
-  `X-Razorpay-Event-Id`, else a deterministic body-hash id), Juspay either `basic`
-  (constant-time `Authorization: Basic`) or `hmac` (configurable header, default
-  `X-Juspay-Signature`) behind a swappable `juspayWebhookVerifier` seam — all constant-time
+  `v0` ignored), Razorpay `HMAC-SHA256(raw body)` from `X-Razorpay-Signature`, Juspay either
+  **`hmac` (the DEFAULT since Phase 51 — configurable header, default `X-Juspay-Signature`)**
+  or `basic` (constant-time `Authorization: Basic`, an **EXPLICIT OPT-IN**) behind a
+  swappable `juspayWebhookVerifier` seam — all constant-time
   (`hmac.Equal`/`subtle.ConstantTimeCompare`), verified over the RAW bytes BEFORE the JSON is
-  parsed, every failure a coarse 401. **IDEMPOTENCY** is keyed on `(provider, event_id)` and
+  parsed, every failure a coarse 401. ⭐ **IDEMPOTENCY (Phase 51, ADR 0039 — revising §4 of
+  ADR 0034): the dedup key MUST be derived only from bytes the provider's SIGNATURE COVERS.**
+  `billing.Event` gained `DedupKey` + `Event.IdempotencyKey()` (falls back to `ID`), and
+  `internal/api/billing.go` passes `EventID: ev.IdempotencyKey()`. Stripe sets
+  `DedupKey = env.ID` (its id is INSIDE the signed payload); **Razorpay ALWAYS sets
+  `DedupKey = "body-" + hex(SHA-256(rawBody))`** — Razorpay signs the BODY ONLY, so a
+  captured valid delivery replayed with a fresh **`X-Razorpay-Event-Id`** header still
+  verifies, and keying on that header made every replay look like a NEW event (an
+  attacker-driven, unbounded processed-events ledger); the header is now only a correlation
+  LABEL on `Event.ID`. Juspay derives its id from the BODY too — so the invariant holds under
+  `scheme=hmac` and is **VACUOUS under `scheme=basic`** (which authenticates the CONNECTION
+  and covers no bytes). That asymmetry is why `hmac` is now the default: `cmd/server`
+  requires `SIGILD_JUSPAY_WEBHOOK_SECRET` when the scheme is unset, choosing `basic` without
+  its credentials is a BOOT FAILURE whose message names what was given up, and a `basic` boot
+  logs a WARN naming the limitation EVERY start. Both schemes still fail CLOSED on an unset
+  secret. The key is
   **fused with the state change into ONE atomic op** (`SubscriptionStore.ApplyWebhookEvent`:
   one mutex in mem, one tx with `ON CONFLICT DO NOTHING` + `SELECT … FOR UPDATE` in Postgres),
   so a **duplicate delivery is a no-op that still answers 200** (outcomes
@@ -365,7 +380,8 @@ public, make no security claims, until the audit completes and trademark clears.
   is non-durable (a redelivery across a restart could double-apply); no rate limit on the
   webhook route; and **billing living inside `sigild` is PROVISIONAL** — a scaffold placement,
   not a final topology. Contract in [`docs/api.md`](docs/api.md), operator guide in
-  [`docs/deployment.md`](docs/deployment.md) §13; ADR 0034.
+  [`docs/deployment.md`](docs/deployment.md) §13; ADR 0034, **ADR 0039** (the dedup-key
+  invariant + the Juspay default).
 - `sigild/` **DEVICE-TO-DEVICE VAULT SHARING (Phase 46, ADR 0035)** — a **key relay**,
   behind the SAME dev gate + the SAME v3 auth choke points (`authenticateDevice` /
   `authorizeVault` / `authorizeOpsRequest`; there is **no new auth path**), in
@@ -424,6 +440,25 @@ public, make no security claims, until the audit completes and trademark clears.
   particular that `internal/auth` is **NOT** where the real auth lives (that is
   `internal/api/deviceauth.go` + `internal/store/devicestore.go`).
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
+  ⚠️ **Phase 51 corrected `app/security/page.tsx`, which was UNDER-claiming but still
+  FALSE.** It said "nothing below is implemented" and listed ML-KEM-768 / ML-DSA-65 as
+  "planned". Now Argon2id, XChaCha20-Poly1305, X25519, Ed25519, ML-KEM-768 and ML-DSA-65
+  read **"Implemented; unaudited"**; ML-KEM-768 is additionally **load-bearing** (combined
+  with X25519 into the hybrid KEM that wraps a vault key when a vault is shared);
+  ML-DSA-65 is **"implemented; not yet in the authentication path"** (device auth is still
+  Ed25519 alone); TLS `X25519MLKEM768` stays **"Designed; planned"**. A defined status
+  vocabulary pins what the words mean — **"implemented" = the code exists in the
+  pre-release repo and its own tests pass, NOT released and NOT reviewed** — and a
+  dedicated paragraph states that implementing ML-KEM/ML-DSA does **NOT** make a system
+  "post-quantum secure" and that we do not claim it does. ⚠️ **Premise correction, and an
+  invariant for anyone writing about the PQ primitives:** the audit finding claimed they
+  are "tested against FIPS vectors". **THAT IS FALSE IN THIS REPO** — `mlkem.rs:332` and
+  `mldsa.rs:335` state plainly that **NO official FIPS 203 / FIPS 204 / NIST ACVP
+  known-answer vector is embedded**; the **UPSTREAM RustCrypto crates** are ACVP-validated,
+  and our correctness rests on round-trip/determinism tests plus that upstream vetting.
+  The page therefore says the primitives are "covered by their own tests". **Never write
+  that we verify against FIPS/ACVP vectors.** Public copy still obeys
+  [`web/apps/marketing/MARKETING-CLAIMS.md`](web/apps/marketing/MARKETING-CLAIMS.md).
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — Next.js 15 app running the libsigil
   core via **WebAssembly, entirely client-side** (over the `@sigil/wasm` loader that
   wasm-packs the repo-root `sigil-wasm` crate for a bundler target; ADR 0027). Now a
@@ -1090,7 +1125,44 @@ public, make no security claims, until the audit completes and trademark clears.
   `sigil` pin are ONE record — no second pin store, no second safety-number
   implementation), exposing `DeviceConfig::{peer_safety_number, pairwise_safety_number,
   pins, repin_device, rotate_vault}`; a mismatch is `DesktopError::KeyPinMismatch`, tagged
-  across the IPC as **`"key changed"`**. Do NOT store real 2FA
+  across the IPC as **`"key changed"`**.
+  ⭐ **Phase 51 made that alarm VISIBLE — it was raised but barely shown.** Before:
+  `desktop/src-tauri/src/main.rs` tagged the error `"key changed"` but `desktop/ui/main.js`
+  had NO handler and NO re-pin control, so a refused share flashed a 7-second toast — while
+  the webapp and the extension both blocked and explained. A control the user cannot see is
+  a control they do not have. Now IPC errors cross as a **STRUCTURED value**:
+  `type CmdResult<T> = Result<T, IpcError>` where `IpcError { kind, message, key_change? }`;
+  `key_change` is populated for **exactly one kind** (`"key changed"`) and carries
+  `device_id` + `pinned_safety_number` + `presented_safety_number` — **PUBLIC material only,
+  no key bytes and no seed**. `From<String> for IpcError` keeps every existing `?` site
+  unchanged. `desktop/ui/{index.html,styles.css,main.js}` gained a `#pin-mismatch`
+  `role="alert"` block that **BLOCKS the share and rotate buttons**, prints both safety
+  numbers, and offers a `window.confirm`-guarded re-pin sending `expected` = the presented
+  number so the native side re-checks it; wording matches the webapp/extension. It is reached
+  from the single central `call()` error path, so every command's errors route through it,
+  and non-key-change errors still toast exactly as before. ⚠️ **The REFUSAL itself did not
+  change — only its visibility.** ⚠️ **Premise correction:** the audit finding that prompted
+  this ALSO claimed the desktop did not surface safety-number / pinned-key views; that clause
+  was WRONG — those views already existed and were NOT added. **The raising path also gained
+  its first regression test:** `desktop/core/tests/server_interop.rs`
+  `a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders` (the desktop was the
+  ONLY client whose key-substitution defence had no test; the browser side is covered by
+  `sigil-wasm/test/pinning-interop.mjs`). It boots a real sigild + the real `sigil` CLI, has
+  the CLI publish K1, shares (which PINS K1), then runs `sigil device hybrid-publish
+  --regenerate` so the SAME device id presents a DIFFERENT key — exactly what a hostile
+  server does, and deliberately indistinguishable from a legitimate re-enrolment — then
+  asserts the share is refused as `DesktopError::KeyPinMismatch` (not a generic error)
+  carrying both numbers in the 6-groups-of-5-digits shape the UI prints, that rotation is
+  refused too, that a re-pin to a WRONG number is refused and leaves the old pin standing,
+  and that only a deliberate re-pin to the presented number lets sharing resume.
+  MUTATION-TESTED: with the pin check in `cli/src/lib.rs` neutered to fail open it fails with
+  *"SHARED TO A SUBSTITUTED KEY — the pin check did not fire"*.
+  ⚠️ **A latent harness bug that new test exposed:** `Harness::start()` built its temp dir
+  from pid + `now_unix()` in **SECONDS**, and `cargo` runs the tests in that file in PARALLEL
+  threads of ONE process — so two harnesses starting in the same second got the SAME path and
+  the second one's `remove_dir_all` deleted the first one's state, surfacing as a baffling
+  "No such file or directory" in the OTHER test. Fixed with an `AtomicUsize` counter in the
+  directory name. Do NOT store real 2FA
   secrets. ADR 0032, ADR 0037, ADR 0038.
 - `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
   `extension/` and `desktop/` are now real — see above.)
@@ -1158,7 +1230,7 @@ grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplie
 go=/opt/homebrew/bin/go
 gofmt -l sigild            # must print nothing
 $go -C sigild vet ./...
-$go -C sigild test ./...
+$go -C sigild test -race ./...   # -race is the gate; CI (sigild.yml) runs -race too since Phase 51
 $go -C sigild build ./...
 
 # sigild container (multi-stage → distroless, ~14 MB) — needs the Docker daemon
@@ -1200,17 +1272,23 @@ corepack pnpm -C extension test               # `pretest` re-runs build.sh; 3 Pl
 # perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
 cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path desktop/Cargo.toml   # 15 unit tests + 2 integration tests
+cargo test  --manifest-path desktop/Cargo.toml   # 15 unit tests + 3 integration tests (2 files)
 grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
 # Integration test 1 is THE VAULT INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
 # builds the real `sigil` binary itself and drives it against ONE shared vault file in
 # both directions, so it needs no setup (~20 s: real Argon2id + a CLI build).
 cargo test  --manifest-path desktop/Cargo.toml --test cli_interop -- --nocapture
-# Integration test 2 is THE NETWORK PROOF (desktop/core/tests/server_interop.rs): it
-# builds a REAL sigild (go build ./cmd/server; GO=… overrides /opt/homebrew/bin/go) AND
-# the real `sigil` binary, boots sigild on a free loopback port with dev ops + device
-# auth v3, and proves desktop<->CLI sharing BOTH ways (94287082 each way) plus the
-# 403 / NotEnrolled / Unreachable negatives. No setup, no mocks (~40 s).
+# Integration test file 2 is THE NETWORK PROOF (desktop/core/tests/server_interop.rs) and
+# now holds TWO tests: it builds a REAL sigild (go build ./cmd/server; GO=… overrides
+# /opt/homebrew/bin/go) AND the real `sigil` binary, boots sigild on a free loopback port
+# with dev ops + device auth v3, and proves (a) desktop<->CLI sharing BOTH ways (94287082
+# each way) plus the 403 / NotEnrolled / Unreachable negatives, and (b) Phase 51's
+# KEY-SUBSTITUTION ALARM: a device republishes a DIFFERENT hybrid key under the SAME id
+# (`sigil device hybrid-publish --regenerate`), the share is refused as
+# DesktopError::KeyPinMismatch carrying BOTH safety numbers, rotation is refused too, a
+# re-pin to a WRONG number is refused, and only a deliberate re-pin resumes sharing.
+# No setup, no mocks (~40 s). The two tests run in PARALLEL threads of one process, which
+# is why Harness::start() now puts an AtomicUsize counter in its temp-dir name.
 cargo test  --manifest-path desktop/Cargo.toml --test server_interop -- --nocapture
 # The applicable build is cargo --release; `tauri build` (the .app bundler) has NOT
 # been run, and the binary is unsigned / unnotarized / undistributed.
@@ -1224,22 +1302,68 @@ cargo build --manifest-path desktop/Cargo.toml --release   # -> ~8.6 MB native b
 `workflow_dispatch`-only (no `push`/`pull_request` trigger) so nothing builds or
 publishes automatically while in stealth.
 
-**Every surface now has a CI job**: `libsigil.yml`, `cli.yml`, `sigild.yml`,
-`web.yml` (a Rust-free `build` job for marketing **plus** a `webapp` job carrying
-the Rust + wasm-pack toolchain), **`extension.yml`** (Rust + wasm toolchain →
-`extension/build.sh`, then the real-extension Playwright run in chromium), and
-**`desktop.yml`** (Rust + Tauri's Linux WebKitGTK system libs → fmt/clippy/test
-incl. the desktop↔CLI vault interop test, a release build, and a re-check that
-`libsigil/Cargo.lock` stays `getrandom`-free). ⚠️ Like the repo's other CI
-mirrors, the `webapp`/`extension`/`desktop` jobs are **validated locally only**
-(YAML-parsed; each step mirrors a known-green local command) — they have **not**
-been run on real GitHub Actions from this machine, and the Tauri Linux
-system-dependency list in `desktop.yml` is by-eye because the dev machine is macOS.
-⚠️ **Known CI gap after Phase 49:** `desktop.yml` runs a bare `cargo test`, which now
-also picks up `server_interop`, and that test builds `sigild` with the Go at
-**`/opt/homebrew/bin/go`** unless **`GO=`** is set — a path that does not exist on a
-GitHub runner. The workflow has **not** been updated (it is not a doc), so either point
-`GO` at the runner's Go or scope the CI test step before relying on that job.
+**Every surface, and the cross-surface interop suite, now has a CI job.** The full
+list of `.github/workflows/` (ten files):
+
+- **`libsigil.yml`** — the core workspace: rustfmt / clippy `-D warnings` / `cargo test
+  --all` / the `wasm32-unknown-unknown` build of `sigil-core`.
+- **`cli.yml`** — mirrors it for the standalone `cli/` crate: rustfmt / clippy / test /
+  build. ⚠️ **Neither of these two runs the `getrandom`==0 lockfile guard** — that check
+  lives only in **`desktop.yml`** and **`interop.yml`**. Coverage still exists (a `cli/**`
+  or `libsigil/**` change triggers `interop.yml`, which asserts `getrandom`==0 for BOTH
+  `libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock`), but do not assume the crate's own
+  job checks it — run the `grep -c 'name = "getrandom"'` command locally, as the Build &
+  test block above says.
+- **`sigild.yml`** — gofmt/vet/**`go test -race ./...`**/build, with a Postgres service
+  container (`SIGILD_TEST_POSTGRES`) so the integration tests run rather than skip.
+  ⚠️ `-race` since Phase 51: the local gate always ran `-race`, so CI was the WEAKER of
+  the two on a concurrent server whose op-log, nonce cache, rate limiter and subscription
+  store are all shared mutable state with concurrency tests aimed at them.
+- **`web.yml`** — a Rust-free `build` job for marketing **plus** a `webapp` job carrying
+  the Rust + wasm-pack toolchain (`@sigil/wasm` build + the Playwright suite).
+- **`extension.yml`** — Rust + wasm toolchain → `extension/build.sh`, then the
+  real-extension Playwright run in chromium.
+- **`desktop.yml`** — Rust + Tauri's Linux WebKitGTK system libs → fmt/clippy/test incl.
+  the desktop↔CLI vault interop test, a release build, and a re-check that
+  `libsigil/Cargo.lock` stays `getrandom`-free.
+- **`interop.yml`** (added in commit `5735f80`; **second job added in Phase 51**) — **the
+  cross-component suite, which until it existed ran in NO workflow at all.** Job 1
+  (`interop`) carries all three toolchains at once (Rust + wasm32 + `wasm-pack` /
+  `wasm-bindgen-cli@0.2.100`, Go, Node 22), runs the **`sigil-wasm` crate's own
+  fmt/clippy/test** — which had no CI gate either, and which includes the golden
+  `SIGILcli` / `SIGILhyb` header tests guarding the constants that MUST stay
+  byte-identical with `cli/src/lib.rs` — builds the bindings and the real `sigil`
+  binary, runs **all NINE Node interop tests** (roundtrip, interop, hybrid-interop,
+  sync-interop, totp-interop, migration-interop, device-auth-interop, sharing-interop,
+  pinning-interop), and re-asserts `getrandom`==0 in both lockfiles. Job 2
+  (`e2e-sharing`, Phase 51) runs **`cli/tests/e2e-sharing.sh`** — the tenth
+  cross-component proof and the only shell one, which was in the same position: run by
+  nothing. It needs Go + Rust + bash + curl + python3 and no wasm, so it is a separate,
+  parallel job. `e2e-sharing.sh` now resolves its Go as `$GO` → Homebrew → PATH (it
+  hardcoded the macOS Homebrew path), and the job sets `GO: go`.
+- **`security.yml`** — gitleaks (full history) + govulncheck + **cargo-audit across a
+  matrix of ALL FOUR Rust workspaces** (`libsigil`, `cli`, `sigil-wasm`, `desktop`;
+  Phase 51 — it audited `libsigil` only, which says nothing about the other three, and
+  `desktop/` pulls the whole Tauri tree, by far the largest dependency surface here).
+- **`release.yml`** — `workflow_dispatch`-only **and** deliberately **inert** (`if: false`
+  on its job); cosign/SLSA signing deferred. It builds and publishes nothing.
+- **`publish-sigild.yml`** — the manual, human-gated GHCR publish (see above).
+
+⚠️ Like the repo's other CI mirrors, the `webapp`/`extension`/`desktop`/`interop`/
+`security` jobs are **validated locally only** (YAML-parsed; each step mirrors a
+known-green local command) — they have **not** been run on real GitHub Actions from
+this machine, and the Tauri Linux system-dependency list in `desktop.yml` is by-eye
+because the dev machine is macOS.
+✅ **The "desktop CI cannot find Go" gap is CLOSED** (it was closed inside Phase 49 itself,
+after the journal entry that flagged it — this note was stale until Phase 51 corrected it).
+`desktop.yml` installs Go with `actions/setup-go@v5`, and `server_interop.rs`'s
+`resolve_go()` resolves **`$GO` → `go` on PATH → `/opt/homebrew/bin/go`**, and **PANICS
+rather than skipping** when Go is genuinely absent (a suite that silently skips reads green
+while proving nothing — a failure mode this repo has already been bitten by). `desktop.yml`
+still runs a bare `cargo test`, which now picks up **both** `server_interop` tests; that is
+intended. `desktop.yml` was **not** modified in Phase 51 (only `sigild.yml`, `security.yml`
+and `interop.yml` were). The separate `$GO` → Homebrew → PATH resolver added in Phase 51 is
+in **`cli/tests/e2e-sharing.sh`**, which had the macOS Homebrew path hardcoded.
 
 ## Conventions & guardrails
 

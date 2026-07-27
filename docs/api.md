@@ -130,9 +130,11 @@ cardinality blow-up, and no vault ID or device ID — a device-ID label would le
 scrape enumerate the registry — is exported). The endpoint performs **no
 cryptography** and reads no stored bytes; it only reports aggregate counts, and
 it never exposes a public key, an enrollment token or its digest, an admin
-token, a signature, or a nonce. The three **vault-sharing** counters follow the
-same rule: they are counts only, carrying no envelope byte, no hybrid public key,
-no vault key, and no vault or device ID as a label.
+token, a signature, or a nonce. The four **vault-sharing** counters
+(`sigild_device_hybrid_keys_published_total`, `sigild_vault_key_envelopes_total`,
+`sigild_vault_key_envelope_fetches_total`, `sigild_key_envelope_deletes_total`)
+follow the same rule: they are counts only, carrying no envelope byte, no hybrid
+public key, no vault key, and no vault or device ID as a label.
 
 Every **billing** label above comes from a **closed set materialized at startup**
 (the three provider names, the six outcomes, the five rejection reasons, the five
@@ -1606,8 +1608,8 @@ attacker could mutate the body freely).
 |----------|-------------------------------|----------------------------------|----------------|-----------------|
 | **Stripe** | `Stripe-Signature: t=<unix>,v1=<hex>[,v1=<hex>][,v0=…]` | `"<t>" + "." + RAW_BODY_BYTES` | HMAC-SHA256 keyed by the **endpoint signing secret** (`whsec_…`), lowercase hex | **yes** — `abs(now − t) ≤ 5 min` (`stripeDefaultTolerance`), checked in **both** directions |
 | **Razorpay** | `X-Razorpay-Signature: <hex>` | `RAW_BODY_BYTES` — no timestamp, no prefix, no separator | HMAC-SHA256 keyed by the dashboard **webhook secret**, lowercase hex | **none in the scheme** — replay is bounded only by our idempotency ledger |
-| **Juspay**, `scheme=basic` (default) | `Authorization: Basic base64(user:pass)` | *nothing* — this authenticates the **connection**, not the body | constant-time compare of both halves | none |
-| **Juspay**, `scheme=hmac` | `X-Juspay-Signature` (**name configurable** via `SIGILD_JUSPAY_WEBHOOK_SIG_HEADER`) | `RAW_BODY_BYTES` | HMAC-SHA256 keyed by `SIGILD_JUSPAY_WEBHOOK_SECRET`, lowercase hex | none |
+| **Juspay**, `scheme=hmac` (**default**) | `X-Juspay-Signature` (**name configurable** via `SIGILD_JUSPAY_WEBHOOK_SIG_HEADER`) | `RAW_BODY_BYTES` | HMAC-SHA256 keyed by `SIGILD_JUSPAY_WEBHOOK_SECRET`, lowercase hex | none |
+| **Juspay**, `scheme=basic` (**explicit opt-in only**) | `Authorization: Basic base64(user:pass)` | *nothing* — this authenticates the **connection**, not the body | constant-time compare of both halves | none |
 
 Details that matter:
 
@@ -1616,15 +1618,20 @@ Details that matter:
   rotation zero-downtime), with **no early exit**, so neither the number of
   candidates nor which matched is observable in timing. Legacy **`v0` elements
   are ignored**, never accepted — accepting them would be a downgrade path.
-- **Razorpay**: the event ID comes from the **`X-Razorpay-Event-Id`** header.
-  When it is absent, the adapter derives a **deterministic** ID
-  (`"body-" + hex(SHA-256(raw body))`) so a byte-identical redelivery still
-  deduplicates. *The header name is part of the unverified surface.*
+- **Razorpay**: the **idempotency key is derived from the signed body**, always —
+  `"body-" + hex(SHA-256(raw body))`. The **`X-Razorpay-Event-Id`** header is kept
+  only as a **correlation label** for the dashboard and the audit log, and is never
+  a security decision, because Razorpay's signature covers the body and nothing
+  else: a captured valid delivery replayed with a fresh header would otherwise
+  look like a new event ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)).
+  *The header name is part of the unverified surface.*
 - **Juspay, basic scheme — stated plainly**: HTTP Basic auth proves the caller
   knows a shared password; it does **not** prove the payload was not modified in
-  transit. Prefer `scheme=hmac` where the dashboard offers it; where only basic
-  is available the endpoint **must** be TLS-only and the credential treated as a
-  bearer secret.
+  transit, and anyone holding the credential can post any body. `hmac` is
+  therefore the **default**, and `basic` must be requested by name; where only
+  basic is available the endpoint **must** be TLS-only and the credential treated
+  as a bearer secret. `sigild` logs a `WARN` naming that limitation at every boot
+  under `scheme=basic`.
 - All comparisons use `hmac.Equal` / `subtle.ConstantTimeCompare`; a hex string
   that fails to decode is simply "not equal", so a malformed and a wrong
   signature are indistinguishable.
@@ -1696,8 +1703,22 @@ independent guards; both must pass.
 from a dashboard — so this is a documented behaviour to design for, not an edge
 case.
 
-The key is **`(provider, event_id)`**. Recording "we handled it" and applying the
-state change are **fused into one atomic operation**
+⭐ **The key is derived only from bytes the provider's signature covers**
+([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)). Nothing an
+attacker can vary while keeping a captured signature valid may feed it — otherwise
+a replay with one header changed is not a duplicate at all, and the guarantee
+above is false. Per provider:
+
+| Provider | Idempotency key | Why it is covered |
+|----------|-----------------|-------------------|
+| **Stripe** | the event id **inside** the JSON payload | the signed message is `"<t>.<raw body>"`, so the id is inside it |
+| **Razorpay** | **always** `"body-" + hex(SHA-256(raw body))` | the signature covers the body and nothing else, so a byte-identical body is exactly one event whatever the headers say |
+| **Juspay** | the id parsed out of the **body**, else `"body-" + hex(SHA-256(raw body))` | both forms come out of the body, never a header — so under `scheme=hmac` the key is signature-covered. ⚠️ Under `scheme=basic` the invariant is **vacuous**: that scheme covers no bytes at all |
+
+The key is therefore **`(provider, dedup key)`** — stored in the `event_id` column
+of the ledger, which is why the API and the schema still speak of an event id.
+Recording "we handled it" and applying the state change are **fused into one
+atomic operation**
 (`SubscriptionStore.ApplyWebhookEvent`): one mutex in the in-memory backend, one
 **transaction** in Postgres, where the ledger insert is
 `INSERT … ON CONFLICT (provider, event_id) DO NOTHING` and zero rows affected
@@ -1716,7 +1737,7 @@ The response `status` reports the verdict:
 |----------|---------|----------------|
 | `accepted` | fresh, legal, in order — applied | **yes** |
 | `ignored` | authentic but not a modeled event type | no |
-| `duplicate` | `(provider, event_id)` already processed — **the idempotency guarantee** | no |
+| `duplicate` | `(provider, dedup key)` already processed — **the idempotency guarantee** | no |
 | `stale` | predates the last applied event | no |
 | `illegal` | not a legal transition from the current status | no |
 | `unresolved` | no subject on the event and none resolvable from its subscription reference. **Deliberately not recorded as processed**, so a later event can establish the binding and this one can then be redelivered | no |
@@ -1782,9 +1803,9 @@ device auth, `500` on a store fault, `501` when billing is off.
 | `SIGILD_RAZORPAY_API_BASE_URL` | optional | API host override (default `https://api.razorpay.com`). |
 | `SIGILD_JUSPAY_MERCHANT_ID` / `SIGILD_JUSPAY_API_KEY` | **required for `juspay`** | Merchant ID (sent as `x-merchantid`) and API key (Basic-auth username, empty password). |
 | `SIGILD_JUSPAY_CLIENT_ID` | optional | Payment-page client ID. |
-| `SIGILD_JUSPAY_WEBHOOK_SCHEME` | optional | `basic` (default) or `hmac`. Any other value is a **boot error**. |
-| `SIGILD_JUSPAY_WEBHOOK_USERNAME` / `SIGILD_JUSPAY_WEBHOOK_PASSWORD` | **required for `scheme=basic`** | Endpoint Basic-auth credentials. |
-| `SIGILD_JUSPAY_WEBHOOK_SECRET` | **required for `scheme=hmac`** | HMAC key. |
+| `SIGILD_JUSPAY_WEBHOOK_SCHEME` | optional | **`hmac` (default)** or `basic`. Any other value is a **boot error**. `hmac` binds the body; `basic` authenticates only the **connection**, so it must be asked for by name and is warned about at every boot ([ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md)). |
+| `SIGILD_JUSPAY_WEBHOOK_SECRET` | **required for `scheme=hmac`, i.e. whenever the scheme is unset** | HMAC key. |
+| `SIGILD_JUSPAY_WEBHOOK_USERNAME` / `SIGILD_JUSPAY_WEBHOOK_PASSWORD` | **required for `scheme=basic`** | Endpoint Basic-auth credentials. Missing either is a **boot failure** whose message names what `basic` gives up. |
 | `SIGILD_JUSPAY_WEBHOOK_SIG_HEADER` | optional | Signature header name for `scheme=hmac` (default `X-Juspay-Signature`) — configurable **because the real name is unconfirmed**. |
 | `SIGILD_JUSPAY_AMOUNT_MINOR` | optional | Default amount in minor units (paise); rendered to the decimal major-unit string Juspay expects, by integer arithmetic only. |
 | `SIGILD_JUSPAY_CURRENCY` | optional | Default currency. |
@@ -1803,7 +1824,7 @@ Two tables on top of the untouched `0001_init` / `0002_devices`:
 | Table | Holds |
 |-------|-------|
 | `sigil_subscriptions` | `subject` (PK), `provider`, `customer_ref`, `subscription_ref`, `status`, `current_period_end`, `last_event_at` (the ordering guard), `created_at`, `updated_at`; partial index `sigil_subscriptions_by_provider_ref (provider, subscription_ref) WHERE subscription_ref <> ''` for subject resolution |
-| `sigil_billing_processed_events` | `(provider, event_id)` **PRIMARY KEY** — the idempotency key, enforced by the **database**, not by application timing — plus the **normalized** `event_type`, `subject`, `processed_at`; index `sigil_billing_processed_events_by_time (processed_at)` |
+| `sigil_billing_processed_events` | `(provider, event_id)` **PRIMARY KEY** — the idempotency key, enforced by the **database**, not by application timing. ⚠️ The `event_id` **column** holds the **dedup key** (`Event.IdempotencyKey()`), which for Razorpay is a body hash rather than the provider's own event id — the column name predates [ADR 0039](decisions/0039-webhook-idempotency-from-signed-bytes.md) and was not migrated. Plus the **normalized** `event_type`, `subject`, `processed_at`; index `sigil_billing_processed_events_by_time (processed_at)` |
 
 The migration is **pure DDL** and adds **no column that can hold a card number,
 CVV, expiry, cardholder name, billing address, email or phone**. What is stored
@@ -1827,7 +1848,7 @@ amount:
 |-------|--------|
 | `billing.checkout_created` | `request_id`, `provider`, `subject`, `session_id` |
 | `billing.checkout_failed` | `request_id`, `provider`, `subject`, `err` (a `ProviderError` carrying **only** provider + operation + HTTP status, or a transport error — never the provider's response body, which can echo customer data) |
-| `billing.webhook` | `request_id`, `provider`, `event_type` (normalized), `event_id` (so a `duplicate` is explainable), `outcome` |
+| `billing.webhook` | `request_id`, `provider`, `event_type` (normalized), `event_id` — the provider's own **correlation** id, so a `duplicate` is explainable in the dashboard; note it is **not** the idempotency key (see above) — and `outcome` |
 | `billing.webhook_rejected` | `request_id`, `provider`, `reason` — the fixed enum `unknown_provider` / `unreadable_body` / `payload_too_large` / `bad_signature` / `malformed` / `store_unavailable`, surfaced **only** here and in the metric, never to the caller |
 | `billing.subscription_transition` | `request_id`, `provider`, `subject`, `from`, `to` — fires **once per applied transition**, never for a duplicate/stale/illegal delivery, so the trail is a faithful history of entitlement |
 
@@ -1837,7 +1858,8 @@ amount:
   real webhook, no real payment. The Stripe scheme is implemented with **high**
   confidence, the Razorpay **webhook** scheme with high confidence and its
   surrounding details (notably the `X-Razorpay-Event-Id` header name and the
-  exact subscription event names) with **medium**; the **Juspay** adapter is
+  exact subscription event names) with **medium** — which is a further reason the
+  idempotency key no longer depends on that header at all; the **Juspay** adapter is
   explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD** — its header names, signed
   message, endpoint path, response envelope and event vocabulary are a
   best-supported reading and **must** be confirmed before use. That uncertainty

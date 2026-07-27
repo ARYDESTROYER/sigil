@@ -99,15 +99,55 @@ struct Export {
     lines: Vec<String>,
 }
 
-/// Errors cross the IPC as plain strings; they never contain secret material.
-type CmdResult<T> = Result<T, String>;
+/// Errors cross the IPC as a small STRUCTURED value; they never contain secret
+/// material (no password, no seed, no vault key — only ids, fingerprints and
+/// safety numbers, all of which are public).
+type CmdResult<T> = Result<T, IpcError>;
+
+/// What the webview receives when a command fails.
+///
+/// `kind` is a coarse, machine-readable tag the UI branches on; `message` is the
+/// human text. `key_change` is populated for EXACTLY ONE kind — `"key changed"`
+/// — and carries the two safety numbers the user has to compare, because a
+/// key-substitution alarm the UI cannot render properly is a control that does
+/// not exist.
+#[derive(Serialize)]
+struct IpcError {
+    kind: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_change: Option<KeyChange>,
+}
+
+/// The two safety numbers behind a `"key changed"` alarm. PUBLIC material only.
+#[derive(Serialize)]
+struct KeyChange {
+    device_id: String,
+    pinned_safety_number: String,
+    presented_safety_number: String,
+}
+
+impl From<String> for IpcError {
+    fn from(message: String) -> Self {
+        IpcError {
+            kind: "error",
+            message,
+            key_change: None,
+        }
+    }
+}
+
+/// A plain, untagged error message.
+fn msg(m: impl Into<String>) -> IpcError {
+    IpcError::from(m.into())
+}
 
 /// Render a core error for the UI, TAGGED with what the user can do about it.
 ///
 /// The tag is what lets the webview tell "sign in again" (401) from "ask the
 /// owner" (403) from "the server has this switched off" (501) from "you are
 /// offline" — all four are genuinely different situations.
-fn ipc(e: DesktopError) -> String {
+fn ipc(e: DesktopError) -> IpcError {
     let kind = match &e {
         DesktopError::Unreachable(_) => "server unreachable",
         DesktopError::Unauthenticated(_) => "unauthenticated",
@@ -123,7 +163,26 @@ fn ipc(e: DesktopError) -> String {
         DesktopError::Server { .. } => "server error",
         _ => "error",
     };
-    format!("{kind}: {e}")
+    // ⭐ The alarm carries STRUCTURE, not just prose: the UI must be able to put
+    // the pinned and presented safety numbers side by side and offer a
+    // deliberate re-pin. Both numbers are public.
+    let key_change = match &e {
+        DesktopError::KeyPinMismatch {
+            device_id,
+            pinned_safety_number,
+            presented_safety_number,
+        } => Some(KeyChange {
+            device_id: device_id.clone(),
+            pinned_safety_number: pinned_safety_number.clone(),
+            presented_safety_number: presented_safety_number.clone(),
+        }),
+        _ => None,
+    };
+    IpcError {
+        kind,
+        message: format!("{kind}: {e}"),
+        key_change,
+    }
 }
 
 /// Borrow the unlocked session or fail with a UI-friendly message.
@@ -150,7 +209,7 @@ fn sync_config(state: &State<'_, AppState>) -> CmdResult<DeviceConfig> {
         .map_err(|_| "sync state poisoned".to_string())?;
     guard
         .clone()
-        .ok_or_else(|| "no sync server configured: set one in the Sync panel first".to_string())
+        .ok_or_else(|| msg("no sync server configured: set one in the Sync panel first"))
 }
 
 /// Build a [`Status`] from whatever the state currently holds.
@@ -268,14 +327,14 @@ fn add_secret(
             digits,
             period,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| msg(e.to_string()))
     })
 }
 
 /// Add an account from an `otpauth://totp/...` URI.
 #[tauri::command]
 fn add_uri(uri: String, state: State<'_, AppState>) -> CmdResult<String> {
-    with_session(&state, |s| s.add_uri(&uri).map_err(|e| e.to_string()))
+    with_session(&state, |s| s.add_uri(&uri).map_err(|e| msg(e.to_string())))
 }
 
 /// Import a Google Authenticator `otpauth-migration://` URI, a single
@@ -296,7 +355,7 @@ fn import(text: String, state: State<'_, AppState>) -> CmdResult<Imported> {
 /// Remove one account by label.
 #[tauri::command]
 fn remove(label: String, state: State<'_, AppState>) -> CmdResult<()> {
-    with_session(&state, |s| s.remove(&label).map_err(|e| e.to_string()))
+    with_session(&state, |s| s.remove(&label).map_err(|e| msg(e.to_string())))
 }
 
 /// Export as `otpauth://` URIs. **Reveals the secrets in the clear** — the UI
@@ -652,7 +711,9 @@ fn rotate(
         .filter(|d| !d.is_empty())
         .collect();
     if recipients.is_empty() {
-        return Err("list every device that KEEPS access (usually including this one)".to_string());
+        return Err(msg(
+            "list every device that KEEPS access (usually including this one)",
+        ));
     }
     let config = sync_config(&state)?;
     let path = {

@@ -875,8 +875,13 @@ Any device with **read** access to the vault may see who else can reach it.
 ### Client support (the `sigil` CLI)
 
 The **`sigil` CLI implements contract v3** — it was the first client to speak it,
-covering four of the five device routes above (the **browser clients** now speak it
-too — see [below](#client-support-the-browser--node-clients)). Commands (see
+covering four of the five device routes above. **All four client surfaces now speak
+it**: the CLI, the webapp and the MV3 extension (see
+[below](#client-support-the-browser--node-clients)), and the **native desktop app**,
+which does not implement the contract at all but *links this CLI's library target* and
+calls `enroll_device` / `push_op_auth` / `pull_ops_auth` directly
+([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)) — so the
+canonical message has **three** implementations, not four. Commands (see
 [`../cli/src/main.rs`](../cli/src/main.rs)):
 
 | Command | Route it calls |
@@ -945,11 +950,15 @@ extended **additively** with one optional `opts.fetch` (defaulting to the global
 `fetch`) plus an additive `err.status`, so the **unauthenticated** dev path is
 behaviourally identical and the authenticated path simply injects the signer.
 
-**The canonical message layout now exists in three implementations** —
+**The canonical message layout exists in three implementations — and deliberately
+stopped there** —
 [`../sigild/internal/api/deviceauth.go`](../sigild/internal/api/deviceauth.go)
 (Go, the source of truth), [`../cli/src/lib.rs`](../cli/src/lib.rs) (Rust), and
 `device-auth.mjs` (JS: `canonicalV3Message` / `canonicalEnrollMessage` /
-`enrollTokenHash`) — and they **must stay byte-identical**; a one-byte drift does
+`enrollTokenHash`). The **native desktop client added no fourth copy**: it calls the
+Rust one through the `sigil-cli` library
+([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)). The three
+**must stay byte-identical**; a one-byte drift does
 not fail loudly, it just yields `401` on every request. That is what the interop
 tests guard: [`../sigil-wasm/test/device-auth-interop.mjs`](../sigil-wasm/test/device-auth-interop.mjs)
 boots a **real** sigild with `SIGILD_DEVICE_AUTH=1` and drives the JS client
@@ -1255,8 +1264,36 @@ cannot open, so the guard is
 [`../sigil-wasm/test/sharing-interop.mjs`](../sigil-wasm/test/sharing-interop.mjs),
 which boots a **real** sigild, builds the **real** `sigil` binary, and shares a vault
 **both ways** between the JS client and the CLI (both ends reaching the same key
-fingerprint and the same RFC 6238 code), plus the `403` negatives. The **desktop** client
-does **not** implement sharing yet.
+fingerprint and the same RFC 6238 code), plus the `403` negatives.
+
+### Client support (the native desktop app)
+
+The **desktop client was the last holdout, and no longer is**: `desktop/core/src/net.rs`
+implements enrollment, contract-v3 signed sync **and** sharing, so **all four client
+surfaces** (CLI, webapp, MV3 extension, native desktop) now drive these routes. It is
+the odd one out in *how*: rather than mirroring the protocol a fourth time it **links
+the `sigil-cli` library** and calls `publish_hybrid_key` / `fetch_hybrid_key`,
+`put_key_envelope` / `get_key_envelope`, `wrap_vault_key` / `unwrap_vault_key` and
+`grant_vault_access` — the same functions the `sigil` binary calls — behind
+`DeviceConfig::{enroll, publish_hybrid, push_vault, pull_vault, share_vault,
+accept_vault, status, check_server}` and eleven Tauri commands
+([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)). Consequences
+worth knowing when reading the rest of this document:
+
+- **There is no desktop HTTP client, signer or canonical message.** Everything on the
+  wire is produced by `sigil-cli`, so the desktop cannot drift from the CLI's bytes.
+- **Its state files are the CLI's files** — `device.key`, `device.hybrid`(`.pub`) and
+  `vault-keys.json`, mode `0600` in a `0700` state directory that defaults to
+  `$HOME/.sigil`. Point `sigil --key` (or `HOME`) at a desktop state directory and it is
+  the same device on this server.
+- **Contract selection is the CLI's rule**, unchanged: v3 when enrolled, legacy v2 for
+  an identity with no device id, unsigned with no identity.
+- **Proof:** [`../desktop/core/tests/server_interop.rs`](../desktop/core/tests/server_interop.rs)
+  boots a **real** sigild (dev-ops + device auth) and builds the **real** `sigil`
+  binary, and shares a vault **both ways** — desktop → CLI and CLI → desktop, each
+  reaching the same key fingerprint and the same RFC 6238 code — plus the `403` for an
+  unauthorized third device, a clear not-enrolled error rather than a panic, and a clear
+  unreachable error with the offline flow still generating codes.
 
 ### Honest limits (read before believing any of the above)
 
@@ -1278,9 +1315,11 @@ does **not** implement sharing yet.
 - **Request authentication is classical Ed25519** (contract v3). The wrap is
   PQ-hybrid; the signature over the request is not, and **the system is not
   "post-quantum secure"**.
-- **Client-side key storage is only as strong as its host.** The CLI's hybrid secret
-  and keyring are `0600` files; the browser clients seal both into the device-identity
-  container but hold them **unzeroized in JS memory** while the vault is unlocked.
+- **Client-side key storage is only as strong as its host, and differs per client.**
+  The CLI **and the native desktop app** keep the hybrid secret and the keyring in the
+  *same* `0600` plaintext files; the browser clients seal both into the device-identity
+  container (stronger at rest) but hold them **unzeroized in JS memory** while the vault
+  is unlocked. Nothing is zeroized on any client.
 
 ---
 

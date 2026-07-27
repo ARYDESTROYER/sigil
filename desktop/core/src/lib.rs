@@ -35,9 +35,24 @@
 //! Only the **sealed** container is ever written. The password is held in memory
 //! for the lifetime of a [`VaultSession`] and is best-effort zeroed on drop; it
 //! is never persisted, logged, or included in any returned value.
+//!
+//! # Talking to a server
+//!
+//! Everything network-facing — device enrollment, contract-v3 signed op-log
+//! sync, and device-to-device vault sharing — lives in [`net`] and is likewise
+//! **driven by the `sigil-cli` library**, not reimplemented. See that module for
+//! the reuse table and the on-disk secret model. A user with no server
+//! configured never touches any of it: the offline flow above is unchanged.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod net;
+
+pub use net::{
+    pull_and_adopt, DeviceConfig, DeviceStatus, PulledVault, ServerCheck, VaultKeyInfo,
+    DEVICE_IDENTITY_FILE, HYBRID_PUBLIC_FILE, HYBRID_SECRET_FILE,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -89,6 +104,39 @@ pub enum DesktopError {
     NotFound(PathBuf),
     /// An empty password was supplied.
     EmptyPassword,
+
+    // -- server-facing (see [`net`]) ------------------------------------
+    /// A contract-v3 operation was attempted before this device enrolled. The
+    /// path is where its identity file would live.
+    NotEnrolled(PathBuf),
+    /// Enrollment was attempted on a device that already has a device id. The
+    /// existing identity is never silently overwritten — that would destroy this
+    /// device's only credential.
+    AlreadyEnrolled(String),
+    /// A sharing operation was attempted on a vault this device holds no vault
+    /// key for: it is still password-sealed, or no share has been accepted. The
+    /// human password is never shared.
+    NotShared(String),
+    /// The server could not be reached at all (wrong URL, nothing listening,
+    /// no network). The local vault is unaffected — the app stays usable offline.
+    Unreachable(String),
+    /// HTTP 401: the server did not accept this device's credentials.
+    Unauthenticated(String),
+    /// HTTP 403: authenticated, but not permitted (not the owner, not granted,
+    /// or not the addressee of an envelope).
+    Forbidden(String),
+    /// HTTP 404: nothing is there — no published hybrid key, or nothing shared.
+    MissingOnServer(String),
+    /// HTTP 501: the server has that route switched off (sigild's sync and
+    /// device routes are dev-gated).
+    NotEnabled(String),
+    /// Any other non-2xx status from the server.
+    Server {
+        /// The HTTP status code.
+        status: u16,
+        /// A display message. Never contains key material.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for DesktopError {
@@ -101,6 +149,28 @@ impl std::fmt::Display for DesktopError {
             }
             DesktopError::NotFound(p) => write!(f, "no vault at {}", p.display()),
             DesktopError::EmptyPassword => write!(f, "password must not be empty"),
+            DesktopError::NotEnrolled(p) => write!(
+                f,
+                "this device is not enrolled ({} has no device id): enroll it with a server URL \
+                 and an enrollment token first",
+                p.display()
+            ),
+            DesktopError::AlreadyEnrolled(id) => write!(
+                f,
+                "this device is already enrolled as {id}; it will not be re-enrolled because that \
+                 would destroy its only credential"
+            ),
+            DesktopError::NotShared(v) => write!(
+                f,
+                "this device holds no vault key for {v:?}: convert the vault to a shared vault \
+                 (owner) or accept a share (recipient) first — your password is never shared"
+            ),
+            DesktopError::Unreachable(m)
+            | DesktopError::Unauthenticated(m)
+            | DesktopError::Forbidden(m)
+            | DesktopError::MissingOnServer(m)
+            | DesktopError::NotEnabled(m) => write!(f, "{m}"),
+            DesktopError::Server { message, .. } => write!(f, "{message}"),
         }
     }
 }

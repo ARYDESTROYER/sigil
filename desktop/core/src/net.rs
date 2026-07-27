@@ -1,0 +1,872 @@
+//! The server-facing half of the desktop column: enrollment, contract-v3
+//! authenticated sync, and device-to-device vault sharing.
+//!
+//! # STATUS: PRE-AUDIT — UNAUDITED — DEV / LOCALHOST / PLAIN HTTP
+//!
+//! # Reuse, not reimplementation
+//!
+//! There is **no HTTP client, no signing path and no canonical message** in this
+//! file. Every byte that goes on the wire is produced by the `sigil-cli`
+//! library, which the `sigil` binary itself uses:
+//!
+//! | what | reused from `sigil_cli` |
+//! |---|---|
+//! | enrollment (token + proof-of-possession) | [`enroll_device`] |
+//! | op-log push / pull, contract v3 signed | [`push_op_auth`] / [`pull_ops_auth`] |
+//! | hybrid public key publish / fetch | [`publish_hybrid_key`] / [`fetch_hybrid_key`] |
+//! | wrapped-key relay | [`put_key_envelope`] / [`get_key_envelope`] |
+//! | wrap / unwrap a vault key (X25519 + ML-KEM-768) | [`wrap_vault_key`] / [`unwrap_vault_key`] |
+//! | per-vault authorization | [`grant_vault_access`] |
+//! | identity, hybrid identity, keyring file formats | [`KeyFile`](sigil_cli::KeyFile), [`HybridSecretIdentity`](sigil_cli::HybridSecretIdentity), [`VaultKeyring`] |
+//!
+//! Because the file formats are the CLI's own types written by the CLI's own
+//! writers, the files this module creates are **byte-interchangeable with the
+//! `sigil` CLI**: point `sigil --key <file>` (or `HOME`) at a desktop state
+//! directory and the CLI is the same device.
+//!
+//! # Secrets on disk
+//!
+//! Native client, native model — the same one the CLI documents:
+//!
+//! | file | holds | mode |
+//! |---|---|---|
+//! | `<state>/device.key` | Ed25519 seed (SECRET) + assigned device id | `0600` |
+//! | `<state>/device.hybrid` | X25519 secret + ML-KEM keygen seed (SECRET) | `0600` |
+//! | `<state>/device.hybrid.pub` | public halves only | default |
+//! | `<state>/vault-keys.json` | vault id → 32-byte vault key (SECRET) | `0600` |
+//!
+//! all inside a `0700` state directory. **Nothing here ever prints, logs or
+//! returns a seed, a vault key or an enrollment token** — only SHA-256
+//! fingerprints (via [`vault_key_fingerprint`]) and opaque device ids.
+//!
+//! # The key model (it must match the CLI exactly or nothing interoperates)
+//!
+//! * a PERSONAL vault stays sealed under the human password;
+//! * a SHARED vault is sealed under a **random 32-byte vault key** — the
+//!   `SIGILcli` container takes arbitrary password bytes, so no format changes;
+//! * that key is wrapped **per recipient** with the PQ-hybrid seal and relayed
+//!   as opaque ciphertext. The human password is **never** shared or wrapped.
+
+use std::path::{Path, PathBuf};
+
+use sigil_cli::{
+    enroll_device, fetch_hybrid_key, generate_hybrid_identity, generate_key, generate_vault_key,
+    get_key_envelope, grant_vault_access, keyring_get, keyring_put, load_hybrid_public,
+    load_hybrid_secret, load_identity, load_key_file, load_keyring, publish_hybrid_key,
+    pull_ops_auth, push_op_auth, put_key_envelope, save_hybrid_public, save_hybrid_secret,
+    save_key, unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, CliError, DeviceIdentity,
+    RequestAuth, VaultKeyring, VAULT_KEYRING_FILE, VAULT_KEY_LEN,
+};
+
+use crate::{DesktopError, Result, VaultSession, STATE_DIR_NAME};
+
+/// File name of this device's Ed25519 identity — the CLI's default name, so the
+/// file is interchangeable with `sigil --key`.
+pub const DEVICE_IDENTITY_FILE: &str = "device.key";
+
+/// File name of this device's SECRET hybrid identity. Matches the CLI's rule
+/// (`device.key` with the extension replaced by `hybrid`).
+pub const HYBRID_SECRET_FILE: &str = "device.hybrid";
+
+/// File name of the shareable PUBLIC hybrid identity (the CLI appends `.pub`).
+pub const HYBRID_PUBLIC_FILE: &str = "device.hybrid.pub";
+
+// ---------------------------------------------------------------------------
+// View models — never any secret material
+// ---------------------------------------------------------------------------
+
+/// One shared vault this device holds a key for. The key itself is never in
+/// here; only a non-reversible fingerprint so two devices can prove they hold
+/// the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultKeyInfo {
+    /// The op-log vault id.
+    pub vault_id: String,
+    /// First 16 hex chars of SHA-256 of the vault key.
+    pub key_fingerprint: String,
+}
+
+/// Everything a UI can say about this device's server posture, read **purely
+/// from local disk** — [`DeviceConfig::status`] never touches the network, so it
+/// works offline and cannot fail because a server is down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceStatus {
+    /// The configured sigild base URL.
+    pub server: String,
+    /// The 0700 state directory holding the files below.
+    pub state_dir: PathBuf,
+    /// Path of the Ed25519 identity file.
+    pub identity_path: PathBuf,
+    /// Whether an identity file exists AND carries a server-assigned device id.
+    pub enrolled: bool,
+    /// The server-assigned device id, when enrolled. Opaque, not secret.
+    pub device_id: Option<String>,
+    /// Fingerprint of the Ed25519 PUBLIC key, when an identity exists.
+    pub device_fingerprint: Option<String>,
+    /// Whether a local hybrid identity exists. Use [`DeviceConfig::check_server`]
+    /// to confirm the *server* holds the published public half.
+    pub hybrid_identity_present: bool,
+    /// Fingerprint of the X25519 public half, when a hybrid identity exists.
+    pub hybrid_fingerprint: Option<String>,
+    /// Path of the local vault keyring.
+    pub keyring_path: PathBuf,
+    /// Which shared vaults this device holds keys for (fingerprints only).
+    pub vaults: Vec<VaultKeyInfo>,
+}
+
+/// The result of a best-effort server probe. Never an error for "the server is
+/// down" — that is reported as `reachable: false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCheck {
+    /// Whether sigild answered at all.
+    pub reachable: bool,
+    /// Whether the server holds this device's published hybrid public key.
+    pub hybrid_published: bool,
+    /// A short human-readable explanation, safe to display. Never secret.
+    pub detail: String,
+}
+
+/// One sealed container pulled back from the op-log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledVault {
+    /// The op-log sequence number of the container returned.
+    pub seq: u64,
+    /// The OPAQUE sealed bytes, exactly as the server returned them.
+    pub container: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Error mapping — a UI must be able to tell 401 from 403 from 501 from "down"
+// ---------------------------------------------------------------------------
+
+/// Translate a `sigil-cli` failure into a [`DesktopError`] a UI can act on,
+/// keeping the HTTP status distinctions the server actually makes.
+///
+/// `what` names the operation in progress; it never contains secret material.
+fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
+    match e {
+        CliError::Http(msg) => DesktopError::Unreachable(format!(
+            "could not reach the sync server at {server} while {what}: {msg}. \
+             Check the server URL, or work offline — your vault is on this machine."
+        )),
+        CliError::Server { status: 401, .. } => DesktopError::Unauthenticated(format!(
+            "the server rejected this device's credentials while {what} (HTTP 401). \
+             Enroll this device, check it has not been revoked, and make sure this \
+             machine's clock is within 300s of the server's."
+        )),
+        CliError::Server { status: 403, .. } => DesktopError::Forbidden(format!(
+            "this device is authenticated but not permitted while {what} (HTTP 403). \
+             Only the vault owner or a granted device may do this, and only the \
+             addressee may collect a key envelope."
+        )),
+        CliError::Server { status: 404, .. } => DesktopError::MissingOnServer(format!(
+            "nothing there while {what} (HTTP 404). The other device may not have \
+             published a hybrid key, or nothing has been shared to this device yet."
+        )),
+        CliError::Server { status: 501, .. } => DesktopError::NotEnabled(format!(
+            "the server has this route switched off while {what} (HTTP 501). \
+             sigild's sync and device routes are dev-gated."
+        )),
+        CliError::Server { status, body } => DesktopError::Server {
+            status,
+            message: format!("the server returned HTTP {status} while {what}: {body}"),
+        },
+        other => DesktopError::Vault(format!("{other} (while {what})")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeviceConfig
+// ---------------------------------------------------------------------------
+
+/// Where this device's server-facing state lives, and which server it talks to.
+///
+/// The file names deliberately match the `sigil` CLI's defaults, so a state
+/// directory written here is the CLI's `$HOME/.sigil` and vice versa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceConfig {
+    server: String,
+    state_dir: PathBuf,
+}
+
+impl DeviceConfig {
+    /// Point at `server`, keeping state in `state_dir` (created `0700` on first
+    /// write).
+    #[must_use]
+    pub fn new(server: impl Into<String>, state_dir: impl Into<PathBuf>) -> Self {
+        DeviceConfig {
+            server: server.into().trim().to_string(),
+            state_dir: state_dir.into(),
+        }
+    }
+
+    /// Point at `server` with the standard state directory `$HOME/.sigil` — the
+    /// SAME directory the `sigil` CLI uses.
+    #[must_use]
+    pub fn for_server(server: impl Into<String>) -> Self {
+        let dir = match std::env::var_os("HOME") {
+            Some(home) if !home.is_empty() => PathBuf::from(home).join(STATE_DIR_NAME),
+            _ => PathBuf::from(STATE_DIR_NAME),
+        };
+        Self::new(server, dir)
+    }
+
+    /// The configured server base URL.
+    #[must_use]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// The state directory.
+    #[must_use]
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Path of the Ed25519 device identity file (`0600`).
+    #[must_use]
+    pub fn identity_path(&self) -> PathBuf {
+        self.state_dir.join(DEVICE_IDENTITY_FILE)
+    }
+
+    /// Path of the SECRET hybrid identity file (`0600`).
+    #[must_use]
+    pub fn hybrid_secret_path(&self) -> PathBuf {
+        self.state_dir.join(HYBRID_SECRET_FILE)
+    }
+
+    /// Path of the shareable PUBLIC hybrid identity file.
+    #[must_use]
+    pub fn hybrid_public_path(&self) -> PathBuf {
+        self.state_dir.join(HYBRID_PUBLIC_FILE)
+    }
+
+    /// Path of the local vault keyring (`0600`).
+    #[must_use]
+    pub fn keyring_path(&self) -> PathBuf {
+        self.state_dir.join(VAULT_KEYRING_FILE)
+    }
+
+    // -- identity ---------------------------------------------------------
+
+    /// Load the device identity, or `None` when this device has no identity file
+    /// yet. The seed inside is SECRET and is never returned to a UI.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] if the file exists but is malformed.
+    pub fn identity(&self) -> Result<Option<DeviceIdentity>> {
+        let path = self.identity_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(load_identity(&path)?))
+    }
+
+    /// Load the identity and require that it has been ENROLLED (has a
+    /// server-assigned device id), which every contract-v3 route needs.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when there is no identity file, or it has
+    ///   no device id yet. This is the "clear error, not a panic" path.
+    fn enrolled_identity(&self) -> Result<DeviceIdentity> {
+        let path = self.identity_path();
+        let Some(identity) = self.identity()? else {
+            return Err(DesktopError::NotEnrolled(path));
+        };
+        if identity.device_id.is_none() {
+            return Err(DesktopError::NotEnrolled(path));
+        }
+        Ok(identity)
+    }
+
+    /// The auth to sign op-log requests with: contract v3 when enrolled, the
+    /// legacy v2 contract when an identity exists but is not enrolled, and
+    /// unsigned when there is no identity at all (the offline / no-auth dev
+    /// path, unchanged).
+    fn sync_auth(identity: &Option<DeviceIdentity>) -> RequestAuth<'_> {
+        match identity {
+            Some(id) => id.auth(),
+            None => RequestAuth::None,
+        }
+    }
+
+    // -- enrollment -------------------------------------------------------
+
+    /// ENROLL this device with sigild and persist the assigned device id into a
+    /// `0600` identity file inside a `0700` state directory.
+    ///
+    /// The Ed25519 key pair is generated locally on first enrollment and reused
+    /// if an un-enrolled identity file is already present; an ALREADY-enrolled
+    /// file is never silently overwritten (that would destroy this device's only
+    /// credential).
+    ///
+    /// `token` is a single-use BEARER SECRET: it is handed straight to
+    /// [`enroll_device`], never stored, never logged, and never returned.
+    ///
+    /// Returns the assigned device id (opaque, not secret).
+    ///
+    /// # Errors
+    /// - [`DesktopError::AlreadyEnrolled`] if this device already has a device id.
+    /// - [`DesktopError::Unauthenticated`] on a bad/spent token or failed proof.
+    /// - [`DesktopError::NotEnabled`] when the server's device model is off.
+    /// - [`DesktopError::Unreachable`] when the server cannot be reached.
+    pub fn enroll(&self, token: &str, label: &str) -> Result<String> {
+        if token.trim().is_empty() {
+            return Err(DesktopError::Vault(
+                "an enrollment token is required; ask the operator for one".to_string(),
+            ));
+        }
+        let path = self.identity_path();
+
+        // Reuse an un-enrolled key file; refuse to clobber an enrolled one.
+        let key_file = if path.exists() {
+            let existing = load_key_file(&path)?;
+            if let Some(id) = existing.device_id.as_ref().filter(|d| !d.is_empty()) {
+                return Err(DesktopError::AlreadyEnrolled(id.clone()));
+            }
+            existing
+        } else {
+            generate_key()?
+        };
+        let identity = key_file.decode()?;
+
+        let device = enroll_device(
+            &self.server,
+            token.trim(),
+            label,
+            &identity.public_key,
+            &identity.seed,
+        )
+        .map_err(|e| net_error(e, &self.server, "enrolling this device"))?;
+
+        ensure_state_dir(&self.state_dir)?;
+        let mut stored = key_file;
+        stored.device_id = Some(device.device_id.clone());
+        save_key(&path, &stored)?;
+        Ok(device.device_id)
+    }
+
+    /// PUBLISH this device's hybrid PUBLIC key so other devices can wrap a vault
+    /// key to it, creating the hybrid identity on first use.
+    ///
+    /// Only the public half is ever sent; the secret identity is written `0600`
+    /// and never leaves the machine. An existing secret is never regenerated —
+    /// that would orphan every envelope already addressed to this device.
+    ///
+    /// Returns the X25519 public key's fingerprint (never the key).
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::Forbidden`] when publishing into another device's slot.
+    /// - [`DesktopError::Unreachable`] / [`DesktopError::NotEnabled`] as above.
+    pub fn publish_hybrid(&self) -> Result<String> {
+        let identity = self.enrolled_identity()?;
+        let device_id = identity.device_id.clone().expect("enrolled");
+        let secret_path = self.hybrid_secret_path();
+        let public_path = self.hybrid_public_path();
+
+        let public = if secret_path.exists() {
+            if !public_path.exists() {
+                return Err(DesktopError::Vault(format!(
+                    "the hybrid secret {} exists but its public half {} is missing; restore it \
+                     rather than regenerating (a new hybrid identity would orphan every envelope \
+                     already addressed to this device)",
+                    secret_path.display(),
+                    public_path.display()
+                )));
+            }
+            load_hybrid_public(&public_path)?
+        } else {
+            ensure_state_dir(&self.state_dir)?;
+            let (secret, public) = generate_hybrid_identity()?;
+            save_hybrid_secret(&secret_path, &secret)?;
+            save_hybrid_public(&public_path, &public)?;
+            public
+        };
+
+        publish_hybrid_key(&self.server, &device_id, &public, &identity.auth()).map_err(|e| {
+            net_error(
+                e,
+                &self.server,
+                "publishing this device's hybrid public key",
+            )
+        })?;
+
+        Ok(vault_key_fingerprint(&public.decode()?.x25519_public_key))
+    }
+
+    // -- sync -------------------------------------------------------------
+
+    /// PUSH an OPAQUE sealed container to the op-log, contract-v3 signed when
+    /// this device is enrolled. The server never sees anything but ciphertext.
+    ///
+    /// Returns the sequence number the server assigned.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Unreachable`] / [`DesktopError::Unauthenticated`] /
+    ///   [`DesktopError::Forbidden`] / [`DesktopError::NotEnabled`].
+    pub fn push_vault(&self, vault_id: &str, container: &[u8]) -> Result<u64> {
+        let identity = self.identity()?;
+        let auth = Self::sync_auth(&identity);
+        push_op_auth(&self.server, vault_id, container, &auth)
+            .map_err(|e| net_error(e, &self.server, "pushing the sealed vault"))
+    }
+
+    /// [`DeviceConfig::push_vault`] over a sealed container file's bytes.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Io`] if the file cannot be read, plus the push errors.
+    pub fn push_vault_file(&self, vault_id: &str, path: &Path) -> Result<u64> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| DesktopError::Io(format!("could not read {}: {e}", path.display())))?;
+        self.push_vault(vault_id, &bytes)
+    }
+
+    /// PULL the LATEST sealed container for `vault_id` (ops with `seq > since`),
+    /// or `Ok(None)` when there is nothing new.
+    ///
+    /// Each op is a whole vault snapshot, so only the highest sequence matters.
+    ///
+    /// # Errors
+    /// Same as [`DeviceConfig::push_vault`].
+    pub fn pull_vault(&self, vault_id: &str, since: u64) -> Result<Option<PulledVault>> {
+        let identity = self.identity()?;
+        let auth = Self::sync_auth(&identity);
+        let ops = pull_ops_auth(&self.server, vault_id, since, &auth)
+            .map_err(|e| net_error(e, &self.server, "pulling the sealed vault"))?;
+        Ok(ops
+            .into_iter()
+            .max_by_key(|op| op.seq)
+            .map(|op| PulledVault {
+                seq: op.seq,
+                container: op.blob,
+            }))
+    }
+
+    // -- sharing ----------------------------------------------------------
+
+    /// The vault key this device holds for `vault_id`, if any. SECRET — this is
+    /// for opening a vault, never for display.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] if the keyring is malformed.
+    pub fn vault_key(&self, vault_id: &str) -> Result<Option<[u8; VAULT_KEY_LEN]>> {
+        Ok(keyring_get(&self.keyring_path(), vault_id)?)
+    }
+
+    /// SHARE a vault with another enrolled device: fetch that device's published
+    /// hybrid public key, WRAP this vault's key to it with fresh ephemeral
+    /// entropy, deposit the OPAQUE envelope, and GRANT access through the same
+    /// authorization API the CLI uses — so keys and permissions never drift.
+    ///
+    /// `permission` is `"read"` or `"write"`. The vault key never leaves this
+    /// machine unwrapped and is never printed; the returned fingerprint is what
+    /// the two devices compare.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::NotShared`] when this vault is still password-sealed
+    ///   (convert it first — the human password is NEVER shared).
+    /// - [`DesktopError::MissingOnServer`] when the recipient has published no
+    ///   hybrid key, [`DesktopError::Forbidden`] when this device may not write.
+    pub fn share_vault(&self, vault_id: &str, to_device: &str, permission: &str) -> Result<String> {
+        let identity = self.enrolled_identity()?;
+        let auth = identity.auth();
+
+        let key = self
+            .vault_key(vault_id)?
+            .ok_or_else(|| DesktopError::NotShared(vault_id.to_string()))?;
+
+        // 1) the recipient's PUBLIC hybrid key, straight from the registry
+        let recipient = fetch_hybrid_key(&self.server, to_device, &auth).map_err(|e| {
+            net_error(
+                e,
+                &self.server,
+                "fetching the recipient's hybrid public key",
+            )
+        })?;
+
+        // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce
+        let envelope = wrap_vault_key(&recipient, &key)?;
+
+        // 3) deposit the OPAQUE envelope; the server cannot read it
+        put_key_envelope(&self.server, vault_id, to_device, &envelope, &auth)
+            .map_err(|e| net_error(e, &self.server, "depositing the wrapped vault key"))?;
+
+        // 4) authorize through the EXISTING grant API
+        grant_vault_access(&self.server, vault_id, to_device, permission, &auth)
+            .map_err(|e| net_error(e, &self.server, "granting vault access"))?;
+
+        Ok(vault_key_fingerprint(&key))
+    }
+
+    /// ACCEPT a vault shared TO this device: collect the envelope addressed to
+    /// it, unwrap it with this device's hybrid SECRET identity, and record the
+    /// recovered key in the `0600` keyring.
+    ///
+    /// Returns the key's fingerprint — never the key.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::MissingOnServer`] when nothing has been shared here.
+    /// - [`DesktopError::Forbidden`] when this device may not read the vault.
+    /// - [`DesktopError::Vault`] when the envelope does not open (wrong device or
+    ///   tampered bytes); no plaintext is leaked.
+    pub fn accept_vault(&self, vault_id: &str) -> Result<String> {
+        let identity = self.enrolled_identity()?;
+        let device_id = identity.device_id.clone().expect("enrolled");
+        let auth = identity.auth();
+
+        let envelope = get_key_envelope(&self.server, vault_id, &device_id, &auth)
+            .map_err(|e| net_error(e, &self.server, "collecting the wrapped vault key"))?;
+
+        let secret_path = self.hybrid_secret_path();
+        if !secret_path.exists() {
+            return Err(DesktopError::Vault(format!(
+                "this device has no hybrid identity at {}; publish one before accepting a share \
+                 (only the hybrid secret can open an envelope addressed here)",
+                secret_path.display()
+            )));
+        }
+        let secret = load_hybrid_secret(&secret_path)?;
+        let key = unwrap_vault_key(&secret, &envelope)?;
+        keyring_put(&self.keyring_path(), vault_id, &key)?;
+        Ok(vault_key_fingerprint(&key))
+    }
+
+    // -- status -----------------------------------------------------------
+
+    /// Everything a UI shows about this device, read from LOCAL DISK ONLY.
+    /// Never touches the network, so it works with no server configured and
+    /// cannot fail because one is down. Fingerprints only — never a key.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] if a local state file is malformed.
+    pub fn status(&self) -> Result<DeviceStatus> {
+        let identity = self.identity()?;
+        let device_fingerprint = identity
+            .as_ref()
+            .map(|i| vault_key_fingerprint(&i.public_key));
+        let device_id = identity.as_ref().and_then(|i| i.device_id.clone());
+
+        let public_path = self.hybrid_public_path();
+        let hybrid_identity_present = self.hybrid_secret_path().exists();
+        let hybrid_fingerprint = if hybrid_identity_present && public_path.exists() {
+            let public = load_hybrid_public(&public_path)?;
+            Some(vault_key_fingerprint(&public.decode()?.x25519_public_key))
+        } else {
+            None
+        };
+
+        let keyring_path = self.keyring_path();
+        let keyring: VaultKeyring = load_keyring(&keyring_path)?;
+        let mut vaults = Vec::with_capacity(keyring.keys.len());
+        for vault_id in keyring.keys.keys() {
+            // Re-read through keyring_get so a malformed entry is reported
+            // rather than silently rendered.
+            let key_fingerprint = match keyring_get(&keyring_path, vault_id)? {
+                Some(key) => vault_key_fingerprint(&key),
+                None => "<unreadable>".to_string(),
+            };
+            vaults.push(VaultKeyInfo {
+                vault_id: vault_id.clone(),
+                key_fingerprint,
+            });
+        }
+
+        Ok(DeviceStatus {
+            server: self.server.clone(),
+            state_dir: self.state_dir.clone(),
+            identity_path: self.identity_path(),
+            enrolled: device_id.is_some(),
+            device_id,
+            device_fingerprint,
+            hybrid_identity_present,
+            hybrid_fingerprint,
+            keyring_path,
+            vaults,
+        })
+    }
+
+    /// Best-effort probe of the configured server: is it up, and does it hold
+    /// this device's published hybrid public key?
+    ///
+    /// A server that is down or has the routes disabled is reported, never
+    /// returned as an error — offline is a normal state for this app.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id (there
+    ///   is nothing to probe with).
+    pub fn check_server(&self) -> Result<ServerCheck> {
+        let identity = self.enrolled_identity()?;
+        let device_id = identity.device_id.clone().expect("enrolled");
+        match fetch_hybrid_key(&self.server, &device_id, &identity.auth()) {
+            Ok(_) => Ok(ServerCheck {
+                reachable: true,
+                hybrid_published: true,
+                detail: format!(
+                    "{} is reachable and holds this device's hybrid public key",
+                    self.server
+                ),
+            }),
+            Err(CliError::Server { status: 404, .. }) => Ok(ServerCheck {
+                reachable: true,
+                hybrid_published: false,
+                detail: format!(
+                    "{} is reachable but has no hybrid public key for this device yet",
+                    self.server
+                ),
+            }),
+            Err(e) => {
+                let mapped = net_error(e, &self.server, "checking the server");
+                Ok(ServerCheck {
+                    reachable: !matches!(mapped, DesktopError::Unreachable(_)),
+                    hybrid_published: false,
+                    detail: mapped.to_string(),
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VaultSession: the password -> vault-key transition, and opening a shared vault
+// ---------------------------------------------------------------------------
+
+impl VaultSession {
+    /// Convert this PASSWORD-sealed vault into a SHARED vault: draw a fresh
+    /// random 32-byte vault key, re-seal the SAME file under it, and record the
+    /// key in this device's `0600` keyring.
+    ///
+    /// This is the one-way door between the two key models and it is explicit —
+    /// an untouched password vault keeps working exactly as before. Afterwards
+    /// the session holds the vault KEY in place of the password, so subsequent
+    /// saves and pushes are already the shared ones. **The human password is
+    /// never shared, wrapped or uploaded.**
+    ///
+    /// Returns the key's fingerprint — never the key.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] on an RNG, seal or keyring failure.
+    /// - [`DesktopError::Io`] on a write failure.
+    pub fn convert_to_shared(&mut self, config: &DeviceConfig, vault_id: &str) -> Result<String> {
+        let key = generate_vault_key()?;
+        // Swap the sealing secret first, then save: `save` re-seals under
+        // `self.password`, so the file is rewritten under the new vault key.
+        let mut old = std::mem::replace(&mut self.password, key.to_vec());
+        // Best-effort scrub of the password we just stopped using.
+        for b in old.iter_mut() {
+            *b = 0;
+        }
+        self.save()?;
+        keyring_put(&config.keyring_path(), vault_id, &key)?;
+        Ok(vault_key_fingerprint(&key))
+    }
+
+    /// Unlock a SHARED vault file with the vault key this device holds for
+    /// `vault_id` (the `SIGILcli` container takes arbitrary secret bytes, so a
+    /// random key needs no format change).
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotShared`] when this device holds no key for that vault
+    ///   (convert it, or accept a share, first).
+    /// - [`DesktopError::NotFound`] / [`DesktopError::Vault`] as [`VaultSession::unlock`].
+    pub fn unlock_shared(
+        path: impl Into<PathBuf>,
+        config: &DeviceConfig,
+        vault_id: &str,
+    ) -> Result<Self> {
+        let key = config
+            .vault_key(vault_id)?
+            .ok_or_else(|| DesktopError::NotShared(vault_id.to_string()))?;
+        VaultSession::unlock(path, &key)
+    }
+}
+
+/// PULL the latest sealed container for `vault_id` and ADOPT it as the local
+/// vault at `path`, returning the freshly opened session and the op-log sequence
+/// it came from (or `Ok(None)` when the server had nothing newer).
+///
+/// The container is opened with this device's vault key BEFORE anything is
+/// written, so a container this device cannot read — or one the server mangled —
+/// can never clobber a good local vault.
+///
+/// # Errors
+/// - [`DesktopError::NotShared`] when this device holds no key for that vault.
+/// - The [`DeviceConfig::pull_vault`] errors, plus [`DesktopError::Vault`] when
+///   the pulled container does not open under this device's key.
+pub fn pull_and_adopt(
+    config: &DeviceConfig,
+    vault_id: &str,
+    path: &Path,
+    since: u64,
+) -> Result<Option<(VaultSession, u64)>> {
+    let key = config
+        .vault_key(vault_id)?
+        .ok_or_else(|| DesktopError::NotShared(vault_id.to_string()))?;
+
+    let Some(pulled) = config.pull_vault(vault_id, since)? else {
+        return Ok(None);
+    };
+
+    // Prove it opens under THIS device's key before it touches the disk.
+    sigil_cli::open_vault(&key, &pulled.container)?;
+    write_private_bytes(path, &pulled.container)?;
+
+    let session = VaultSession::unlock(path, &key)?;
+    Ok(Some((session, pulled.seq)))
+}
+
+/// Create the state directory `0700` if it is not there yet. It holds the device
+/// seed, the hybrid secret and the vault keyring.
+fn ensure_state_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    if dir.as_os_str().is_empty() || dir.exists() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| DesktopError::Io(format!("could not create {}: {e}", dir.display())))
+}
+
+/// Write opaque sealed bytes to `path` with mode `0600` via a temp file +
+/// rename, so an interrupted adopt cannot truncate a good vault.
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            ensure_state_dir(parent)?;
+        }
+    }
+    let tmp = path.with_extension("sigil.pull.tmp");
+    crate::write_private(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        DesktopError::Io(format!(
+            "could not move {} into place at {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    crate::set_mode(path, 0o600)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the OFFLINE half. Everything here runs with NO server in existence,
+// which is the point: a user who never configures one must be unaffected.
+// The full networked proof (a real sigild + the real `sigil` binary, both
+// directions, plus the 401/403/501/unreachable negatives) is
+// `tests/server_interop.rs`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sigil_core::Argon2Params;
+
+    const FAST: Argon2Params = Argon2Params {
+        m_cost: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    const PASSWORD: &[u8] = b"correct horse battery staple";
+    const RFC_SEED_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sigil-desktop-net-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    /// The file names must be the CLI's, or a desktop state directory is not the
+    /// same device as `sigil --key`.
+    #[test]
+    fn state_file_names_are_the_cli_defaults() {
+        let c = DeviceConfig::new("http://127.0.0.1:1", "/tmp/nowhere");
+        assert!(c.identity_path().ends_with("device.key"));
+        assert!(c.hybrid_secret_path().ends_with("device.hybrid"));
+        assert!(c.hybrid_public_path().ends_with("device.hybrid.pub"));
+        assert!(c.keyring_path().ends_with(VAULT_KEYRING_FILE));
+        assert_eq!(c.server(), "http://127.0.0.1:1");
+    }
+
+    /// `status` is a pure local read: it must succeed with nothing on disk and
+    /// never touch the network.
+    #[test]
+    fn status_with_no_state_is_empty_and_never_fails() {
+        let c = DeviceConfig::new("http://127.0.0.1:1", scratch("emptystatus"));
+        let s = c.status().expect("status");
+        assert!(!s.enrolled);
+        assert!(s.device_id.is_none() && s.device_fingerprint.is_none());
+        assert!(!s.hybrid_identity_present && s.hybrid_fingerprint.is_none());
+        assert!(s.vaults.is_empty());
+        assert!(!c.state_dir().exists(), "a read must not create state");
+    }
+
+    /// Every contract-v3 operation must refuse CLEARLY before it ever opens a
+    /// socket, so an un-enrolled user gets a message and not a hang or a panic.
+    #[test]
+    fn v3_operations_without_an_identity_report_not_enrolled() {
+        let c = DeviceConfig::new("http://127.0.0.1:1", scratch("notenrolled"));
+        for e in [
+            c.publish_hybrid().unwrap_err(),
+            c.share_vault("v", "dev_x", "read").unwrap_err(),
+            c.accept_vault("v").unwrap_err(),
+            c.check_server().unwrap_err(),
+        ] {
+            assert!(matches!(e, DesktopError::NotEnrolled(_)), "got {e:?}");
+            assert!(e.to_string().contains("not enrolled"), "{e}");
+        }
+    }
+
+    /// The password -> vault-key transition, entirely offline: the vault is
+    /// re-sealed under a random 32-byte key, the key lands in a 0600 keyring,
+    /// and the password no longer opens the file. The password is never stored.
+    #[test]
+    fn convert_to_shared_swaps_the_secret_and_records_a_0600_keyring() {
+        let dir = scratch("convert");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let config = DeviceConfig::new("http://127.0.0.1:1", &dir);
+        let path = dir.join("totp-vault.sigil");
+
+        let mut s = VaultSession::create(&path, PASSWORD)
+            .expect("create")
+            .with_params(FAST);
+        s.add_secret_base32("a", None, RFC_SEED_B32, "sha1", Some(8), Some(30))
+            .expect("add");
+
+        let fp = s.convert_to_shared(&config, "shared").expect("convert");
+        assert_eq!(fp.len(), 16, "a fingerprint, never the key");
+        assert_eq!(mode_of(&config.keyring_path()), 0o600);
+
+        // The session kept working under the new secret.
+        assert_eq!(s.entries_at(59).expect("codes")[0].code, "94287082");
+
+        // The password is now the WRONG secret; the vault key is the right one.
+        assert!(VaultSession::unlock(&path, PASSWORD).is_err());
+        let reopened =
+            VaultSession::unlock_shared(&path, &config, "shared").expect("unlock with the key");
+        assert_eq!(reopened.entries_at(59).expect("codes")[0].code, "94287082");
+
+        // ...and the status now lists it by fingerprint only.
+        let status = config.status().expect("status");
+        assert_eq!(status.vaults.len(), 1);
+        assert_eq!(status.vaults[0].vault_id, "shared");
+        assert_eq!(status.vaults[0].key_fingerprint, fp);
+
+        // A vault this device holds no key for is a clear NotShared, not a panic.
+        assert!(matches!(
+            VaultSession::unlock_shared(&path, &config, "other"),
+            Err(DesktopError::NotShared(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

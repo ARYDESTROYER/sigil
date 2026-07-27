@@ -60,7 +60,10 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > gives the webapp and the MV3 extension the same flow as the CLI, with the hybrid
 > secret identity and every accepted vault key stored inside the **sealed
 > device-identity container**, schema v2 — so a browser still persists only sealed
-> containers),
+> containers) **and by the native desktop client, which reaches the network by driving
+> the `sigil-cli` library rather than reimplementing enrollment, contract-v3 sync or
+> sharing — so all four client surfaces are peers and the canonical signed message still
+> exists in only three implementations**,
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -138,3 +141,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07) |
 | [0035](0035-device-to-device-vault-sharing.md) | Device-to-device vault sharing — random per-vault key sealed into the unchanged `SIGILcli` container, wrapped per device with `hybrid_seal` (X25519 + ML-KEM-768), relayed as an opaque envelope, authorized by the existing v3 grants | Accepted (2026-07) |
 | [0036](0036-browser-sharing-secret-storage.md) | Browser sharing-secret storage — keep the hybrid secret identity and the vault keyring inside the existing sealed device-identity container (schema bumped to v2, v1 still readable) rather than adding a new store | Accepted (2026-07) |
+| [0037](0037-desktop-reuses-cli-library-for-protocol.md) | The desktop client drives the `sigil-cli` library instead of reimplementing the wire protocol — no fourth copy of the canonical contract-v3 message, and the CLI's own state files | Accepted (2026-07) |

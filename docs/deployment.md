@@ -317,7 +317,11 @@ To avoid any over-claim, the honest gaps:
   `sigil device enroll|list|revoke|grant` against a `SIGILD_DEVICE_AUTH` server
   (**contract v3**, so a client exercises the device model end to end) — and so do the
   **webapp and the MV3 extension**, which since Phase 44 enroll and sign under the same
-  contract and since Phase 48 also drive the vault-sharing routes. All of it is
+  contract and since Phase 48 also drive the vault-sharing routes, and since Phase 49
+  the **native desktop app**, which does all three by calling the CLI's library rather
+  than reimplementing the protocol
+  ([`decisions/0037-desktop-reuses-cli-library-for-protocol.md`](decisions/0037-desktop-reuses-cli-library-for-protocol.md)).
+  All of it is
   **dev / localhost / plain HTTP, nothing deployed**. `libsigil`'s
   real-but-**unaudited** AEAD building block is **not wired into any product flow**.
   A **`web/apps/webapp`** Next.js app now exists — it runs the libsigil core via

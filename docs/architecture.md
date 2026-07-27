@@ -845,11 +845,17 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   `entries_at`/`entries_now`, `add_secret_base32`, `add_uri`, `import_text`,
   `remove`, `export_uris`, `export_migration_uri`, `save`), the `EntryView` /
   `ImportSummary` view models, `DesktopError`, `default_vault_path` and the
-  `BANNER_TITLE` / `BANNER_BODY` / `EXPORT_WARNING` constants — and is
+  `BANNER_TITLE` / `BANNER_BODY` / `EXPORT_WARNING` constants, plus the whole
+  server-facing half in `desktop/core/src/net.rs` (below) — and is
   `#![forbid(unsafe_code)]`; **`sigil-desktop`** (`desktop/src-tauri`) is a thin
-  shell holding a `Mutex<Option<VaultSession>>` and **ten `#[tauri::command]`s**
-  (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`,
-  `export_uris`, `export_migration`). `desktop/ui` is framework-free HTML/CSS/JS —
+  shell holding an `AppState { session: Mutex<Option<VaultSession>>, sync:
+  Mutex<Option<DeviceConfig>> }` and **twenty-one `#[tauri::command]`s** — the ten
+  offline ones (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`,
+  `import`, `remove`, `export_uris`, `export_migration`) plus **eleven added in
+  Phase 49** (`unlock_shared`, `set_server`, `sync_status`, `enroll`,
+  `publish_hybrid`, `check_server`, `convert_to_shared`, `push`, `pull`, `share`,
+  `accept`), each of which clones the `DeviceConfig` out of the mutex *before* any
+  network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI cannot be clicked by
   a test runner, so everything that could be wrong lives where a test can drive it.
   It **reimplements nothing**: `sigil-desktop-core` path-depends on `sigil-core` **and
@@ -885,12 +891,86 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   Proven by `desktop/core/tests/cli_interop.rs`, which builds the **real `sigil`
   binary** and drives it as a subprocess against **one shared vault file** in both
   directions, plus an RFC 6238 Appendix B KAT in `desktop/core/src/lib.rs` (`T=59` →
-  `94287082` at 8 digits, `287082` at 6). It is **dev / UNAUDITED**, **not signed, not
+  `94287082` at 8 digits, `287082` at 6).
+
+  **The desktop is no longer offline-only (Phase 49).** `desktop/core/src/net.rs`
+  adds device **enrollment**, **contract-v3 signed op-log sync**, and
+  **device-to-device vault sharing**, so all four client surfaces (CLI, webapp, MV3
+  extension, native desktop) are peers on the network. The operations are
+  `DeviceConfig` (`new` / `for_server`, which defaults the state directory to
+  `$HOME/.sigil` — the CLI's) with `enroll`, `publish_hybrid`, `push_vault` /
+  `push_vault_file`, `pull_vault`, `share_vault`, `accept_vault`, `status` and
+  `check_server`, plus `VaultSession::convert_to_shared` / `unlock_shared` and the
+  free function `pull_and_adopt`. Contract selection follows the CLI's rule
+  exactly: **v3 when enrolled**, legacy **v2** when an identity file has no device
+  id, **unsigned** when there is no identity at all.
+  ⭐ **The engineering point is reuse, not reimplementation, at the protocol layer
+  too** ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)):
+  `net.rs` imports **30 symbols from the `sigil-cli` library** in one `use` —
+  `enroll_device`, `push_op_auth` / `pull_ops_auth`, `publish_hybrid_key` /
+  `fetch_hybrid_key`, `put_key_envelope` / `get_key_envelope`, `wrap_vault_key` /
+  `unwrap_vault_key`, `grant_vault_access`, the key/identity/keyring readers and
+  writers, `RequestAuth`, `DeviceIdentity`, `CliError` — so **there is no HTTP
+  client, no signing path and no canonical-message construction anywhere under
+  `desktop/`** (grep-verified: zero copies of the v3 message domain, zero copies of
+  the enrollment-challenge domain, zero direct `ureq`/`reqwest`, zero direct
+  Ed25519 signing). The canonical signed bytes already exist in **three**
+  implementations — `sigild/internal/api/deviceauth.go` (Go, the source of truth),
+  `cli/src/lib.rs` (Rust) and `sigil-wasm/device-auth.mjs` (JS) — kept in sync only
+  by interop tests, so a **fourth copy was explicitly avoided**. What could *not*
+  be reused is app-level only, with no protocol or crypto in it: the CLI's
+  path-resolution and error-explanation helpers live in `cli/src/main.rs`, i.e. the
+  **binary**, so they are not importable; `DeviceConfig` therefore re-derives the
+  same file names and `net_error` maps `CliError` onto typed `DesktopError`
+  variants. **`cli/` was not edited.**
+  Because the CLI's own writers and file names are used, the desktop's state files
+  are **interchangeable with the CLI's**: `device.key` (Ed25519 seed + assigned
+  device id, `0600`), `device.hybrid` (X25519 secret + ML-KEM keygen seed, `0600`),
+  `device.hybrid.pub` (public halves), and `vault-keys.json` (vault id → 32-byte
+  vault key, `0600`), all inside a `0700` state directory — point `sigil --key` (or
+  `HOME`) at a desktop state directory and it is literally the same device.
+  Two deliberate shapes in the seam: **`status()` is purely local** (it reads disk
+  only, never opens a socket, so it renders with no server configured and cannot
+  fail because one is down), while **`check_server` reports reachability as data**
+  (`ServerCheck { reachable, hybrid_published, detail }`) rather than as an error;
+  and **`pull_and_adopt` opens the pulled container *before* writing it** (then
+  temp-file + rename, `0600`), so a container this device cannot read can never
+  clobber a good vault. Failures reach the UI tagged distinctly — `unauthenticated`
+  (401), `not authorized` (403), `route disabled` (501), `nothing there` (404),
+  `server unreachable`, `not enrolled`, `already enrolled`, `not a shared vault`.
+  **No seed, hybrid secret, vault key, password or enrollment token ever crosses
+  the IPC, is printed, or is logged** — only opaque device ids and 16-hex SHA-256
+  fingerprints; the enrollment token is a password-type field used for one call and
+  cleared in a `finally`, never stored.
+  ⚠️ **At-rest asymmetry worth stating plainly:** the desktop keeps those secrets as
+  **`0600` plaintext files** (the documented native model, identical to the CLI's),
+  whereas the **browser clients seal everything** into a `SIGILcli` container under
+  the vault password ([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)).
+  The browser clients are therefore **stronger at rest**; the native clients trade
+  that for OS file permissions. Nothing is zeroized on either side.
+  **The network proof** is `desktop/core/tests/server_interop.rs`, which boots a
+  **real `sigild`** (dev-ops + device auth) on a free loopback port and builds the
+  **real `sigil` binary**: the desktop enrolls (identity `0600` in a `0700` dir),
+  publishes its hybrid public key (secret `0600`, never uploaded), re-seals its
+  vault under a random 32-byte vault key so the password no longer opens it, pushes
+  it as seq 1 contract-v3 signed, and then **(a)** the real `sigil totp code`
+  prints `94287082` from that vault and **(b)** the desktop unwraps the CLI's key
+  and computes `94287082` from the CLI's vault — the RFC 6238 Appendix B vector,
+  with the clock pinned by `period = 1_600_000_000` so the TOTP counter equals
+  App B's `T = 59` counter from 2020 to 2071. The negatives are asserted too: an
+  enrolled but unauthorized third device is **403** on read and on accept, an
+  unenrolled desktop gets a clear `NotEnrolled` error rather than a panic, and with
+  the server unreachable there is a clear `Unreachable` error **and the offline flow
+  still generates codes**.
+
+  It is **dev / UNAUDITED**, **not signed, not
   notarized and not distributed** (`tauri build` was not run; the applicable build is
   `cargo build --release`), the **GUI is build-and-launch verified but not visually
-  verified** here, and there is **no sync, no device enrollment, no QR scanning, no
-  code verification and no hardened zeroization** in this column
-  ([ADR 0032](decisions/0032-native-desktop-client.md)).
+  verified** here (all behaviour lives in the headless core the tests drive), the
+  server side it talks to is **dev-gated, loopback, plain HTTP**, and there is still
+  **no QR scanning, no code verification and no hardened zeroization** in this column
+  ([ADR 0032](decisions/0032-native-desktop-client.md),
+  [ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)).
 
 ```
                          CLIENT SIDE  (all cryptography lives here)
@@ -948,12 +1028,15 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
      no sync, no background worker; dev / UNAUDITED; not published to any store.
    desktop (Tauri v2): the FIRST NATIVE client — sigil-core linked as a plain Rust
      dependency, NO wasm. sigil-desktop-core (headless logic, all the tests) +
-     sigil-desktop (shell: 10 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
+     sigil-desktop (shell: 21 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
      SIGILcli container + TotpVault schema + migration codec, and shares the CLI's
      $HOME/.sigil/totp-vault.sigil, so desktop and `sigil totp` drive ONE vault file.
-     Sealed-only persistence, in-memory password; webview does no crypto (capability
-     = core:default only); own workspace + Cargo.lock. Dev / UNAUDITED; unsigned,
-     unnotarized, not distributed.
+     Sealed-only vault persistence, in-memory password; webview does no crypto
+     (capability = core:default only); own workspace + Cargo.lock. Also enrolls,
+     syncs (contract v3) and shares vaults by DRIVING THE sigil-cli LIBRARY — no
+     second HTTP client, signer or canonical message — so its device.key /
+     device.hybrid / vault-keys.json (0600, in a 0700 dir) ARE the CLI's files.
+     Dev / UNAUDITED; unsigned, unnotarized, not distributed.
 ```
 
 ---
@@ -1086,18 +1169,25 @@ recipient with the public-key path above.
         └──────────▶  A and B now generate the SAME code from the SAME vault.
 ```
 
-**This is not a CLI-only flow.** The diagram labels the CLI commands because the CLI is
-the reference client, but the **webapp and the MV3 extension perform the identical
-sequence** through [`../sigil-wasm/sharing.mjs`](../sigil-wasm/sharing.mjs)
-(`publishHybridKey` → `generateVaultKey` → `shareVault` → `acceptVault`), against the
-same routes with the same v3 signatures. Either end of the diagram can be a browser or
-the CLI, and the two interoperate in both directions — proven with no mocks by
-[`../sigil-wasm/test/sharing-interop.mjs`](../sigil-wasm/test/sharing-interop.mjs),
-which shares a vault from the JS client to the **real `sigil` binary** and back, both
-sides reaching the same vault-key fingerprint and the same RFC 6238 code. The browser
+**This is not a CLI-only flow — all four clients perform it.** The diagram labels the
+CLI commands because the CLI is the reference client, but the **webapp and the MV3
+extension perform the identical sequence** through
+[`../sigil-wasm/sharing.mjs`](../sigil-wasm/sharing.mjs)
+(`publishHybridKey` → `generateVaultKey` → `shareVault` → `acceptVault`), and the
+**native desktop app** performs it through `desktop/core/src/net.rs`
+(`publish_hybrid` → `convert_to_shared` → `share_vault` → `accept_vault`), which
+**calls the `sigil-cli` library functions the CLI itself uses** rather than
+reimplementing them ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)).
+All of them hit the same routes with the same v3 signatures, so either end of the
+diagram can be a browser, the CLI or the desktop — proven with no mocks by
+[`../sigil-wasm/test/sharing-interop.mjs`](../sigil-wasm/test/sharing-interop.mjs)
+(JS ↔ the **real `sigil` binary**) and
+[`../desktop/core/tests/server_interop.rs`](../desktop/core/tests/server_interop.rs)
+(desktop ↔ the real `sigil` binary against a real `sigild`), each direction reaching
+the same vault-key fingerprint and the same RFC 6238 code. The browser
 clients keep the recovered key inside their **sealed v2 device-identity container**
-([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)) where the CLI uses a
-`0600` keyring file.
+([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)) where the CLI and the
+desktop app use the same `0600` keyring file.
 
 **The zero-knowledge boundary is unchanged — and this is the sharpest test of it.**
 The server relays *key* material and still cannot use it: it has no decapsulation
@@ -1257,8 +1347,10 @@ authoritative list, with rationale, is the **defer ledger** in
   ([ADR 0032](decisions/0032-native-desktop-client.md)) — but it is **dev /
   UNAUDITED**, **unsigned, unnotarized and undistributed** (no `.app` bundle was
   built), its **GUI has not been visually verified** here (all behaviour is proven
-  through the headless `sigil-desktop-core` crate and its CLI-interop test), and it
-  has **no sync, no device enrollment, no QR scanning and no code verification**. The
+  through the headless `sigil-desktop-core` crate and its interop tests), and while it
+  now enrolls, syncs and shares like the other clients, it does so only against a
+  **dev-gated, loopback, plain-HTTP** server and still has **no QR scanning and no code
+  verification**. The
   **mobile** clients (iOS/Android/watch) and the other desktop platforms
   (Windows/Linux) remain **unbuilt**; native apps outside this repo consume `libsigil`
   as a versioned artifact, and the admin console is still a reserved directory. The
@@ -1294,10 +1386,13 @@ authoritative list, with rationale, is the **defer ledger** in
   extension ambitions (phishing protection, passkey provider, content scripts).
   **Both browser clients can now authenticate as enrolled devices** against a dev
   `SIGILD_DEVICE_AUTH` server ([ADR 0033](decisions/0033-browser-device-identity-storage.md)),
-  which closes the auth story across the CLI + browser clients — but the **native
-  `desktop/` client still has no sync and no device enrollment**, the enrollment UI in
-  both browser clients is **not** covered by a Playwright test, and none of this is TLS,
-  an account model, or audited.
+  and since Phase 49 the **native `desktop/` client enrolls, syncs under contract v3 and
+  shares vaults too** — by driving the `sigil-cli` library rather than duplicating the
+  protocol ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)) — so
+  the auth story is closed across **all four** client surfaces. But the enrollment UI in
+  both browser clients is **not** covered by a Playwright test, the desktop's GUI is
+  build-and-launch verified rather than visually verified (its behaviour is proven in the
+  headless core), and none of this is TLS, an account model, or audited.
 - **Auth and authorization now exist for the dev op-log, but no account model
   does.** The op-log is still **wide open by default**. Two opt-in contracts
   change that: legacy `SIGILD_OPLOG_PUBKEY` (a **single static** Ed25519 dev key,

@@ -382,9 +382,13 @@ audited; see the status note below.)
   **same vault file as the CLI** (`$HOME/.sigil/totp-vault.sigil`): add an account in
   the app and `sigil totp code` prints it, and vice versa. Only the sealed container is
   stored; the password stays in memory. Its own cargo workspace, so the wasm-pure core
-  is untouched ([ADR 0032](docs/decisions/0032-native-desktop-client.md)). **Dev,
+  is untouched ([ADR 0032](docs/decisions/0032-native-desktop-client.md)). It now also
+  **enrolls as a device, syncs its sealed vault and shares vaults** like the other
+  clients — by calling the CLI's own library rather than reimplementing the protocol
+  ([ADR 0037](docs/decisions/0037-desktop-reuses-cli-library-for-protocol.md)), against a
+  dev-gated loopback server. **Dev,
   UNAUDITED, unsigned, unnotarized and not distributed** — no installer was built, and
-  there is no sync, no device enrollment and no QR scanning. Do not store real 2FA
+  there is no QR scanning. Do not store real 2FA
   secrets.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
@@ -406,7 +410,7 @@ libsigil/        Rust crypto core (workspace: core + ffi)
 sigild/          Go sync server (cmd/server, cmd/worker-*, internal/*)
 web/             Next.js marketing + webapp (in-browser wasm authenticator) + @sigil/wasm loader (admin reserved), pnpm workspace
 extension/       MV3 browser extension — popup TOTP authenticator over the wasm (dev, unpublished)
-desktop/         Tauri v2 native desktop authenticator — libsigil linked natively, shares the CLI's vault (dev, unsigned)
+desktop/         Tauri v2 native desktop authenticator — libsigil linked natively, shares the CLI's vault, syncs + shares via the CLI's library (dev, unsigned)
 cli/             Rust demo CLI — `sigil` seals/opens a file via libsigil (pre-audit)
 sigil-wasm/      Rust wasm-bindgen binding — in-browser seal/open demo over the core (pre-audit)
 deploy/          terraform / nomad / caddy / systemd + local/ (loopback smoke) + preflight.sh
@@ -414,10 +418,10 @@ docs/            architecture, threat model, crypto spec, op-log API, sprint pla
 docs/decisions/  Architecture Decision Records (ADRs)
 ```
 
-All four clients that talk to the dev sync server — the `sigil` CLI, the `sigil-wasm`
-JS client, `web/apps/webapp` and the MV3 extension — can now **enroll and authenticate
-as devices** against a `SIGILD_DEVICE_AUTH` dev server (loopback plain HTTP, no TLS,
-UNAUDITED; the native `desktop/` app still has no sync).
+Every client in this repo — the `sigil` CLI, the `sigil-wasm` JS client,
+`web/apps/webapp`, the MV3 extension and the native `desktop/` app — can now **enroll
+and authenticate as devices, sync, and share vaults** against a `SIGILD_DEVICE_AUTH` dev
+server (loopback plain HTTP, no TLS, UNAUDITED).
 
 One native client now lives **in this repo** — `desktop/`, which links `libsigil`
 directly as a Rust dependency. The remaining native platform clients
@@ -449,7 +453,9 @@ cargo test  --manifest-path sigil-wasm/Cargo.toml   # native *_inner unit tests
 ./sigil-wasm/build-wasm.sh && node sigil-wasm/test/roundtrip.mjs   # browser/Node round-trip
 
 # Native desktop app (separate workspace; Tauri v2, no wasm toolchain needed)
-cargo test  --manifest-path desktop/Cargo.toml     # incl. the desktop <-> CLI vault interop proof
+# The suite builds the real `sigil` binary AND a real sigild itself: it proves the
+# shared vault file interoperates, and that the desktop enrolls/syncs/shares as a peer.
+cargo test  --manifest-path desktop/Cargo.toml     # incl. the CLI vault + live-server interop proofs
 cargo build --manifest-path desktop/Cargo.toml --release
 
 # Go sync server

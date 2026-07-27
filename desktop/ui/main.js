@@ -198,6 +198,170 @@ $("export-uris-btn").addEventListener("click", () => reveal("export_uris"));
 $("export-migration-btn").addEventListener("click", () => reveal("export_migration"));
 
 // ---------------------------------------------------------------------------
+// Sync & sharing
+//
+// Still dumb: this panel names a server, a vault id and a device id, and shows
+// FINGERPRINTS the native side computed. It never sees a seed, a vault key or a
+// wrapped envelope, and the enrollment token it collects is passed straight
+// across the IPC once and then cleared from the DOM -- it is never stored here.
+// ---------------------------------------------------------------------------
+
+/** Read the vault id the sync/share actions operate on. */
+function vaultId() {
+  const id = $("sync-vault-id").value.trim();
+  if (!id) toast("enter a vault id first", true);
+  return id;
+}
+
+/** Render the device facts table. Values are fingerprints and ids, never keys. */
+function applySync(sync) {
+  $("sync-state").textContent = !sync.configured
+    ? "off"
+    : sync.enrolled
+      ? "enrolled"
+      : "not enrolled";
+  if (sync.configured && $("server-url").value.trim() === "") {
+    $("server-url").value = sync.server;
+  }
+  $("enroll-block").hidden = !sync.configured;
+  $("vault-block").hidden = !sync.configured;
+  $("share-block").hidden = !sync.configured;
+
+  const dl = $("device-facts");
+  dl.textContent = "";
+  const put = (key, value, dim = false) => {
+    const dt = document.createElement("dt");
+    dt.textContent = key;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (dim) dd.className = "off";
+    dl.append(dt, dd);
+  };
+
+  if (!sync.configured) {
+    put("server", "none — this app is offline and stays offline", true);
+    return;
+  }
+  put("server", sync.server);
+  put("state", sync.state_dir);
+  put("device id", sync.device_id ?? "not enrolled yet");
+  if (sync.device_fingerprint) put("device key", `sha256 ${sync.device_fingerprint}`);
+  put(
+    "hybrid key",
+    sync.hybrid_identity_present
+      ? `sha256 ${sync.hybrid_fingerprint ?? "?"}`
+      : "not created yet",
+    !sync.hybrid_identity_present
+  );
+  put(
+    "shared vaults",
+    sync.vaults.length === 0
+      ? "none"
+      : sync.vaults.map((v) => `${v.vault_id} (sha256 ${v.key_fingerprint})`).join("\n"),
+    sync.vaults.length === 0
+  );
+}
+
+async function refreshSync() {
+  applySync(await call("sync_status"));
+}
+
+$("server-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const sync = await call("set_server", { server: $("server-url").value });
+  applySync(sync);
+  toast(sync.configured ? `server set to ${sync.server}` : "server cleared — offline");
+});
+
+$("check-server-btn").addEventListener("click", async () => {
+  const probe = await call("check_server");
+  toast(probe.detail, !probe.reachable);
+});
+
+$("enroll-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const field = $("enroll-token");
+  const token = field.value;
+  if (!token) return;
+  try {
+    const deviceId = await call("enroll", { token, label: $("enroll-label").value });
+    toast(`enrolled as ${deviceId}`);
+  } finally {
+    field.value = ""; // never keep the token in the DOM
+  }
+  await refreshSync();
+});
+
+$("publish-hybrid-btn").addEventListener("click", async () => {
+  const fp = await call("publish_hybrid");
+  toast(`hybrid public key published (sha256 ${fp}) — the secret half never left this machine`);
+  await refreshSync();
+});
+
+$("convert-btn").addEventListener("click", async () => {
+  const id = vaultId();
+  if (!id) return;
+  if (
+    !window.confirm(
+      `Re-seal this vault under a random vault key for "${id}"?\n\n` +
+        "This is one-way: afterwards the vault opens with that key, not your " +
+        "password. Your password is never shared or uploaded."
+    )
+  )
+    return;
+  const fp = await call("convert_to_shared", { vaultId: id });
+  toast(`shared vault ready (key sha256 ${fp}) — the key itself is never shown`);
+  await refreshSync();
+});
+
+$("push-btn").addEventListener("click", async () => {
+  const id = vaultId();
+  if (!id) return;
+  const seq = await call("push", { vaultId: id });
+  toast(`pushed the sealed container as seq ${seq} (the server cannot read it)`);
+});
+
+$("pull-btn").addEventListener("click", async () => {
+  const id = vaultId();
+  if (!id) return;
+  const r = await call("pull", { vaultId: id });
+  toast(
+    r.adopted
+      ? `pulled seq ${r.seq} — ${r.count} accounts`
+      : "nothing new on the server"
+  );
+  if (r.adopted) refresh();
+});
+
+$("share-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = vaultId();
+  if (!id) return;
+  const fp = await call("share", {
+    vaultId: id,
+    deviceId: $("share-device").value,
+    permission: $("share-permission").value,
+  });
+  toast(`shared ${id} (key sha256 ${fp}) — wrapped to that device, opaque to the server`);
+});
+
+$("accept-btn").addEventListener("click", async () => {
+  const id = vaultId();
+  if (!id) return;
+  const fp = await call("accept", { vaultId: id });
+  toast(`accepted ${id} (key sha256 ${fp}) — now Pull to fetch the vault`);
+  await refreshSync();
+});
+
+$("unlock-shared-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const status = await call("unlock_shared", { vaultId: $("unlock-vault-id").value });
+  applyStatus(status);
+  await refreshSync();
+  toast(`unlocked with the vault key · ${status.count} accounts`);
+});
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -207,4 +371,7 @@ $("export-migration-btn").addEventListener("click", () => reveal("export_migrati
     "WARNING: an export reveals your TOTP SECRETS IN THE CLEAR. Anyone who can " +
     "read the screen can generate your codes.";
   applyStatus(status);
+  // The Sync panel is visible whether or not the vault is unlocked: a recipient
+  // device has to enroll and accept a share BEFORE it can open anything.
+  await refreshSync();
 })();

@@ -305,3 +305,41 @@ not.
   UNAUDITED. Two are worth restating in browser terms: JS `Uint8Array`s holding key
   material are **not zeroized**, and converting a personal vault into a shared vault
   is a **one-way door** in both UIs.
+
+## Desktop client support (added Phase 49, 2026-07-27)
+
+The Phase 48 section above closed by recording one remaining limit — *"The **desktop**
+client still does not."* **That limit is now retired.** The native desktop app
+(`desktop/`) implements this flow as well, so **all four client surfaces** — the `sigil`
+CLI, `web/apps/webapp`, the MV3 `extension/` and the native desktop app — share vaults
+through these routes.
+
+- **Nothing in the decisions above was revised.** The protocol, the four routes, the
+  `SIGILhyb` envelope layout, the key hierarchy and the authorization model are
+  unchanged, and `sigild/`, `cli/` and `libsigil/` were not edited.
+- **The client half is [`../../desktop/core/src/net.rs`](../../desktop/core/src/net.rs)**,
+  exposing `DeviceConfig::{publish_hybrid, share_vault, accept_vault}` alongside
+  enrollment and sync, plus `VaultSession::{convert_to_shared, unlock_shared}` and
+  `pull_and_adopt`, behind eleven new `#[tauri::command]`s.
+- **It is not a fourth implementation.** Unlike the browsers, which mirror the flow in
+  JS, the desktop **calls the `sigil-cli` library** — `publish_hybrid_key` /
+  `fetch_hybrid_key`, `put_key_envelope` / `get_key_envelope`, `wrap_vault_key` /
+  `unwrap_vault_key`, `grant_vault_access` — so decision 4 (wrap → deposit → grant
+  through the existing grant API) and the 32-byte length check on a recovered plaintext
+  hold by construction rather than by mirroring. That choice is recorded in
+  [ADR 0037](0037-desktop-reuses-cli-library-for-protocol.md).
+- **Where the desktop keeps the secrets is the CLI's answer, not the browsers'**: the
+  hybrid secret identity and the vault keyring are the CLI's own `0600` files in a
+  `0700` state directory, written by the CLI's own writers — so the two are literally
+  interchangeable. No new storage decision was needed, and
+  [ADR 0036](0036-browser-sharing-secret-storage.md) remains browser-specific.
+- **Proof:** [`../../desktop/core/tests/server_interop.rs`](../../desktop/core/tests/server_interop.rs)
+  boots a real `sigild` and builds the **real `sigil` binary**, and shares **both ways** —
+  desktop → CLI and CLI → desktop — with both ends reaching the same vault-key
+  fingerprint and the same RFC 6238 code, plus the `403` for an unauthorized third
+  device, a clear not-enrolled error, and a clear unreachable error with the offline flow
+  still generating codes.
+- **Every limit above still applies**, and one is worth restating in native terms: the
+  desktop's hybrid secret and vault keyring are **`0600` plaintext files**, which is
+  **weaker at rest than the browser clients**, whose equivalents are sealed in a
+  `SIGILcli` container under the vault password. Nothing is zeroized on either.

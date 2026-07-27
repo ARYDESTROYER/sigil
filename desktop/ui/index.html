@@ -51,6 +51,19 @@
         The password is held only in memory by the native process for this
         session. Only the sealed container is ever written to disk.
       </p>
+      <details>
+        <summary>This vault is shared with me</summary>
+        <p class="hint">
+          A shared vault is sealed under a random 32-byte vault key, not a
+          password. Set the server below, <code>accept</code> the share, then
+          open it by its vault id.
+        </p>
+        <form id="unlock-shared-form" autocomplete="off">
+          <label for="unlock-vault-id">Vault id</label>
+          <input id="unlock-vault-id" spellcheck="false" placeholder="team-vault" required />
+          <button type="submit" class="ghost">Open with my vault key</button>
+        </form>
+      </details>
     </section>
 
     <!-- ------------------------------------------------------------------ -->
@@ -119,6 +132,91 @@
         <pre id="export-out" hidden></pre>
       </section>
     </main>
+
+    <!-- ---------------------------------------------------------------- -->
+    <!-- Sync & sharing                                                    -->
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Sync &amp; sharing</h2>
+        <span class="count" id="sync-state">off</span>
+      </div>
+      <p class="hint">
+        Optional. With no server set, this app never touches the network and
+        nothing below runs. The server only ever stores the <em>sealed</em>
+        container and opaque wrapped keys &mdash; it cannot read either.
+        Dev/localhost, plain HTTP, unaudited.
+      </p>
+
+      <form id="server-form" autocomplete="off">
+        <label for="server-url">Server URL</label>
+        <input id="server-url" spellcheck="false" placeholder="http://127.0.0.1:8080" />
+        <div class="row">
+          <button type="submit" class="ghost">Use this server</button>
+          <button type="button" id="check-server-btn" class="link">Check</button>
+        </div>
+      </form>
+
+      <dl class="kv" id="device-facts"></dl>
+
+      <details id="enroll-block" hidden>
+        <summary>Enroll this device</summary>
+        <p class="hint">
+          The enrollment token is single-use. It is passed straight to the
+          server for this one call and is never written to disk, never logged,
+          and never shown again.
+        </p>
+        <form id="enroll-form" autocomplete="off">
+          <label for="enroll-token">Enrollment token</label>
+          <input id="enroll-token" type="password" autocomplete="off" spellcheck="false" required />
+          <label for="enroll-label">Device label <span class="opt">(optional)</span></label>
+          <input id="enroll-label" placeholder="my laptop" />
+          <button type="submit" class="primary">Enroll</button>
+        </form>
+        <div class="row">
+          <button id="publish-hybrid-btn" class="ghost">Publish my hybrid key</button>
+        </div>
+      </details>
+
+      <details id="vault-block" hidden>
+        <summary>This vault on the server</summary>
+        <label for="sync-vault-id">Vault id</label>
+        <input id="sync-vault-id" spellcheck="false" placeholder="team-vault" />
+        <p class="hint">
+          <strong>Convert to shared</strong> re-seals this vault under a fresh
+          random 32-byte key so it can be shared. Your password is never
+          shared, wrapped or uploaded &mdash; and the conversion is one-way.
+        </p>
+        <div class="row">
+          <button id="convert-btn" class="ghost">Convert to shared</button>
+          <button id="push-btn" class="ghost">Push</button>
+          <button id="pull-btn" class="ghost">Pull</button>
+        </div>
+      </details>
+
+      <details id="share-block" hidden>
+        <summary>Share with another device</summary>
+        <p class="hint">
+          The vault key is wrapped to that device's published hybrid public key
+          (X25519 + ML-KEM-768) and relayed as ciphertext. Fingerprints are
+          shown so both devices can confirm they hold the same key; the key
+          itself is never displayed.
+        </p>
+        <form id="share-form" autocomplete="off">
+          <label for="share-device">Recipient device id</label>
+          <input id="share-device" spellcheck="false" placeholder="dev_…" required />
+          <label for="share-permission">Permission</label>
+          <select id="share-permission">
+            <option value="read" selected>read</option>
+            <option value="write">write</option>
+          </select>
+          <button type="submit" class="primary">Share</button>
+        </form>
+        <div class="row">
+          <button id="accept-btn" class="ghost">Accept a vault shared with me</button>
+        </div>
+      </details>
+    </section>
 
     <p id="toast" class="toast" hidden role="status"></p>
 

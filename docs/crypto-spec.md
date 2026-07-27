@@ -345,6 +345,13 @@ files, the browser clients keep them inside their **sealed device-identity conta
 ([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)) — sealed with the same
 Argon2id → XChaCha20-Poly1305 `SIGILcli` construction as a vault.
 
+The **native desktop app** runs the identical construction through a third route: it
+calls the `sigil-cli` library's `wrap_vault_key` / `unwrap_vault_key` directly
+([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)), so there is no
+third implementation of it either, and it stores the hybrid secret and the keyring in
+**the same `0600` files as the CLI** — weaker at rest than the browsers' sealed
+container.
+
 ### What the server sees, and what it cannot do
 
 `sigild` **relays** the envelope: `PUT`/`GET /v1/vaults/{vaultID}/keys/{deviceID}`

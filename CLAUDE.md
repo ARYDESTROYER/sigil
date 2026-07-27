@@ -884,10 +884,15 @@ public, make no security claims, until the audit completes and trademark clears.
   `import_text`/`import_file`, `remove`, `export_uris`, `export_migration_uri`,
   `save`), the `EntryView`/`ImportSummary` view models, `DesktopError`,
   `default_vault_path`, and the `BANNER_TITLE`/`BANNER_BODY`/`EXPORT_WARNING`
-  constants; **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
-  a `Mutex<Option<VaultSession>>` app state, and **ten `#[tauri::command]`s**
-  (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`,
-  `export_uris`, `export_migration`). `desktop/ui` is framework-free HTML/CSS/JS —
+  constants, **plus the whole server-facing half in `desktop/core/src/net.rs`**
+  (below); **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
+  an `AppState { session: Mutex<Option<VaultSession>>, sync: Mutex<Option<DeviceConfig>> }`,
+  and **twenty-one `#[tauri::command]`s**: the ten offline ones (`status`, `unlock`,
+  `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`, `export_uris`,
+  `export_migration`) **plus ELEVEN added in Phase 49** (`unlock_shared`, `set_server`,
+  `sync_status`, `enroll`, `publish_hybrid`, `check_server`, `convert_to_shared`,
+  `push`, `pull`, `share`, `accept`), each cloning the `DeviceConfig` out of the mutex
+  **before** any network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI can't be clicked by a
   test runner, so all behaviour lives where tests can drive it. **REUSE, NOT
   REIMPLEMENT (the rule for this directory): NO crypto, container format or vault
@@ -927,14 +932,63 @@ public, make no security claims, until the audit completes and trademark clears.
   (`T=59` → `94287082` at 8 digits / `287082` at 6). ⚠️ The interop test pins the clock
   by using **`period = u32::MAX`** (counter stays 0 until ~2106 ⇒ constant code) for the
   exact cross-process equality assertions — a **deliberate test artifice, NOT product
-  behaviour**; an ordinary 30 s account is also checked with a bounded retry. **Dev /
+  behaviour**; an ordinary 30 s account is also checked with a bounded retry.
+  **ON THE NETWORK SINCE PHASE 49 (ADR 0037):** `desktop/core/src/net.rs` adds device
+  **enrollment**, **contract-v3 signed sync** and **vault sharing**, so all four client
+  surfaces (CLI, webapp, MV3 extension, native desktop) are peers. Operations:
+  `DeviceConfig` (`new`/`for_server` → state dir defaults to `$HOME/.sigil`) with
+  `enroll`, `publish_hybrid`, `push_vault`/`push_vault_file`, `pull_vault`,
+  `share_vault`, `accept_vault`, `status`, `check_server`, plus
+  `VaultSession::convert_to_shared`/`unlock_shared` and the free `pull_and_adopt`;
+  contract v3 when enrolled, legacy v2 when the identity has no device id, unsigned
+  with no identity. ⭐ **THE RULE, EXTENDED TO THE PROTOCOL: `net.rs` imports 30
+  symbols from the `sigil-cli` LIBRARY** (`enroll_device`, `push_op_auth`/
+  `pull_ops_auth`, `publish_hybrid_key`/`fetch_hybrid_key`, `put_key_envelope`/
+  `get_key_envelope`, `wrap_vault_key`/`unwrap_vault_key`, `grant_vault_access`,
+  `keyring_get`/`keyring_put`, `load_*`/`save_*`, `generate_*`,
+  `vault_key_fingerprint`, `RequestAuth`, `DeviceIdentity`, `VaultKeyring`,
+  `CliError`, `VAULT_KEYRING_FILE`, `VAULT_KEY_LEN`) — so there is **NO HTTP client,
+  NO signing path and NO canonical-message copy anywhere under `desktop/`**
+  (grep-verified: zero v3-message/enroll-challenge domain strings, zero `ureq`/
+  `reqwest`, zero direct Ed25519). The canonical bytes stay at **THREE**
+  implementations (Go server / Rust CLI / JS browser, kept in sync only by interop
+  tests); a fourth was deliberately avoided. Only app-level glue was written, because
+  the CLI's path-resolution + error-explanation helpers live in `cli/src/main.rs` (the
+  **binary**, not importable): `DeviceConfig` re-derives the file names and `net_error`
+  maps `CliError` → typed `DesktopError`. **`cli/` was NOT edited.** **State files are
+  the CLI's own, hence INTERCHANGEABLE** — `device.key` (Ed25519 seed + device id,
+  0600), `device.hybrid` (X25519 secret + ML-KEM seed, 0600), `device.hybrid.pub`
+  (public), `vault-keys.json` (vault id → 32-byte key, 0600), in a **0700** state dir;
+  point `sigil --key` (or `HOME`) at it and it is the SAME device. Two shapes worth
+  remembering: **`status()` is purely LOCAL** (no network, cannot fail because a server
+  is down) and reports fingerprints only, while **`check_server` reports reachability
+  as DATA** (`ServerCheck{reachable,hybrid_published,detail}`), not an error; and
+  **`pull_and_adopt` OPENS the pulled container BEFORE writing** (temp file + rename,
+  0600) so an unreadable container can never clobber a good vault. UI errors are tagged
+  distinctly: `unauthenticated` (401) / `not authorized` (403) / `route disabled` (501)
+  / `nothing there` (404) / `server unreachable` / `not enrolled` / `already enrolled`
+  / `not a shared vault`. **NOTHING secret crosses the IPC, is printed or logged** —
+  no seed / hybrid secret / vault key / password / enrollment token, only device ids +
+  16-hex SHA-256 fingerprints (the only prints are the pre-audit banner); the
+  enrollment token is a password-type field used for ONE call and cleared in a
+  `finally`. ⚠️ **AT-REST ASYMMETRY: the desktop's secrets are 0600 PLAINTEXT files
+  (the native model, same as the CLI) — the BROWSER clients are STRONGER at rest**
+  (everything sealed in a `SIGILcli` container, ADR 0036); no zeroization anywhere.
+  **The network proof is `desktop/core/tests/server_interop.rs`** — boots a REAL
+  `sigild` (`SIGILD_ENABLE_DEV_OPS=1` + `SIGILD_DEVICE_AUTH=1`) on a free loopback port,
+  builds the REAL `sigil` binary, and proves **both directions with `94287082`** (RFC
+  6238 App B; the clock is pinned by **`period = 1_600_000_000`** so the counter equals
+  App B's `T=59` counter from 2020 to 2071), plus the **403** for an enrolled-but-
+  unauthorized third device, a clear **NotEnrolled** error instead of a panic, and a
+  clear **Unreachable** error with the **offline flow still generating codes**. **Dev /
   UNAUDITED**, **NOT signed, NOT notarized, NOT distributed** (`tauri build` / the
   `.app` bundler was **not** run — the applicable build is `cargo build --release`),
   the **GUI is build-and-launch verified but NOT visually verified** on this machine
-  (screencapture denied → no screenshot proof), and there is **no sync, no device
-  enrollment, no QR scanning, no code verification, no hardened zeroization**; the
+  (screencapture denied → no screenshot proof; all behaviour lives in the headless core
+  the tests drive), the server side is **dev-gated / loopback / plain HTTP**, and there
+  is still **no QR scanning, no code verification, no hardened zeroization**; the
   other native platforms (**mobile especially**) remain unbuilt. Do NOT store real 2FA
-  secrets. ADR 0032.
+  secrets. ADR 0032, ADR 0037.
 - `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
   `extension/` and `desktop/` are now real — see above.)
 
@@ -1042,12 +1096,18 @@ corepack pnpm -C extension test               # `pretest` re-runs build.sh; 3 Pl
 # perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
 cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path desktop/Cargo.toml   # 11 unit tests + 1 integration test
+cargo test  --manifest-path desktop/Cargo.toml   # 15 unit tests + 2 integration tests
 grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
-# The integration test is THE INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
+# Integration test 1 is THE VAULT INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
 # builds the real `sigil` binary itself and drives it against ONE shared vault file in
 # both directions, so it needs no setup (~20 s: real Argon2id + a CLI build).
 cargo test  --manifest-path desktop/Cargo.toml --test cli_interop -- --nocapture
+# Integration test 2 is THE NETWORK PROOF (desktop/core/tests/server_interop.rs): it
+# builds a REAL sigild (go build ./cmd/server; GO=… overrides /opt/homebrew/bin/go) AND
+# the real `sigil` binary, boots sigild on a free loopback port with dev ops + device
+# auth v3, and proves desktop<->CLI sharing BOTH ways (94287082 each way) plus the
+# 403 / NotEnrolled / Unreachable negatives. No setup, no mocks (~40 s).
+cargo test  --manifest-path desktop/Cargo.toml --test server_interop -- --nocapture
 # The applicable build is cargo --release; `tauri build` (the .app bundler) has NOT
 # been run, and the binary is unsigned / unnotarized / undistributed.
 cargo build --manifest-path desktop/Cargo.toml --release   # -> ~8.6 MB native binary
@@ -1071,6 +1131,11 @@ mirrors, the `webapp`/`extension`/`desktop` jobs are **validated locally only**
 (YAML-parsed; each step mirrors a known-green local command) — they have **not**
 been run on real GitHub Actions from this machine, and the Tauri Linux
 system-dependency list in `desktop.yml` is by-eye because the dev machine is macOS.
+⚠️ **Known CI gap after Phase 49:** `desktop.yml` runs a bare `cargo test`, which now
+also picks up `server_interop`, and that test builds `sigild` with the Go at
+**`/opt/homebrew/bin/go`** unless **`GO=`** is set — a path that does not exist on a
+GitHub runner. The workflow has **not** been updated (it is not a doc), so either point
+`GO` at the runner's Go or scope the CI test step before relying on that job.
 
 ## Conventions & guardrails
 

@@ -66,6 +66,16 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # The server_interop test builds and boots the REAL sigild to prove the
+      # desktop client interoperates with a live server and the real sigil CLI,
+      # so this job needs the Go toolchain as well as Rust. The test resolves
+      # `go` from PATH (or $GO) and PANICS if it finds none — deliberately, so a
+      # missing toolchain can never make the suite look green by skipping.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: sigild/go.sum
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop

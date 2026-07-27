@@ -48,7 +48,9 @@ desktop/
   Cargo.toml          workspace root — OWN Cargo.lock, outside the libsigil workspace
   core/               sigil-desktop-core: ALL the logic, headless + unit-tested
     src/lib.rs        VaultSession: unlock / list+codes / add / import / export / remove
-    tests/cli_interop.rs   THE INTEROP PROOF (drives the real `sigil` binary)
+    src/net.rs        enrollment, contract-v3 sync, device-to-device vault sharing
+    tests/cli_interop.rs      THE VAULT INTEROP PROOF (drives the real `sigil` binary)
+    tests/server_interop.rs   THE NETWORK PROOF (real sigild + the real `sigil` binary)
   src-tauri/          the shell: window + one #[tauri::command] per action
   ui/                 framework-free HTML/CSS/JS (no npm, no bundler, no CDN)
 ```
@@ -89,9 +91,63 @@ glue that only marshals arguments.
 - Remove an account.
 - A loud pre-audit banner, sourced from the same Rust constants the terminal
   prints, so no surface can quietly soften it.
+- **Sync & sharing** (optional, see below): enroll this device, publish its
+  hybrid public key, push/pull the sealed vault, convert a password vault to a
+  shared vault, share it to another device, and accept one shared here.
 
-Not implemented: sync (`push`/`pull`), device enrollment, QR scanning, code
-verification, hardened zeroization.
+Not implemented: QR scanning, code verification, hardened zeroization, multi-vault
+UI (the app operates on one vault file at a time).
+
+## Sync & sharing
+
+Entirely **optional**. With no server configured the app never touches the
+network and everything above behaves exactly as it did before.
+
+Like the vault format, none of this is reimplemented: `core/src/net.rs` drives the
+**`sigil-cli` library** — `enroll_device`, `push_op_auth` / `pull_ops_auth`,
+`publish_hybrid_key` / `fetch_hybrid_key`, `put_key_envelope` / `get_key_envelope`,
+`wrap_vault_key` / `unwrap_vault_key` and `grant_vault_access` — so there is **no
+second HTTP client, no second signing path, and no second copy of the canonical
+contract-v3 message** in this directory.
+
+### Device state on disk (the native model, identical to the CLI's)
+
+| File | Holds | Mode |
+| --- | --- | --- |
+| `$HOME/.sigil/device.key` | Ed25519 seed (SECRET) + assigned device id | `0600` |
+| `$HOME/.sigil/device.hybrid` | X25519 secret + ML-KEM-768 keygen seed (SECRET) | `0600` |
+| `$HOME/.sigil/device.hybrid.pub` | public halves only | default |
+| `$HOME/.sigil/vault-keys.json` | vault id → 32-byte vault key (SECRET) | `0600` |
+
+…all inside a `0700` directory. These are the CLI's own types written by the CLI's
+own writers, so the files are **interchangeable**: point `sigil --key` (or `HOME`)
+at this directory and the CLI *is* the same device.
+
+Nothing here ever prints, logs or returns a seed, a vault key or an enrollment
+token — only SHA-256 **fingerprints** and opaque device ids. The enrollment token
+crosses the IPC once, is used for that one call, and is never stored.
+
+### The key model
+
+- A **personal** vault stays sealed under your password.
+- A **shared** vault is sealed under a **random 32-byte vault key** (the `SIGILcli`
+  container takes arbitrary secret bytes, so no format change). *Convert to
+  shared* is the explicit, one-way door.
+- That key is wrapped **per recipient** with the PQ-hybrid seal (X25519 +
+  ML-KEM-768) and relayed as opaque ciphertext. **Your password is never shared,
+  wrapped or uploaded.**
+
+The server stores sealed containers and wrapped keys it cannot read.
+
+### Failure modes are shown, never swallowed
+
+Every server error reaches the UI tagged: `unauthenticated` (401), `not
+authorized` (403), `route disabled` (501), `nothing there` (404), `server
+unreachable`, `not enrolled`, `not a shared vault`. Nothing panics, nothing
+silently no-ops, and the offline flow keeps working with the server down.
+
+**Dev only**: sigild's sync, device and sharing routes are dev-gated, plain HTTP
+and localhost. Do not point this at a remote host.
 
 ## Trust boundary
 
@@ -115,10 +171,11 @@ cargo build --manifest-path desktop/Cargo.toml --release
 ./desktop/target/release/sigil-desktop                # opens the window (needs a GUI session)
 ```
 
-`cargo test` builds the real `sigil` binary itself, so the interop proof needs no
-setup. It takes ~20 s (real Argon2id + a CLI build).
+`cargo test` builds the real `sigil` binary **and a real `sigild`** itself, so the
+proofs need no setup. Allow ~40 s (two real builds + real Argon2id + a live
+server). `sigild` is built with `/opt/homebrew/bin/go` (override with `GO=…`).
 
-### The interop proof
+### The vault interop proof
 
 `desktop/core/tests/cli_interop.rs` proves the headline claim without a human:
 
@@ -136,6 +193,34 @@ years): its TOTP counter is `floor(now / period) = 0` for any date before 2106, 
 the code is a constant two independently-clocked processes must agree on. The
 ordinary 30 s account is cross-checked with a bounded retry that tolerates a step
 boundary landing between the two processes.
+
+### The network proof
+
+`desktop/core/tests/server_interop.rs` boots a **real sigild** (dev-ops +
+multi-device auth, contract v3) on a free loopback port, builds the **real `sigil`
+binary**, and proves the desktop is a peer:
+
+1. **(a) desktop → CLI.** The desktop enrolls, publishes its hybrid public key,
+   creates a vault holding the RFC 6238 seed, converts it to a shared vault,
+   pushes it, and shares it to an enrolled CLI device — and the real `sigil`
+   binary accepts, pulls and prints `94287082`.
+2. **(b) CLI → desktop.** The CLI re-keys and shares a vault to the desktop
+   device; the desktop accepts, pulls and computes the same code. Both sides
+   report the *same* key fingerprint.
+3. **(c) negatives.** An unauthorized third device gets **403**; an unenrolled
+   desktop gets a clear `NotEnrolled` error, not a panic; with the server
+   unreachable the push reports `Unreachable` and the offline flow still
+   generates codes.
+4. **Opacity.** The bytes the CLI pulled are byte-identical to the bytes the
+   desktop pushed and contain neither the seed nor the label.
+
+The server is killed and every temp file removed in a `Drop` guard, so an
+assertion failure still tears the world down.
+
+**Pinning the clock, again.** RFC 6238 Appendix B's `T = 59` is TOTP counter
+`floor(59/30) = 1`, so any period `P` with `floor(now/P) == 1` yields the same
+published code. `P = 1_600_000_000` satisfies that from 2020 until 2071 — which is
+why two independently-clocked processes must both print exactly `94287082`.
 
 Correctness of the code path itself is pinned by an RFC 6238 Appendix B
 known-answer test in `core/src/lib.rs`: seed ASCII `12345678901234567890`, `T=59`,

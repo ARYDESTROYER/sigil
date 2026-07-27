@@ -174,6 +174,52 @@ client side is **what a browser profile now holds**:
   hybrid public key it has for it. See the substitution gap below — it is the same gap
   as for the CLI, but a paste-and-click UI makes it easier to walk into.
 
+### The native desktop client (enrolls, syncs and shares — with the CLI's `0600` files)
+
+Since Phase 49 the Tauri desktop app also enrolls, signs contract-v3 requests and shares
+vaults, through `desktop/core/src/net.rs`. It introduces **no new protocol surface**: it
+drives the `sigil-cli` library, so there is no second HTTP client, no second signing path
+and no fourth copy of the canonical message
+([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)) — one fewer place
+for a signature-verification bug to hide. What it *does* change is where a fourth kind of
+host now holds bearer secrets:
+
+- ⚠️ **Its secrets are `0600` plaintext files, not sealed containers.** `device.key`
+  (Ed25519 seed + device id), `device.hybrid` (X25519 secret + ML-KEM seed) and
+  `vault-keys.json` (a 32-byte key per shared vault) sit in a `0700` state directory
+  (`$HOME/.sigil` by default), unencrypted, exactly like the CLI's — **they are the same
+  files**, and the modes are asserted in the tests. Only the TOTP vault itself is sealed.
+  **The browser clients are STRONGER at rest here**: they seal the device seed, the hybrid
+  secret and every vault key inside a `SIGILcli` container under the vault password
+  ([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)), so an offline attacker
+  with a profile dump or a backup gets ciphertext and must pay Argon2id to get anything.
+  Against the desktop, an offline attacker who can read the user's home directory as that
+  user — a stolen unencrypted disk, an unsealed backup, a sync-to-cloud folder, another
+  process running as the same user — gets the device identity, the hybrid secret and every
+  accepted vault key directly. The defense is the OS: file permissions plus full-disk
+  encryption. This is the documented native model, not an oversight, but it is a real
+  asymmetry and it belongs in an audit's scope.
+- **Nothing is zeroized.** Neither the vault password (best-effort zeroed on `Drop`, with
+  no `zeroize` crate and no volatile guarantee) nor any key material read off disk is
+  scrubbed; there is no `mlock` and no enclave. Same posture as the CLI and the browsers.
+- **The enrollment token is handled once and never stored.** It is a password-type field
+  in the UI, crosses the IPC for exactly one `enroll` call, is cleared in a `finally` so it
+  does not linger in the DOM, and is never persisted or logged. Nothing else secret crosses
+  the IPC in either direction: no seed, no hybrid secret, no vault key, no password — only
+  opaque device ids and 16-hex SHA-256 fingerprints.
+- **The webview is not part of the trust boundary.** It holds no key material, does no
+  cryptography, and the Tauri capability file grants `core:default` only (no `fs`, `shell`,
+  `http` or `dialog` plugin), so it reaches disk and the network only through the explicit
+  commands.
+- **Every sharing limit below applies unchanged**, and two are worth naming here: there is
+  **no out-of-band verification of a published hybrid public key** (a hostile registry could
+  substitute one), and **revocation cannot un-learn a vault key this device already
+  accepted**. There is also no key rotation and no re-wrap on revoke.
+- **Dev-gated, loopback, plain HTTP, UNAUDITED**, and the GUI itself is build-and-launch
+  verified rather than visually verified — all the behaviour above lives in the headless
+  core that `desktop/core/tests/server_interop.rs` drives against a real `sigild` and the
+  real `sigil` binary.
+
 **Zero-knowledge is unaffected by the auth model — or by sharing.** The registry
 stores **auth metadata only** — Ed25519 **public** keys, server-assigned IDs,
 labels, permissions, timestamps, and a bearer token's SHA-256 digest. Migrations
@@ -239,11 +285,12 @@ Everything here is **dev-gated (`501` by default), opt-in, plain HTTP in dev, an
 UNAUDITED** — and the cryptography it now leans on (the hybrid combiner and the
 custom KEM-then-AEAD seal) is **the same unaudited code**, only now load-bearing.
 
-The rows below are **client-agnostic**: the `sigil` CLI, the webapp and the MV3
-extension all drive the same four routes with the same v3 signatures, so every defense
-and every gap applies to all three. The browser-specific consequences — two more
-bearer secrets in a browser profile, no zeroization, no password recovery for a shared
-vault — are in the subsection above.
+The rows below are **client-agnostic**: the `sigil` CLI, the webapp, the MV3 extension
+and the native desktop app all drive the same four routes with the same v3 signatures,
+so every defense and every gap applies to all four. The client-specific consequences are
+in the subsections above — two more bearer secrets in a browser profile, no zeroization
+and no password recovery for a shared vault on the browsers; `0600` plaintext key files
+on the desktop.
 
 | # | Adversary | Capability | Defense as implemented | Layer |
 | --- | --- | --- | --- | --- |
@@ -292,13 +339,14 @@ vault — are in the subsection above.
   interoperability. The hybrid property (secure if **either** X25519 or ML-KEM-768
   holds) is design intent of unaudited code, and the **SYSTEM is not "post-quantum
   secure."**
-- **Local key storage differs per client, and neither is strong.** In the **CLI** the
-  hybrid secret identity (`$HOME/.sigil/device.hybrid`) and the vault keyring
+- **Local key storage differs per client, and neither model is strong.** In the **CLI
+  and the native desktop app** — which share the *same* files — the hybrid secret
+  identity (`$HOME/.sigil/device.hybrid`) and the vault keyring
   (`$HOME/.sigil/vault-keys.json`) are mode `0600` plaintext files — **not** sealed
   under the password, not zeroized, not in an enclave; anything that can read the
   user's home directory as that user has the vault keys (adversary class 9 above). In
   the **browser clients** both are sealed under the vault password inside the v2
-  device-identity container, which is better at rest but **not** while unlocked: the
+  device-identity container, which is **stronger at rest** but **not** while unlocked: the
   decrypted key material sits unzeroized in the JS heap, reachable by anything running
   in that origin/extension context (see the browser-sharing subsection above).
 - **Plain HTTP in dev.** Signing proves who sent a request; it is not transport

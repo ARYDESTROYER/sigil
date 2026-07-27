@@ -1,0 +1,120 @@
+name: interop
+
+# The cross-component interop suite — the tests that prove the SYSTEM works, as
+# opposed to the per-component suites that prove each part works alone.
+#
+# WHY THIS WORKFLOW EXISTS: these nine Node tests were, until now, run by NO
+# workflow at all. They are the only automated proof of several load-bearing
+# claims, including the one that matters most:
+#   * roundtrip          — seal/open through the wasm in a JS runtime
+#   * interop            — SIGILcli container, wasm <-> the REAL sigil binary
+#   * hybrid-interop     — SIGILhyb PQ-hybrid container, both directions
+#   * sync-interop       — the E2EE sync loop against a LIVE sigild
+#   * totp-interop       — cross-client TOTP (CLI writes, browser reads)
+#   * migration-interop  — the Google Authenticator codec agrees Rust <-> JS
+#   * device-auth-interop— contract v3 against a live device-auth server
+#   * sharing-interop    — vault sharing, browser <-> CLI, both directions
+#   * pinning-interop    — the KEY-SUBSTITUTION ATTACK is detected and refused
+# A test nobody runs is a test that rots, and these guard the invariants that
+# three separate implementations (Go, Rust, JS) have to agree on.
+#
+# It is a heavier job than the others because it genuinely needs all three
+# toolchains at once: Rust + wasm to build the bindings, Cargo to build the real
+# `sigil` binary, Go to build the real `sigild`, and Node to drive them.
+#
+# HONESTY NOTE: like the repo's other CI mirrors, this workflow is validated
+# locally (YAML-parsed, and every step mirrors a known-green local command) but
+# has NOT been run on real GitHub Actions from the build machine.
+
+on:
+  push:
+    paths:
+      - "sigil-wasm/**"
+      - "cli/**"
+      - "sigild/**"
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/interop.yml"
+  pull_request:
+    paths:
+      - "sigil-wasm/**"
+      - "cli/**"
+      - "sigild/**"
+      - "libsigil/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/interop.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Prebuilt binaries so build-wasm.sh finds `wasm-pack` / `wasm-bindgen` on
+      # PATH under Linux. The wasm-bindgen version is pinned to match the
+      # `=0.2.100` dependency in sigil-wasm/Cargo.toml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.100,wasm-pack
+
+      # Several of these tests build and boot the REAL sigild.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: sigild/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            sigil-wasm
+            cli
+
+      # Emits pkg-web + pkg-node. The tests import pkg-node.
+      - name: Build the wasm bindings
+        run: ./sigil-wasm/build-wasm.sh
+
+      # Built once here so the first test does not pay for it (each test also
+      # builds it itself, which is then a cache hit).
+      - name: Build the real sigil CLI
+        run: cargo build --manifest-path cli/Cargo.toml --bin sigil
+
+      - name: 1/9 wasm seal/open round-trip
+        run: node sigil-wasm/test/roundtrip.mjs
+      - name: 2/9 SIGILcli container interop with the real CLI
+        run: node sigil-wasm/test/interop.mjs
+      - name: 3/9 SIGILhyb hybrid public-key interop
+        run: node sigil-wasm/test/hybrid-interop.mjs
+      - name: 4/9 E2EE sync loop against a live sigild
+        run: node sigil-wasm/test/sync-interop.mjs
+      - name: 5/9 cross-client TOTP through the opaque op-log
+        run: node sigil-wasm/test/totp-interop.mjs
+      - name: 6/9 TOTP migration codec agrees Rust and JS
+        run: node sigil-wasm/test/migration-interop.mjs
+      - name: 7/9 device auth contract v3
+        run: node sigil-wasm/test/device-auth-interop.mjs
+      - name: 8/9 vault sharing, browser and CLI, both directions
+        run: node sigil-wasm/test/sharing-interop.mjs
+      # The most important one: proves a hostile server swapping a recipient's
+      # hybrid public key is DETECTED and REFUSED, and that the Rust and JS
+      # safety numbers agree.
+      - name: 9/9 key pinning blocks the substitution attack
+        run: node sigil-wasm/test/pinning-interop.mjs
+
+      - name: Assert the libsigil core stays getrandom-free
+        run: |
+          for lock in libsigil/Cargo.lock sigil-wasm/Cargo.lock; do
+            count=$(grep -c 'name = "getrandom"' "$lock" || true)
+            echo "$lock getrandom entries: $count"
+            test "$count" -eq 0
+          done

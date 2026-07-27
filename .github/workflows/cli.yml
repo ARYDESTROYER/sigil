@@ -40,3 +40,14 @@ jobs:
         run: cargo test
       - name: build
         run: cargo build
+
+      # `cli/` is a STANDALONE crate with its own lockfile precisely so it can
+      # link `getrandom` natively without polluting the wasm-pure core. This is
+      # the job where that separation is most likely to break, so this is where
+      # it should be checked: building the CLI must never perturb the core
+      # lockfile. (Steps here run in `cli/`, hence the `../`.)
+      - name: Assert the CLI has not leaked getrandom into the core
+        run: |
+          count=$(grep -c 'name = "getrandom"' ../libsigil/Cargo.lock || true)
+          echo "libsigil/Cargo.lock getrandom entries: $count"
+          test "$count" -eq 0

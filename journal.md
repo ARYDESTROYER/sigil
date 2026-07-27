@@ -196,9 +196,9 @@ only `libsigil`, the smallest lockfile; `desktop/` carries the whole Tauri tree)
 it also stopped hardcoding the macOS Homebrew Go). ⚠️ Two doc corrections found while
 writing the CI list out file-by-file: the "desktop CI cannot find Go" warning described a
 gap **already closed inside Phase 49**; and CLAUDE.md wrongly claimed `libsigil.yml` /
-`cli.yml` run the **`getrandom`==0 guard** — they do NOT (only `desktop.yml` and
-`interop.yml` do; coverage survives because `interop.yml` triggers on `cli/**` and
-`libsigil/**`, but do not assume the crate's own job checks it).
+`cli.yml` run the **`getrandom`==0 guard** — at the time they did NOT (only `desktop.yml`
+and `interop.yml` did). **Closed after Phase 52:** the guard now runs in all four, so each
+crate's own job checks its own invariant.
 **NEW ADR 0039**; docs synced in the same change. Details in the Phase 51 entry below.
 
 **Phase 50** **CLOSED THE
@@ -6926,8 +6926,12 @@ that it is closed — and to point out that the Phase 51 Go-resolver work was in
 - **No rate limiting on `/v1/billing/webhook/{provider}`.** ADR 0039 closed the
   unbounded-ledger-growth path that ran *through* the idempotency key; it does not bound
   request volume.
-- **Add the `getrandom`==0 guard to `libsigil.yml` and `cli.yml`** — see the finding
-  above. One step each; not done here because this phase's brief was documentation only.
+- ~~**Add the `getrandom`==0 guard to `libsigil.yml` and `cli.yml`**~~ — **DONE** after
+  Phase 52. One step each: `libsigil.yml` checks its own `Cargo.lock`, and `cli.yml`
+  checks `../libsigil/Cargo.lock`, since `cli/` links `getrandom` natively on purpose and
+  is therefore the job where a leak into the wasm-pure core is most likely. Both were
+  simulated locally from the same working directories CI uses. The guard now runs in four
+  workflows instead of two.
 - **Billing has still never been run against a live provider account**, Juspay remains
   UNVERIFIED-AGAINST-LIVE-DASHBOARD, and the whole repo remains **pre-audit and
   UNAUDITED**. Do not store real secrets.

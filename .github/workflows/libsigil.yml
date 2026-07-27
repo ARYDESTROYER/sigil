@@ -39,3 +39,14 @@ jobs:
         run: cargo test --all
       - name: wasm build (sigil-core)
         run: cargo build -p sigil-core --target wasm32-unknown-unknown
+
+      # THE core invariant, checked where the core is built. sigil-core takes its
+      # entropy from the CALLER (ADR 0007) so it can compile to wasm with no RNG
+      # at all; a transitive `getrandom` creeping in would break that silently,
+      # because nothing else in this job would fail. Until now the guard ran only
+      # in desktop.yml and interop.yml — neither of which is the crate's own gate.
+      - name: Assert libsigil stays getrandom-free
+        run: |
+          count=$(grep -c 'name = "getrandom"' Cargo.lock || true)
+          echo "libsigil/Cargo.lock getrandom entries: $count"
+          test "$count" -eq 0

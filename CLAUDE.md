@@ -1496,14 +1496,14 @@ publishes automatically while in stealth.
 list of `.github/workflows/` (ten files):
 
 - **`libsigil.yml`** — the core workspace: rustfmt / clippy `-D warnings` / `cargo test
-  --all` / the `wasm32-unknown-unknown` build of `sigil-core`.
+  --all` / the `wasm32-unknown-unknown` build of `sigil-core`, **plus the `getrandom`==0
+  guard on `libsigil/Cargo.lock`**.
 - **`cli.yml`** — mirrors it for the standalone `cli/` crate: rustfmt / clippy / test /
-  build. ⚠️ **Neither of these two runs the `getrandom`==0 lockfile guard** — that check
-  lives only in **`desktop.yml`** and **`interop.yml`**. Coverage still exists (a `cli/**`
-  or `libsigil/**` change triggers `interop.yml`, which asserts `getrandom`==0 for BOTH
-  `libsigil/Cargo.lock` and `sigil-wasm/Cargo.lock`), but do not assume the crate's own
-  job checks it — run the `grep -c 'name = "getrandom"'` command locally, as the Build &
-  test block above says.
+  build, **plus a `getrandom`==0 guard on `../libsigil/Cargo.lock`** — `cli/` links
+  `getrandom` natively on purpose, so this is the job where a leak into the wasm-pure
+  core is most likely, and therefore where it is checked. The guard now runs in **four**
+  workflows (`libsigil.yml`, `cli.yml`, `desktop.yml`, `interop.yml`); it previously ran
+  in only the last two, so neither crate's own job checked its own invariant.
 - **`sigild.yml`** — gofmt/vet/**`go test -race ./...`**/build, with a Postgres service
   container (`SIGILD_TEST_POSTGRES`) so the integration tests run rather than skip.
   ⚠️ `-race` since Phase 51: the local gate always ran `-race`, so CI was the WEAKER of

@@ -2222,6 +2222,41 @@ Recording the decision so the doc set stays coherent as the repo grows:
   envelope", "why the client speaks plain HTTP only" remain good candidates to
   capture).
 
+## 2026-07-12 — Documentation reconciliation, `74f3b83` (bring the whole doc set back into order after Phase 13)
+
+> **Backfilled.** A documentation-order pass with no code change; it never got its
+> own entry at the time.
+
+### Why
+Phase 13's deploy artifacts shipped in `c493055`, but the living documentation was
+left out of sync behind them. This pass ran the repo's standard order — audit, fix,
+independent verify — over the documentation set alone.
+
+### What changed
+- **Phase 13 recorded where it was missing.** `journal.md` gained a dated Phase 13
+  entry (the manual GHCR publish workflow, the loopback Caddy to sigild local stack,
+  `preflight.sh`, ADR 0009, the real IaC validation results, and the honest "nothing
+  published, applied or exposed, and no domain" status). The `CLAUDE.md` and
+  `README.md` repo maps gained `deploy/local/`, `deploy/preflight.sh` and the manual
+  `publish-sigild.yml`, and the Git/deploy note was updated to the pushed state.
+- **Drift fixed.** `docs/README.md` now indexes `architecture.md`; the README
+  repo-layout dropped a nonexistent `helm/` directory; the `docs/decisions` intro and
+  the `architecture.md` status were broadened past their Phase-8 wording; and ADR
+  0007's phrase "audited core" was tightened to "audit-bound" so no borderline
+  phrasing survives anywhere.
+- **`deployment.md` reconciled to observed reality.** An independent deploy audit
+  brought the loopback stack up (`/healthz` through Caddy returned 200, bound to
+  127.0.0.1 only, then torn down), installed and ran the `caddy` / `terraform` /
+  `nomad` validators, and ran `preflight.sh`. The document's validation status now
+  matches what actually happened; `systemd-analyze` remains macOS-N/A and by-eye.
+
+### Verified
+163 relative markdown links across 20 files resolve (0 broken); the over-claim scan
+came back clean, with every forbidden-term hit a negation, caveat or technical
+descriptor. Documentation-only — no code was touched, and nothing was published,
+applied or exposed.
+
+
 ## 2026-07-13 — Phase 16 (X25519 classical key-agreement in libsigil-core)
 
 ### Context & mandate
@@ -5693,6 +5728,66 @@ gained `--at <unix>` so a code is reproducible across two machines in a proof.
 
 ---
 
+## 2026-07-27 — Audit #2 follow-up, `cfeb55f` (the Postgres suite was deterministically CI-red, and the install prompt could truncate into an over-claim)
+
+> **Backfilled.** This pass sat between Phase 46 and Phase 48 and never got its own
+> entry at the time.
+
+### Why this pass
+A full-repo audit after seven phases (40-46) found one blocking defect and a handful
+of accuracy issues. Everything else was green: all Rust/Go/JS suites, seven node
+interop tests, migrations 0001-0004 on live Postgres with tamper detection,
+501-by-default on all fifteen gated routes, Playwright 8/8, the real-extension 3/3,
+no auth bypass, no plaintext-secret regression.
+
+### HIGH — the `SIGILD_TEST_POSTGRES` suite was red, and the local gate could not see it
+`dropOplogTables` in `sigild/internal/store/migrate_test.go` enumerated the migration
+tables **by hand**, with a comment noting the list "must be extended whenever a
+migration adds a table". That invariant duly broke. Migrations 0003 (billing) and
+0004 (key sharing) added four tables, two of them carrying
+`REFERENCES sigil_devices ... ON DELETE CASCADE`. Those foreign keys made
+`DROP TABLE sigil_devices` fail with **SQLSTATE 2BP01**, which aborted the teardown
+**half-done**: `schema_migrations` still claimed the latest version, so the
+auto-migrator applied nothing on the next run, and every later Postgres test died on
+a missing relation until the schema was dropped by hand.
+
+The fix removes the fragile human invariant entirely — the tables are **discovered**
+from `pg_tables` and dropped with `CASCADE`, so a future migration can add any number
+of tables and teardown still works with no topological ordering:
+
+```go
+rows, err := pool.Query(ctx,
+    `SELECT tablename FROM pg_tables WHERE schemaname = current_schema()`)
+...
+stmt := fmt.Sprintf(`DROP TABLE IF EXISTS %q CASCADE`, name)
+```
+
+**Why every per-phase gate missed it:** they ran `go test ./...` with the DSN
+**unset**, so those tests *skipped* — and a skipped suite reads exactly like a
+passing one. Verified afterwards by running the gated suite three times in a row
+against live Postgres (the **second** run is the one that used to wedge the database)
+plus the full `-race` suite across all four packages.
+
+### MEDIUM — a truncation could turn a careful claim into a forbidden one
+`web/apps/webapp/app/manifest.ts` described the app as *"Client-side,
+end-to-end-encrypted TOTP authenticator. Pre-audit dev build."* The OS and browser
+install prompt renders that description and **may truncate it**, so the qualifier
+could be cut off, leaving a bare present-tense end-to-end-encryption claim — exactly
+what `MARKETING-CLAIMS.md` forbids. The qualifier now leads and sits in the same
+clause, using the sanctioned "designed end-to-end encrypted" phrasing. The README and
+`CLAUDE.md` taglines got the same treatment for the same reason.
+
+This is a good example of a claim being correct as written and unsafe as rendered.
+
+### LOW — accuracy
+`CLAUDE.md` said `GET .../ops` returns a hex `hash` when the code emits standard
+base64 (`docs/api.md` was already right, so `CLAUDE.md` was internally inconsistent);
+two journal entries still said "nothing was committed in this phase" after those
+phases had been committed; a truncated sentence in `deviceauth.go`'s
+trust-on-first-write comment now states the actual risk; and `MARKETING-CLAIMS.md`
+named a different provisional domain than `CLAUDE.md`.
+
+
 ## 2026-07-27 — Phase 48 (vault sharing reaches the BROWSER clients: webapp + MV3 extension)
 
 ### Why this phase, and what it fixes
@@ -6274,6 +6369,81 @@ Results:
   headlessly, but no test clicks the safety-number, re-pin or rotate buttons.
 
 ---
+
+## 2026-07-27 — Audit #3 follow-up, `c9a88e7` (a GET could CLAIM a vault; SECURITY.md was suppressing the reports we most need)
+
+> **Backfilled.** This pass sat between Phase 50 and Phase 51 and never got its own
+> entry at the time. It is recorded here because two of its findings are
+> security-relevant and one of them was a real authorization defect.
+
+### Why this pass
+A third full-repo adversarial audit ran against `b30dff5` (Phase 50). It came back
+green on substance — every suite, the 501-by-default posture, the pinning work — but
+it surfaced one genuine authorization bug and one piece of documentation that was
+actively working against the project.
+
+### HIGH — a read-shaped request could take ownership of a vault
+`authorizeOpsRequest` in `sigild/internal/api/deviceauth.go` had exactly two access
+levels, `needRead` and `needWrite`, and **`needWrite` carries trust-on-first-write
+claiming**: the first device to authenticate a write to an unowned vault becomes its
+owner. Phase 50 then added two routes — `GET /v1/vaults/{id}/keys` (list envelope
+recipients) and `DELETE /v1/vaults/{id}/keys/{deviceID}` — and wired both to
+`needWrite`, on the entirely reasonable argument that a device which can deposit an
+envelope can already replace any envelope, so enumerate-and-delete grants no new
+power.
+
+That argument is sound about *permissions* and wrong about *ownership*. It meant a
+**GET could claim an unowned vault**, which is not a power the caller was supposed to
+gain by reading.
+
+The fix adds a third level rather than loosening the check:
+
+```go
+// needWriteNoClaim: requires the SAME write-level grant as needWrite, but
+// must NEVER claim an unowned vault — an unowned vault is 403.
+needWriteNoClaim
+```
+
+`permission()` maps anything that is not `needRead` to `PermWrite`, so the required
+grant is unchanged; the claim branch now requires **exactly** `needWrite`, so
+`needWriteNoClaim` returns 403 on an unowned vault instead of taking it. The two
+Phase 50 routes moved to the new level. The op append (`handlers.go`) and the
+envelope PUT (`sharing.go`) keep `needWrite` — those are the deposits that are
+*supposed* to claim.
+
+`TestKeyEnvelopeListDoesNotClaimUnownedVault` proves both halves: the GET and DELETE
+403 on an unowned vault, **and the vault is still unclaimed afterwards**, shown by
+having a different device go on to claim it with a genuine write.
+
+### HIGH (in effect) — `SECURITY.md` told researchers not to report crypto bugs
+The scope section said the cryptographic core was "not yet implemented" and asked
+people not to file findings about missing crypto. That had been false since early in
+the project, and by Phase 50 it was actively harmful: it discouraged exactly the
+reports this project most needs, on the code most likely to be wrong. It was
+**retracted explicitly** rather than quietly edited, and replaced with a list of what
+is real and load-bearing — the Argon2id/XChaCha20-Poly1305 sealed-record path,
+Ed25519, X25519, ML-KEM-768, ML-DSA-65, the hybrid seal that wraps vault keys, the
+device-auth contract, key pinning, and the billing webhook verification.
+
+### LOW — documentation that had drifted from the code
+- `/readyz` schema: the `oplog` key is **omitted** for backends that are not
+  `store.Pinger`, and its value is only `ok` or `unreachable`.
+- `hash` and `tip_hash` are **std-base64**, not hex — `handlers.go` emits
+  `base64.StdEncoding`, and `docs/api.md` is the authority.
+- `?limit` is **clamped** (`<=0` to 1, `>1000` to 1000, both 200); only a
+  non-integer is a 400.
+
+### CI, in the same commit
+`cli.yml`, `web.yml` and `interop.yml` each gained a step; `interop.yml` itself had
+landed moments earlier in `5735f80`, which gave the nine cross-component interop
+tests a workflow for the first time — until then **nothing ran them at all**.
+
+### The pattern worth remembering
+Both real findings were things that *looked* fine. The `needWrite` reuse was a
+defensible-sounding argument that happened to be about the wrong axis, and the
+`SECURITY.md` text was simply never re-read after the thing it described stopped
+being true. Neither would have been caught by any test.
+
 
 ## 2026-07-27 — Phase 51 (closing the third full-repo audit: the desktop's key-substitution ALARM becomes visible, webhook dedup moves inside the signature, and the security page stops lying in the safe direction)
 

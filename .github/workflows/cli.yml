@@ -4,11 +4,13 @@ on:
   push:
     paths:
       - "cli/**"
+      - "libsigil/**"
       - "rust-toolchain.toml"
       - ".github/workflows/cli.yml"
   pull_request:
     paths:
       - "cli/**"
+      - "libsigil/**"
       - "rust-toolchain.toml"
       - ".github/workflows/cli.yml"
 

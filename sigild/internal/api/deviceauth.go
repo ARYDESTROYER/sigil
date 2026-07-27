@@ -117,6 +117,17 @@ const (
 	// needWrite: append to a vault's op-log. A write to an UNOWNED vault claims
 	// ownership (trust-on-first-write, see authorizeVault).
 	needWrite
+	// needWriteNoClaim: requires the SAME write-level grant as needWrite, but
+	// must NEVER claim an unowned vault — an unowned vault is 403.
+	//
+	// This exists because claiming is a side effect, and a side effect belongs
+	// only on a request that is genuinely a write. Listing or deleting key
+	// envelopes is restricted to a writer (a device that can deposit an envelope
+	// can already replace any envelope in that vault), but `GET …/keys` is
+	// read-shaped: letting it claim meant a plain GET on a never-claimed vault
+	// silently made the caller its owner — a vault-ID squatting vector, and a
+	// direct contradiction of the documented rule that "reads never claim".
+	needWriteNoClaim
 	// needOwner: administer a vault (grant another device access).
 	needOwner
 )

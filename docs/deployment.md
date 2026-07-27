@@ -459,7 +459,8 @@ backends have no database and no migrations, and the whole thing is inert unless
 - **Embedded + versioned in the binary.** Each migration is an embedded
   `NNNN_description.sql` file (`go:embed`, `sigild/internal/store/migrations/`);
   the zero-padded leading integer is the version and migrations apply in ascending
-  order. The current set is a single baseline, **`0001_init.sql`** (version `1`),
+  the current set is **`0001_init.sql`**, **`0002_devices.sql`**, **`0003_billing.sql`**
+and **`0004_key_sharing.sql`** (version `4`),
   which creates the `sigil_vault_ops` table (opaque `bytea` `blob` + `bytea`
   `hash` + `(vault_id, seq)` primary key). A **`schema_migrations`** tracking
   table (`version`, `name`, `applied_at`) records what has been applied, so a run
@@ -677,7 +678,8 @@ idempotency key in the database, across processes and restarts. Configure
 Postgres before pointing any real provider at the endpoint. Billing adds **no
 second connection pool and no new dependency** — it reuses the op-log's existing
 `pgxpool` and adds migration **`0003_billing.sql`** (`sigil_subscriptions`,
-`sigil_billing_processed_events`), so `sigild_schema_version` reports **3**
+`sigil_billing_processed_events`, plus `0004_key_sharing.sql`), so
+`sigild_schema_version` reports **4**
 ([§11](#11-schema-migrations-postgres-backend) covers how migrations are applied;
 [§12](#12-backup--restore-postgres-backend)'s `pg_dump`/`pg_restore` runbook
 covers the new tables too, since they are dumped with the rest of the database).

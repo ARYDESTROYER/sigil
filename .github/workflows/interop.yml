@@ -80,6 +80,18 @@ jobs:
             sigil-wasm
             cli
 
+      # The sigil-wasm crate had NO CI lint/test gate of its own. Its 26 tests
+      # include container_header_is_golden and hybrid_container_prefix_is_golden,
+      # which guard the SIGILcli / SIGILhyb constants that CLAUDE.md requires to
+      # stay byte-identical with cli/src/lib.rs — exactly the kind of mirrored
+      # invariant that drifts silently when nothing checks it.
+      - name: sigil-wasm rustfmt
+        run: cargo fmt --manifest-path sigil-wasm/Cargo.toml --all -- --check
+      - name: sigil-wasm clippy
+        run: cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
+      - name: sigil-wasm tests (incl. the golden format-constant guards)
+        run: cargo test --manifest-path sigil-wasm/Cargo.toml
+
       # Emits pkg-web + pkg-node. The tests import pkg-node.
       - name: Build the wasm bindings
         run: ./sigil-wasm/build-wasm.sh

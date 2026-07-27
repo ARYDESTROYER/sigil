@@ -22,7 +22,7 @@ export default function Home() {
 
         <h1 className="mb-2 text-2xl font-bold">Sigil authenticator</h1>
         <p className="mb-8 text-sm text-neutral-600 dark:text-neutral-400">
-          A client-side, end-to-end-encrypted (dev) TOTP authenticator. Codes are
+          A client-side TOTP authenticator, designed end-to-end encrypted (dev). Codes are
           computed by the libsigil core compiled to WebAssembly; your vault is
           sealed with a password and never leaves this browser in the clear. Works
           offline once loaded.

@@ -1138,7 +1138,7 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (26 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the EIGHT Node tests below must all PASS.
+# pkg-web/pkg-node (needs wasm-pack); then the NINE Node tests below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml

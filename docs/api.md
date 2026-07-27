@@ -256,8 +256,10 @@ unbounded slice.
 - **Query:**
   - `since` (optional, integer, default `0`) — return ops with `seq > since`.
   - `limit` (optional, integer, default **`500`**, max **`1000`**) — cap the
-    number of ops returned by this call. An out-of-range or non-integer value
-    (`≤ 0`, `> 1000`, or non-numeric) is rejected with `400 bad_limit`.
+    number of ops returned by this call. An out-of-range value is **CLAMPED**,
+    not rejected: `≤ 0` clamps to `1` and `> 1000` clamps to `1000`, both
+    returning `200`. Only a **non-integer** value (e.g. `?limit=abc`) is
+    rejected, with `400 bad_limit`.
 - **Success — `200 OK`:**
 
   ```json

@@ -607,3 +607,37 @@ func TestRotationRoutesAreDevGated(t *testing.T) {
 		}
 	}
 }
+
+// TestKeyEnvelopeListDoesNotClaimUnownedVault pins a fix for a real defect: the
+// envelope LIST and DELETE routes required needWrite, and needWrite claims an
+// unowned vault under trust-on-first-write. That gave a read-shaped `GET
+// …/keys` a WRITE SIDE EFFECT — a plain GET on a never-claimed vault silently
+// made the caller its owner, which is a vault-ID squatting vector and directly
+// contradicts the documented rule that "reads never claim".
+//
+// They now use needWriteNoClaim: the same write-level grant is still required,
+// but an unowned vault is 403 and ownership is untouched.
+func TestKeyEnvelopeListDoesNotClaimUnownedVault(t *testing.T) {
+	env := newShareEnv(t)
+	listPath := "/v1/vaults/" + env.vault + "/keys"
+
+	// A GET on a vault nobody owns must be refused, NOT silently claimed.
+	assertForbidden(t, v3Get(t, env.deviceEnv, env.devA, listPath))
+	// DELETE is write-shaped but must not claim either.
+	assertForbidden(t, v3Delete(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID)))
+
+	// PROOF the vault is still unowned: a DIFFERENT device can now claim it with
+	// a genuine write. If the GET above had claimed it for A, this would 403.
+	if rec := v3Put(t, env.deviceEnv, env.devB, env.keyPath(env.devB.ID), randBytes(t, 128)); rec.Code != http.StatusCreated {
+		t.Fatalf("B put envelope (claiming the still-unowned vault) = %d, want 201; "+
+			"the earlier GET/DELETE must not have claimed it", rec.Code)
+	}
+
+	// And the owner can still list: write-level access is genuinely required,
+	// so this is a real authorization check, not a blanket refusal.
+	if rec := v3Get(t, env.deviceEnv, env.devB, listPath); rec.Code != http.StatusOK {
+		t.Fatalf("owner list = %d, want 200", rec.Code)
+	}
+	// A is still not authorized on B's vault.
+	assertForbidden(t, v3Get(t, env.deviceEnv, env.devA, listPath))
+}

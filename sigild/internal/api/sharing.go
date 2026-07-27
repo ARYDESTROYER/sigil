@@ -382,7 +382,7 @@ func (h *handlers) keyEnvelopeList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := h.authorizeOpsRequest(r, nil, vaultID, needWrite)
+	out := h.authorizeOpsRequest(r, nil, vaultID, needWriteNoClaim)
 	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
 		return
@@ -422,7 +422,7 @@ func (h *handlers) keyEnvelopeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := h.authorizeOpsRequest(r, nil, vaultID, needWrite)
+	out := h.authorizeOpsRequest(r, nil, vaultID, needWriteNoClaim)
 	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
 		return

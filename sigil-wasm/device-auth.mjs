@@ -244,26 +244,96 @@ function checkVaultId(vaultId) {
 // user's vault password (Argon2id -> XChaCha20-Poly1305, in the wasm). It is a
 // SEPARATE container from the TOTP vault, so the CLI-mirrored `TotpVault` JSON
 // schema is untouched, and it is only readable while the vault is unlocked.
+//
+// ── v2 (Phase 48): the container ALSO carries the SHARING secrets ────────────
+//
+// Device-to-device vault sharing (sharing.mjs) introduces two more pieces of
+// bearer key material on a client:
+//
+//   * the HYBRID SECRET IDENTITY — {x25519Secret(32), mlkemSeed(64)} — the ONLY
+//     thing that can open an envelope addressed to this device; and
+//   * the VAULT KEYRING — `vaultId -> 32-byte vault key` for every shared vault
+//     this device has re-keyed or accepted.
+//
+// The `sigil` CLI keeps those in 0600 files ($HOME/.sigil/device.hybrid and
+// $HOME/.sigil/vault-keys.json) because a POSIX filesystem is what it has. A
+// browser has no such thing, so they ride INSIDE this same sealed container:
+// one password, one lock/unlock lifecycle, and NOTHING new persisted in the
+// clear. Both are readable only while the vault is unlocked.
+//
+// The JSON field names deliberately mirror the CLI's on-disk shapes
+// (`x25519_secret` / `mlkem_seed` from HybridSecretIdentity, and the
+// `vaultId -> b64` map from VaultKeyring.keys).
+//
+// BACKWARD COMPATIBLE: v1 containers (no `hybrid`, no `vault_keys`) still open —
+// they simply yield `hybrid: null` and an empty keyring. Both fields are omitted
+// from the JSON entirely when absent, so a client that never shares writes the
+// same shape it always did.
 
-/** Schema version of the sealed device-identity JSON. */
-export const DEVICE_IDENTITY_VERSION = 1;
+/** Schema version this build WRITES for the sealed device-identity JSON. */
+export const DEVICE_IDENTITY_VERSION = 2;
+
+/** Schema versions this build can READ (v1 predates the sharing fields). */
+const SUPPORTED_DEVICE_IDENTITY_VERSIONS = [1, 2];
+
+/** X25519 secret scalar length in the sealed hybrid identity. */
+const HYBRID_X25519_SECRET_LEN = 32;
+/** ML-KEM-768 keygen seed length in the sealed hybrid identity. */
+const HYBRID_MLKEM_SEED_LEN = 64;
+/** Vault key length (mirrors cli/src/lib.rs::VAULT_KEY_LEN). */
+const VAULT_KEY_LEN = 32;
 
 /**
  * Seal a device identity into a `SIGILcli` container under `password`.
  *
- *   sealDeviceIdentity(wasm, password, { deviceId, seed, baseUrl }, salt, nonce, params)
- *     -> Uint8Array (the sealed container; store THIS, never the seed)
+ *   sealDeviceIdentity(wasm, password, identity, salt, nonce, params)
+ *     -> Uint8Array (the sealed container; store THIS, never the secrets)
+ *
+ * `identity` is `{ deviceId, seed, baseUrl?, hybrid?, vaultKeys? }` where
+ * `hybrid` is `{ x25519Secret: Uint8Array(32), mlkemSeed: Uint8Array(64) }` and
+ * `vaultKeys` is `{ [vaultId]: Uint8Array(32) }`. The two sharing fields are
+ * OPTIONAL and are omitted from the JSON when absent.
  *
  * `salt` and `nonce` are caller-supplied CSPRNG bytes (`crypto.getRandomValues`),
  * exactly as for the TOTP vault. All crypto happens inside the wasm.
  */
 export function sealDeviceIdentity(wasm, password, identity, salt, nonce, params) {
-  const json = JSON.stringify({
+  const obj = {
     version: DEVICE_IDENTITY_VERSION,
     device_id: identity.deviceId,
     seed: bytesToBase64(identity.seed),
     base_url: identity.baseUrl ?? "",
-  });
+  };
+  if (identity.hybrid) {
+    const h = identity.hybrid;
+    if (
+      !(h.x25519Secret instanceof Uint8Array) ||
+      h.x25519Secret.length !== HYBRID_X25519_SECRET_LEN ||
+      !(h.mlkemSeed instanceof Uint8Array) ||
+      h.mlkemSeed.length !== HYBRID_MLKEM_SEED_LEN
+    ) {
+      throw new Error(
+        `device-auth: hybrid must be { x25519Secret: Uint8Array(${HYBRID_X25519_SECRET_LEN}), ` +
+          `mlkemSeed: Uint8Array(${HYBRID_MLKEM_SEED_LEN}) }`,
+      );
+    }
+    obj.hybrid = {
+      x25519_secret: bytesToBase64(h.x25519Secret),
+      mlkem_seed: bytesToBase64(h.mlkemSeed),
+    };
+  }
+  if (identity.vaultKeys && Object.keys(identity.vaultKeys).length > 0) {
+    const keys = {};
+    for (const [vaultId, key] of Object.entries(identity.vaultKeys)) {
+      if (!(key instanceof Uint8Array) || key.length !== VAULT_KEY_LEN) {
+        throw new Error(
+          `device-auth: vault key for ${JSON.stringify(vaultId)} must be a ${VAULT_KEY_LEN}-byte Uint8Array`,
+        );
+      }
+      keys[vaultId] = bytesToBase64(key);
+    }
+    obj.vault_keys = keys;
+  }
   const pw = typeof password === "string" ? TEXT_ENCODER.encode(password) : password;
   return new Uint8Array(
     wasm.seal_to_container(
@@ -273,7 +343,7 @@ export function sealDeviceIdentity(wasm, password, identity, salt, nonce, params
       params.m_cost,
       params.t_cost,
       params.p_cost,
-      TEXT_ENCODER.encode(json),
+      TEXT_ENCODER.encode(JSON.stringify(obj)),
     ),
   );
 }
@@ -282,20 +352,53 @@ export function sealDeviceIdentity(wasm, password, identity, salt, nonce, params
  * Open a sealed device-identity container. Throws on a wrong password or a
  * tampered container (the AEAD tag fails), and on an unknown schema version.
  *
- *   -> { deviceId, seed: Uint8Array(32), baseUrl }
+ *   -> { deviceId, seed: Uint8Array(32), baseUrl,
+ *        hybrid: { x25519Secret, mlkemSeed } | null,
+ *        vaultKeys: { [vaultId]: Uint8Array(32) } }
+ *
+ * A v1 container (written before sharing existed) opens fine and yields
+ * `hybrid: null` with an empty `vaultKeys`.
  */
 export function openDeviceIdentity(wasm, password, containerBytes) {
   const pw = typeof password === "string" ? TEXT_ENCODER.encode(password) : password;
   const plain = wasm.open_container(pw, containerBytes);
   const obj = JSON.parse(new TextDecoder().decode(plain));
-  if (obj.version !== DEVICE_IDENTITY_VERSION) {
+  if (!SUPPORTED_DEVICE_IDENTITY_VERSIONS.includes(obj.version)) {
     throw new Error(`device-auth: unsupported device identity version ${obj.version}`);
   }
   const seed = base64ToBytes(obj.seed);
   if (seed.length !== DEVICE_SEED_LEN) {
     throw new Error(`device-auth: stored seed is ${seed.length} bytes, expected ${DEVICE_SEED_LEN}`);
   }
-  return { deviceId: obj.device_id, seed, baseUrl: obj.base_url ?? "" };
+
+  let hybrid = null;
+  if (obj.hybrid) {
+    const x25519Secret = base64ToBytes(obj.hybrid.x25519_secret ?? "");
+    const mlkemSeed = base64ToBytes(obj.hybrid.mlkem_seed ?? "");
+    if (
+      x25519Secret.length !== HYBRID_X25519_SECRET_LEN ||
+      mlkemSeed.length !== HYBRID_MLKEM_SEED_LEN
+    ) {
+      throw new Error(
+        `device-auth: stored hybrid identity is ${x25519Secret.length}/${mlkemSeed.length} bytes, ` +
+          `expected ${HYBRID_X25519_SECRET_LEN}/${HYBRID_MLKEM_SEED_LEN}`,
+      );
+    }
+    hybrid = { x25519Secret, mlkemSeed };
+  }
+
+  const vaultKeys = {};
+  for (const [vaultId, encoded] of Object.entries(obj.vault_keys ?? {})) {
+    const key = base64ToBytes(encoded);
+    if (key.length !== VAULT_KEY_LEN) {
+      throw new Error(
+        `device-auth: stored vault key for ${JSON.stringify(vaultId)} is ${key.length} bytes, expected ${VAULT_KEY_LEN}`,
+      );
+    }
+    vaultKeys[vaultId] = key;
+  }
+
+  return { deviceId: obj.device_id, seed, baseUrl: obj.base_url ?? "", hybrid, vaultKeys };
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

@@ -58,3 +58,8 @@ export * from "../../../sigil-wasm/totp-migration.mjs";
 // source as sigil-wasm/test/device-auth-interop.mjs, which proves it against a
 // live server.
 export * from "../../../sigil-wasm/device-auth.mjs";
+// Device-to-device vault sharing: hybrid key publish/fetch, vault-key wrap/unwrap
+// and the opaque envelope relay. Same source as
+// sigil-wasm/test/sharing-interop.mjs, which proves it BOTH ways against the real
+// `sigil` CLI through a live server.
+export * from "../../../sigil-wasm/sharing.mjs";

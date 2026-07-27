@@ -312,11 +312,12 @@ To avoid any over-claim, the honest gaps:
   TLS-enabled Go-native listener and a PQ-capable client are prerequisites that
   do not exist on the build machine (LibreSSL can't negotiate the group). See
   [§3](#3-pq-tls-nuance-read-this-before-claiming-a-pq-proof).
-- **Clients are stubbed, and the one browser app is dev-only / NOT deployed.** No
-  admin console or extension consumes this server; the only client that does is the
-  demo **`sigil` CLI** — `push`/`pull` against the dev op-log and, as of Phase 42,
+- **Clients are dev-only / NOT deployed.** No admin console consumes this server. The
+  demo **`sigil` CLI** does — `push`/`pull` against the dev op-log and, as of Phase 42,
   `sigil device enroll|list|revoke|grant` against a `SIGILD_DEVICE_AUTH` server
-  (**contract v3**, so a client now exercises the device model end to end) — all
+  (**contract v3**, so a client exercises the device model end to end) — and so do the
+  **webapp and the MV3 extension**, which since Phase 44 enroll and sign under the same
+  contract and since Phase 48 also drive the vault-sharing routes. All of it is
   **dev / localhost / plain HTTP, nothing deployed**. `libsigil`'s
   real-but-**unaudited** AEAD building block is **not wired into any product flow**.
   A **`web/apps/webapp`** Next.js app now exists — it runs the libsigil core via

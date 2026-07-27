@@ -317,13 +317,33 @@ anything other than 32 bytes is rejected rather than used as a key.
   "change your password everywhere". A per-vault random key is rotatable in
   principle (re-key + re-share) and reveals nothing about the user.
 - **Fresh ephemeral entropy per wrap.** The ephemeral X25519 secret, the ML-KEM coin
-  and the AEAD nonce are drawn from the OS CSPRNG on **every** call, so two shares
+  and the AEAD nonce are drawn from a CSPRNG on **every** call, so two shares
   of the same key never reuse randomness. Consistent with
   [ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md), all of it is
-  supplied by the caller (the CLI); `sigil-core` still generates nothing.
+  supplied by the caller — the OS CSPRNG in the CLI, `crypto.getRandomValues` in the
+  browser clients; `sigil-core` still generates nothing.
 - **Keys are never printed.** A vault key is shown only as
   `vault_key_fingerprint` — the first 16 hex characters of its SHA-256 — so two
   devices can confirm they hold the same key without revealing it.
+
+### The same hierarchy, exercised from the browser
+
+This hierarchy is **not CLI-specific**. The webapp and the MV3 extension run the
+identical construction through [`../sigil-wasm/sharing.mjs`](../sigil-wasm/sharing.mjs)
+(`generateVaultKey` → `wrapVaultKey` / `shareVault` → `acceptVault` /
+`unwrapVaultKey`, with `vaultKeyFingerprint` computing the same 16-hex SHA-256 prefix
+via `crypto.subtle`). **The wrap and unwrap still happen inside the wasm** —
+`hybrid_seal_to_container` / `hybrid_open_container`, i.e. `sigil-core`'s
+`hybrid_seal` / `hybrid_open` — so there is no second implementation of the
+construction and no JS-side cryptography; the JS supplies entropy and moves bytes. The
+recovered-plaintext length check (exactly 32 bytes, else reject) is mirrored in
+`unwrapVaultKey`. A shared vault sealed by a browser is byte-compatible with one sealed
+by the CLI, and vice versa: `sharing-interop.mjs` shares a vault **both ways** between
+the JS client and the real `sigil` binary and both ends reach the same fingerprint and
+the same RFC 6238 code. Where the CLI keeps the hybrid secret and the keyring in `0600`
+files, the browser clients keep them inside their **sealed device-identity container**
+([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)) — sealed with the same
+Argon2id → XChaCha20-Poly1305 `SIGILcli` construction as a vault.
 
 ### What the server sees, and what it cannot do
 
@@ -366,6 +386,9 @@ is the **client's** business.
   envelopes.
 - **Authentication of the sharing routes is classical Ed25519 only** (contract v3).
   The wrap is hybrid; the request signature is not.
+- **No zeroization of key material in the clients.** Rust `Vec`s and JS
+  `Uint8Array`s holding a vault key or a hybrid secret are dropped, not wiped; in the
+  browser they stay live in the JS heap for as long as the vault is unlocked.
 - **The Argon2id pass over an already-uniform 32-byte vault key is redundant work**,
   kept deliberately so the shared vault is byte-identical in shape to a personal
   one and no client's container parser changes. Replacing it with a direct KDF is a

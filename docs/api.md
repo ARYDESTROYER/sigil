@@ -1212,8 +1212,51 @@ testable from the outside — it never attempts to unwrap.
 
 The CLI **never prints a vault key**: `rekey` / `share` / `accept` / `list` show
 only `key_sha256=<16 hex chars>`, the first 8 bytes of the key's SHA-256, so two
-devices can confirm they hold the same key without revealing it. The browser,
-extension and desktop clients **do not implement sharing yet**.
+devices can confirm they hold the same key without revealing it.
+
+### Client support (the browser + Node clients)
+
+The **browser clients implement the same flow**, through
+[`../sigil-wasm/sharing.mjs`](../sigil-wasm/sharing.mjs) — a framework-free,
+dependency-free ESM module that runs in Node **and** the browser and is used by
+`web/apps/webapp` (via the `@sigil/wasm` loader) and by the MV3 `extension/` (via
+its vendored copy). It covers all four routes, plus the two composed operations:
+
+| Module function | Route it calls |
+|-----------------|----------------|
+| `publishHybridKey(wasm, auth, secretIdentity?)` | `PUT /v1/devices/{deviceID}/hybrid-key` — publishes only the public halves, into **this** device's slot |
+| `fetchHybridKey(wasm, auth, deviceId)` | `GET /v1/devices/{deviceID}/hybrid-key` |
+| `putKeyEnvelope(wasm, auth, vaultId, recipientDeviceId, envelopeBytes)` | `PUT /v1/vaults/{vaultID}/keys/{deviceID}` |
+| `getKeyEnvelope(wasm, auth, vaultId, deviceId?)` | `GET /v1/vaults/{vaultID}/keys/{deviceID}` (defaults to `auth.deviceId`) |
+| `shareVault(wasm, auth, {vaultId, recipientDeviceId, vaultKey, permission})` | `GET …/hybrid-key`, then `PUT …/keys/{to}`, then `POST …/grants` — the same three-step composition as `sigil vault share`, so authorization and key distribution cannot drift |
+| `acceptVault(wasm, auth, {vaultId, secretIdentity?})` | `GET …/keys/{deviceID}` — collect, unwrap, return the 32-byte key |
+
+`auth` is exactly the object `openDeviceIdentity` returns plus a `baseUrl`, so an
+unlocked client passes its device identity straight in. Supporting surface:
+`generateHybridIdentity` / `hybridPublicIdentity`, `generateVaultKey` /
+`vaultKeyFingerprint` (the same 16-hex SHA-256 prefix the CLI prints — a vault key is
+never rendered), `wrapVaultKey` / `unwrapVaultKey`, and `explainSharingStatus`, which
+extends `explainAuthStatus` with the statuses only these routes produce (`403` not the
+addressee / not permitted, `404` nothing published or shared yet, `409` revoked
+recipient, `413` oversized). **All KEM/AEAD work happens in the wasm**
+(`hybrid_seal_to_container` / `hybrid_open_container`) and every request signature goes
+through `device-auth.mjs`; the module hand-rolls nothing. Entropy is JS-supplied
+(`crypto.getRandomValues`) for the hybrid identity, each vault key, and the per-wrap
+ephemeral X25519 secret / ML-KEM coin / AEAD nonce. `unwrapVaultKey` rejects any
+recovered plaintext that is not exactly 32 bytes rather than using it as a key.
+
+The browser clients store the hybrid secret identity and every accepted vault key
+**inside their sealed device-identity container** (schema v2), never in plaintext web
+storage — see [ADR 0036](decisions/0036-browser-sharing-secret-storage.md).
+
+The semantics are **MIRRORED — not shared — from `sharing.go` (this server, the source
+of truth) and `cli/src/lib.rs`**; drift yields a `400`/`403` or an envelope the CLI
+cannot open, so the guard is
+[`../sigil-wasm/test/sharing-interop.mjs`](../sigil-wasm/test/sharing-interop.mjs),
+which boots a **real** sigild, builds the **real** `sigil` binary, and shares a vault
+**both ways** between the JS client and the CLI (both ends reaching the same key
+fingerprint and the same RFC 6238 code), plus the `403` negatives. The **desktop** client
+does **not** implement sharing yet.
 
 ### Honest limits (read before believing any of the above)
 
@@ -1235,6 +1278,9 @@ extension and desktop clients **do not implement sharing yet**.
 - **Request authentication is classical Ed25519** (contract v3). The wrap is
   PQ-hybrid; the signature over the request is not, and **the system is not
   "post-quantum secure"**.
+- **Client-side key storage is only as strong as its host.** The CLI's hybrid secret
+  and keyring are `0600` files; the browser clients seal both into the device-identity
+  container but hold them **unzeroized in JS memory** while the vault is unlocked.
 
 ---
 

@@ -56,7 +56,11 @@ the file-backed and opt-in durable-Postgres dev op-log backends,
 > relayed through `sigild` as an **opaque envelope the server cannot read**, authorized
 > by the existing v3 grant/ownership/revocation model; the **first load-bearing use of
 > the hybrid primitives**, still dev-gated and UNAUDITED, and the human password is
-> never shared),
+> never shared) **now implemented by the browser clients too** (`sigil-wasm/sharing.mjs`
+> gives the webapp and the MV3 extension the same flow as the CLI, with the hybrid
+> secret identity and every accepted vault key stored inside the **sealed
+> device-identity container**, schema v2 — so a browser still persists only sealed
+> containers),
 > and the manual / human-gated deploy & publish posture). They record load-bearing
 > decisions that have **actually been made
 > and built** — not aspirations, and not a shipping product. Nothing here is
@@ -79,6 +83,15 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
   rewritten when the world changes.
 - If a decision is reversed or revised, we write a **new** ADR and mark the old
   one **Superseded by NNNN** (and link the replacement). History stays legible.
+- **Addenda are the one permitted exception, and only under these rules:** a
+  clearly-headed, dated `## … (added Phase NN)` section may be APPENDED when a
+  limitation the ADR recorded is later retired, so a reader does not walk away
+  believing a stale constraint still holds. An addendum may **only** report what
+  changed and point at the ADR that made the change — it must never edit the
+  original Status/Context/Decision/Consequences text. If the DECISION itself
+  changes, that is a supersession, not an addendum. (Example: ADR 0035 closed by
+  noting sharing was CLI-only; Phase 48 retired that, so 0035 carries an
+  addendum and the new storage decision got its own ADR 0036.)
 - ADRs are numbered sequentially (`NNNN`) and named
   `NNNN-kebab-case-title.md`.
 - Each has a fixed shape: **Status**, **Context**, **Decision**,
@@ -124,3 +137,4 @@ style](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
 | [0033](0033-browser-device-identity-storage.md) | Browser device-identity storage — seal the Ed25519 device seed in a second `SIGILcli` container under the vault password (never plaintext web storage, never a `TotpVault` field) | Accepted (2026-07) |
 | [0034](0034-billing-provider-seam.md) | Provider-agnostic billing seam in `sigild` (Stripe / Razorpay / Juspay, stdlib-only adapters with no vendor SDKs, hosted checkout only, raw-body HMAC webhooks, idempotency on the provider event ID) | Accepted (2026-07) |
 | [0035](0035-device-to-device-vault-sharing.md) | Device-to-device vault sharing — random per-vault key sealed into the unchanged `SIGILcli` container, wrapped per device with `hybrid_seal` (X25519 + ML-KEM-768), relayed as an opaque envelope, authorized by the existing v3 grants | Accepted (2026-07) |
+| [0036](0036-browser-sharing-secret-storage.md) | Browser sharing-secret storage — keep the hybrid secret identity and the vault keyring inside the existing sealed device-identity container (schema bumped to v2, v1 still readable) rather than adding a new store | Accepted (2026-07) |

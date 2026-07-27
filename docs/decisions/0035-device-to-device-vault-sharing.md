@@ -260,3 +260,48 @@ can confirm they hold the same key without revealing it.
 - **A separate authorization model for sharing** (e.g. an ACL on envelopes).
   Rejected: two policies that must agree eventually disagree. Grants already answer
   "who may touch this vault".
+
+## Browser client support (added Phase 48)
+
+This ADR was written when only the `sigil` CLI implemented the flow, and it closed by
+recording that as a limit. **That limit is now retired for the browser clients:**
+`web/apps/webapp` and the MV3 `extension/` implement the **same** flow, so sharing
+works across every client that talks to the server. The **desktop** client still does
+not.
+
+- **The protocol, the routes and the byte layouts are unchanged.** Nothing in the
+  decisions above was revised. No Rust changed either: the wasm exports the browser
+  needs (`hybrid_x25519_public`, `hybrid_mlkem_encaps_key`, `hybrid_seal_to_container`,
+  `hybrid_open_container`) already existed from
+  [ADR 0021](0021-wasm-hybrid-public-key-encryption.md), and `sigild` was untouched.
+- **The client half is [`../../sigil-wasm/sharing.mjs`](../../sigil-wasm/sharing.mjs)** —
+  framework-free, dependency-free, Node **and** browser — exporting
+  `generateHybridIdentity` / `hybridPublicIdentity`, `publishHybridKey` /
+  `fetchHybridKey`, `generateVaultKey` / `vaultKeyFingerprint`, `wrapVaultKey` /
+  `unwrapVaultKey`, `putKeyEnvelope` / `getKeyEnvelope`, `shareVault` / `acceptVault`,
+  and `explainSharingStatus`. Its semantics are **mirrored, not shared**, from
+  `cli/src/lib.rs` and `sigild/internal/api/sharing.go`. It performs **no
+  cryptography**: the KEM/AEAD runs in the wasm, request signatures go through
+  `device-auth.mjs`, and all entropy is `crypto.getRandomValues`.
+- **`shareVault` keeps decision 4 intact in JS**: it wraps, deposits, and *then*
+  grants through the existing `grantVaultAccess`, so authorization and key
+  distribution cannot drift apart on the browser either. `unwrapVaultKey` mirrors the
+  CLI's rule that a recovered plaintext of any length other than 32 bytes is rejected
+  rather than used as a key.
+- **Where the client keeps the secrets is the one genuinely new decision**, and it is
+  recorded separately in [ADR 0036](0036-browser-sharing-secret-storage.md): the
+  hybrid secret identity and the vault keyring live **inside the existing sealed
+  device-identity container**, whose schema was bumped to **v2**, rather than in a new
+  store. A browser therefore still persists only sealed containers.
+- **Proof:** [`../../sigil-wasm/test/sharing-interop.mjs`](../../sigil-wasm/test/sharing-interop.mjs)
+  boots a real `sigild`, builds the **real `sigil` binary**, and shares **both ways** —
+  JS → CLI and CLI → JS — with both ends reaching the same vault-key fingerprint and
+  the same RFC 6238 code, plus the `403` negatives, the byte-identical relayed
+  envelope, and the check that the human password does **not** open a re-keyed shared
+  vault.
+- **Every limit above still applies**, unchanged and now on more surfaces: no
+  out-of-band verification of a published hybrid key, revocation cannot un-learn an
+  accepted key, no rotation / re-wrap / forward secrecy, dev-gated, plain HTTP,
+  UNAUDITED. Two are worth restating in browser terms: JS `Uint8Array`s holding key
+  material are **not zeroized**, and converting a personal vault into a shared vault
+  is a **one-way door** in both UIs.

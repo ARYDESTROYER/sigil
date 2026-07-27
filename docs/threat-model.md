@@ -136,6 +136,44 @@ not buy:
   vault password destroys the device identity along with the vault; the only recovery
   is an operator revoke plus a fresh enrollment token.
 
+### Browser clients that also SHARE vaults (webapp + MV3 extension)
+
+Both browser clients now run the full sharing flow through `sigil-wasm/sharing.mjs`
+(adversary rows R–W below apply to them exactly as to the CLI). What changes on the
+client side is **what a browser profile now holds**:
+
+- **Two more classes of bearer secret live on the device.** The **hybrid secret
+  identity** (`x25519_secret` + `mlkem_seed`) is the only thing that can open an
+  envelope addressed to this device, and the **vault keyring** (`vaultId → 32 bytes`)
+  opens every shared vault this device accepted. Either one is as sensitive as the
+  device seed.
+- **Both are sealed at rest, in the container that already existed.** Rather than
+  adding a new store, the sealed device-identity container was extended to **schema
+  v2** ([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)): its sealed
+  plaintext is now `{version: 2, device_id, seed, base_url, hybrid: {...},
+  vault_keys: {...}}`. So each client still persists exactly **two** values, both
+  `SIGILcli` containers under the vault password — `sigil.webapp.vault.v1` /
+  `sigil.webapp.device.v1`, `sigil.extension.vault.v1` /
+  `sigil.extension.device.v1`. An offline attacker with the profile directory, a
+  backup, or a `localStorage` dump gets ciphertext, and unsealing costs the same
+  Argon2id work as the vault.
+- **They are exposed in memory while unlocked, and are NOT zeroized.** Sharing needs
+  the hybrid secret and the vault keys in the clear, so between unlock and lock they
+  sit in the JS heap as `Uint8Array`s. JS offers no reliable wipe: Lock / Forget /
+  reload drop the references, but nothing scrubs the bytes, and there is no `mlock`
+  and no enclave. Anything that can run code in the client's context while the vault
+  is unlocked can read them.
+- **A shared vault is not recoverable from the password.** Once a vault is converted
+  to a shared vault it is sealed under the random vault key, so the *only* thing that
+  opens it is a key held in the sealed identity container. Unlock therefore opens the
+  identity first, tries the password, then falls back to each held vault key. Losing
+  the password loses the keyring, and with it every shared vault this device accepted
+  — there is no recovery path. Conversion is also a **one-way door** in both UIs.
+- **A pasted recipient device ID is trusted as typed.** The UI has no directory and no
+  verification step: the sender pastes an ID, and the registry answers with whatever
+  hybrid public key it has for it. See the substitution gap below — it is the same gap
+  as for the CLI, but a paste-and-click UI makes it easier to walk into.
+
 **Zero-knowledge is unaffected by the auth model — or by sharing.** The registry
 stores **auth metadata only** — Ed25519 **public** keys, server-assigned IDs,
 labels, permissions, timestamps, and a bearer token's SHA-256 digest. Migrations
@@ -201,6 +239,12 @@ Everything here is **dev-gated (`501` by default), opt-in, plain HTTP in dev, an
 UNAUDITED** — and the cryptography it now leans on (the hybrid combiner and the
 custom KEM-then-AEAD seal) is **the same unaudited code**, only now load-bearing.
 
+The rows below are **client-agnostic**: the `sigil` CLI, the webapp and the MV3
+extension all drive the same four routes with the same v3 signatures, so every defense
+and every gap applies to all three. The browser-specific consequences — two more
+bearer secrets in a browser profile, no zeroization, no password recovery for a shared
+vault — are in the subsection above.
+
 | # | Adversary | Capability | Defense as implemented | Layer |
 | --- | --- | --- | --- | --- |
 | R | **Malicious server / rogue operator reading a relayed envelope** | Owns `sigild` and its database; wants the vault key in transit | The envelope is **ciphertext the server has no key for**: it is a `SIGILhyb` container holding the vault key sealed under a shared secret that only the recipient's hybrid **secret** identity can decapsulate, and that identity **never leaves the device**. The server stores and returns the bytes **verbatim**, decodes nothing, and its *only* inspection of key material is a **length check** (32 / 1184 bytes) on a *published public* key. Proven, not asserted: the e2e script byte-compares uploaded vs. returned bytes and greps the envelope for the 2FA seed | Architecture + crypto |
@@ -248,11 +292,15 @@ custom KEM-then-AEAD seal) is **the same unaudited code**, only now load-bearing
   interoperability. The hybrid property (secure if **either** X25519 or ML-KEM-768
   holds) is design intent of unaudited code, and the **SYSTEM is not "post-quantum
   secure."**
-- **Local key storage is filesystem permissions, nothing more.** The hybrid secret
-  identity (`$HOME/.sigil/device.hybrid`) and the vault keyring
+- **Local key storage differs per client, and neither is strong.** In the **CLI** the
+  hybrid secret identity (`$HOME/.sigil/device.hybrid`) and the vault keyring
   (`$HOME/.sigil/vault-keys.json`) are mode `0600` plaintext files — **not** sealed
-  under the password, not zeroized, not in an enclave. Anything that can read the
-  user's home directory as that user has the vault keys (adversary class 9 above).
+  under the password, not zeroized, not in an enclave; anything that can read the
+  user's home directory as that user has the vault keys (adversary class 9 above). In
+  the **browser clients** both are sealed under the vault password inside the v2
+  device-identity container, which is better at rest but **not** while unlocked: the
+  decrypted key material sits unzeroized in the JS heap, reachable by anything running
+  in that origin/extension context (see the browser-sharing subsection above).
 - **Plain HTTP in dev.** Signing proves who sent a request; it is not transport
   security.
 

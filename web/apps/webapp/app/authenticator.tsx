@@ -15,11 +15,12 @@ const STORAGE_KEY = "sigil.webapp.vault.v1";
 
 // localStorage key holding the SEALED device identity — a SECOND SIGILcli
 // container, sealed with the SAME vault password, whose plaintext is
-// {device_id, seed, base_url}. The Ed25519 device SEED is secret signing key
-// material, so it is NEVER written in plaintext: it is only readable while the
-// vault is unlocked (the password lives in memory only). Kept in its own
-// container rather than inside the vault JSON so the CLI-mirrored TotpVault
-// schema stays byte-compatible.
+// {device_id, seed, base_url, hybrid?, vault_keys?}. The Ed25519 device SEED,
+// the hybrid SECRET identity (X25519 secret + ML-KEM seed) and every accepted
+// 32-byte VAULT KEY are secret key material, so NONE of them is ever written in
+// plaintext: they are only readable while the vault is unlocked (the password
+// lives in memory only). Kept in its own container rather than inside the vault
+// JSON so the CLI-mirrored TotpVault schema stays byte-compatible.
 const DEVICE_KEY = "sigil.webapp.device.v1";
 
 // Argon2id parameters used when (re)sealing. The container is self-describing
@@ -65,11 +66,21 @@ export default function Authenticator() {
   const [vault, setVault] = useState<TotpVault | null>(null);
   const [announce, setAnnounce] = useState<string>("");
   // The enrolled device identity, decrypted in memory while unlocked (null when
-  // this browser has not enrolled). Its seed never leaves memory in the clear.
+  // this browser has not enrolled). Its seed, hybrid secret and vault keys never
+  // leave memory in the clear.
   const [device, setDevice] = useState<DeviceIdentity | null>(null);
+  // When this vault has been converted to a SHARED vault, the id it is shared
+  // under. Its 32-byte key lives in device.vaultKeys (sealed at rest); null means
+  // this is still a personal, password-sealed vault.
+  const [activeVaultId, setActiveVaultId] = useState<string | null>(null);
 
   // The password lives ONLY in memory while unlocked (never persisted).
   const passwordRef = useRef<string>("");
+  // What SEALS the TOTP vault container: the human password for a personal vault,
+  // or the 32-byte VAULT KEY for a shared one. A SIGILcli container takes
+  // arbitrary password BYTES, so a random key drops straight in where a password
+  // goes — exactly as the `sigil vault rekey` CLI does it. Memory-only.
+  const sealRef = useRef<string | Uint8Array>("");
 
   const now = useUnixClock();
 
@@ -108,12 +119,13 @@ export default function Authenticator() {
     };
   }, []);
 
-  // Seal `v` with `password` (fresh salt + nonce from the CSPRNG) and write the
-  // sealed container (base64) to localStorage. Only the sealed bytes are stored.
-  function persist(m: Wasm, v: TotpVault, password: string): void {
+  // Seal `v` with the CURRENT seal secret (fresh salt + nonce from the CSPRNG)
+  // and write the sealed container (base64) to localStorage. Only the sealed
+  // bytes are stored — never the vault, the password or a vault key.
+  function persist(m: Wasm, v: TotpVault, secret?: string | Uint8Array): void {
     const salt = crypto.getRandomValues(new Uint8Array(m.recommended_salt_len()));
     const nonce = crypto.getRandomValues(new Uint8Array(m.nonce_len()));
-    const container = m.sealVault(m, password, v, salt, nonce, ARGON2);
+    const container = m.sealVault(m, secret ?? sealRef.current, v, salt, nonce, ARGON2);
     window.localStorage.setItem(STORAGE_KEY, m.bytesToBase64(container));
   }
 
@@ -124,7 +136,7 @@ export default function Authenticator() {
     if (!wasm || !vault) throw new Error("vault is locked");
     const draft: TotpVault = { version: vault.version, entries: [...vault.entries] };
     fn(draft);
-    persist(wasm, draft, passwordRef.current);
+    persist(wasm, draft);
     setVault(draft);
     return draft;
   }
@@ -147,24 +159,29 @@ export default function Authenticator() {
   // Decrypt the stored device identity with the just-accepted password. A
   // container that will not open (e.g. sealed under an older password) is
   // treated as "no device" rather than blocking the unlock.
-  function loadDevice(m: Wasm, password: string): void {
+  function loadDevice(m: Wasm, password: string): DeviceIdentity | null {
     const stored = window.localStorage.getItem(DEVICE_KEY);
     if (!stored) {
       setDevice(null);
-      return;
+      return null;
     }
     try {
-      setDevice(m.openDeviceIdentity(m, password, m.base64ToBytes(stored)));
+      const d = m.openDeviceIdentity(m, password, m.base64ToBytes(stored));
+      setDevice(d);
+      return d;
     } catch {
       setDevice(null);
+      return null;
     }
   }
 
   function createVault(password: string): void {
     if (!wasm) throw new Error("wasm not ready");
     const v = wasm.newVault();
-    persist(wasm, v, password);
     passwordRef.current = password;
+    sealRef.current = password;
+    setActiveVaultId(null);
+    persist(wasm, v, password);
     setVault(v);
     loadDevice(wasm, password);
     setPhase("unlocked");
@@ -175,17 +192,48 @@ export default function Authenticator() {
     const stored = window.localStorage.getItem(STORAGE_KEY);
     if (!stored) throw new Error("no sealed vault found");
     const container = wasm.base64ToBytes(stored);
-    const v = wasm.openVault(wasm, password, container); // throws on wrong password
+
+    // The device identity opens with the PASSWORD; it is what carries any vault
+    // keys, so it must be read first.
+    const d = loadDevice(wasm, password);
+
+    // A personal vault opens with the password. A SHARED vault is sealed under a
+    // random 32-byte vault key instead, so fall back to the keys this device
+    // holds — exactly the CLI's `--vault-id` rule, just chosen automatically.
+    let v: TotpVault;
+    let sealedUnder: string | Uint8Array = password;
+    let sharedAs: string | null = null;
+    try {
+      v = wasm.openVault(wasm, password, container);
+    } catch (passwordError) {
+      let opened: TotpVault | null = null;
+      for (const [id, key] of Object.entries(d?.vaultKeys ?? {})) {
+        try {
+          opened = wasm.openVault(wasm, key, container);
+          sealedUnder = key;
+          sharedAs = id;
+          break;
+        } catch {
+          // not this vault's key — try the next one
+        }
+      }
+      if (!opened) throw passwordError; // report the password failure, not the last key
+      v = opened;
+    }
+
     passwordRef.current = password;
+    sealRef.current = sealedUnder;
+    setActiveVaultId(sharedAs);
     setVault(v);
-    loadDevice(wasm, password);
     setPhase("unlocked");
   }
 
   function lock(): void {
     passwordRef.current = "";
+    sealRef.current = "";
+    setActiveVaultId(null);
     setVault(null);
-    setDevice(null); // the seed leaves memory with the password
+    setDevice(null); // the seed, hybrid secret and vault keys leave memory too
     setPhase("locked");
   }
 
@@ -193,9 +241,51 @@ export default function Authenticator() {
     window.localStorage.removeItem(STORAGE_KEY);
     window.localStorage.removeItem(DEVICE_KEY);
     passwordRef.current = "";
+    sealRef.current = "";
+    setActiveVaultId(null);
     setVault(null);
     setDevice(null);
     setPhase("setup");
+  }
+
+  // ── sharing operations (all secrets stay sealed at rest) ───────────────────
+
+  // Merge a change into the device identity and RE-SEAL it under the vault
+  // password. This is how a hybrid secret identity or a newly recovered vault key
+  // reaches storage: inside the sealed container, never as plaintext.
+  function updateDevice(patch: Partial<DeviceIdentity>): DeviceIdentity {
+    if (!wasm) throw new Error("wasm not ready");
+    if (!device) {
+      throw new Error("enroll this browser as a device first (Sync → Device identity)");
+    }
+    const next: DeviceIdentity = { ...device, ...patch };
+    persistDevice(wasm, next);
+    return next;
+  }
+
+  // Convert this PERSONAL vault into a SHARED one: re-seal the same accounts
+  // under `vaultKey` and remember that key inside the sealed device identity.
+  // The human password is NEVER shared, wrapped or sent — this is the one-way
+  // door between the two, mirroring `sigil vault rekey`.
+  function rekeyVault(vaultId: string, vaultKey: Uint8Array): void {
+    if (!wasm || !vault) throw new Error("vault is locked");
+    updateDevice({ vaultKeys: { ...(device?.vaultKeys ?? {}), [vaultId]: vaultKey } });
+    sealRef.current = vaultKey;
+    persist(wasm, vault, vaultKey);
+    setActiveVaultId(vaultId);
+  }
+
+  // Adopt a vault that was shared TO this device: remember the recovered key
+  // (sealed), store the pulled container, and open it in memory.
+  function adoptSharedVault(vaultId: string, vaultKey: Uint8Array, container: Uint8Array): TotpVault {
+    if (!wasm) throw new Error("wasm not ready");
+    const v = wasm.openVault(wasm, vaultKey, container); // throws before anything is stored
+    updateDevice({ vaultKeys: { ...(device?.vaultKeys ?? {}), [vaultId]: vaultKey } });
+    window.localStorage.setItem(STORAGE_KEY, wasm.bytesToBase64(container));
+    sealRef.current = vaultKey;
+    setActiveVaultId(vaultId);
+    setVault(v);
+    return v;
   }
 
   let content: React.ReactNode;
@@ -228,7 +318,11 @@ export default function Authenticator() {
         vault={vault}
         now={now}
         device={device}
+        activeVaultId={activeVaultId}
         onDeviceChange={(d) => persistDevice(wasm, d)}
+        onUpdateDevice={updateDevice}
+        onRekey={rekeyVault}
+        onAdoptSharedVault={adoptSharedVault}
         onAdd={(input) => withVault((d) => wasm.addEntry(d, input))}
         onImportOtpauth={(uri) => {
           const e = wasm.parseOtpauthUri(uri);
@@ -479,7 +573,11 @@ function VaultView({
   vault,
   now,
   device,
+  activeVaultId,
   onDeviceChange,
+  onUpdateDevice,
+  onRekey,
+  onAdoptSharedVault,
   onAdd,
   onImportOtpauth,
   onImportMigration,
@@ -490,13 +588,22 @@ function VaultView({
   vault: TotpVault;
   now: number;
   device: DeviceIdentity | null;
+  activeVaultId: string | null;
   onDeviceChange: (d: DeviceIdentity | null) => void;
+  onUpdateDevice: (patch: Partial<DeviceIdentity>) => DeviceIdentity;
+  onRekey: (vaultId: string, vaultKey: Uint8Array) => void;
+  onAdoptSharedVault: (vaultId: string, vaultKey: Uint8Array, container: Uint8Array) => TotpVault;
   onAdd: (input: AddInput) => void;
   onImportOtpauth: (uri: string) => void;
   onImportMigration: (uri: string) => { imported: number; skipped: number };
   onRemove: (label: string) => void;
   onLock: () => void;
 }) {
+  // Server URL + vault id are shared by the Sync and Sharing panels: a vault key
+  // is per-VAULT-ID, so the two panels must always agree on which vault they mean.
+  const [serverUrl, setServerUrl] = useState("http://127.0.0.1:8080");
+  const [vaultId, setVaultId] = useState("webapp-demo");
+
   return (
     <div data-testid="vault-view" className="space-y-6">
       <div className="flex items-center justify-between">
@@ -537,7 +644,25 @@ function VaultView({
 
       <AddAccountPanel onAdd={onAdd} onImportOtpauth={onImportOtpauth} onImportMigration={onImportMigration} />
       <ExportPanel wasm={wasm} vault={vault} />
-      <SyncPanel wasm={wasm} device={device} onDeviceChange={onDeviceChange} />
+      <SyncPanel
+        wasm={wasm}
+        device={device}
+        onDeviceChange={onDeviceChange}
+        url={serverUrl}
+        setUrl={setServerUrl}
+        vaultId={vaultId}
+        setVaultId={setVaultId}
+      />
+      <SharingPanel
+        wasm={wasm}
+        device={device}
+        activeVaultId={activeVaultId}
+        url={serverUrl}
+        vaultId={vaultId}
+        onUpdateDevice={onUpdateDevice}
+        onRekey={onRekey}
+        onAdoptSharedVault={onAdoptSharedVault}
+      />
     </div>
   );
 }
@@ -991,13 +1116,19 @@ function SyncPanel({
   wasm,
   device,
   onDeviceChange,
+  url,
+  setUrl,
+  vaultId,
+  setVaultId,
 }: {
   wasm: Wasm;
   device: DeviceIdentity | null;
   onDeviceChange: (d: DeviceIdentity | null) => void;
+  url: string;
+  setUrl: (v: string) => void;
+  vaultId: string;
+  setVaultId: (v: string) => void;
 }) {
-  const [url, setUrl] = useState("http://127.0.0.1:8080");
-  const [vaultId, setVaultId] = useState("webapp-demo");
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("this browser");
   const [status, setStatus] = useState("");
@@ -1192,6 +1323,280 @@ function SyncPanel({
       </div>
       {status && (
         <p data-testid="sync-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
+          {status}
+        </p>
+      )}
+    </Card>
+  );
+}
+
+// ── Sharing (dev) — device-to-device vault sharing ───────────────────────────
+//
+// The key model, mirrored exactly from the `sigil vault ...` CLI (deviating
+// would break interop AND security):
+//
+//   * a PERSONAL vault stays sealed under your human password. The password is
+//     NEVER shared, NEVER wrapped, and never leaves this browser.
+//   * a SHARED vault is sealed under a RANDOM 32-byte VAULT KEY. "Convert" is
+//     the one-way door between the two (the CLI's `vault rekey`).
+//   * that vault key is WRAPPED to each recipient device's published HYBRID
+//     public key (X25519 + ML-KEM-768) into an opaque SIGILhyb envelope. sigild
+//     relays the envelope and cannot read it: it holds no decapsulation key.
+//
+// STORAGE: the hybrid SECRET identity and every vault key live INSIDE the
+// password-sealed device-identity container (DEVICE_KEY), exactly like the device
+// seed. Nothing new is ever written to localStorage in the clear.
+//
+// Pre-audit / UNAUDITED / DEV / LOCALHOST. The construction is a CUSTOM
+// KEM-then-AEAD, NOT RFC 9180 HPKE; the system is NOT "post-quantum secure".
+
+function SharingPanel({
+  wasm,
+  device,
+  activeVaultId,
+  url,
+  vaultId,
+  onUpdateDevice,
+  onRekey,
+  onAdoptSharedVault,
+}: {
+  wasm: Wasm;
+  device: DeviceIdentity | null;
+  activeVaultId: string | null;
+  url: string;
+  vaultId: string;
+  onUpdateDevice: (patch: Partial<DeviceIdentity>) => DeviceIdentity;
+  onRekey: (vaultId: string, vaultKey: Uint8Array) => void;
+  onAdoptSharedVault: (vaultId: string, vaultKey: Uint8Array, container: Uint8Array) => TotpVault;
+}) {
+  const [recipient, setRecipient] = useState("");
+  const [permission, setPermission] = useState<"read" | "write">("read");
+  const [status, setStatus] = useState("");
+  const [fingerprint, setFingerprint] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // 401 (not authenticated) vs 403 (authenticated but not permitted) vs 404
+  // (nothing shared yet) are spelled out rather than shown as a generic error —
+  // they mean completely different things to the user.
+  function shareMsg(e: unknown): string {
+    const status = (e as { status?: number } | null)?.status;
+    if (typeof status === "number" && status >= 400) return wasm.explainSharingStatus(status);
+    return msg(e);
+  }
+
+  if (!device) {
+    return (
+      <Card>
+        <h3 className="mb-1 text-base font-semibold">Sharing (dev)</h3>
+        <p data-testid="sharing-status" className="text-sm text-neutral-600 dark:text-neutral-400">
+          Enroll this browser as a device first (Sync → Device identity). Sharing a
+          vault requires an enrolled device on both sides.
+        </p>
+      </Card>
+    );
+  }
+
+  const id = vaultId.trim();
+  const auth = { ...device, baseUrl: url.trim() };
+  const isShared = activeVaultId === id && Boolean(device.vaultKeys?.[id]);
+
+  async function run(what: string, fn: () => Promise<void>) {
+    setBusy(true);
+    setStatus(`${what}…`);
+    try {
+      await fn();
+    } catch (e) {
+      setStatus(`${what} failed: ${shareMsg(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Generate this device's hybrid identity if it has none (sealing it under the
+  // vault password), then publish ONLY its public halves. Self-only server-side.
+  function publish() {
+    void run("Publishing this device's hybrid key", async () => {
+      const hybrid = device!.hybrid ?? wasm.generateHybridIdentity();
+      const next = onUpdateDevice({ hybrid });
+      await wasm.publishHybridKey(wasm, { ...next, baseUrl: url.trim() });
+      setStatus(
+        `Published this device's hybrid public key (X25519 + ML-KEM-768). Other devices can now share vaults to ${next.deviceId}.`,
+      );
+    });
+  }
+
+  // The one-way door: re-seal this vault under a fresh random 32-byte vault key.
+  function convert() {
+    void run("Converting to a shared vault", async () => {
+      if (!id) throw new Error("set a vault id first (Sync → Vault id)");
+      const key = wasm.generateVaultKey();
+      onRekey(id, key);
+      const fp = await wasm.vaultKeyFingerprint(key);
+      setFingerprint(fp);
+      setStatus(
+        `Vault "${id}" is now sealed under a random 32-byte vault key (key sha256 ${fp}). ` +
+          "Your password no longer opens it and was never shared. Push it, then share it.",
+      );
+    });
+  }
+
+  // Fetch the recipient's hybrid key, wrap, deposit, and grant — one call, so
+  // authorization and key distribution can never drift apart.
+  function share() {
+    void run("Sharing the vault", async () => {
+      const key = device!.vaultKeys?.[id];
+      if (!key) throw new Error(`this vault is not shared yet — convert "${id}" to a shared vault first`);
+      const to = recipient.trim();
+      if (!to) throw new Error("paste the recipient's device id");
+      const res = await wasm.shareVault(wasm, auth, {
+        vaultId: id,
+        recipientDeviceId: to,
+        vaultKey: key,
+        permission,
+      });
+      setFingerprint(res.fingerprint);
+      setStatus(
+        `Shared "${id}" with ${to} (${res.permission}). Wrapped the vault key to that device's hybrid public key: ` +
+          `a ${res.envelopeBytes}-byte envelope the server relays but cannot read. Key sha256 ${res.fingerprint}.`,
+      );
+    });
+  }
+
+  // Collect the envelope addressed to THIS device, unwrap it, remember the key
+  // (sealed), then pull and open the shared vault.
+  function accept() {
+    void run("Accepting the shared vault", async () => {
+      if (!id) throw new Error("set the shared vault's id first (Sync → Vault id)");
+      const accepted = await wasm.acceptVault(wasm, auth, { vaultId: id });
+      // Seal the recovered key immediately, so a failed pull cannot lose it.
+      onUpdateDevice({ vaultKeys: { ...(device!.vaultKeys ?? {}), [id]: accepted.vaultKey } });
+      setFingerprint(accepted.fingerprint);
+
+      const ops = await wasm.pullContainersAuthed(wasm, device!, url.trim(), id, 0);
+      if (ops.length === 0) {
+        setStatus(
+          `Accepted the vault key for "${id}" (sha256 ${accepted.fingerprint}) and sealed it locally, ` +
+            "but the server holds no vault yet — ask the owner to push.",
+        );
+        return;
+      }
+      const v = onAdoptSharedVault(id, accepted.vaultKey, ops[ops.length - 1].container);
+      setStatus(
+        `Accepted and opened the shared vault "${id}" — ${v.entries.length} account(s). ` +
+          `Key sha256 ${accepted.fingerprint}: compare it with the sender out of band.`,
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <h3 className="mb-1 text-base font-semibold">Sharing (dev)</h3>
+      <p className="mb-3 text-xs text-neutral-600 dark:text-neutral-400">
+        Share this vault with another enrolled device. A shared vault is sealed
+        under a <strong>random 32-byte vault key</strong>, and that key is wrapped
+        to the recipient&rsquo;s <strong>hybrid</strong> public key (X25519 +
+        ML-KEM-768). Your password is never shared or wrapped. The server relays an
+        opaque envelope it cannot read. Uses the server URL and vault id from Sync
+        above.
+      </p>
+
+      <div className="mb-3 rounded border border-neutral-200 p-3 text-xs dark:border-neutral-800">
+        <p className="mb-1">
+          <span className="font-medium">This device:</span>{" "}
+          <span data-testid="sharing-device-id" className="break-all font-mono">
+            {device.deviceId}
+          </span>{" "}
+          <button
+            data-testid="sharing-copy-device-id"
+            type="button"
+            className="underline"
+            onClick={() => void navigator.clipboard?.writeText(device.deviceId)}
+          >
+            copy
+          </button>
+        </p>
+        <p data-testid="sharing-hybrid-state">
+          <span className="font-medium">Hybrid key:</span>{" "}
+          {device.hybrid
+            ? "this device has a hybrid identity (publish it so others can share to you)"
+            : "not created yet — publish to create and register one"}
+        </p>
+        <p data-testid="sharing-vault-state">
+          <span className="font-medium">Vault &ldquo;{id || "?"}&rdquo;:</span>{" "}
+          {isShared
+            ? `SHARED — sealed under a random vault key${fingerprint ? ` (sha256 ${fingerprint})` : ""}`
+            : "personal — sealed with your password"}
+        </p>
+      </div>
+
+      <div className="flex flex-wrap gap-3">
+        <button
+          data-testid="sharing-publish"
+          className={btnGhost}
+          type="button"
+          onClick={publish}
+          disabled={busy}
+        >
+          Publish this device&rsquo;s hybrid key
+        </button>
+        <button
+          data-testid="sharing-convert"
+          className={btnGhost}
+          type="button"
+          onClick={convert}
+          disabled={busy || isShared}
+        >
+          {isShared ? "Already a shared vault" : "Convert to a shared vault"}
+        </button>
+        <button
+          data-testid="sharing-accept"
+          className={btnGhost}
+          type="button"
+          onClick={accept}
+          disabled={busy}
+        >
+          Accept a vault shared to this device
+        </button>
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <label className="block text-sm sm:col-span-2">
+          <span className="mb-1 block font-medium">Recipient device id</span>
+          <input
+            data-testid="sharing-recipient"
+            className={`${inputCls} font-mono`}
+            value={recipient}
+            onChange={(e) => setRecipient(e.target.value)}
+            placeholder="dev_…"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">Permission</span>
+          <select
+            data-testid="sharing-permission"
+            className={inputCls}
+            value={permission}
+            onChange={(e) => setPermission(e.target.value === "write" ? "write" : "read")}
+          >
+            <option value="read">read</option>
+            <option value="write">write</option>
+          </select>
+        </label>
+      </div>
+      <button
+        data-testid="sharing-share"
+        className={`${btnGhost} mt-3`}
+        type="button"
+        onClick={share}
+        disabled={busy || !isShared || recipient.trim() === ""}
+      >
+        Share this vault with that device
+      </button>
+
+      {status && (
+        <p data-testid="sharing-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
           {status}
         </p>
       )}

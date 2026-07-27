@@ -6,7 +6,11 @@ audited; see the status note below.)
 
 > **STATUS: pre-launch / pre-audit skeleton.** This repository is the
 > foundation scaffold from the 72-hour deployment sprint — _not_ a shipping
-> product. The sync server and every client are intentionally stubbed.
+> product. The sync server is a **dev-gated** skeleton (every stateful route
+> returns `501` unless explicitly enabled), but the clients are no longer stubs:
+> a CLI, an offline-capable web app, an MV3 browser extension and a native
+> desktop app all exist, share one sealed vault format, and are exercised by
+> tests that drive the real binaries. All of it is pre-audit.
 > `libsigil` now has **real but UNAUDITED** crypto building blocks — an
 > Argon2id KDF, an XChaCha20-Poly1305 + HKDF AEAD, a C-ABI `seal`/`open`
 > over them, and a hybrid (X25519 + ML-KEM-768) public-key seal. Most are still
@@ -228,8 +232,10 @@ audited; see the status note below.)
   **system is not "post-quantum secure"**; there is **no out-of-band verification**
   of a recipient's published hybrid key; and **revoking a device cannot make it
   forget a key it already accepted** — there is no key rotation, no automatic
-  re-wrap on revoke, and no forward secrecy for a delivered vault key. Only the
-  `sigil` CLI implements it so far. See
+  re-wrap on revoke, and no forward secrecy for a delivered vault key. **Every client
+  that talks to the server can now share** — the `sigil` CLI, the webapp and the
+  browser extension — and a vault shared from one opens on the others; still dev-gated
+  and unaudited. See
   [`docs/api.md`](docs/api.md#device-to-device-vault-sharing-dev-gated-opt-in--phase-46),
   [`docs/crypto-spec.md`](docs/crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use)
   and [ADR 0035](docs/decisions/0035-device-to-device-vault-sharing.md).
@@ -273,7 +279,8 @@ audited; see the status note below.)
   `sigil device revoke` (self, or operator with `--admin-token`) manage the registry.
   **Dev / localhost / plain HTTP, no TLS, UNAUDITED** — trust-on-first-write ownership,
   no account model, no session issuance, no key rotation.
-  The CLI is also the **only client that can share a vault between devices** —
+  The CLI is also the **reference client for sharing a vault between devices** (the
+  webapp and the extension do the same thing from the browser) —
   `sigil device hybrid-publish` publishes this device's hybrid public key, `sigil
   vault rekey` re-seals a vault under a random vault key (your password is never
   shared), `sigil vault share --to <deviceID>` wraps that key to the recipient's

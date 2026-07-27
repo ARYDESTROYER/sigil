@@ -224,6 +224,27 @@ export function pullContainers(
 
 // ── device-auth helpers (sigild multi-device contract v3) ───────────────────
 
+/**
+ * A hybrid SECRET identity — the only thing that can open an envelope addressed
+ * to this device. BOTH halves are secret; never persist them in plaintext.
+ */
+export interface HybridSecretIdentity {
+  /** X25519 secret scalar (32 bytes). */
+  x25519Secret: Uint8Array;
+  /** ML-KEM-768 keygen seed `d‖z` (64 bytes). */
+  mlkemSeed: Uint8Array;
+}
+
+/** The shareable PUBLIC half of a hybrid identity (what the registry stores). */
+export interface HybridPublicIdentity {
+  deviceId?: string;
+  /** X25519 public key (32 bytes). */
+  x25519PublicKey: Uint8Array;
+  /** ML-KEM-768 encapsulation key (1184 bytes). */
+  mlkemEncapsKey: Uint8Array;
+  updatedAt?: string;
+}
+
 /** A local device identity: the server-assigned id plus the SECRET 32-byte seed. */
 export interface DeviceIdentity {
   deviceId: string;
@@ -231,6 +252,10 @@ export interface DeviceIdentity {
   seed: Uint8Array;
   /** The server this identity was enrolled with (informational). */
   baseUrl?: string;
+  /** SECRET hybrid identity for vault sharing; null when this device has none. */
+  hybrid?: HybridSecretIdentity | null;
+  /** SECRET per-vault keys this device holds (`vaultId -> 32 bytes`). */
+  vaultKeys?: Record<string, Uint8Array>;
 }
 
 /** An HTTP failure carrying the status, so 401 and 403 are distinguishable. */
@@ -355,6 +380,118 @@ export function openDeviceIdentity(
   password: string | Uint8Array,
   containerBytes: Uint8Array,
 ): DeviceIdentity;
+
+// ── sharing helpers (device-to-device vault sharing) ────────────────────────
+
+/**
+ * The auth context every sharing call takes: an unlocked device identity plus
+ * the server it is enrolled with. This is exactly what {@link openDeviceIdentity}
+ * returns, so an unlocked client passes its identity straight in.
+ */
+export interface SharingAuth extends DeviceIdentity {
+  baseUrl: string;
+}
+
+export const VAULT_KEY_LEN: number;
+export const HYBRID_X25519_SECRET_LEN: number;
+export const HYBRID_X25519_PUBLIC_LEN: number;
+export const HYBRID_MLKEM_SEED_LEN: number;
+export const HYBRID_MLKEM_ENCAPS_LEN: number;
+export const KEY_ENVELOPE_MAGIC: string;
+export const WRAPPED_VAULT_KEY_LEN: number;
+
+/** Plain-language explanation of a sharing-endpoint status (401/403/404/409/413). */
+export function explainSharingStatus(status: number): string;
+
+/** Draw a fresh hybrid SECRET identity from the CSPRNG. */
+export function generateHybridIdentity(): HybridSecretIdentity;
+
+/** Derive the shareable PUBLIC half of a hybrid identity, in the wasm. */
+export function hybridPublicIdentity(
+  wasm: Pick<SigilWasm, "hybrid_x25519_public" | "hybrid_mlkem_encaps_key">,
+  secretIdentity: HybridSecretIdentity,
+): HybridPublicIdentity;
+
+/** PUBLISH this device's hybrid PUBLIC key (self-only; upsert). */
+export function publishHybridKey(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  secretIdentity?: HybridSecretIdentity | null,
+): Promise<{ deviceId: string; updatedAt: string }>;
+
+/** FETCH another device's published hybrid PUBLIC key. */
+export function fetchHybridKey(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  deviceId: string,
+): Promise<HybridPublicIdentity>;
+
+/** Draw a fresh 32-byte VAULT KEY from the CSPRNG. */
+export function generateVaultKey(): Uint8Array;
+
+/** First 16 hex chars of SHA-256(key) — a non-reversible fingerprint. */
+export function vaultKeyFingerprint(key: Uint8Array): Promise<string>;
+
+/** WRAP a vault key to a recipient's hybrid public key (fresh entropy per call). */
+export function wrapVaultKey(
+  wasm: Pick<SigilWasm, "hybrid_seal_to_container" | "nonce_len">,
+  recipientPublic: HybridPublicIdentity,
+  vaultKey: Uint8Array,
+): Uint8Array;
+
+/** UNWRAP an envelope with this device's hybrid SECRET identity. Throws. */
+export function unwrapVaultKey(
+  wasm: Pick<SigilWasm, "hybrid_open_container">,
+  mySecretIdentity: HybridSecretIdentity,
+  envelopeBytes: Uint8Array,
+): Uint8Array;
+
+/** DEPOSIT an opaque wrapped vault key addressed to one device. */
+export function putKeyEnvelope(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  vaultId: string,
+  recipientDeviceId: string,
+  envelopeBytes: Uint8Array,
+): Promise<{ vaultId: string; deviceId: string; sizeBytes: number; createdAt: string }>;
+
+/** COLLECT the opaque envelope addressed to a device (addressee only). */
+export function getKeyEnvelope(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  vaultId: string,
+  deviceId?: string | null,
+): Promise<Uint8Array>;
+
+/** SHARE a vault: fetch key, wrap, deposit, then grant — in one call. */
+export function shareVault(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  args: {
+    vaultId: string;
+    recipientDeviceId: string;
+    vaultKey: Uint8Array;
+    permission?: "read" | "write";
+  },
+): Promise<{
+  recipientDeviceId: string;
+  envelope: Uint8Array;
+  envelopeBytes: number;
+  permission: string;
+  fingerprint: string;
+}>;
+
+/** ACCEPT a vault shared to this device: collect, unwrap, return the key. */
+export function acceptVault(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  args: { vaultId: string; secretIdentity?: HybridSecretIdentity | null },
+): Promise<{
+  vaultId: string;
+  vaultKey: Uint8Array;
+  envelope: Uint8Array;
+  fingerprint: string;
+}>;
 
 // ── totp-migration helpers ──────────────────────────────────────────────────
 

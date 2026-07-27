@@ -11,7 +11,56 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 46, `main` @ origin, clean tree).** Phase 46 delivered **device-to-device VAULT SHARING** — the answer to "a grant says who the
+**Where we are (through Phase 48, `main` @ origin, clean tree).** Phase 48 took **vault
+sharing to the BROWSER clients** — the webapp and the MV3 extension — so sharing now works
+across **every client that talks to the server**, not just the CLI (desktop still does not).
+⭐ **NO protocol, route, byte layout or Rust source changed:** every wasm export the browsers
+need (`hybrid_x25519_public`, `hybrid_mlkem_encaps_key`, `hybrid_seal_to_container`,
+`hybrid_open_container`) already existed from Phase 31, and `sigild` was untouched. The client
+half is a NEW framework-free, dependency-free ESM module **`sigil-wasm/sharing.mjs`** (Node +
+browser) — `generateHybridIdentity` / `hybridPublicIdentity`, `publishHybridKey` /
+`fetchHybridKey`, `generateVaultKey` / `vaultKeyFingerprint`, `wrapVaultKey` /
+`unwrapVaultKey` (rejects a recovered plaintext that is not exactly 32 bytes),
+`putKeyEnvelope` / `getKeyEnvelope`, `shareVault` (fetch key → wrap → PUT envelope → grant
+through the **EXISTING** `grantVaultAccess`, so authorization and key distribution cannot
+drift), `acceptVault`, `explainSharingStatus` — **MIRRORED** from `cli/src/lib.rs` +
+`sigild/internal/api/sharing.go`. It does **no crypto itself** (KEM/AEAD in the wasm,
+signatures through `device-auth.mjs`) and every byte of entropy is `crypto.getRandomValues`.
+⭐ **THE STORAGE DECISION (ADR 0036): nothing new is persisted in the clear.** Instead of a
+new store, the EXISTING sealed device-identity container was bumped **v1→v2**, so each browser
+client persists exactly **TWO** keys, both sealed `SIGILcli` containers: the TOTP vault
+(`sigil.webapp.vault.v1` / `sigil.extension.vault.v1`) and the device identity
+(`sigil.webapp.device.v1` / `sigil.extension.device.v1`) whose plaintext is now
+`{version:2, device_id, seed, base_url, hybrid:{x25519_secret, mlkem_seed},
+vault_keys:{vaultId: b64 32 bytes}}` — Ed25519 seed + hybrid SECRET identity + every accepted
+vault key in ONE container under the vault password; **v1 still opens** (hybrid null, empty
+keyring). Password + all decrypted secrets are memory-only, cleared on lock/forget/unload.
+**Unlock now opens the device identity FIRST, tries the password, then falls back to each held
+vault key**, so a shared vault re-opens after reload. BOTH clients got the **FULL** flow (show/
+copy device id · publish hybrid key · convert to a shared vault under a fresh random 32-byte
+key · share to a pasted recipient device id with read/write · accept), with 401/403/404
+surfaced distinctly; `extension/build.sh` vendors `sharing.mjs` alongside the other helpers.
+✅ **VERIFIED FIRST-HAND:** cargo fmt/clippy `-D warnings` clean, **26** wasm tests, **ALL
+EIGHT** node tests PASS (roundtrip, interop, hybrid-interop, sync-interop, totp-interop,
+migration-interop, device-auth-interop, **sharing-interop**); webapp typecheck/lint/build green
+with **Playwright 8/8**; **extension 3/3**; marketing build green; **both `Cargo.lock`s
+`getrandom`==0**; nothing changed under `sigild/`, `cli/`, `libsigil/` or `desktop/`.
+⭐ **THE CROSS-CLIENT PROOF** (`sharing-interop.mjs`, live sigild + the REAL `sigil` binary,
+both ways): JS sealed a vault under a random vault key, pushed, and shared a **1226-byte**
+envelope → the real CLI accepted, unwrapped to the **SAME fingerprint**, pulled and printed
+**94287082** at T=59 (the RFC 6238 vector); CLI → browser also produced **94287082**, and the
+human password does **NOT** open that vault; an unauthorized third identity is **403** three
+ways; the relayed envelope is byte-identical ciphertext with no key or seed in it; two wraps
+of the same key differ; the server logged only fingerprints. ⚠️ **HONEST LIMITS (inherited
+from Phase 46, unchanged):** ⭐ **NO out-of-band verification of a published hybrid public
+key** — a hostile/compromised registry could substitute its own and intercept a share (the
+recipient device id and key are trusted as served) — **the biggest gap**; JS `Uint8Array`s
+holding secrets are **not zeroized**; revocation **cannot un-learn** a vault key a device
+already accepted; **no rotation, no re-wrap-on-revoke**; converting a personal vault to a
+shared one is a **ONE-WAY DOOR** in the UI; dev-gated, plain HTTP on loopback, **UNAUDITED**.
+ADR 0035 (browser-support section) + **NEW ADR 0036** (the v2 container decision); details in
+the Phase 48 entry below.
+Phase 46 delivered **device-to-device VAULT SHARING** — the answer to "a grant says who the
 server will talk to, but the server holds no key, so how does a SECOND device actually decrypt?".
 ⭐ **The key hierarchy:** the **human password seals a PERSONAL vault and is NEVER shared, never
 wrapped, never sent**; a SHARED vault is sealed under a **random 32-byte VAULT KEY**; that key is
@@ -5436,3 +5485,164 @@ gained `--at <unix>` so a code is reproducible across two machines in a proof.
 - **Wire the hybrid SIGNATURE into something** — it is now the only hybrid construction
   still used by nothing.
 - (Committed after this entry was written: Phase 46 is `ab50783` on `main`.)
+
+---
+
+## 2026-07-27 — Phase 48 (vault sharing reaches the BROWSER clients: webapp + MV3 extension)
+
+### Why this phase, and what it fixes
+Phase 46 shipped device-to-device vault sharing and closed with an explicit limit:
+**"Only the CLI implements sharing. The webapp, extension and desktop clients do not."**
+That is a real hole, not a cosmetic one — a sharing feature that exists in exactly one
+client is a demo, and the two browser surfaces were already the ones a user would
+actually reach for. Phase 48 closes it for the browsers. Desktop still does not share.
+
+The pleasing part: **nothing new had to be built underneath.** The wasm exports the
+browsers need (`hybrid_x25519_public`, `hybrid_mlkem_encaps_key`,
+`hybrid_seal_to_container`, `hybrid_open_container`) have existed since Phase 31, and
+`sigild` already served the four routes. **No Rust source changed and `sigild/`, `cli/`,
+`libsigil/` and `desktop/` were untouched.** What was missing was a client half in
+JavaScript and an answer to "where does a browser keep a hybrid secret".
+
+### What was built
+
+**`sigil-wasm/sharing.mjs` — NEW.** Framework-free, dependency-free ESM, Node **and**
+browser, mirroring `cli/src/lib.rs` and `sigild/internal/api/sharing.go`. Exports:
+`generateHybridIdentity` / `hybridPublicIdentity`, `publishHybridKey` /
+`fetchHybridKey`, `generateVaultKey` / `vaultKeyFingerprint`, `wrapVaultKey` /
+`unwrapVaultKey`, `putKeyEnvelope` / `getKeyEnvelope`, the two composed operations
+`shareVault` / `acceptVault`, and `explainSharingStatus`.
+
+- ⭐ **It does NO cryptography.** The KEM/AEAD happens in the wasm; every request
+  signature goes through `device-auth.mjs`. Nothing is hand-rolled.
+- ⭐ **Every byte of entropy is `crypto.getRandomValues`** — the hybrid identity, each
+  vault key, and the per-wrap ephemeral X25519 secret / ML-KEM coin / AEAD nonce. Both
+  `Cargo.lock`s stay `getrandom`==0.
+- `shareVault` deliberately does **wrap + deposit and THEN the grant through the
+  EXISTING `grantVaultAccess`** — the same composition as `sigil vault share`, so
+  authorization and key distribution cannot drift apart.
+- `unwrapVaultKey` **rejects any recovered plaintext that is not exactly 32 bytes**
+  rather than using it as a key (the CLI's rule, mirrored).
+- `explainSharingStatus` extends `explainAuthStatus` with the statuses only these
+  routes produce, so a UI can say "not signed in" (401) vs "that envelope is not
+  yours" (403) vs "nothing shared yet" (404) instead of one generic error.
+
+**The storage decision — the important part (ADR 0036).** ⭐ **Nothing new is persisted
+in the clear.** Sharing puts two more classes of bearer secret on a browser: the
+**hybrid SECRET identity** (the only thing that can open an envelope addressed to this
+device) and the **vault keyring** (a 32-byte key per shared vault). The CLI keeps those
+in `0600` files; a browser has no equivalent. Rather than adding a store, the **EXISTING
+sealed device-identity container was extended v1→v2**:
+
+```
+{ version: 2, device_id, seed, base_url,
+  hybrid: { x25519_secret, mlkem_seed },
+  vault_keys: { "<vaultID>": "<b64 32 bytes>" } }
+```
+
+So the Ed25519 device seed, the hybrid secret and every accepted vault key sit inside
+**one** container sealed under the vault password, and each client persists exactly
+**TWO** values, both sealed `SIGILcli` containers: `sigil.webapp.vault.v1` +
+`sigil.webapp.device.v1`, `sigil.extension.vault.v1` + `sigil.extension.device.v1`.
+Verified by grep that **all eight persistence writes across the two clients are
+`bytesToBase64(container)`**. `DEVICE_IDENTITY_VERSION = 2`; **v1 containers still open**
+(→ `hybrid: null`, empty keyring), so it is backward compatible with no migration step.
+The password and every decrypted secret are memory-only and are dropped on lock / forget
+/ unload.
+
+**Both clients got the FULL flow, not a reduced one** — webapp `SharingPanel` in
+`app/authenticator.tsx`, extension Sharing section in `popup.html` + `popup.js`:
+show/copy this device id · publish this device's hybrid key · convert a password vault
+into a shared vault sealed under a fresh random 32-byte key · share to a pasted
+recipient device id with read/write · accept a vault shared to this device. **Unlock
+changed in both:** it opens the device identity FIRST (with the password), tries the
+password on the vault, then **falls back to each held vault key**, so a shared vault
+re-opens after a reload. `extension/build.sh` now vendors `sharing.mjs` alongside
+`totp-vault.mjs` / `totp-migration.mjs` / `sync.mjs` / `device-auth.mjs` (it imports two
+of them, so all five must stay siblings), and `@sigil/wasm` re-exports it for the webapp.
+
+### ✅ VERIFIED FIRST-HAND (this session)
+- `cargo fmt` / `clippy -D warnings` clean; **26** wasm tests.
+- ⭐ **ALL EIGHT Node tests PASS** — `roundtrip`, `interop`, `hybrid-interop`,
+  `sync-interop`, `totp-interop`, `migration-interop`, `device-auth-interop`, and the
+  new **`sharing-interop`**.
+- **webapp** typecheck / lint / build green, **Playwright 8/8**; **extension 3/3**;
+  marketing build green.
+- **Both `Cargo.lock`s still `getrandom`==0**; nothing changed under `sigild/`, `cli/`,
+  `libsigil/` or `desktop/`.
+- ⭐ **THE CROSS-CLIENT PROOF — `sigil-wasm/test/sharing-interop.mjs`**, which boots a
+  real `sigild` and builds the **REAL `sigil` binary** (no mocks):
+  - **(a) browser → CLI.** The JS client sealed a vault under a random vault key, pushed
+    it, and shared a **1226-byte** envelope to the CLI device. The **real `sigil`
+    binary** accepted it, unwrapped it to the **SAME key fingerprint**, pulled the vault
+    and printed **`94287082`** at T=59 — the published RFC 6238 vector.
+  - **(b) CLI → browser.** The CLI shared to the JS device; both produced **`94287082`**.
+    And the human password does **NOT** open that vault — proving it is sealed under the
+    random vault key, not the password.
+  - **Negatives.** An unauthorized third identity is **403** fetching another device's
+    envelope, **403** fetching its own, and **403** depositing.
+  - **Zero-knowledge.** The relayed envelope is **byte-identical** ciphertext containing
+    no plaintext key and no seed; two wraps of the same key differ (no entropy reuse);
+    the server logged only fingerprints.
+
+### ⚠️ HONEST LIMITS — inherited from Phase 46 and unchanged
+- ⭐ **NO out-of-band verification of a published hybrid public key.** A hostile or
+  compromised registry could substitute its own key and intercept a share — the
+  recipient device id and the key served for it are simply **trusted as served**. This
+  remains the single largest gap, and a paste-a-device-id UI makes it easier to walk
+  into than a CLI flag did.
+- **JS `Uint8Array`s holding secrets are not zeroized.** While the vault is unlocked the
+  hybrid secret and every vault key sit in the JS heap; lock/forget/reload drop the
+  references but nothing scrubs the bytes. No `mlock`, no enclave.
+- **Revocation cannot un-learn a vault key a device already accepted.** It stops FUTURE
+  server access only.
+- **No key rotation and no re-wrap-on-revoke.**
+- **Converting a personal vault to a shared vault is a ONE-WAY DOOR in the UI**, and a
+  shared vault has no password fallback — losing the password loses the keyring with it,
+  and there is no recovery path.
+- **Dev-gated, plain HTTP on loopback, UNAUDITED.** Do NOT store real 2FA secrets.
+
+### Docs updated in the same change
+- `docs/architecture.md` — `sharing.mjs` added to the `sigil-wasm` bullet; the sharing
+  panel + the v2 sealed device container + the unlock fallback in the **webapp** and
+  **extension** bullets; §2b now states the flow is **not CLI-only** (either end may be a
+  browser) and its honest limits gained the one-way door + no-zeroization notes.
+- `docs/api.md` — a new **Client support (the browser + Node clients)** subsection in the
+  sharing section (the module→route table, `auth` shape, supporting surface, and the
+  interop guard), the stale "the browser, extension and desktop clients do not implement
+  sharing yet" corrected to desktop-only, and one honest-limits bullet on client-side key
+  storage.
+- `docs/crypto-spec.md` — a new **"The same hierarchy, exercised from the browser"**
+  subsection (wrap/unwrap still happen in the wasm; entropy is `crypto.getRandomValues`),
+  and a no-zeroization limit.
+- `docs/threat-model.md` — a new **"Browser clients that also SHARE vaults"** subsection
+  (two more bearer secrets, sealed at rest in the v2 container, exposed unzeroized in
+  memory, no password recovery for a shared vault, a pasted device id is trusted as
+  typed); the R–W table marked client-agnostic; the local-key-storage limit rewritten to
+  cover both clients.
+- `docs/deployment.md` — corrected the stale "the only client that consumes this server
+  is the CLI".
+- `docs/decisions/0035-device-to-device-vault-sharing.md` — a **"Browser client support
+  (added Phase 48)"** section recording that the webapp and extension implement the flow
+  and that the protocol is unchanged.
+- `docs/decisions/0036-browser-sharing-secret-storage.md` — **NEW ADR 0036** for the
+  narrow storage decision (extend the sealed device container to v2 rather than add a
+  store), plus its index row and a banner line in `docs/decisions/README.md`.
+- `CLAUDE.md` — the `sigil-wasm` bullet (`sharing.mjs` + the v2 container), the webapp
+  and extension bullets (sharing panel, v2 container, unlock fallback), and the
+  known-green command list now naming **all EIGHT** Node tests.
+- `README.md` — one honest sentence that every client which talks to the server can now
+  share (CLI, webapp, extension), still dev-gated and unaudited.
+- `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 48**.
+
+### ➡️ Still open (honest)
+- ⭐ **Bind a hybrid public key to the device's enrolled Ed25519 identity** (self-sign at
+  publish, verify at wrap). Still the highest-value follow-up, and now it protects three
+  clients instead of one.
+- **Rotation + re-wrap on revoke**, so revocation has a real remediation path.
+- **Teach the DESKTOP client to share** — the last client surface without it.
+- **Wire the hybrid SIGNATURE into something** — still the only hybrid construction used
+  by nothing.
+- **Playwright coverage for the sharing UI** — the protocol is proven live in Node, but
+  nobody has driven the publish/convert/share/accept buttons in a headless browser (the
+  same honest gap the enrollment UI has).

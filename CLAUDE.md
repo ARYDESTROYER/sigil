@@ -446,7 +446,24 @@ public, make no security claims, until the audit completes and trademark clears.
   forget deletes the sealed identity too. The enrollment token is an in-memory bearer
   secret cleared after use, never stored or logged. ⚠️ The enrollment UI itself is NOT
   Playwright-covered (the protocol is proven live in Node); the existing 8-test suite
-  still passes. Do NOT store real 2FA secrets.
+  still passes. **Now ALSO SHARES vaults (Phase 48, ADR 0035/0036):** a **`SharingPanel`**
+  in `app/authenticator.tsx` (over `sharing.mjs` re-exported by `@sigil/wasm`) gives the
+  webapp the **FULL** flow — show/copy this device id, **publish** this device's hybrid
+  key (`generateHybridIdentity` on first use → `publishHybridKey`), **convert** the
+  password vault into a shared vault under a fresh random 32-byte key
+  (`generateVaultKey`; the UI's `sigil vault rekey`, a **ONE-WAY DOOR**), **share** to a
+  pasted recipient device id with read/write (`shareVault`), and **accept** a vault
+  shared to this device (`acceptVault` → pull → open); `explainSharingStatus` renders
+  401/403/404 distinctly. ⭐ **NOTHING NEW IS PERSISTED IN THE CLEAR:** the EXISTING
+  sealed device-identity container was extended **v1→v2** rather than adding a store, so
+  `sigil.webapp.device.v1` now seals `{version:2, device_id, seed, base_url,
+  hybrid:{x25519_secret, mlkem_seed}, vault_keys:{...}}` — the Ed25519 seed, the hybrid
+  SECRET identity and every accepted vault key in ONE container under the vault
+  password. `localStorage` still holds exactly TWO keys, both sealed containers
+  (`sigil.webapp.vault.v1` + `sigil.webapp.device.v1`); the password and all decrypted
+  secrets are memory-only and cleared on lock/forget/unload. **Unlock now opens the
+  device identity FIRST, tries the password, then falls back to each held vault key**,
+  so a shared vault re-opens after a reload. Do NOT store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -454,8 +471,8 @@ public, make no security claims, until the audit completes and trademark clears.
   the wasm surface (`seal_record`/`open_record`, `seal_to_container`/`open_container`,
   `hybrid_*`, `totp`/`hotp`/`format_code`, …) behind an `initWasm()` awaitable +
   `index.d.ts`, PLUS re-uses the **proven, wasm-agnostic helpers** from the repo-root
-  `sigil-wasm/{totp-vault,sync,totp-migration}.mjs` by relative import (the same tested
-  code, not a rewrite). Key bundling detail: rustc 1.85+ force-enables the wasm
+  `sigil-wasm/{totp-vault,sync,totp-migration,device-auth,sharing}.mjs` by relative
+  import (the same tested code, not a rewrite). Key bundling detail: rustc 1.85+ force-enables the wasm
   `reference-types`+`multivalue` target features, so wasm-bindgen emits `externref`,
   which Next.js 15's bundled (old `@webassemblyjs`) webpack parser cannot decode
   (`parseVec could not cast the value`); `build.sh` works around it with a **3-step
@@ -752,6 +769,39 @@ public, make no security claims, until the audit completes and trademark clears.
   a spent enrollment token is 401. Dev / localhost / plain-HTTP / no TLS, UNAUDITED —
   request auth for a DEV op-log, NOT the product account/session/key-management model.
   ADR 0033 (how browser clients store the identity).
+  **Now ALSO does DEVICE-TO-DEVICE VAULT SHARING (Phase 48) — the client half of the
+  Phase 46 flow (ADR 0035) for JavaScript, so sharing is no longer CLI-only.** A NEW
+  framework-free, dependency-free ESM module **`sigil-wasm/sharing.mjs`** (Node +
+  browser) exports `generateHybridIdentity` / `hybridPublicIdentity`,
+  `publishHybridKey` / `fetchHybridKey`, `generateVaultKey` / `vaultKeyFingerprint`,
+  `wrapVaultKey` / `unwrapVaultKey` (which **rejects any recovered plaintext that is
+  not exactly 32 bytes**), `putKeyEnvelope` / `getKeyEnvelope`, the two composed
+  operations **`shareVault`** (fetch key → wrap → PUT envelope → grant through the
+  **EXISTING** `grantVaultAccess`, so authorization and key distribution cannot drift)
+  and **`acceptVault`**, plus `explainSharingStatus` (401 vs 403 vs 404/409/413).
+  ⚠️ **NO Rust changed** — every wasm export it needs (`hybrid_x25519_public`,
+  `hybrid_mlkem_encaps_key`, `hybrid_seal_to_container`, `hybrid_open_container`)
+  already existed from Phase 31. It does **NO crypto itself**: the KEM/AEAD happens in
+  the wasm and every signature goes through `device-auth.mjs`; ALL entropy (hybrid
+  identity, vault key, per-wrap ephemeral X25519 secret + ML-KEM coin + AEAD nonce) is
+  `crypto.getRandomValues`, so both `Cargo.lock`s stay `getrandom`==0. Semantics +
+  byte layouts are **MIRRORED — not shared — from `cli/src/lib.rs` and
+  `sigild/internal/api/sharing.go`** and MUST stay in sync (drift yields a 400/403 or
+  an envelope the CLI cannot open). **`device-auth.mjs`'s sealed device-identity
+  container was bumped v1→v2** to carry the sharing secrets: `sealDeviceIdentity` /
+  `openDeviceIdentity` now round-trip `{version:2, device_id, seed, base_url,
+  hybrid:{x25519_secret, mlkem_seed}, vault_keys:{<vaultId>: b64 32 bytes}}`, with
+  `DEVICE_IDENTITY_VERSION = 2`; **v1 containers still open** (→ `hybrid: null`, empty
+  keyring), so it is backward compatible (ADR 0036). Proven by
+  **`sigil-wasm/test/sharing-interop.mjs`** — boots a LIVE `sigild` + builds the REAL
+  `sigil` binary and shares **BOTH ways**: (a) JS seals a vault under a random vault
+  key, pushes, shares a **1226-byte** envelope → the real CLI accepts, unwraps to the
+  SAME fingerprint, pulls and prints **94287082** at T=59 (the RFC 6238 vector);
+  (b) CLI shares → JS accepts and both produce **94287082**, and the human password
+  does NOT open that vault; an unauthorized third identity is **403** three ways; the
+  relayed envelope is byte-identical ciphertext holding no key/seed; two wraps of the
+  same key differ; the server logged only fingerprints. Dev / localhost / plain-HTTP,
+  UNAUDITED. ADR 0035, ADR 0036.
 - `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
   whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
   as **WebAssembly inside the extension page** — the **second real product client
@@ -762,7 +812,7 @@ public, make no security claims, until the audit completes and trademark clears.
   `--target web`) and **vendors** into a **gitignored `extension/vendor/`** the
   wasm-bindgen bindings (`sigil_wasm.js` + `sigil_wasm_bg.wasm` + `.d.ts`) plus
   **verbatim copies** of the proven, framework-free `sigil-wasm/totp-vault.mjs`,
-  `totp-migration.mjs`, `sync.mjs` and `device-auth.mjs` (+ a `BUILD-INFO.txt`
+  `totp-migration.mjs`, `sync.mjs`, `device-auth.mjs` and `sharing.mjs` (+ a `BUILD-INFO.txt`
   provenance stamp, so a stale `vendor/` is obvious). The **source** is `manifest.json` + `src/popup/popup.{html,css,js}`
   (UI glue + storage only; `popup.js` imports the vendored wasm via
   `chrome.runtime.getURL("vendor/sigil_wasm_bg.wasm")`). The vault seals into the
@@ -784,7 +834,17 @@ public, make no security claims, until the audit completes and trademark clears.
   is NEVER stored in plaintext**: sealed into a **SECOND `SIGILcli` container under the
   SAME vault password**, persisted at `chrome.storage.local` key
   **`sigil.extension.device.v1`**; the seed is memory-only while unlocked and the
-  single-use enrollment token is cleared right after use. ⚠️ **`manifest.json` gained
+  single-use enrollment token is cleared right after use. **Now ALSO SHARES vaults
+  (Phase 48, ADR 0035/0036) — the SAME full flow as the webapp**: a **Sharing (dev)**
+  section in `popup.html` + `popup.js` (publish hybrid key / convert to shared /
+  share to a pasted recipient device id with read/write / accept a vault shared to this
+  device) over a **vendored `sharing.mjs`** — `build.sh` now copies it beside
+  `totp-vault.mjs` / `totp-migration.mjs` / `sync.mjs` / `device-auth.mjs` (it imports
+  two of them, so all five must stay siblings). Storage matches the webapp: the sealed
+  device-identity container is the **v2 schema** carrying the hybrid secret + the vault
+  keyring beside the seed, so `chrome.storage.local` still holds only the two sealed
+  containers, and **unlock opens the identity, tries the password, then falls back to
+  each held vault key**. ⚠️ **`manifest.json` gained
   `"host_permissions": ["http://127.0.0.1/*", "http://localhost/*"]`** — MV3 extension
   pages cannot fetch cross-origin without an explicit host permission; it is
   deliberately **LOOPBACK-ONLY** (with an explanatory comment in the manifest) so the
@@ -921,18 +981,19 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (26 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the SEVEN Node tests below must all PASS.
+# pkg-web/pkg-node (needs wasm-pack); then the EIGHT Node tests below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/7 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/7 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/7 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/7 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/7 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/7 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/7 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/8 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/8 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/8 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/8 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/8 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/8 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/8 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/8 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build

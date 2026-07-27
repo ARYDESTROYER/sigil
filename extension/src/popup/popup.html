@@ -175,6 +175,61 @@
           <button type="button" id="sync-pull" data-testid="sync-pull">Pull</button>
         </div>
       </details>
+
+      <details class="panel">
+        <summary data-testid="sharing-toggle">Sharing (dev)</summary>
+        <p class="hint">
+          Share this vault with another enrolled device. A shared vault is sealed
+          under a <strong>random 32-byte vault key</strong>, and that key is
+          wrapped to the recipient&rsquo;s <strong>hybrid</strong> public key
+          (X25519 + ML-KEM-768). Your password is never shared or wrapped &mdash;
+          the server relays an opaque envelope it cannot read. Uses the
+          <em>Server URL</em> and <em>Vault id</em> from Sync above.
+        </p>
+
+        <p id="sharing-device" class="hint" data-testid="sharing-device-id">
+          Enroll this browser as a device first (Sync above).
+        </p>
+        <p id="sharing-hybrid-state" class="hint" data-testid="sharing-hybrid-state"></p>
+        <p id="sharing-vault-state" class="hint" data-testid="sharing-vault-state"></p>
+
+        <div class="row">
+          <button type="button" id="sharing-publish" data-testid="sharing-publish">
+            Publish hybrid key
+          </button>
+          <button type="button" id="sharing-convert" data-testid="sharing-convert">
+            Convert to shared
+          </button>
+        </div>
+
+        <label for="sharing-recipient">Recipient device id</label>
+        <input
+          id="sharing-recipient"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_…"
+          data-testid="sharing-recipient"
+        />
+        <div class="row">
+          <span>
+            <label for="sharing-permission">Permission</label>
+            <select id="sharing-permission" data-testid="sharing-permission">
+              <option value="read" selected>read</option>
+              <option value="write">write</option>
+            </select>
+          </span>
+          <span>
+            <label for="sharing-share">&nbsp;</label>
+            <button type="button" id="sharing-share" data-testid="sharing-share">
+              Share vault
+            </button>
+          </span>
+        </div>
+
+        <button type="button" id="sharing-accept" data-testid="sharing-accept">
+          Accept a vault shared to this device
+        </button>
+      </details>
     </section>
 
     <footer class="foot">

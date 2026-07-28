@@ -1,0 +1,115 @@
+# Engineering lessons — how this project has actually failed
+
+**Status: internal, pre-audit.** This document is a consolidated record of the
+mistakes made building Sigil, what each one cost, and what changed as a result.
+It exists because the same failure keeps recurring in different costumes, and
+because a reviewer is better served by knowing our failure modes than by a
+document that implies there were none.
+
+`journal.md` is the chronological record; this is the pattern extracted from it.
+Nothing here is hypothetical — every entry happened, and the fixes named at the
+end are in the repository.
+
+---
+
+## The one failure mode this project has, in nine disguises
+
+> **Work that quietly does not run looks exactly like work that passes.**
+
+Every serious defect found here has been an instance of it. Not a wrong
+algorithm — a *green signal that meant nothing*.
+
+| # | What happened | Why it read as success |
+|---|---|---|
+| 1 | The Postgres integration suite **skipped** whenever `SIGILD_TEST_POSTGRES` was unset. A broken teardown shipped CI-red. | `go test ./...` exits 0 on a skip. |
+| 2 | A literal **NUL byte** in `extension/src/popup/popup.js` made the file binary, so `grep` silently skipped it — and a security sweep for plaintext secrets "came back clean". | An empty grep looks like an absence of findings. |
+| 3 | `requirePinStore(null)` **returned an empty store** instead of throwing, so the key-pinning control degraded into a no-op that still reported success. | The control "ran". |
+| 4 | Nine cross-component interop suites ran in **no workflow at all** for roughly twenty phases. Then `accounts`/`recovery` repeated it. Then `entitlement-interop` repeated it again. | They were green locally, every time. |
+| 5 | A security test named for a control **survived a mutation of that control**. Four other planted mutations were caught; that one was theatre. | A passing test. |
+| 6 | `scripts/gate.sh` — written *specifically* to stop this class of problem — began with a hardcoded absolute path, so run from a git worktree it tested the **main checkout instead**. A `getrandom` stanza planted in a worktree lockfile still printed `getrandom==0`. | The gate said green about a tree it was not looking at. |
+| 7 | A test double (`fake-sigild.mjs`) sent `Access-Control-Allow-Origin`, which **real `sigild` does not**. Six webapp specs passed while the app could not reach a real server at all. | The mock was more permissive than the thing it stood in for. |
+| 8 | `cors.spec.ts` resolved Go via a hardcoded macOS path, so on CI it **`test.skip`ped itself** — leaving the only browser-level proof of a fix with zero coverage. Adding `actions/setup-go` did **not** fix it, because that sets `PATH` and never `$GO`. | A skipped file and a green job are indistinguishable. |
+| 9 | No test asserted the "browsers persist only sealed containers" invariant. A planted plaintext write of the device seed, hybrid secret and every vault key passed **19/19 and 12/12**. | The suites checked for one needle, not for the property. |
+
+The common shape: **the measurement was broken, not the code.** In most of these
+the product was fine; what failed was the thing that was supposed to notice.
+
+---
+
+## Reasoning errors, separately
+
+These are not tooling gaps. They are wrong conclusions drawn confidently.
+
+**A no-op edit read as evidence.** A timing hypothesis was "ruled out" by raising
+a Playwright timeout from 20 s to 150 s and observing no change. That option is
+documented as **ignored** — `locator.isVisible({ timeout })` does not wait. The
+parameter was never read, so the experiment could not have answered the question
+either way. This led to a long instrumentation hunt for a React defect that did
+not exist. *Before concluding a hypothesis is dead, check the knob is connected.*
+
+**A snapshot mistaken for an outcome.** A failure artifact showed an unlocked
+vault with the correct code, and was reported as the fix working. It was a
+sanity-check step earlier in the same test.
+
+**Instrumentation anchored on a non-unique string.** A probe was inserted at the
+first match of `setPhase("unlocked")`, which was in a different function, so it
+fired during an unrelated step and actively misled the investigation.
+
+**A fix tested where the fix did not exist.** A `gate.sh` correction was
+"verified" inside a git worktree, which checks out `HEAD` — i.e. the old script.
+The same trap nearly recurred when worktree isolation was almost used for an
+agent verifying *uncommitted* work.
+
+**Claims repeated without re-checking.** A doc pass reported that four test
+suites ran in no workflow; the same commit had already wired them. That stale
+claim was then repeated downstream before anyone verified it.
+
+**Documentation that was true when written.** Several status blocks told a
+reader that `sigild` "performs no cryptography" and "holds no keys" while there
+were crypto call sites in fifteen non-test files. A threat-model row advertised
+recovery delegates with a seven-day veto window that has never existed. Both
+would have scoped real code out of a review.
+
+---
+
+## What changed as a result
+
+These are controls, not intentions:
+
+- **`scripts/gate.sh`** runs every suite, **enumerated dynamically** so a new one
+  cannot be missed; **counts results** rather than trusting exit codes; resolves
+  the repo from its own location and **prints which tree and commit it gated**;
+  starts a throwaway Postgres and **fails if any test skipped**; and carries a
+  **CI-drift check** asserting every suite on disk is named in some workflow.
+  That drift check is itself mutation-tested.
+- **Mutation testing is the default standard of proof** for anything
+  security-relevant. A control whose mutation survives the suite is treated as
+  broken, and several were.
+- **Adversarial verification is a separate step from building**, with an explicit
+  pass/fail acceptance criterion (for example "no lockout", or "reads are never
+  refused"). Verifiers are told that a skipped suite, an unexercised control and a
+  mock more permissive than the real thing are all *broken*.
+- **Test doubles must not be more permissive than the real thing**, and where they
+  are, the file says so in its own header.
+- **Every terminal assertion waits.** `isVisible()` is banned as an outcome check
+  in the browser suites; the suites were swept for it.
+- **Claims are grepped against the code** before they are written down — env vars,
+  metric names, route counts, test counts, command counts.
+
+---
+
+## The uncomfortable summary
+
+The fourth full-repo adversarial audit put it best: **the code held up; the
+verification layer did not.** Seventeen of eighteen authorization mutations, seven
+of nine storage mutations and thirty-three of thirty-eight test-integrity
+mutations went red. A full secret hunt across `pg_dump`, every `bytea` column and
+the server log found zero hits with a working positive control.
+
+And in the same audit, **two of the three verification blind spots were in
+tooling written hours earlier** — including the gate script built to prevent
+exactly this.
+
+The lesson worth keeping is not "test more". It is that **a green signal is a
+claim, and claims from your own tooling deserve the same scepticism as claims
+from anywhere else.**

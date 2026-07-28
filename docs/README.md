@@ -98,6 +98,12 @@ that file discouraged them, which was wrong and is retracted.
   what-is-not-deployable / validation-status accounting.
 - [`decisions/`](decisions/README.md) — Architecture Decision Records (the
   load-bearing *why*), Nygard-style and pre-audit.
+- [`engineering-lessons.md`](engineering-lessons.md) — **how this project has
+  actually failed**: a consolidated record of the mistakes made building it, what
+  each cost, and which controls exist because of them. Worth reading before the
+  design documents, because almost every serious defect found here was a *green
+  signal that meant nothing* rather than a wrong algorithm — and two of the three
+  blind spots in the last audit were in tooling written hours earlier.
 
 Every line here is **subject to change**. Substantial parts of the scaffold now
 exist and are tested (the crypto core, the CLI, the dev op-log server, four

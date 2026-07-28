@@ -1008,6 +1008,18 @@ enrollment-token field (neither can *mint* one; the CLI and the desktop app can)
 > [ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md) and
 > [`api.md` → Abuse rate limiting](api.md#abuse-rate-limiting-enrollment--invite-minting).
 
+> ⚠️ **Read [`deploy/caddy/Caddyfile`](../deploy/caddy/Caddyfile) before you
+> enable either limiter.** Behind the reverse proxy this repo documents, every
+> request reaches `sigild` from Caddy's address, so the enrollment limiter
+> collapses to ONE global bucket and is a **backstop, not a defence**. The
+> Caddyfile now carries a ready-to-uncomment per-source `rate_limit` block for
+> the enrollment and invite routes, together with the `xcaddy` line that builds a
+> Caddy able to run it — rate limiting is a **plugin**, not a stock module, which
+> is why the block ships commented out (a live `rate_limit` directive would fail
+> `caddy validate` on a stock binary, and this repo validates its IaC offline).
+> That file also records why the billing webhook route must **not** get a rate
+> zone, only an allowlist.
+
 ### 15.1 The two limiters
 
 | Variable | Default | What it bounds |

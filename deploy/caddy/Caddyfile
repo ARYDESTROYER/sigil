@@ -9,6 +9,65 @@
 # sigild listener (Go 1.24.x, CurvePreferences=nil), NOT this Caddy edge. Do not
 # mislabel a Caddy classical handshake as the PQ proof.
 
+# ⚠️ EDGE RATE LIMITING — READ THIS BEFORE ENABLING sigild's OWN LIMITER.
+#
+# sigild has an in-process abuse limiter (SIGILD_ENROLL_RATE_LIMIT /
+# SIGILD_INVITE_RATE_LIMIT, ADR 0041). Behind THIS reverse proxy it is close to
+# useless and must be understood as a backstop, not a defence: every request
+# reaches sigild from Caddy's address, so the enrollment limiter — which keys on
+# the socket peer address and deliberately ignores X-Forwarded-For, because
+# trusting it would let one client mint unlimited buckets — collapses to ONE
+# global bucket for all traffic. That is precisely why sigild charges its bucket
+# only on the DENIAL path and fails OPEN at its key cap: so that this topology
+# cannot turn an abuse control into a global enrollment outage.
+#
+# The component that actually knows the peer is this one. Per-source limiting
+# therefore belongs HERE.
+#
+# STOCK CADDY CANNOT DO IT. Rate limiting is the caddy-ratelimit plugin, not a
+# built-in, so the block below is commented out — leaving it live would make
+# `caddy validate` fail on a stock binary, and this repo validates its IaC
+# offline. To enable it, build a Caddy that has the module:
+#
+#     xcaddy build --with github.com/mholt/caddy-ratelimit
+#
+# then uncomment the block inside the site below and re-run `caddy validate`.
+#
+#	rate_limit {
+#		# Enrollment is the one UNAUTHENTICATED write path, and the route a
+#		# flood is most useful against. Key on the real client address, which
+#		# only the edge knows.
+#		zone enroll {
+#			match {
+#				method POST
+#				path /v1/devices/enroll
+#			}
+#			key    {remote_host}
+#			events 10
+#			window 1m
+#		}
+#		# Invite minting is authenticated, so sigild already limits it per
+#		# ACCOUNT — which is tighter than anything an address-based edge rule
+#		# can express. This zone is only a coarse outer bound.
+#		zone invites {
+#			match {
+#				method POST
+#				path /v1/account/invites
+#			}
+#			key    {remote_host}
+#			events 30
+#			window 1m
+#		}
+#	}
+#
+# ⛔ DO NOT ADD A ZONE FOR /v1/billing/webhook/*. sigild's webhook limiter was
+# built, proven harmful and REMOVED (ADR 0041): shedding traffic on a route where
+# shedding costs money, and where the legitimate sender has a finite retry
+# budget, loses payment events. An edge rule keyed on the provider's address is
+# a little better than one keyed on the provider name, but a provider retries
+# from a pool you do not control and cannot enumerate. If you bound that route at
+# all, bound it by an ALLOWLIST of provider source ranges, never by a rate.
+
 api.example.com {
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:8080

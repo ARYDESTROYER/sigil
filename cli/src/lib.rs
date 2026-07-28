@@ -3811,6 +3811,38 @@ pub fn verify_recipient_for_wrap(
     })
 }
 
+// --- billing / entitlement (READ ONLY) --------------------------------------
+
+/// The URL PATH of the subscription-status route.
+const BILLING_SUBSCRIPTION_PATH: &str = "/v1/billing/subscription";
+
+/// READ this device's ACCOUNT's subscription, and return the RAW JSON body.
+///
+/// ⭐ THE WARNING CHANNEL. It is the only signal that can say `"grace"` — that an
+/// account has lapsed but writes still work, and when they will stop. A client
+/// that never asks learns about a lapse only when a write is refused, which is
+/// exactly the surprise ADR 0043 exists to avoid.
+///
+/// It is deliberately a RAW STRING, not a parsed struct: the additive
+/// `entitlement` block is interpreted in exactly one place per client (the
+/// desktop's `EntitlementView::from_subscription_block`), and a second
+/// interpretation here would be a second thing to keep in sync.
+///
+/// NO REQUEST NAMES AN ACCOUNT (ADR 0040): the subject is the account behind the
+/// verified signature, so there is nothing here to enumerate with. This route is
+/// itself never gated by entitlement — refusing to tell a customer WHY they are
+/// being refused, because they are being refused, would be absurd.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx (`401` unauthenticated, `403` no account,
+///   `501` billing turned off on this server).
+/// - [`CliError::Http`] if the server is unreachable.
+pub fn fetch_subscription(server: &str, auth: &RequestAuth<'_>) -> Result<String, CliError> {
+    let req = ureq::get(&join_url(server, BILLING_SUBSCRIPTION_PATH));
+    let req = apply_auth(req, auth, "GET", BILLING_SUBSCRIPTION_PATH, "", b"")?;
+    finish(req.call())
+}
+
 // --- vault key rotation + re-wrap ------------------------------------------
 
 /// The URL PATH of a vault's envelope COLLECTION (list / rotate support).

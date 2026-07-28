@@ -905,12 +905,43 @@ fn auth_for(identity: &Option<DeviceIdentity>) -> RequestAuth<'_> {
     }
 }
 
+/// ⭐ HTTP 402 — a BILLING state, and NOTHING ELSE.
+///
+/// sigild's entitlement gate (ADR 0043) runs strictly AFTER authentication and
+/// authorization have BOTH succeeded, and it is called from exactly three WRITE
+/// handlers: op-log append, key-envelope deposit and vault grant. No read handler
+/// contains one line of entitlement code, and a key deposit (plus the grant that
+/// accompanies it) to a device of YOUR OWN account is exempt even past grace.
+///
+/// So a 402 must never be rendered as `401` (your key is wrong) or `403` (you may
+/// not touch this) — those send a paying customer to debug the wrong thing — and
+/// it must never suggest that any code has been lost. Nothing has.
+fn explain_payment_required(e: &CliError, what: &str) -> String {
+    format!(
+        "{e}\n  -> HTTP 402: this is a BILLING state, not an authentication or permission failure.\n     \
+         The server authenticated AND authorized this device, then asked for payment: the\n     \
+         subscription lapsed and its grace period has ended, so it refused {what}.\n     \
+         ⭐ NOTHING YOU ALREADY HAVE IS AFFECTED. Reads are NEVER refused: `sigil pull`, opening\n     \
+         a vault and printing codes (`sigil totp code`) all still work — codes are computed\n     \
+         locally and need no server at all. Collecting your key envelopes, enumerating what a\n     \
+         device can decrypt, publishing a hybrid key, enrolling, revoking, minting an invite and\n     \
+         reading your account are all still served, and so is giving another device OF YOUR OWN\n     \
+         ACCOUNT the key to a vault — which is why `sigil recovery generate` and `sigil recovery\n     \
+         cover` still work while lapsed. Nothing is deleted and nothing expires.\n     \
+         What stops is uploading NEW changes (`sigil push`) and sharing a vault to a device of a\n     \
+         DIFFERENT account. Pay via the server's checkout route to resume."
+    )
+}
+
 /// Turn a sync error into an actionable message, distinguishing the two auth
 /// verdicts sigild can return: `401` = the request was not authenticated at all
 /// (missing/invalid/replayed signature, unknown or revoked device), `403` = it WAS
 /// authenticated but this device holds no sufficient grant on that vault.
 fn explain_sync_error(e: CliError, vault: &str, contract: &str) -> String {
     match &e {
+        CliError::Server { status: 402, .. } => {
+            explain_payment_required(&e, &format!("this write to vault {vault:?}"))
+        }
         CliError::Server { status: 401, .. } => format!(
             "{e}\n  -> HTTP 401: sigild did not accept this request's credentials (contract {contract}).\n     \
              Check that the device is enrolled and not revoked, that --key/SIGIL_DEVICE_KEY points at the\n     \
@@ -1140,6 +1171,7 @@ fn cmd_device(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 /// Never echoes a token.
 fn explain_device_error(e: CliError, what: &str) -> String {
     match &e {
+        CliError::Server { status: 402, .. } => explain_payment_required(&e, what),
         CliError::Server { status: 401, .. } => format!(
             "{e}\n  -> HTTP 401: sigild rejected the credentials for {what}. Enrollment tokens are\n     \
              SINGLE-USE and time-limited, the admin token must match SIGILD_ADMIN_TOKEN exactly, and the\n     \
@@ -1778,6 +1810,7 @@ fn cmd_account(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 /// Explain an account-route HTTP failure. Never echoes an invite secret.
 fn explain_account_error(e: CliError, what: &str) -> String {
     match &e {
+        CliError::Server { status: 402, .. } => explain_payment_required(&e, what),
         CliError::Server { status: 401, .. } => format!(
             "{e}\n  -> HTTP 401: sigild did not authenticate this device for {what}. The identity must be\n     \
              ENROLLED (contract v3), not revoked, and the clock within 300s of the server."
@@ -2212,6 +2245,7 @@ fn write_envelope_file(path: &str, bytes: &[u8]) -> Result<(), String> {
 /// echoes a key, an envelope, or a token.
 fn explain_sharing_error(e: CliError, what: &str) -> String {
     match &e {
+        CliError::Server { status: 402, .. } => explain_payment_required(&e, what),
         CliError::Server { status: 401, .. } => format!(
             "{e}\n  -> HTTP 401: sigild did not accept this request's credentials while {what}.\n     \
              Check the device is enrolled and NOT REVOKED, that --key points at its identity, and\n     \
@@ -3329,6 +3363,7 @@ fn cmd_recovery(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 /// on. Never echoes the code, a seed, or a key.
 fn explain_recovery_error(e: CliError, what: &str) -> String {
     match &e {
+        CliError::Server { status: 402, .. } => explain_payment_required(&e, what),
         // The offline decode already ran, so a 401 here means exactly one thing.
         CliError::Server { status: 401, .. } => format!(
             "{e}\n  -> valid code, but this server has no such device.\n     \
@@ -3797,5 +3832,68 @@ fn default_state_dir() -> std::path::PathBuf {
     match std::env::var_os("HOME") {
         Some(home) if !home.is_empty() => std::path::Path::new(&home).join(".sigil"),
         _ => std::path::PathBuf::from("."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payment_error() -> CliError {
+        CliError::Server {
+            status: 402,
+            body:
+                r#"{"error":"payment_required","reads_allowed":true,"key_recovery_allowed":true}"#
+                    .to_string(),
+        }
+    }
+
+    /// ⭐ A 402 must read as BILLING on every surface that can receive one — and
+    /// must never be dressed up as an auth or permission failure, nor imply that
+    /// any code has been lost. Before this, `sigil push` dumped the raw JSON body
+    /// while 401/403/501 each got a friendly explainer.
+    #[test]
+    fn payment_required_is_explained_on_every_surface() {
+        let rendered = [
+            explain_sync_error(payment_error(), "demo-vault", "v3"),
+            explain_device_error(payment_error(), "enrolling this device"),
+            explain_account_error(payment_error(), "minting an invite"),
+            explain_sharing_error(payment_error(), "depositing a key envelope"),
+            explain_recovery_error(payment_error(), "covering a vault"),
+        ];
+        for msg in rendered {
+            assert!(msg.contains("402"), "must name the status: {msg}");
+            assert!(msg.contains("BILLING state"), "must call it billing: {msg}");
+            assert!(
+                msg.contains("not an authentication or permission failure"),
+                "must rule out auth/permission: {msg}"
+            );
+            // The truthful half: reads and key recovery are never refused.
+            assert!(msg.contains("Reads are NEVER refused"), "{msg}");
+            assert!(msg.contains("recovery generate"), "{msg}");
+            // …and it must not be rendered as a raw JSON dump.
+            assert!(
+                !msg.trim_end().ends_with("key_recovery_allowed\":true}"),
+                "the raw body must not be the whole message: {msg}"
+            );
+        }
+    }
+
+    /// A status the explainers do not special-case still falls through unchanged,
+    /// so adding the 402 arm cannot have swallowed anything.
+    #[test]
+    fn other_statuses_are_untouched() {
+        let e = CliError::Server {
+            status: 418,
+            body: "teapot".to_string(),
+        };
+        assert_eq!(
+            explain_sync_error(e, "demo-vault", "v3"),
+            CliError::Server {
+                status: 418,
+                body: "teapot".to_string()
+            }
+            .to_string()
+        );
     }
 }

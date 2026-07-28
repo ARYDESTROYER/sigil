@@ -3104,6 +3104,7 @@ dependencies = [
 name = "sigil-desktop-core"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "sigil-cli",
  "sigil-core",
 ]

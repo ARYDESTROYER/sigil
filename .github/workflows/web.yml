@@ -68,6 +68,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.100,wasm-pack
+      # Go, because tests/cors.spec.ts builds and boots a REAL sigild to prove the
+      # webapp can actually reach a server cross-origin. ⚠️ WITHOUT THIS THE SPEC
+      # `test.skip`s ITSELF and the job stays green while proving nothing — which
+      # is precisely the regression it exists to catch: before the CORS fix, every
+      # signed request from the webapp was preflighted and blocked, and a test
+      # double that sent Access-Control-Allow-Origin hid it for a whole phase.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: sigild/go.sum
       - run: pnpm install --frozen-lockfile
       - run: corepack pnpm --filter @sigil/wasm build
       - run: corepack pnpm --filter webapp typecheck

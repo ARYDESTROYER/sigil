@@ -175,6 +175,17 @@ type Config struct {
 	// nothing until the provider's retries AND this window have both run out.
 	EntitlementGrace time.Duration
 
+	// CORSOrigins is the OPT-IN browser origin allowlist (SIGILD_CORS_ORIGINS),
+	// as EXACT origins (scheme + host + port), already normalized and validated
+	// by cmd/server. EMPTY (the default) installs no CORS middleware at all and
+	// no response carries an Access-Control-* header — byte-identical to the
+	// behaviour before CORS existed.
+	//
+	// ⚠️ It is NOT an authentication or CSRF control: every authenticated
+	// request is signed per-request with a device key, and no cookie or ambient
+	// credential exists for a cross-origin page to abuse. See cors.go.
+	CORSOrigins []string
+
 	// AdminToken is the OPTIONAL operator token (SIGILD_ADMIN_TOKEN) that
 	// authorizes the operator-only device routes (list all devices, revoke any
 	// device). Empty (the default) means those operator paths are permanently
@@ -382,10 +393,18 @@ func NewRouter(cfg Config) http.Handler {
 
 	// Outermost first: count every response (even a recoverer-written 500),
 	// recover panics, assign a request ID, then access-log.
-	return chain(mux,
+	middleware := []func(http.Handler) http.Handler{
 		countRequests(h.metrics),
 		recoverer(cfg.Logger),
 		requestID,
 		accessLog(cfg.Logger),
-	)
+	}
+	// CORS sits INNERMOST — closest to the mux — so a preflight it answers is
+	// still counted, still gets a request ID and still appears in the access log.
+	// With no allowlist configured (the default) it is not installed at all, so
+	// the chain is exactly what it always was.
+	if len(cfg.CORSOrigins) > 0 {
+		middleware = append(middleware, corsMiddleware(cfg.CORSOrigins))
+	}
+	return chain(mux, middleware...)
 }

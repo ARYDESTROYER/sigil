@@ -694,12 +694,27 @@ export function makeSignedFetch(wasm, identity) {
  *
  * Like the unauthenticated path, this moves OPAQUE bytes and does no crypto on
  * the container — it only signs the REQUEST.
+ *
+ * `opts.onResponse(res)` is OPTIONAL and additive: it receives the raw Response
+ * before the body is read, which is the ONLY way to see sigild's
+ * `X-Sigil-Entitlement*` headers — they ride on a write that is still being
+ * SERVED inside the grace period, so they never appear in an error. Pass
+ * `entitlement.mjs`'s `readEntitlementHeaders` here to surface that warning. An
+ * observer that throws is ignored; it cannot break a push.
  */
-export async function pushContainerAuthed(wasm, identity, baseUrl, vaultId, containerBytes) {
+export async function pushContainerAuthed(
+  wasm,
+  identity,
+  baseUrl,
+  vaultId,
+  containerBytes,
+  opts = {},
+) {
   checkVaultId(vaultId);
   return asAuthError(
     pushContainer(baseUrl, vaultId, containerBytes, {
       fetch: makeSignedFetch(wasm, identity),
+      onResponse: opts.onResponse,
     }),
     "pushContainerAuthed",
   );

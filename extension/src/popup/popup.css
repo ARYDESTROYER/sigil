@@ -268,3 +268,57 @@ button.ghost {
   font-size: 10px;
   color: var(--dim);
 }
+
+/* ── the printed recovery sheet ─────────────────────────────────────────────
+ * The ONE thing in this popup meant to leave the screen on paper. Given a heavy
+ * border so it reads as a document, and a monospaced, widely-tracked code so a
+ * human copying 56 characters by hand does not lose their place. */
+.sheet {
+  margin-top: 10px;
+  padding: 8px;
+  border: 2px solid var(--fg);
+  border-radius: 6px;
+}
+.sheet h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+.kitcode {
+  margin: 8px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  letter-spacing: 0.12em;
+  word-break: break-all;
+}
+.warnlist {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.warnlist li {
+  margin-bottom: 5px;
+}
+
+/* Printing a kit prints ONLY the kit: a page that also carried the rest of the
+ * popup would wrap a credential in noise. */
+@media print {
+  body:has(.sheet:not([hidden])) * {
+    visibility: hidden;
+  }
+  body:has(.sheet:not([hidden])) .sheet,
+  body:has(.sheet:not([hidden])) .sheet * {
+    visibility: visible;
+  }
+  body:has(.sheet:not([hidden])) .sheet {
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 100%;
+  }
+  body:has(.sheet:not([hidden])) .sheet .row,
+  body:has(.sheet:not([hidden])) .sheet label,
+  body:has(.sheet:not([hidden])) .sheet button {
+    display: none;
+  }
+}

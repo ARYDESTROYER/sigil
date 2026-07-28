@@ -68,7 +68,32 @@ import {
   listKeyEnvelopes,
   newPinStore,
   KeyPinMismatchError,
+  UnverifiedRecoveryKitError,
+  SafetyNumberMismatchError,
 } from "../../vendor/sharing.mjs";
+// THE RECOVERY KIT (ADR 0042). Same vendored module the webapp imports; this
+// file adds no cryptography and no codec of its own.
+import {
+  generateRecoveryKit,
+  coverVault,
+  restoreFromKit,
+  revokeRecoveryKit,
+  pinDerivedKey,
+  explainRecoveryStatus,
+  RECOVERY_DEVICE_LABEL,
+} from "../../vendor/recovery.mjs";
+// ENTITLEMENT (ADR 0043, read side): what the server already says about payment.
+import {
+  getSubscription,
+  entitlementState,
+  describeEntitlement,
+  describePaymentRequired,
+  explainSubscriptionStatus,
+  paymentRequiredFrom,
+  readEntitlementHeaders,
+  formatInstant,
+  NEVER_REFUSED,
+} from "../../vendor/entitlement.mjs";
 
 /** chrome.storage.local key holding ONLY the sealed container, base64. */
 const STORAGE_KEY = "sigil.extension.vault.v1";
@@ -136,6 +161,10 @@ function show(view) {
   for (const name of ["setup", "locked", "unlocked"]) {
     $(`view-${name}`).hidden = name !== view;
   }
+  // ⭐ RESTORE IS VISIBLE WHENEVER THE VAULT IS NOT OPEN — including on a
+  // completely fresh install, which is precisely the state a customer who lost
+  // every device is in. It is not a sub-feature of an unlocked vault.
+  $("view-restore").hidden = view === "unlocked";
   $("lock").hidden = view !== "unlocked";
   document.body.dataset.phase = view;
 }
@@ -217,8 +246,19 @@ function renderDevice() {
   }
   const showBtn = $("account-show");
   if (showBtn) showBtn.hidden = !device;
+  const entBtn = $("entitlement-check");
+  if (entBtn) entBtn.hidden = !device;
   renderAccount();
   renderSharing();
+  renderRecovery();
+}
+
+/** Reflect whether a kit generated right now would cover anything. */
+function renderRecovery() {
+  const warn = $("recovery-no-keys");
+  if (!warn) return;
+  const holds = Object.keys(device?.vaultKeys ?? {}).length;
+  warn.hidden = !device || holds > 0 || !$("recovery-sheet").hidden;
 }
 
 // ── account membership (Phase 52) ────────────────────────────────────────────
@@ -454,6 +494,15 @@ function lock() {
   $("accounts").dataset.labels = "";
   $("export-out").hidden = true;
   $("export-out").value = "";
+  // A recovery code on screen is a credential on screen: locking removes it.
+  $("recovery-code").textContent = "";
+  $("recovery-sheet").hidden = true;
+  $("recovery-written").checked = false;
+  $("recovery-hide").disabled = true;
+  $("recovery-coverage").hidden = true;
+  $("recovery-unverified").hidden = true;
+  $("entitlement-state").hidden = true;
+  $("entitlement-402").hidden = true;
   $("unlock-pw").value = "";
   show("locked");
   say("Locked.");
@@ -566,6 +615,7 @@ $("unlock-form").addEventListener("submit", async (ev) => {
     renderSharing();
     $("unlock-pw").value = "";
     unlocked();
+    if (device) void refreshEntitlement();
   } catch (e) {
     vault = null;
     password = "";
@@ -705,6 +755,9 @@ $("device-enroll").addEventListener("click", async () => {
     // Persist SEALED under the vault password — never the raw seed.
     await persistDevice({ deviceId: enrolled.deviceId, seed, baseUrl });
     $("device-token").value = ""; // single-use: drop it immediately
+    // A client that only ever READS is never refused and never sees a warning
+    // header, so the subscription route is its only warning channel. Read it.
+    void refreshEntitlement();
     say(`Enrolled as ${enrolled.deviceId}.`);
   } catch (e) {
     say(`Enrollment failed: ${authErr(e)}`, "error");
@@ -737,17 +790,47 @@ $("account-show").addEventListener("click", async () => {
 $("sync-push").addEventListener("click", async () => {
   try {
     say("Pushing…");
+    $("entitlement-402").hidden = true;
     const got = await chrome.storage.local.get(STORAGE_KEY);
     const sealed = got[STORAGE_KEY];
     if (!sealed) throw new Error("no sealed vault to push");
     const container = base64ToBytes(sealed);
     const baseUrl = $("sync-url").value.trim();
     const vaultId = $("sync-vault").value.trim();
+    // ⭐ THE GRACE CHANNEL. sigild sets X-Sigil-Entitlement* on a write it is
+    // still SERVING inside the grace period — a 2xx — so that warning lives ONLY
+    // in the response headers and never in a body or an error. Reading it here is
+    // what turns a lapse into notice the user can act on, instead of a refusal
+    // that arrives with none.
+    let warn = null;
     const { seq } = device
-      ? await pushContainerAuthed(wasm, device, baseUrl, vaultId, container)
+      ? await pushContainerAuthed(wasm, device, baseUrl, vaultId, container, {
+          onResponse: (res) => {
+            warn = readEntitlementHeaders(res);
+          },
+        })
       : await pushContainer(baseUrl, vaultId, container);
+    if (warn) {
+      $("entitlement-402").textContent =
+        `Subscription ${warn.status || "lapsed"} — uploading new changes stops` +
+        `${warn.graceEndsAt ? ` on ${formatInstant(warn.graceEndsAt)}` : " soon"}. ` +
+        `${NEVER_REFUSED}`;
+      $("entitlement-402").hidden = false;
+    }
     say(`Pushed sealed container as op #${seq}${device ? " (signed)" : ""}.`);
   } catch (e) {
+    // ⭐ A 402 is a BILLING state, not an auth failure and not a bug: the server
+    // authenticated AND authorized this device and then asked for payment.
+    // Rendering it as "unauthorized" would send the user to debug a key that is
+    // working perfectly, and would imply a loss of access that has not happened.
+    const pay = paymentRequiredFrom(e, "Push");
+    if (pay) {
+      const note = describePaymentRequired(pay);
+      $("entitlement-402").textContent = `${note.headline} ${note.detail}`;
+      $("entitlement-402").hidden = false;
+      say("Push was refused pending payment. Nothing else changed.");
+      return;
+    }
     say(`Push failed: ${authErr(e)}`, "error");
   }
 });
@@ -1073,6 +1156,397 @@ $("sharing-accept").addEventListener("click", async () => {
     say(`Accept failed: ${sharingErr(e)}`, "error");
   }
 });
+
+// ── recovery kit (dev) ───────────────────────────────────────────────────────
+//
+// ⚠️⚠️ THE KIT IS A CREDENTIAL, stronger than a stolen locked phone: whoever
+// holds the 56 characters has full control of the account. It is put into the
+// DOM ONCE, is never written to chrome.storage.local, never logged, never placed
+// in a URL, and is cleared the moment the user confirms they have written it
+// down. Everything cryptographic happens in the vendored, proven recovery.mjs
+// (which itself only calls the wasm); this file is UI glue.
+
+/** Classify a recovery failure into the things a user can actually act on. */
+function recoveryErr(e) {
+  const status = e && typeof e.status === "number" ? e.status : 0;
+  if (status >= 400) return explainRecoveryStatus(status);
+  const text = err(e);
+  if (/unsupported recovery kit version/i.test(text)) {
+    return (
+      "This kit was printed by a NEWER version of Sigil: the code itself is intact (its checksum " +
+      "is correct) but this build does not understand its format version. Update this extension; " +
+      "do not retype the code."
+    );
+  }
+  if (/not a valid recovery code/i.test(text)) {
+    return (
+      "That is not a valid recovery code — check for a mistyped character. Nothing was sent " +
+      "anywhere: the code is checked on this device before any request. Hyphens, spaces and case " +
+      "do not matter; the letters I, L and O are never used (read them as 1, 1 and 0) and U is " +
+      "never used at all."
+    );
+  }
+  if (/nothing to recover/i.test(text)) {
+    return (
+      "Valid kit, but it covers NOTHING on this server: the code and device id are correct and " +
+      "the server knows this kit, it just holds no vault key for it. The kit was enrolled but " +
+      "never covered a vault, or a rotation dropped it."
+    );
+  }
+  return text;
+}
+
+/** The wrap gate refused, or a supplied number did not match. Say which. */
+function wrapGateErr(e) {
+  if (e instanceof UnverifiedRecoveryKitError) {
+    $("recovery-unverified").textContent =
+      `REFUSED — ${e.deviceId} is a recovery kit this browser has never seen. Nothing was ` +
+      `wrapped and nothing was uploaded. The only thing vouching for that kit's key is the ` +
+      `server, and a hostile server that substituted its own key would be handed this vault's ` +
+      `key. THE SAFETY NUMBER IS PRINTED ON THE RECOVERY SHEET — compare it with these digits ` +
+      `out of band, then type it in and try again. From server: ${e.presentedSafetyNumber}`;
+    $("recovery-unverified").hidden = false;
+    return true;
+  }
+  if (e instanceof SafetyNumberMismatchError) {
+    $("recovery-unverified").textContent =
+      `REFUSED — the safety number you typed does not match the key this server is serving for ` +
+      `${e.deviceId}. You typed ${e.expectedSafetyNumber}; the server presented ` +
+      `${e.presentedSafetyNumber}. Either it was mistyped, or the server substituted a key it can ` +
+      `decrypt with. Nothing was wrapped, nothing uploaded, no key pinned.`;
+    $("recovery-unverified").hidden = false;
+    return true;
+  }
+  return false;
+}
+
+$("recovery-generate").addEventListener("click", async () => {
+  try {
+    const auth = sharingAuth();
+    say("Generating a recovery kit…");
+    $("recovery-unverified").hidden = true;
+    const vaultKeys = Object.entries(device.vaultKeys ?? {}).map(([vaultId, vaultKey]) => ({
+      vaultId,
+      vaultKey,
+    }));
+    const pins = device.pins ?? newPinStore();
+    const res = await generateRecoveryKit(wasm, auth, { vaultKeys, pins });
+    // Persist the DERIVED pin (and nothing else) inside the sealed container.
+    await persistDevice({ ...device, pins: res.pins });
+
+    $("recovery-code").textContent = res.formatted;
+    $("recovery-kit-id").textContent = res.deviceId;
+    $("recovery-account").textContent = res.accountId;
+    $("recovery-server").textContent = res.baseUrl;
+    $("recovery-safety").textContent = res.safetyNumber;
+    $("recovery-covered").textContent = res.covered.length
+      ? res.covered.map((c) => c.vaultId).join(", ")
+      : "NONE";
+    $("recovery-covers-nothing").hidden = res.covered.length > 0;
+    $("recovery-written").checked = false;
+    $("recovery-hide").disabled = true;
+    $("recovery-sheet").hidden = false;
+    renderRecovery();
+    say(
+      `Kit ${res.deviceId} created in account ${res.accountId} and verified end to end — it ` +
+        `re-derived its own identity from the printed code, authenticated, and unwrapped ` +
+        `${res.verification.unwrappedVault || "no vault"}. Write the code down NOW.`,
+    );
+  } catch (e) {
+    say(`Generating a recovery kit failed: ${recoveryErr(e)}`, "error");
+  }
+});
+
+$("recovery-written").addEventListener("change", () => {
+  $("recovery-hide").disabled = !$("recovery-written").checked;
+});
+
+$("recovery-hide").addEventListener("click", () => {
+  // ⭐ USED — clear it from the DOM. Nothing about it was ever persisted.
+  $("recovery-code").textContent = "";
+  $("recovery-sheet").hidden = true;
+  $("recovery-written").checked = false;
+  $("recovery-hide").disabled = true;
+  renderRecovery();
+  say(
+    "The recovery code has been cleared from this screen and was never stored. If you did not " +
+      "write it down, generate a new kit and revoke the old one.",
+  );
+});
+
+$("recovery-print").addEventListener("click", () => window.print());
+
+$("recovery-copy").addEventListener("click", async () => {
+  await copy($("recovery-code").textContent ?? "");
+  say(
+    "Copied to the clipboard — which other applications can read. Paste it into whatever will " +
+      "hold it, then clear your clipboard.",
+    "error",
+  );
+});
+
+$("recovery-cover").addEventListener("click", async () => {
+  try {
+    const auth = sharingAuth();
+    const id = sharingVaultId();
+    const to = $("recovery-kit").value.trim();
+    if (!to) throw new Error("paste the kit's device id (it is printed on the sheet)");
+    const key = device.vaultKeys?.[id];
+    if (!key) {
+      throw new Error(
+        `vault "${id}" is still a PERSONAL vault sealed with your password. A recovery kit can ` +
+          "only be given a vault KEY, so convert it to a shared vault first (Sharing above).",
+      );
+    }
+    $("recovery-unverified").hidden = true;
+    say("Wrapping this vault's key to the kit…");
+    const res = await coverVault(wasm, auth, {
+      kitDeviceId: to,
+      vaultId: id,
+      vaultKey: key,
+      pins: device.pins ?? newPinStore(),
+      expectedSafetyNumber: $("recovery-cover-safety").value.trim() || null,
+    });
+    await persistDevice({ ...device, pins: res.pins });
+    say(
+      `Vault "${id}" is now covered by kit ${to} — a ${res.envelopeBytes}-byte envelope the ` +
+        `server relays but cannot read (key sha256 ${res.fingerprint}). ` +
+        (res.derived
+          ? "The kit's key was derived locally by this browser, so nothing was fetched and " +
+            "nothing could have been substituted."
+          : "The kit's key came from the server and matched the safety number you supplied."),
+    );
+  } catch (e) {
+    if (wrapGateErr(e)) {
+      say("Cover REFUSED: that kit's key is not verified. Nothing was wrapped.", "error");
+      return;
+    }
+    say(`Cover failed: ${recoveryErr(e)}`, "error");
+  }
+});
+
+$("recovery-check").addEventListener("click", async () => {
+  try {
+    const auth = sharingAuth();
+    say("Checking recovery…");
+    const acct = await getAccount(wasm, device, auth.baseUrl);
+    const kits = (acct.devices ?? []).filter((d) => d.label === RECOVERY_DEVICE_LABEL);
+    const lines = [];
+    let covered = 0;
+    const vaultIds = Object.keys(device.vaultKeys ?? {});
+    for (const v of vaultIds) {
+      let holders = [];
+      try {
+        holders = (await listKeyEnvelopes(wasm, auth, v))
+          .map((h) => h.deviceId)
+          .filter((d) => kits.some((k) => k.device_id === d));
+      } catch (e) {
+        lines.push(`${v}: could not be checked (${sharingErr(e)})`);
+        continue;
+      }
+      if (holders.length) covered++;
+      lines.push(holders.length ? `${v}: covered by ${holders.join(", ")}` : `${v}: NOT covered`);
+    }
+    const el = $("recovery-coverage");
+    el.textContent =
+      (kits.length === 0
+        ? "Recovery: NOT SET UP — this account has no recovery kit. If every device is lost, the " +
+          "account and its vaults are unreachable, by you and by us, and a kit cannot be created " +
+          "after the fact. "
+        : `Recovery: ${kits.length} kit(s) enrolled (${kits
+            .map((k) => `${k.device_id} ${k.status ?? "active"}`)
+            .join("; ")}). `) +
+      (vaultIds.length
+        ? `${covered} of ${vaultIds.length} vault(s) this browser holds a key for are covered. ` +
+          lines.join(" · ")
+        : "This browser holds no vault keys, so there is nothing to cover yet.");
+    el.hidden = false;
+    say(kits.length ? `${kits.length} recovery kit(s) enrolled.` : "Recovery is NOT set up.");
+  } catch (e) {
+    say(`Check failed: ${recoveryErr(e)}`, "error");
+  }
+});
+
+$("recovery-revoke").addEventListener("click", async () => {
+  try {
+    const auth = sharingAuth();
+    const to = $("recovery-revoke-kit").value.trim();
+    if (!to) throw new Error("paste the kit's device id");
+    say("Revoking the kit…");
+    const res = await revokeRecoveryKit(wasm, auth, {
+      kitDeviceId: to,
+      vaultIds: Object.keys(device.vaultKeys ?? {}),
+    });
+    say(
+      `Revoked kit ${to}; removed its envelope for ${
+        res.removed.length ? res.removed.join(", ") : "no vault"
+      }. ${res.rotateReminder}`,
+      "error",
+    );
+  } catch (e) {
+    say(`Revoke failed: ${recoveryErr(e)}`, "error");
+  }
+});
+
+// ── restore from a printed kit, on a client with NO local state ─────────────
+//
+// ⭐ THE FLOW THAT MATTERS. It runs from the setup / locked screens because a
+// user who lost every device is looking at a FRESH INSTALL: no vault, no device
+// identity, no pin store, no keyring — only a sheet of paper.
+//
+// The code is decoded and checksummed OFFLINE before any network I/O, so a
+// mistyped code never reaches a server. It is cleared from the form the moment
+// it works, and NOTHING derived from it is stored except inside the SEALED
+// device-identity container, under the new password.
+
+$("restore-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const errBox = $("restore-error");
+  errBox.hidden = true;
+  const pw = $("restore-pw").value;
+  if (pw.length < 8) {
+    errBox.textContent = "Choose a password of at least 8 characters for this browser.";
+    errBox.hidden = false;
+    return;
+  }
+  if (pw !== $("restore-pw2").value) {
+    errBox.textContent = "Those passwords do not match.";
+    errBox.hidden = false;
+    return;
+  }
+  try {
+    const baseUrl = $("restore-url").value.trim();
+    say("Checking the code on this device, then asking the server…");
+    const res = await restoreFromKit(wasm, {
+      baseUrl,
+      code: $("restore-code").value,
+      deviceId: $("restore-device").value.trim(),
+    });
+
+    const kitAuth = {
+      deviceId: res.deviceId,
+      seed: res.identity.ed25519Seed,
+      baseUrl,
+      hybrid: res.identity.hybrid,
+    };
+
+    // A kit recovers KEYS. The ciphertext still has to exist, so try each
+    // recovered vault until one has content this key opens.
+    const notes = res.skipped.map((s) => `${s.vaultId}: ${s.reason}`);
+    let opened = null;
+    let openedId = "";
+    let openedKey = null;
+    let openedContainer = null;
+    for (const v of res.vaults) {
+      try {
+        const ops = await pullContainersAuthed(wasm, kitAuth, baseUrl, v.vaultId, 0);
+        if (ops.length === 0) {
+          notes.push(`${v.vaultId}: key recovered, but the server holds no vault content for it`);
+          continue;
+        }
+        const container = ops[ops.length - 1].container;
+        opened = openVault(wasm, v.vaultKey, container); // throws before anything is stored
+        openedId = v.vaultId;
+        openedKey = v.vaultKey;
+        openedContainer = container;
+        break;
+      } catch (e) {
+        notes.push(`${v.vaultId}: ${err(e)}`);
+      }
+    }
+    if (!opened) {
+      // Persist NOTHING: a half-restored profile is worse than a clean refusal,
+      // and this is the documented limit — a kit recovers keys, not data.
+      throw new Error(
+        `the code and device id are valid and ${res.vaults.length} vault key(s) were recovered, ` +
+          "but no vault content could be opened. A recovery kit recovers KEYS, not DATA: a vault " +
+          "whose sealed container was never pushed to this server cannot come back." +
+          (notes.length ? ` Details: ${notes.join("; ")}.` : ""),
+      );
+    }
+
+    // ADOPT the kit. Keep every recovered vault key, and PIN the kit's own
+    // hybrid key as DERIVED so a later cover from here wraps to a locally
+    // derived key and never asks the server for one.
+    const vaultKeys = {};
+    for (const v of res.vaults) vaultKeys[v.vaultId] = v.vaultKey;
+    const pins = newPinStore();
+    await pinDerivedKey(pins, res.deviceId, hybridPublicIdentity(wasm, res.identity.hybrid));
+
+    password = pw;
+    sealSecret = openedKey;
+    activeVaultId = openedId;
+    vault = opened;
+    await persistDevice({
+      deviceId: res.deviceId,
+      seed: res.identity.ed25519Seed,
+      baseUrl,
+      hybrid: res.identity.hybrid,
+      vaultKeys,
+      pins,
+    });
+    await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(openedContainer) });
+
+    // ⭐ USED — clear it from the form immediately.
+    $("restore-code").value = "";
+    $("restore-pw").value = "";
+    $("restore-pw2").value = "";
+    $("sync-url").value = baseUrl;
+    $("sync-vault").value = openedId;
+    renderSharing();
+    unlocked();
+    say(
+      `Restored vault "${openedId}" — ${opened.entries.length} account(s) — from the printed kit. ` +
+        "⚠️ THIS BROWSER IS NOW A SECOND COPY OF THAT PAPER: it holds the kit's keys. Keep the " +
+        "sheet itself somewhere else." +
+        (notes.length ? ` Not restored: ${notes.join("; ")}.` : ""),
+      "error",
+    );
+  } catch (e) {
+    errBox.textContent = recoveryErr(e);
+    errBox.hidden = false;
+    say("Restore failed.", "error");
+  }
+});
+
+// ── entitlement (dev): read what the server says about payment ──────────────
+//
+// ⭐ THE MESSAGE MUST BE TRUE. sigild refuses WRITES only, only past grace, and
+// never a key deposit to a device of the caller's OWN account. So this never says
+// a billing state has cost the user their codes — it has not: codes are computed
+// here, in the wasm, offline, from a vault this browser already holds.
+
+async function refreshEntitlement() {
+  const el = $("entitlement-state");
+  if (!device) {
+    el.hidden = true;
+    return;
+  }
+  const baseUrl = $("sync-url").value.trim();
+  try {
+    const sub = await getSubscription(wasm, { ...device, baseUrl }, baseUrl);
+    const state = entitlementState(sub);
+    const note = describeEntitlement(state);
+    if (note.tone === "none") {
+      // A server that does not enforce payment says NOTHING. Inventing a warning
+      // here would be inventing a state the server never reported.
+      el.textContent = "This server does not enforce payment, so nothing here is gated.";
+    } else {
+      el.textContent = `${note.headline} ${note.detail}`;
+    }
+    el.dataset.tone = note.tone;
+    el.hidden = false;
+  } catch (e) {
+    const status = e && typeof e.status === "number" ? e.status : 0;
+    el.textContent = `Subscription unavailable: ${
+      status ? explainSubscriptionStatus(status) : err(e)
+    }`;
+    el.dataset.tone = "none";
+    el.hidden = false;
+  }
+}
+
+$("entitlement-check").addEventListener("click", refreshEntitlement);
 
 $("sync-vault").addEventListener("input", renderSharing);
 

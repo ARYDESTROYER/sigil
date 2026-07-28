@@ -60,6 +60,57 @@
       </button>
     </section>
 
+    <!-- ── restore from a printed recovery kit ─────────────────────────────────
+         ⭐ SHOWN WHENEVER THE VAULT IS NOT OPEN — including on a completely
+         FRESH INSTALL, which is exactly the state a customer who lost every
+         device is in. Recovery hidden behind an unlocked vault would be
+         reachable only by people who do not need it.
+
+         ⚠️ The 56-character code is a CREDENTIAL, not a password: whoever holds
+         it has full control of the account. It is checked on this device before
+         anything is sent, used once, and cleared from the form the moment it
+         works. It is never stored and never appears in a URL. -->
+    <section id="view-restore" hidden data-testid="view-restore">
+      <details class="panel">
+        <summary data-testid="restore-toggle">Lost every device? Restore from a recovery kit</summary>
+        <p class="warn" role="note">
+          <strong>The code on your sheet is a credential.</strong> It is checked
+          on this device before anything is sent, used once, then cleared from
+          this screen &mdash; it is never stored here and never appears in a web
+          address. Once this succeeds,
+          <strong>this browser becomes a second copy of that paper</strong>, so
+          keep the sheet itself somewhere else. A kit cannot be created after you
+          have lost access.
+        </p>
+        <form id="restore-form" autocomplete="off">
+          <label for="restore-url">Server URL <span class="dim">(printed on the sheet)</span></label>
+          <input id="restore-url" spellcheck="false" value="http://127.0.0.1:8080" data-testid="restore-url" />
+          <label for="restore-device">Kit device id <span class="dim">(printed on the sheet)</span></label>
+          <input id="restore-device" spellcheck="false" placeholder="dev_…" data-testid="restore-device-id" />
+          <label for="restore-code">Recovery code <span class="dim">(56 characters)</span></label>
+          <textarea
+            id="restore-code"
+            rows="3"
+            spellcheck="false"
+            placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX"
+            data-testid="restore-code"
+          ></textarea>
+          <p class="hint">
+            Hyphens, spaces and upper/lower case are all ignored. The letters I,
+            L and O are never used &mdash; read them as 1, 1 and 0.
+          </p>
+          <label for="restore-pw">New password for this browser</label>
+          <input id="restore-pw" type="password" data-testid="restore-password" />
+          <label for="restore-pw2">Confirm password</label>
+          <input id="restore-pw2" type="password" data-testid="restore-confirm" />
+          <button type="submit" class="primary" data-testid="restore-submit">
+            Restore my vault
+          </button>
+        </form>
+        <p id="restore-error" class="warn" role="alert" hidden data-testid="restore-error"></p>
+      </details>
+    </section>
+
     <!-- ── unlocked ───────────────────────────────────────────────────────── -->
     <section id="view-unlocked" hidden data-testid="view-unlocked">
       <ul id="accounts" class="accounts" data-testid="accounts"></ul>
@@ -185,10 +236,26 @@
         <p id="account-state" class="hint" data-testid="account-state"></p>
         <p id="account-awaiting-key" class="warn" role="status" hidden data-testid="account-awaiting-key"></p>
 
+        <!--
+          Subscription / entitlement (ADR 0043, read side). sigild may refuse
+          WRITES from an account whose subscription lapsed past its grace period.
+          It NEVER refuses reads, and never refuses giving a device of the
+          caller's OWN account the key to a vault — so codes keep generating and
+          a recovery kit can still be printed. Say exactly that, and nothing more.
+          A server with enforcement off says nothing at all.
+        -->
+        <button type="button" id="entitlement-check" hidden data-testid="entitlement-refresh">
+          Check subscription
+        </button>
+        <p id="entitlement-state" class="hint" role="status" hidden data-testid="entitlement-state"></p>
+
         <div class="row">
           <button type="button" id="sync-push" data-testid="sync-push">Push</button>
           <button type="button" id="sync-pull" data-testid="sync-pull">Pull</button>
         </div>
+        <!-- A refused write is a BILLING state: its own region, never rendered
+             as "unauthorized" and never styled as a fault of this device. -->
+        <p id="entitlement-402" class="warn" role="status" hidden data-testid="entitlement-402"></p>
       </details>
 
       <details class="panel">
@@ -323,6 +390,146 @@
           Draws a fresh vault key, re-seals this vault, re-wraps it to those devices and
           <strong>deletes every other envelope</strong>. Protects <strong>future content
           only</strong> — a device that already unwrapped the old key keeps what it copied.
+        </p>
+      </details>
+
+      <!-- ── recovery kit (dev) ──────────────────────────────────────────────
+           RESTORE is deliberately NOT here: it lives above, outside the unlocked
+           view, because a fresh install is where it is needed.
+
+           ⚠️⚠️ THE KIT IS A CREDENTIAL and is stronger than a stolen locked
+           phone: no OS lock, no biometric, no vault password in front of it.
+           Whoever holds the 56 characters can read every vault it covers and
+           revoke every device. It is rendered ONCE, into the DOM only, and
+           cleared as soon as the user confirms they have written it down. It is
+           never written to chrome.storage.local, never logged, never in a URL. -->
+      <details class="panel">
+        <summary data-testid="recovery-toggle">Recovery kit (dev)</summary>
+        <p class="hint">
+          A recovery kit is an <strong>ordinary member device of your account
+          whose keys come from paper</strong>. The server gains no concept of
+          &ldquo;recovery&rdquo;: it sees one more device, one more published
+          public key and one more opaque envelope per covered vault. It is the
+          only thing that gets your vaults back if every device is lost, and
+          <strong>it cannot be created after that happens</strong>.
+        </p>
+
+        <div class="row">
+          <button type="button" id="recovery-generate" data-testid="recovery-generate">
+            Generate a kit
+          </button>
+          <button type="button" id="recovery-check" data-testid="recovery-check">
+            Check recovery
+          </button>
+        </div>
+        <p id="recovery-no-keys" class="warn" role="note" hidden data-testid="recovery-no-vault-keys">
+          This browser holds no vault keys yet, so a kit generated now would cover
+          <strong>nothing</strong> &mdash; and a kit that covers nothing recovers
+          nothing. Convert this vault to a shared vault first (Sharing above).
+        </p>
+
+        <!-- The printed sheet. Shown ONCE. -->
+        <div id="recovery-sheet" class="sheet" hidden data-testid="recovery-sheet">
+          <h3>Your recovery kit &mdash; write this down now</h3>
+          <p id="recovery-code" class="kitcode" data-testid="recovery-code"></p>
+          <p class="hint">
+            Kit device id: <span id="recovery-kit-id" data-testid="recovery-kit-id"></span><br />
+            Account: <span id="recovery-account"></span><br />
+            Server: <span id="recovery-server"></span><br />
+            Safety number: <span id="recovery-safety" data-testid="recovery-safety-number"></span><br />
+            Vaults covered as of today:
+            <span id="recovery-covered" data-testid="recovery-covered"></span>
+          </p>
+          <p id="recovery-covers-nothing" class="warn" role="alert" hidden data-testid="recovery-covers-nothing">
+            <strong>This kit covers NOTHING, so it would recover nothing.</strong>
+            It can authenticate to the account but holds no vault key. Convert a
+            vault to a shared vault and then use <em>Cover this vault</em> below,
+            or this sheet is worthless.
+          </p>
+          <ul class="warnlist">
+            <li>
+              WHOEVER HOLDS THIS CODE HAS FULL CONTROL OF THE ACCOUNT. They can
+              read every vault it covers and revoke every device. There is no OS
+              lock, no biometric and no vault password in front of it &mdash; the
+              56 characters are the whole credential.
+            </li>
+            <li>
+              STORE IT AWAY FROM YOUR DEVICES: a safe, a sealed envelope, a bank
+              box. Not in a password manager you unlock with one of these
+              devices, and not in the drawer under the laptop.
+            </li>
+            <li>
+              NEVER PHOTOGRAPH IT and never type it into anything but a Sigil
+              client. It is shown once, here, for you to write down &mdash; this
+              browser does not store it and cannot show it again.
+            </li>
+            <li>
+              IT RECOVERS KEYS, NOT DATA, and only for the vaults listed above AS
+              OF TODAY. A vault created later needs covering; a vault never
+              pushed to the server cannot come back. A kit cannot be created
+              after you have lost access.
+            </li>
+          </ul>
+          <div class="row">
+            <button type="button" id="recovery-print" data-testid="recovery-print">Print</button>
+            <button type="button" id="recovery-copy" data-testid="recovery-copy">Copy code</button>
+          </div>
+          <label>
+            <input type="checkbox" id="recovery-written" data-testid="recovery-written" />
+            I have written the code down and stored it away from my devices. I
+            understand it cannot be shown again.
+          </label>
+          <button type="button" id="recovery-hide" class="primary" disabled data-testid="recovery-hide">
+            I have written it down &mdash; hide the code
+          </button>
+        </div>
+
+        <p id="recovery-coverage" class="hint" hidden data-testid="recovery-coverage"></p>
+
+        <!-- ⛔ The first-sight refusal. The safety number is printed on the
+             sheet, which is what makes this requirement usable rather than
+             merely strict: the out-of-band channel is in the user's hand. -->
+        <p id="recovery-unverified" class="warn" role="alert" hidden data-testid="recovery-unverified"></p>
+
+        <label for="recovery-kit">Kit device id</label>
+        <input
+          id="recovery-kit"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_… (printed on the sheet)"
+          data-testid="recovery-cover-kit"
+        />
+        <label for="recovery-cover-safety">
+          Its safety number (required on a browser that did not print it)
+        </label>
+        <input
+          id="recovery-cover-safety"
+          spellcheck="false"
+          autocomplete="off"
+          inputmode="numeric"
+          placeholder="83791 28129 67801 50284 55242 77845"
+          data-testid="recovery-cover-safety"
+        />
+        <button type="button" id="recovery-cover" data-testid="recovery-cover">
+          Cover this vault with that kit
+        </button>
+
+        <label for="recovery-revoke-kit">Retire a kit (device id)</label>
+        <input
+          id="recovery-revoke-kit"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_…"
+          data-testid="recovery-revoke-kit"
+        />
+        <button type="button" id="recovery-revoke" data-testid="recovery-revoke">
+          Revoke this kit and take back its envelopes
+        </button>
+        <p class="hint">
+          Revocation stops the sheet talking to the server. It
+          <strong>cannot un-learn</strong> a vault key the kit already unwrapped
+          &mdash; rotate each vault (dropping the kit) so future content is
+          unreadable to it.
         </p>
       </details>
     </section>

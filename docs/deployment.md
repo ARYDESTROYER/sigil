@@ -1249,12 +1249,13 @@ sigil recovery restore --device-id <kitID>      # prompts for the code; --adopt 
 - ⚠️ **`--code` puts the secret in `argv`** (readable via `/proc/<pid>/cmdline`,
   and recorded in shell history). It warns on stderr. Prefer the interactive
   prompt or `--code-stdin`. **There is deliberately no environment variable.**
-- ⚠️ **Client coverage is PARTIAL.** Only the **`sigil` CLI** has the kit
-  lifecycle. The webapp has **no recovery UI**, the MV3 extension has **none**
-  (though its `build.sh` vendors `recovery.mjs`), and the desktop has **no
-  recovery commands**. Since `restore` runs on a **new install**, **a customer
-  whose only client was the browser or the extension cannot restore there today**
-  — they need the CLI.
+- **Client coverage (Phase 56): all four surfaces.** The **`sigil` CLI**, the
+  **webapp** (a restore panel on the setup **and** locked screens, so a customer
+  who lost everything can restore into a fresh browser profile), the **MV3
+  extension** and the **desktop** can each generate, cover, check, revoke and
+  restore. ⚠️ **A browser restore needs the server reachable from that page's
+  origin** — see §18: with `SIGILD_CORS_ORIGINS` unlisted, a browser blocks the
+  request before it leaves the page.
 - **Entitlement never blocks it.** Printing or extending a kit is a same-account
   key deposit, which §16 exempts, so a lapsed customer can still create one.
 
@@ -1269,3 +1270,84 @@ ordinary device. What you will see:
 | `vault.key_envelope_put` addressed to the kit | the audit log — a vault was covered |
 | `sigild_key_envelope_index_total` / `device.key_envelope_index` | `GET /metrics` and the audit log — a device asked which vaults hold a key for it (the restore path uses this) |
 | `device.revoked` naming the kit | the audit log — a sheet was retired |
+
+---
+
+## 18. Browser origins / CORS (operator guide — opt-in)
+
+> **The short version: in production you should not set this.** Serve the app and
+> the API from the **same origin** behind the reverse proxy that already fronts
+> `sigild`, and no origin needs listing. `SIGILD_CORS_ORIGINS` exists for the
+> **localhost dev topology**, where the webapp is on one port and `sigild` on
+> another. See [ADR 0044](decisions/0044-opt-in-cors-allowlist.md) and
+> [`api.md`](api.md#cross-origin-requests-sigild_cors_origins--opt-in-off-by-default).
+
+### 18.1 What it is for
+
+Every signed request carries `X-Sigil-Device` / `-Timestamp` / `-Nonce` /
+`-Signature`. Those are not CORS-safelisted request headers, so a **browser
+preflights every one of them** with an `OPTIONS` request. `sigild` routes no
+`OPTIONS` of its own, so without this setting a preflight is answered `405` and
+the browser blocks the real request — which means enrollment, sync, sharing,
+restore-from-a-recovery-kit and the entitlement read are all unreachable **from a
+browser page on a different origin**. (The MV3 extension is exempt: its
+`host_permissions` bypass CORS. The CLI and desktop are not browsers and were
+never affected.)
+
+### 18.2 Turning it on
+
+```bash
+# Dev only. EXACT origins: scheme + host + optional port, nothing else.
+SIGILD_CORS_ORIGINS=http://127.0.0.1:3000,http://localhost:3000
+```
+
+- **Unset (the default) installs no CORS middleware at all** — not one response
+  header changes, and `OPTIONS` still returns `405`.
+- Validated **before the listener binds**. A path, query, fragment, trailing
+  slash, embedded credentials or non-`http(s)` scheme is a **startup failure**.
+- **`*` is refused at boot** (exit code 1, the listener never binds). There is no
+  wildcard mode and no reflect-all mode.
+- Changing the list requires a **restart**.
+
+When it is on, the boot log says so:
+
+```
+level=WARN msg="CORS ENABLED for an explicit browser origin allowlist — this is
+for the LOCALHOST DEV topology; in production serve the app and the API from the
+SAME origin behind the reverse proxy. No credentials mode is enabled and no
+wildcard is possible; every request is still authenticated by its own per-request
+signature" origins=http://127.0.0.1:3000
+```
+
+If you see that warning on a production host, the deployment is serving the app
+from somewhere other than where you think it is.
+
+### 18.3 What it does and does not do
+
+⚠️ **It is not an authentication control and not a CSRF control.** `sigild` issues
+no cookie, no session and no ambient token; every authenticated request is
+authenticated by a per-request Ed25519 signature, so a hostile cross-origin page
+cannot forge one whatever CORS says. `Access-Control-Allow-Credentials` is
+**never** set. Do not treat the allowlist as an access control:
+
+- It constrains **browsers only**. `curl`, the `sigil` CLI, the desktop app and
+  anything server-side ignore it entirely.
+- It does **not** make the dev transport safe: an allowlisted origin over plain
+  `http://` is still cleartext.
+- Removing an origin is not instantaneous — `Access-Control-Max-Age: 600` means an
+  already-open browser can hold a cached preflight for up to ten minutes.
+- No Private Network Access header is sent.
+
+One operational detail worth knowing: the entitlement warning headers (§16) are
+**only readable by a browser client when this is configured**, because the
+middleware is what sets `Access-Control-Expose-Headers`. A same-origin
+deployment gets them for free.
+
+### 18.4 What to watch
+
+There is no CORS metric. A misconfiguration shows up **in the browser**, not in
+the server logs: the page reports *"blocked by CORS policy: No
+'Access-Control-Allow-Origin' header is present"* while `sigild` records a normal
+`405` for the `OPTIONS`. If a customer reports that the web client "cannot reach
+the server" while the CLI works fine against the same host, this is the first
+thing to check.

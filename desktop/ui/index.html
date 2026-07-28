@@ -23,6 +23,24 @@
       <span id="banner-body"></span>
     </div>
 
+    <!-- ⭐ ENTITLEMENT (ADR 0043). Hidden unless the server has actually told
+         this client something that needs saying. It states the asymmetry every
+         time, because "payment required" on a product that holds your second
+         factor must never read as "your codes are gone": writes may be refused,
+         reads and same-account key recovery never are. -->
+    <div id="entitlement-banner" class="alarm" role="status" hidden>
+      <strong id="entitlement-title"></strong>
+      <p id="entitlement-detail"></p>
+      <p class="hint" id="entitlement-still">
+        Still available, always: reading every vault you hold, generating every
+        code you already have, and giving another device of this account a vault
+        key &mdash; including creating or extending a <strong>recovery kit</strong>.
+      </p>
+      <div class="row">
+        <button id="entitlement-dismiss" class="link">Dismiss</button>
+      </div>
+    </div>
+
     <header class="topbar">
       <div class="brand">
         <span class="mark" aria-hidden="true"></span>
@@ -154,6 +172,13 @@
         <div class="row">
           <button type="submit" class="ghost">Use this server</button>
           <button type="button" id="check-server-btn" class="link">Check</button>
+          <!-- ⭐ The GRACE channel. A refusal can only ever say "already too
+               late"; this is the one request that can say "lapsed, still
+               working, stops on <date>". It is a read and is never itself
+               refused for payment. -->
+          <button type="button" id="check-subscription-btn" class="link">
+            Check subscription
+          </button>
         </div>
       </form>
 
@@ -325,6 +350,108 @@
           />
           <button type="submit" class="ghost">Rotate this vault&rsquo;s key</button>
         </form>
+      </details>
+
+      <!-- ------------------------------------------------------------ -->
+      <!-- RECOVERY KIT (ADR 0042)                                       -->
+      <!--                                                               -->
+      <!-- A kit is an ORDINARY MEMBER DEVICE whose keys are derived from -->
+      <!-- 32 bytes printed on paper. RESTORE is deliberately reachable   -->
+      <!-- without an unlocked vault and without this machine being       -->
+      <!-- enrolled: it runs on a NEW INSTALL, which is the situation the -->
+      <!-- sheet exists for.                                             -->
+      <!-- ------------------------------------------------------------ -->
+      <details id="recovery-block" hidden>
+        <summary>Recovery kit (if you lose every device)</summary>
+        <p class="hint">
+          Without one, losing every device in this account means the vaults are
+          gone &mdash; unreadable by you <em>and</em> by us. A kit is 56
+          characters you write down on paper. It is not stored here, not stored
+          on the server, and cannot be re-shown.
+        </p>
+
+        <div class="row">
+          <button id="recovery-kits-btn" class="ghost">Is recovery set up?</button>
+          <button id="recovery-generate-btn" class="ghost">Print a new recovery kit</button>
+        </div>
+        <dl class="kv" id="recovery-facts"></dl>
+
+        <!-- ⚠️ THE CREDENTIAL. Shown exactly once, in the DOM only, and wiped
+             by the button below, by locking, or by any other recovery action.
+             It is never written to disk and never put in a URL. -->
+        <div id="recovery-sheet" class="alarm" role="alert" hidden>
+          <strong>Write this down NOW. It is shown once and cannot be re-shown.</strong>
+          <p class="warn">
+            ⚠️ Anyone who holds these characters has <strong>full control of
+            this account</strong>: they can read every covered vault and revoke
+            every device. There is no OS lock, no biometric and no vault
+            password in front of it &mdash; it is stronger than a stolen locked
+            phone. Keep the paper somewhere you would keep a passport, not in a
+            desk drawer, and do not photograph it.
+          </p>
+          <pre id="recovery-code"></pre>
+          <pre id="recovery-sheet-facts"></pre>
+          <p class="hint">
+            It only opens the vaults it covers <strong>as of today</strong>, and
+            it recovers <strong>keys, not data</strong>: a vault that was never
+            pushed to the server cannot be brought back by anything. Cover new
+            vaults as you create them.
+          </p>
+          <div class="row">
+            <button id="recovery-code-clear" class="danger-btn">
+              I have written it down &mdash; clear it from this screen
+            </button>
+          </div>
+        </div>
+
+        <hr />
+        <p class="hint">
+          <strong>Cover</strong> extends an existing kit to one more vault.
+          <strong>Check</strong> asks what the kit can still reach, as seen from
+          this device.
+        </p>
+        <form id="recovery-cover-form" autocomplete="off">
+          <label for="recovery-device">Kit device id <span class="opt">(printed on the sheet)</span></label>
+          <input id="recovery-device" spellcheck="false" placeholder="dev_…" required />
+          <!-- ⭐ Required on any device that did not print the kit. The wrap gate
+               refuses a first sight of a kit's key without it, before anything is
+               wrapped or uploaded — and the digits are on the sheet. -->
+          <label for="recovery-safety">
+            Kit safety number <span class="hint">(from the sheet — required unless this device printed the kit)</span>
+          </label>
+          <input id="recovery-safety" spellcheck="false" inputmode="numeric"
+                 placeholder="08305 29810 32983 47730 97596 01197" />
+          <div class="row">
+            <button type="submit" class="ghost">Cover the vault id above</button>
+            <button type="button" id="recovery-check-btn" class="link">Check coverage</button>
+            <button type="button" id="recovery-revoke-btn" class="link">Revoke this kit</button>
+          </div>
+        </form>
+
+        <hr />
+        <p class="hint">
+          <strong>Restore.</strong> Run this on a machine that has nothing. Set
+          the server above, then type the 56 characters and the kit device id
+          from the sheet. The code is checked <em>offline</em> first, so a
+          mistyped one never reaches a server.
+        </p>
+        <form id="recovery-restore-form" autocomplete="off">
+          <label for="recovery-code-in">Recovery code</label>
+          <input id="recovery-code-in" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="XXXXXXXX-XXXXXXXX-… (7 groups of 8)" required />
+          <label for="recovery-restore-device">Kit device id</label>
+          <input id="recovery-restore-device" spellcheck="false" placeholder="dev_…" required />
+          <label class="checkline">
+            <input id="recovery-adopt" type="checkbox" />
+            Also keep the kit&rsquo;s identity on this machine
+            <span class="opt">(makes this machine a second copy of the paper)</span>
+          </label>
+          <div class="row">
+            <button type="button" id="recovery-verify-btn" class="link">Check the code offline</button>
+            <button type="submit" class="primary">Restore my vaults</button>
+          </div>
+        </form>
+        <pre id="recovery-restore-out" hidden></pre>
       </details>
     </section>
 

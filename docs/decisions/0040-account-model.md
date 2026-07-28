@@ -627,3 +627,30 @@ records only what changed and which ADR changed it.
   including its database work; the limiter replaces only the response.
   **The second clause of limitation 12 is unchanged — there is still no sweep job
   for expired invites.**
+
+## Limitation 18 (partial client coverage) is narrowed, not closed (added Phase 56, 2026-07-28)
+
+Per this repo's addendum rule the text above is left untouched.
+
+**What changed.** Phase 56 built the recovery-kit lifecycle and an entitlement
+warning surface on the **webapp**, the **MV3 extension** and the **desktop**
+([ADR 0042](0042-recovery-kit.md) addendum, [ADR 0043](0043-entitlement-enforcement.md)
+addendum). Two consequences for this ADR:
+
+- **Limitation 1's addendum reads differently now.** When it was written, the
+  recovery kit existed only in the `sigil` CLI, and `restore` runs on a **new
+  install** — precisely the situation a customer who lost every device is in — so
+  **a customer whose only client was a browser could not recover, and their
+  printed sheet was useless to them.** All four client surfaces can now generate,
+  cover, check, revoke **and restore**. Everything else in that addendum is
+  unchanged: there is still no email, no password, no operator break-glass, a kit
+  still cannot be created after the loss, and whoever holds the paper holds the
+  account.
+- **Limitation 18 is narrowed.** The webapp and the extension are no longer
+  "wrap-gate consumers only". ⚠️ **But its central claim still stands: they still
+  have NO UI to MINT, LIST or REVOKE an ordinary invite.** (Browser `recovery
+  generate` mints one internally, pinned to the kit's own public key, as a step in
+  printing a sheet — that is not an invite-management UI.) Account **minting**
+  remains a CLI and desktop capability. Do not read limitation 18 as done.
+
+Every other limitation in this ADR stands as written.

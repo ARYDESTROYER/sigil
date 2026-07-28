@@ -50,12 +50,12 @@
 use std::path::{Path, PathBuf};
 
 use sigil_cli::{
-    enroll_device, fetch_hybrid_key, generate_hybrid_identity, generate_key, generate_vault_key,
-    get_key_envelope, keyring_get, keyring_put, load_hybrid_public, load_hybrid_secret,
-    load_identity, load_key_file, load_keyring, publish_hybrid_key, pull_ops_auth, push_op_auth,
-    save_hybrid_public, save_hybrid_secret, save_key, share_vault_to_known_key, unwrap_vault_key,
-    vault_key_fingerprint, CliError, DeviceIdentity, RequestAuth, VaultKeyring, VAULT_KEYRING_FILE,
-    VAULT_KEY_LEN,
+    enroll_device, fetch_hybrid_key, fetch_subscription, generate_hybrid_identity, generate_key,
+    generate_vault_key, get_key_envelope, keyring_get, keyring_put, load_hybrid_public,
+    load_hybrid_secret, load_identity, load_key_file, load_keyring, publish_hybrid_key,
+    pull_ops_auth, push_op_auth, save_hybrid_public, save_hybrid_secret, save_key,
+    share_vault_to_known_key, unwrap_vault_key, vault_key_fingerprint, CliError, DeviceIdentity,
+    RequestAuth, VaultKeyring, VAULT_KEYRING_FILE, VAULT_KEY_LEN,
 };
 // Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
 // The desktop adds NO implementation of its own: it calls the same sigil-cli
@@ -252,7 +252,7 @@ pub struct PulledVault {
 /// keeping the HTTP status distinctions the server actually makes.
 ///
 /// `what` names the operation in progress; it never contains secret material.
-fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
+pub(crate) fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
     match e {
         CliError::Http(msg) => DesktopError::Unreachable(format!(
             "could not reach the sync server at {server} while {what}: {msg}. \
@@ -276,6 +276,33 @@ fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
             "the server has this route switched off while {what} (HTTP 501). \
              sigild's sync and device routes are dev-gated."
         )),
+        // ⭐ NOT a generic server error. A 402 is a BILLING state, and rendering
+        // it as "HTTP error 402" would turn a payment problem into something a
+        // user reads as data loss. It is parsed so the UI can say what is still
+        // available — and reads and same-account key recovery ALWAYS are.
+        CliError::Server { status: 402, body } => {
+            let entitlement = crate::entitlement::EntitlementView::from_payment_required(&body)
+                .unwrap_or_else(|| {
+                    let mut v = crate::entitlement::EntitlementView::unknown();
+                    v.known = true;
+                    v.writes = crate::entitlement::WRITES_REFUSED.to_string();
+                    v.detail = "The server refused this write for payment reasons (HTTP 402) in a \
+                                shape this client did not recognise. Your existing vaults and \
+                                codes are unaffected: reads are never refused."
+                        .to_string();
+                    v
+                });
+            DesktopError::PaymentRequired {
+                message: format!(
+                    "payment required while {what} (HTTP 402): {}\n  -> Still available, always: \
+                     reading every vault you hold, generating every code you already have, and \
+                     giving another device of THIS account a vault key — including creating or \
+                     extending a RECOVERY KIT.",
+                    entitlement.detail
+                ),
+                entitlement: Box::new(entitlement),
+            }
+        }
         CliError::Server { status, body } => DesktopError::Server {
             status,
             message: format!("the server returned HTTP {status} while {what}: {body}"),
@@ -422,7 +449,7 @@ impl DeviceConfig {
     /// # Errors
     /// - [`DesktopError::NotEnrolled`] when there is no identity file, or it has
     ///   no device id yet. This is the "clear error, not a panic" path.
-    fn enrolled_identity(&self) -> Result<DeviceIdentity> {
+    pub(crate) fn enrolled_identity(&self) -> Result<DeviceIdentity> {
         let path = self.identity_path();
         let Some(identity) = self.identity()? else {
             return Err(DesktopError::NotEnrolled(path));
@@ -935,6 +962,53 @@ impl DeviceConfig {
                 })
                 .collect(),
         })
+    }
+
+    /// READ this account's SUBSCRIPTION and turn it into an
+    /// [`EntitlementView`](crate::entitlement::EntitlementView).
+    ///
+    /// ⭐ THE WARNING CHANNEL, and the ONLY signal that can say **grace** — that
+    /// this account has lapsed, that writes still work, and when they will stop.
+    /// Without it a customer learns about a lapse the first time a write is
+    /// refused, which is the surprise ADR 0043 exists to prevent. The refusal
+    /// body (`402`) can only ever say "already too late".
+    ///
+    /// It reuses the `sigil-cli` library's signed transport like everything else
+    /// here, so there is still NO second HTTP client and NO second request-signing
+    /// path under `desktop/` (ADR 0037).
+    ///
+    /// A server with enforcement OFF — the default — sends no `entitlement`
+    /// block, and that is reported as
+    /// [`EntitlementView::not_enforced`](crate::entitlement::EntitlementView::not_enforced),
+    /// which needs no attention and must render as nothing.
+    ///
+    /// This route is never gated by entitlement, and it names no account: the
+    /// subject is the account behind the verified signature (ADR 0040).
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::Unauthenticated`] (401), [`DesktopError::Forbidden`] (403).
+    /// - [`DesktopError::NotEnabled`] (501) when this server has billing off.
+    /// - [`DesktopError::Unreachable`] when the server cannot be reached.
+    pub fn subscription(&self) -> Result<crate::entitlement::EntitlementView> {
+        let identity = self.enrolled_identity()?;
+        let body = fetch_subscription(&self.server, &identity.auth())
+            .map_err(|e| net_error(e, &self.server, "reading this account's subscription"))?;
+        Ok(
+            crate::entitlement::EntitlementView::from_subscription_block(&body).unwrap_or_else(
+                || {
+                    let status = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    crate::entitlement::EntitlementView::not_enforced(&status)
+                },
+            ),
+        )
     }
 
     /// MINT a single-use invite letting ONE more device join this account.

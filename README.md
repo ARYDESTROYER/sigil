@@ -348,7 +348,8 @@ audited; see the status note below.)
   UNAUDITED**, and revoking a device cannot make it forget a key it already
   accepted — rotation only protects what is written afterwards (see the sharing note
   above).
-  **The CLI is also the only client that can print and use a RECOVERY KIT.**
+  **The CLI can also print and use a RECOVERY KIT** (and since Phase 56 so can the
+  webapp, the extension and the desktop app).
   `sigil recovery generate | cover | check | verify | restore | revoke` produces a
   56-character code on paper whose device and hybrid keys are derived from 32 bytes of
   local randomness — **never sent to the server, and not derivable from anything the
@@ -358,9 +359,9 @@ audited; see the status note below.)
   the account** — read every covered vault, revoke every device, immediately and without
   notification, with no OS lock or vault password in the way. It recovers **keys, not
   data**, only for the vaults it was told to **cover**, and **it cannot be created after
-  the loss**. ⚠️ It is **CLI-only today** — the webapp, the extension and the desktop app
-  have **no recovery UI**, and since `restore` runs on a new install, a user whose only
-  client was a browser cannot restore there. See
+  the loss**. All four clients can now generate, cover, check, revoke and **restore** —
+  which matters because `restore` runs on a **new install**, so a customer whose only
+  client was a browser previously could not use the sheet they printed. See
   [ADR 0042](docs/decisions/0042-recovery-kit.md).
   Standalone
   crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build is not
@@ -494,7 +495,15 @@ docs/decisions/  Architecture Decision Records (ADRs)
 Every client in this repo — the `sigil` CLI, the `sigil-wasm` JS client,
 `web/apps/webapp`, the MV3 extension and the native `desktop/` app — can now **enroll
 and authenticate as devices, sync, and share vaults** against a `SIGILD_DEVICE_AUTH` dev
-server (loopback plain HTTP, no TLS, UNAUDITED).
+server (loopback plain HTTP, no TLS, UNAUDITED). ⚠️ A **browser** page additionally needs
+its origin listed in **`SIGILD_CORS_ORIGINS`** (opt-in, off by default, no wildcard):
+signed requests carry custom headers, so a browser preflights them, and `sigild` answered
+every preflight `405` until Phase 56 — which meant the webapp could not reach a real
+server at all. The MV3 extension was never affected, because a `host_permissions` page is
+exempt from CORS. This is **not** an authentication control — every request is
+authenticated by its own per-request signature — see
+[ADR 0044](docs/decisions/0044-opt-in-cors-allowlist.md); in production, serve the app and
+the API from the same origin behind the reverse proxy.
 
 One native client now lives **in this repo** — `desktop/`, which links `libsigil`
 directly as a Rust dependency. The remaining native platform clients
@@ -510,6 +519,11 @@ in **separate repositories** and consume `libsigil` as a versioned binary artifa
 - Node 22 (`.nvmrc`) + pnpm 9 (via Corepack).
 
 ## Build & test
+
+`./scripts/gate.sh` runs all of the below plus the Node interop suites, the shell
+end-to-end scripts and the browser suites — enumerating them dynamically, counting
+results rather than trusting exit codes, and checking that every suite on disk is
+actually run by some CI workflow. The individual commands:
 
 ```bash
 # Rust crypto core

@@ -142,6 +142,14 @@ not buy:
   `http://127.0.0.1/*` + `http://localhost/*`, so this build **cannot** talk to a
   remote server even if a URL were pasted in. That is a deployment bound, not a
   cryptographic one.
+- ⚠️ **The webapp's `SIGILD_CORS_ORIGINS` allowlist is NOT a control here.** It
+  exists so a browser page can reach `sigild` at all (custom `X-Sigil-*` headers
+  make every signed request preflighted, and `sigild` answered every preflight
+  `405` until Phase 56). It authenticates nothing: there is **no cookie and no
+  ambient credential**, so a hostile cross-origin page could not forge a signed
+  request even with CORS wide open, and `Access-Control-Allow-Credentials` is never
+  set. Treat it as a reachability and configuration-hygiene setting, not a defence
+  ([ADR 0044](decisions/0044-opt-in-cors-allowlist.md)).
 
 **What this explicitly does NOT defend against:**
 
@@ -600,12 +608,17 @@ would help someone forge or recover a kit.
 - ⚠️ **`--code` still puts the secret in `argv`** (and shell history). It is warned
   about on stderr, not removed, because scripts need it; the prompt and
   `--code-stdin` paths avoid it.
-- ⚠️ **CLIENT COVERAGE IS PARTIAL.** Only the **`sigil` CLI** has the kit lifecycle.
-  The webapp has **no recovery UI**, the extension has **none** (though its
-  `build.sh` vendors `recovery.mjs`), and the desktop has **no recovery commands**;
-  those surfaces consume only the *wrap gate*. Since `restore` runs on a **new
-  install**, **a user whose only client was the browser or the extension cannot
-  restore there today.**
+- **Client coverage is complete across all four surfaces since Phase 56** — the
+  `sigil` CLI, the webapp, the MV3 extension and the desktop can each generate,
+  cover, check, revoke and **restore** (restore is reachable from the browsers'
+  setup/locked screens, because `restore` runs on a **new install**). ⚠️ The
+  browser suites drive a **test double** for everything except the webapp's
+  `cors.spec.ts`; real-server conformance stays in `cli/tests/e2e-recovery.sh` and
+  `sigil-wasm/test/recovery-interop.mjs`. ⚠️ A **browser** client additionally
+  needs its origin allowlisted in `SIGILD_CORS_ORIGINS`
+  ([ADR 0044](decisions/0044-opt-in-cors-allowlist.md)) or the browser blocks the
+  request before it is sent — which is not a defence, only a reachability
+  requirement.
 - ⚠️ **Dev-gated, plain HTTP in dev, UNAUDITED**, and the codec, derivation and
   gate are all new code.
 

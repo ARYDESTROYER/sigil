@@ -14,6 +14,12 @@ description = "Headless authenticator logic for the pre-audit Sigil desktop app:
 # 4226/6238 OTP primitive.
 sigil-cli = { workspace = true }
 sigil-core = { workspace = true }
+# Reading ONE thing the server sends that no sigil-cli function returns as a
+# type: the machine-readable HTTP 402 entitlement body (ADR 0043). It is parsed,
+# never produced -- no request is built here. Already in this workspace's
+# lockfile via src-tauri and sigil-cli, so it adds no new package.
+serde_json = "1"
+
 
 [dev-dependencies]
 # The interop proof shells out to the REAL `sigil` binary; no extra crates needed.

@@ -23,6 +23,19 @@ test("landing (setup) page has no serious/critical axe violations", async ({ pag
   await expectNoSeriousA11yViolations(page);
 });
 
+// The recovery form is the ONE screen a customer who lost every device will
+// reach, and they will reach it on a fresh install, possibly under stress. It
+// must be as accessible as the rest.
+test("the restore-from-a-recovery-kit form has no serious/critical axe violations", async ({
+  page,
+}) => {
+  await page.goto("/?t=59");
+  await expect(page.getByTestId("restore-open")).toBeVisible({ timeout: T });
+  await page.getByTestId("restore-open").click();
+  await expect(page.getByTestId("restore-code")).toBeVisible({ timeout: T });
+  await expectNoSeriousA11yViolations(page);
+});
+
 test("unlocked vault view has no serious/critical axe violations", async ({ page }) => {
   await page.goto("/?t=59");
   await expect(page.getByTestId("setup-submit")).toBeVisible({ timeout: T });

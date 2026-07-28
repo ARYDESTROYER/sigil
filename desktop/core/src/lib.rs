@@ -47,12 +47,19 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod entitlement;
 pub mod net;
+pub mod recovery;
 
+pub use entitlement::EntitlementView;
 pub use net::{
     pull_and_adopt, AccountMember, AccountView, DeviceConfig, DeviceStatus, MintedInvite,
     OpenInvite, PulledVault, ServerCheck, VaultKeyInfo, DEVICE_IDENTITY_FILE, HYBRID_PUBLIC_FILE,
     HYBRID_SECRET_FILE,
+};
+pub use recovery::{
+    format_code, verify_recovery_code, CoverageView, CoveredVault, KitView, RecoveryKitSheet,
+    RecoveryProof, RestoreView, RestoredVault, RevokeView,
 };
 
 use std::path::{Path, PathBuf};
@@ -166,6 +173,29 @@ pub enum DesktopError {
         /// A human explanation. Never key material.
         detail: String,
     },
+    /// ⚠️ A RECOVERY KIT operation failed at the client layer: an undecodable
+    /// printed code (rejected OFFLINE, before anything was sent), a kit whose
+    /// index holds nothing to recover, or a failed pre-print verification.
+    ///
+    /// NEVER carries the recovery code, a derived seed, a vault key or any other
+    /// secret bytes.
+    Recovery(String),
+    /// HTTP 402: this account's subscription has lapsed past its grace period,
+    /// so **new writes** are refused (ADR 0043).
+    ///
+    /// ⭐ It is deliberately its own variant and not a `Server { status: 402 }`:
+    /// a client must be able to tell *"pay to continue"* from *"your key is
+    /// wrong"* and from *"you may not touch this vault"*, and it must be able to
+    /// say what is **still** available — reading every vault, generating every
+    /// code, and giving another device of this same account a vault key
+    /// (including a recovery kit) are never refused.
+    PaymentRequired {
+        /// What the server said, parsed into something renderable. Boxed so a
+        /// billing state cannot bloat every `Result` in the crate.
+        entitlement: Box<EntitlementView>,
+        /// A display message. Never secret, never a card field.
+        message: String,
+    },
     /// Any other non-2xx status from the server.
     Server {
         /// The HTTP status code.
@@ -222,6 +252,8 @@ impl std::fmt::Display for DesktopError {
                  TRUSTED out-of-band channel, then re-pin deliberately."
             ),
             DesktopError::KeyUnverified { detail, .. } => write!(f, "{detail}"),
+            DesktopError::Recovery(m) => write!(f, "recovery kit: {m}"),
+            DesktopError::PaymentRequired { message, .. } => write!(f, "{message}"),
             DesktopError::Server { message, .. } => write!(f, "{message}"),
         }
     }

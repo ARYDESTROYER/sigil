@@ -20,7 +20,9 @@ independent audit completes and trademark clears (brief, GTM Phase 1).
   multi-device auth model, its opt-in **abuse rate limits**, the **account
   model**, the vault-key relay, what a **recovery kit** looks like on the wire,
   the billing routes and their opt-in **entitlement enforcement** (`402` on
-  writes only) — all dev-gated and all `501` by default.
+  writes only) — all dev-gated and all `501` by default — plus the opt-in
+  **browser-origin allowlist** (`SIGILD_CORS_ORIGINS`), which is off by default
+  and is deliberately *not* an authentication control.
 - [`deployment.md`](deployment.md) — the (not-yet-applied) `sigild` deployment
   runbook: topology, secrets posture, PQ-TLS nuance, and an honest
   what-is-not-deployable / validation-status accounting.
@@ -32,9 +34,11 @@ exist and are tested (the crypto core, the CLI, the dev op-log server, four
 client surfaces — webapp, MV3 extension, native desktop and the CLI — device
 **enrollment**, real per-vault **authorization**, an **account model**, and,
 since Phases 53–55, opt-in **abuse bounds**, a printable **recovery kit** and
-opt-in **entitlement enforcement**). But the system as a whole is **pre-audit and
-not production-ready**: nothing here is **audited**, every one of those
-server-side pieces is **dev-gated and `501` by default**, and the product-level
-layer is still missing — an **identity** system (no email, no password, no
-operator break-glass; the only recovery is a **paper kit printed in advance**,
-and it is **CLI-only**), session/token issuance, device-key rotation, and mobile.
+opt-in **entitlement enforcement** — with Phase 56 bringing the kit and the
+payment warnings to **all four** client surfaces). But the system as a whole is
+**pre-audit and not production-ready**: nothing here is **audited**, every one of
+those server-side pieces is **dev-gated and `501` by default**, and the
+product-level layer is still missing — an **identity** system (no email, no
+password, no operator break-glass; the only recovery is a **paper kit printed in
+advance**, and it **cannot be created after the loss**), session/token issuance,
+device-key rotation, and mobile.

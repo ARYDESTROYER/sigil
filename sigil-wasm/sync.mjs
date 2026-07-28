@@ -80,6 +80,23 @@ export async function pushContainer(baseUrl, vaultId, containerBytes, opts = {})
     body,
   });
 
+  // Additive (Phase 56): hand the RAW Response to an optional observer before it
+  // is consumed, so a caller can read RESPONSE HEADERS. sigild sets its
+  // X-Sigil-Entitlement* warning headers on a write it is still SERVING inside
+  // the grace period — a 2xx — so that warning is unreachable from the parsed
+  // body. A throwing observer must never break sync: this moves bytes, it does
+  // not render UI.
+  //
+  // ⚠️ Cross-origin, those headers are only readable if the server lists them in
+  // Access-Control-Expose-Headers (sigild's CORS middleware does).
+  if (typeof opts.onResponse === "function") {
+    try {
+      opts.onResponse(res);
+    } catch {
+      /* an observer's failure is not a transport failure */
+    }
+  }
+
   if (res.status !== 201) {
     const text = await res.text().catch(() => "");
     const err = new Error(
@@ -90,6 +107,11 @@ export async function pushContainer(baseUrl, vaultId, containerBytes, opts = {})
     // Additive: carry the status so an auth-aware caller can tell 401 from 403
     // without parsing the message. The message text itself is unchanged.
     err.status = res.status;
+    // Additive (Phase 56): carry the RAW body too, so a caller can read a
+    // MACHINE-READABLE refusal — notably sigild's 402 payment-required body,
+    // which names the billing status and what is still allowed — without
+    // re-parsing prose out of `message`.
+    err.body = text;
     throw err;
   }
 
@@ -131,8 +153,10 @@ export async function pullContainers(baseUrl, vaultId, sinceOpt = 0, opts = {}) 
           text ? ` — ${text.trim()}` : ""
         }`,
       );
-      // Additive: see pushContainer — the status rides along for auth-aware callers.
+      // Additive: see pushContainer — the status (and, since Phase 56, the raw
+      // body) ride along for auth-aware callers.
       err.status = res.status;
+      err.body = text;
       throw err;
     }
 

@@ -39,18 +39,23 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use sigil_desktop_core::{
-    default_vault_path, now_unix, pull_and_adopt, DesktopError, DeviceConfig, VaultSession,
-    BANNER_BODY, BANNER_TITLE, EXPORT_WARNING,
+    default_vault_path, now_unix, pull_and_adopt, verify_recovery_code, DesktopError, DeviceConfig,
+    EntitlementView, VaultSession, BANNER_BODY, BANNER_TITLE, EXPORT_WARNING,
 };
 use tauri::{Manager, State};
 
 /// The unlocked session (`None` when locked; `VaultSession` zeroes its password
 /// on drop, so `lock()` is just `*guard = None`) plus the OPTIONAL server
-/// configuration (`None` until the user names a server — the offline default).
+/// configuration (`None` until the user names a server — the offline default)
+/// and the last ENTITLEMENT the server told us about.
+///
+/// ⚠️ Note what is NOT in here: no recovery code, no seed, no vault key. The kit
+/// code crosses the IPC once, outbound, and is never stored on either side.
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<VaultSession>>,
     sync: Mutex<Option<DeviceConfig>>,
+    entitlement: Mutex<EntitlementView>,
 }
 
 /// What the UI shows in its header/lock screen.
@@ -117,6 +122,10 @@ struct IpcError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     key_change: Option<KeyChange>,
+    /// Populated for EXACTLY ONE kind — `"payment required"` — so the UI can
+    /// state what is STILL available instead of rendering a bare HTTP status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entitlement: Option<Box<EntitlementDto>>,
 }
 
 /// The two safety numbers behind a `"key changed"` alarm. PUBLIC material only.
@@ -127,12 +136,44 @@ struct KeyChange {
     presented_safety_number: String,
 }
 
+/// Entitlement as the webview sees it. PUBLIC facts only — there is no card
+/// field, no customer identity and no key here, and the server sends none.
+#[derive(Serialize, Clone)]
+struct EntitlementDto {
+    known: bool,
+    writes: String,
+    reads: String,
+    key_recovery: String,
+    subscription_status: String,
+    grace_ends_at: String,
+    checkout_path: String,
+    detail: String,
+    needs_attention: bool,
+}
+
+impl From<&EntitlementView> for EntitlementDto {
+    fn from(v: &EntitlementView) -> Self {
+        EntitlementDto {
+            known: v.known,
+            writes: v.writes.clone(),
+            reads: v.reads.clone(),
+            key_recovery: v.key_recovery.clone(),
+            subscription_status: v.subscription_status.clone(),
+            grace_ends_at: v.grace_ends_at.clone(),
+            checkout_path: v.checkout_path.clone(),
+            detail: v.detail.clone(),
+            needs_attention: v.needs_attention(),
+        }
+    }
+}
+
 impl From<String> for IpcError {
     fn from(message: String) -> Self {
         IpcError {
             kind: "error",
             message,
             key_change: None,
+            entitlement: None,
         }
     }
 }
@@ -161,6 +202,11 @@ fn ipc(e: DesktopError) -> IpcError {
         // server error. The UI must present it as the key-substitution alarm.
         DesktopError::KeyPinMismatch { .. } => "key changed",
         DesktopError::KeyUnverified { .. } => "key unverified",
+        // ⭐ Its own tag: a lapsed subscription is a BILLING state, not a
+        // security failure and not data loss. The UI must be able to say so, and
+        // to say what still works.
+        DesktopError::PaymentRequired { .. } => "payment required",
+        DesktopError::Recovery(_) => "recovery",
         DesktopError::Server { .. } => "server error",
         _ => "error",
     };
@@ -179,11 +225,38 @@ fn ipc(e: DesktopError) -> IpcError {
         }),
         _ => None,
     };
+    let entitlement = match &e {
+        DesktopError::PaymentRequired { entitlement, .. } => {
+            Some(Box::new(EntitlementDto::from(&**entitlement)))
+        }
+        _ => None,
+    };
     IpcError {
         kind,
         message: format!("{kind}: {e}"),
         key_change,
+        entitlement,
     }
+}
+
+/// Run a SERVER-GATED WRITE, recording what its answer says about entitlement.
+///
+/// Writes are the only requests `sigild` gates (ADR 0043 §2), so they are the
+/// only ones that carry a verdict: a `402` says the account lapsed past grace, a
+/// success says it was served. Reads are never refused, so they never update
+/// this — a read failure means something else went wrong.
+fn track_write<T>(state: &State<'_, AppState>, r: sigil_desktop_core::Result<T>) -> CmdResult<T> {
+    let observed = match &r {
+        Ok(_) => Some(EntitlementView::write_accepted()),
+        Err(DesktopError::PaymentRequired { entitlement, .. }) => Some((**entitlement).clone()),
+        Err(_) => None,
+    };
+    if let Some(view) = observed {
+        if let Ok(mut guard) = state.entitlement.lock() {
+            *guard = view;
+        }
+    }
+    r.map_err(ipc)
 }
 
 /// Borrow the unlocked session or fail with a UI-friendly message.
@@ -559,7 +632,9 @@ fn convert_to_shared(vault_id: String, state: State<'_, AppState>) -> CmdResult<
 fn push(vault_id: String, state: State<'_, AppState>) -> CmdResult<u64> {
     let config = sync_config(&state)?;
     let path = with_session(&state, |s| Ok(s.path().to_path_buf()))?;
-    config.push_vault_file(vault_id.trim(), &path).map_err(ipc)
+    // An op-log append is THE gated write (ADR 0043 §2): this is where a lapsed
+    // account learns it has lapsed, and where the UI learns to say so.
+    track_write(&state, config.push_vault_file(vault_id.trim(), &path))
 }
 
 /// Pull the latest sealed container for `vault_id` and adopt it as the local
@@ -620,14 +695,16 @@ fn share(
     let expected = safety_number
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let out = sync_config(&state)?
-        .share_vault(
+    let config = sync_config(&state)?;
+    let out = track_write(
+        &state,
+        config.share_vault(
             vault_id.trim(),
             device_id.trim(),
             permission,
             expected.as_deref(),
-        )
-        .map_err(ipc)?;
+        ),
+    )?;
     Ok(ShareView {
         fingerprint: out.fingerprint,
         safety_number: out.safety_number,
@@ -900,9 +977,10 @@ fn rotate(
         .map(|(d, n)| (d.trim().to_string(), n.trim().to_string()))
         .filter(|(d, n)| !d.is_empty() && !n.is_empty())
         .collect();
-    let (old, new, rewrapped, removed) = config
-        .rotate_vault(vault_id.trim(), &path, &recipients, &drop, &safety)
-        .map_err(ipc)?;
+    let (old, new, rewrapped, removed) = track_write(
+        &state,
+        config.rotate_vault(vault_id.trim(), &path, &recipients, &drop, &safety),
+    )?;
     // The in-memory session still holds the OLD key, so drop it: the file on disk
     // is now sealed under the new one and must be unlocked afresh.
     if let Ok(mut guard) = state.session.lock() {
@@ -923,6 +1001,293 @@ struct RotationView {
     new_fingerprint: String,
     rewrapped: Vec<String>,
     removed: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 54/56 — THE RECOVERY KIT.
+//
+// A kit is an ORDINARY MEMBER DEVICE whose keys are derived from 32 bytes
+// printed on paper. Every command here delegates to `sigil_desktop_core::
+// recovery`, which delegates to the `sigil-cli` library: no codec, no
+// derivation, no safety-number digest and no HTTP lives under desktop/.
+//
+// ⚠️ THE ONE SECRET THAT CROSSES THIS IPC is `RecoveryKitView::code`, outbound,
+// exactly once, because the human has to write it down — the same necessity as
+// an account invite. It is never stored on either side, never logged, never put
+// in a URL, and the webview clears it from the DOM as soon as it is confirmed.
+// ---------------------------------------------------------------------------
+
+/// One vault a kit covers. Fingerprint only.
+#[derive(serde::Serialize)]
+struct CoveredView {
+    vault_id: String,
+    key_fingerprint: String,
+}
+
+/// A freshly printed sheet. ⚠️ `code` IS THE CREDENTIAL.
+#[derive(serde::Serialize)]
+struct RecoveryKitView {
+    code: String,
+    device_id: String,
+    account_id: String,
+    server: String,
+    safety_number: String,
+    created_at: u64,
+    covered: Vec<CoveredView>,
+    seats_used: usize,
+    seat_limit: usize,
+    verified_account_id: String,
+    verified_vault: String,
+    verified_fingerprint: String,
+    indexed_vaults: usize,
+}
+
+/// One vault's coverage as seen FROM THIS DEVICE.
+#[derive(serde::Serialize)]
+struct CoverageRow {
+    vault_id: String,
+    covered: bool,
+    covered_at: String,
+    synced: bool,
+}
+
+/// What a restore rebuilt on a machine that had nothing.
+#[derive(serde::Serialize)]
+struct RestoreOutcome {
+    device_id: String,
+    account_id: String,
+    vaults: Vec<RestoredRow>,
+    skipped: Vec<(String, String)>,
+    adopted: bool,
+}
+
+/// One vault a restore wrote back.
+#[derive(serde::Serialize)]
+struct RestoredRow {
+    vault_id: String,
+    path: String,
+    key_fingerprint: String,
+    entries: usize,
+}
+
+/// What a revocation did.
+#[derive(serde::Serialize)]
+struct RevokeOutcome {
+    device_id: String,
+    envelopes_removed: Vec<String>,
+    already_clear: Vec<String>,
+}
+
+/// A kit this device can see in its own account listing.
+#[derive(serde::Serialize)]
+struct KitRow {
+    device_id: String,
+    status: String,
+    created_at: String,
+}
+
+/// GENERATE a recovery kit and cover `vault_ids` (empty = every shared vault
+/// this device holds a key for).
+///
+/// ⚠️ Returns THE CREDENTIAL once. The webview must render it for transcription
+/// and then drop it: it is stronger than a stolen locked phone, because there is
+/// no OS lock, no biometric and no vault password in front of it.
+#[tauri::command]
+fn recovery_generate(
+    vault_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> CmdResult<RecoveryKitView> {
+    let vaults: Vec<String> = vault_ids
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let config = sync_config(&state)?;
+    // Covering a vault is a key deposit, which ADR 0043 exempts from the
+    // entitlement gate for a device of your OWN account — so a lapsed customer
+    // can still print a kit. Tracked as a write anyway: if this ever DOES come
+    // back 402, the UI must say so rather than swallow it.
+    let kit = track_write(&state, config.recovery_generate(&vaults))?;
+    Ok(RecoveryKitView {
+        code: kit.code,
+        device_id: kit.device_id,
+        account_id: kit.account_id,
+        server: kit.server,
+        safety_number: kit.safety_number,
+        created_at: kit.created_at,
+        covered: kit
+            .covered
+            .into_iter()
+            .map(|c| CoveredView {
+                vault_id: c.vault_id,
+                key_fingerprint: c.key_fingerprint,
+            })
+            .collect(),
+        seats_used: kit.seats_used,
+        seat_limit: kit.seat_limit,
+        verified_account_id: kit.proof.account_id,
+        verified_vault: kit.proof.unwrapped_vault,
+        verified_fingerprint: kit.proof.key_fingerprint,
+        indexed_vaults: kit.proof.indexed_vaults,
+    })
+}
+
+/// COVER one more vault with an existing kit. `safety_number` is the digits
+/// PRINTED ON THE SHEET; it is required on any device that did not generate the
+/// kit, and the wrap gate refuses without it before anything is wrapped.
+#[tauri::command]
+fn recovery_cover(
+    device_id: String,
+    vault_id: String,
+    safety_number: Option<String>,
+    state: State<'_, AppState>,
+) -> CmdResult<(String, bool)> {
+    let expected = safety_number
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let config = sync_config(&state)?;
+    track_write(
+        &state,
+        config.recovery_cover(device_id.trim(), vault_id.trim(), expected.as_deref()),
+    )
+}
+
+/// What the kit still covers, CHECKED FROM THIS DEVICE (a vault created on a
+/// sibling device that never heard of the kit is invisible here).
+#[tauri::command]
+fn recovery_check(device_id: String, state: State<'_, AppState>) -> CmdResult<Vec<CoverageRow>> {
+    Ok(sync_config(&state)?
+        .recovery_check(device_id.trim())
+        .map_err(ipc)?
+        .into_iter()
+        .map(|c| CoverageRow {
+            vault_id: c.vault_id,
+            covered: c.covered,
+            covered_at: c.covered_at,
+            synced: c.synced,
+        })
+        .collect())
+}
+
+/// VERIFY a typed code OFFLINE — decode + checksum, no network at all.
+///
+/// The code is NOT echoed back and NOT stored: only the verdict crosses back.
+#[tauri::command]
+fn recovery_verify(code: String) -> CmdResult<bool> {
+    verify_recovery_code(&code).map_err(ipc)?;
+    Ok(true)
+}
+
+/// RESTORE from a printed kit. This is the command that runs on a NEW INSTALL —
+/// the situation the sheet exists for.
+///
+/// `adopt = true` writes the kit's own secrets onto this machine, making it a
+/// SECOND COPY OF THE PAPER; the UI must say that before offering it.
+#[tauri::command]
+fn recovery_restore(
+    code: String,
+    device_id: String,
+    adopt: Option<bool>,
+    state: State<'_, AppState>,
+) -> CmdResult<RestoreOutcome> {
+    let r = sync_config(&state)?
+        .recovery_restore(&code, device_id.trim(), None, adopt.unwrap_or(false))
+        .map_err(ipc)?;
+    Ok(RestoreOutcome {
+        device_id: r.device_id,
+        account_id: r.account_id,
+        vaults: r
+            .vaults
+            .into_iter()
+            .map(|v| RestoredRow {
+                vault_id: v.vault_id,
+                path: v.path.display().to_string(),
+                key_fingerprint: v.key_fingerprint,
+                entries: v.entries,
+            })
+            .collect(),
+        skipped: r.skipped,
+        adopted: r.adopted,
+    })
+}
+
+/// REVOKE a kit and delete its envelopes. It does NOT rotate, and it cannot
+/// un-learn a key the kit already unwrapped — rotation is the remediation, and
+/// it protects future content only.
+#[tauri::command]
+fn recovery_revoke(
+    device_id: String,
+    vault_ids: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> CmdResult<RevokeOutcome> {
+    let vaults: Vec<String> = vault_ids
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let r = sync_config(&state)?
+        .recovery_revoke(device_id.trim(), &vaults)
+        .map_err(ipc)?;
+    Ok(RevokeOutcome {
+        device_id: r.device_id,
+        envelopes_removed: r.envelopes_removed,
+        already_clear: r.already_clear,
+    })
+}
+
+/// The kits in this device's account, as the SERVER lists them — the answer to
+/// "is recovery set up?". ⚠️ Label-based, so a server that renames the label
+/// hides a kit here (ADR 0042 §5); no trust decision rests on it.
+#[tauri::command]
+fn recovery_kits(state: State<'_, AppState>) -> CmdResult<Vec<KitRow>> {
+    Ok(sync_config(&state)?
+        .recovery_kits()
+        .map_err(ipc)?
+        .into_iter()
+        .map(|k| KitRow {
+            device_id: k.device_id,
+            status: k.status,
+            created_at: k.created_at,
+        })
+        .collect())
+}
+
+/// What the server has told THIS client about entitlement (ADR 0043).
+///
+/// Purely a cached read: it opens no socket and cannot fail because a server is
+/// down. `known: false` means "not observed" and is deliberately NOT rendered as
+/// "you are paid up" — an un-enforcing server looks identical from here.
+#[tauri::command]
+fn entitlement_status(state: State<'_, AppState>) -> CmdResult<EntitlementDto> {
+    let guard = state
+        .entitlement
+        .lock()
+        .map_err(|_| "entitlement state poisoned".to_string())?;
+    Ok(EntitlementDto::from(&*guard))
+}
+
+/// ⭐ ASK THE SERVER about this account's subscription, and cache the answer.
+///
+/// This is the ONLY way this client can learn it is in its GRACE period —
+/// lapsed, still served, with a deadline. A refusal (`402`) can only ever say
+/// "already too late", and the grace warning `sigild` puts in response headers is
+/// dropped by the library's transport. Without this command the desktop's
+/// in-grace banner was unreachable code: `track_write` only ever produced
+/// "allowed" or "refused".
+///
+/// It is a READ and is never gated by entitlement, so a lapsed account can always
+/// find out why. A server with enforcement off answers "not enforced", which
+/// renders as nothing.
+#[tauri::command]
+fn entitlement_refresh(state: State<'_, AppState>) -> CmdResult<EntitlementDto> {
+    let view = sync_config(&state)?.subscription().map_err(ipc)?;
+    let dto = EntitlementDto::from(&view);
+    if let Ok(mut guard) = state.entitlement.lock() {
+        *guard = view;
+    }
+    Ok(dto)
 }
 
 fn main() {
@@ -967,7 +1332,16 @@ fn main() {
             account_status,
             account_invite,
             account_invites,
-            account_revoke_invite
+            account_revoke_invite,
+            recovery_generate,
+            recovery_cover,
+            recovery_check,
+            recovery_verify,
+            recovery_restore,
+            recovery_revoke,
+            recovery_kits,
+            entitlement_status,
+            entitlement_refresh
         ])
         .run(tauri::generate_context!())
         .expect("could not start the Sigil desktop window");

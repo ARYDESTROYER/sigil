@@ -438,7 +438,11 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   ways** between the JS client and the CLI.
 - **`sigild`** ([`../sigild/`](../sigild/)) — the Go sync-server **skeleton**. Serves
   `/healthz`, `/readyz`, `/version`, request-ID / access-log / panic-recovery
-  middleware, and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
+  middleware (plus, **only when `SIGILD_CORS_ORIGINS` is set**, an innermost
+  browser-origin **CORS** middleware — unset, it is not installed and no response
+  carries an `Access-Control-*` header;
+  [ADR 0044](decisions/0044-opt-in-cors-allowlist.md)),
+  and a **dev-gated** (`SIGILD_ENABLE_DEV_OPS`, default off → `501`),
   vault op-log that stores **opaque client-encrypted blobs** and hands them back
   unchanged. The op-log is **unauthenticated by default**; when started with
   **`SIGILD_OPLOG_PUBKEY`** (std-base64 Ed25519 public key) it additionally
@@ -845,10 +849,22 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   [ADR 0028](decisions/0028-webapp-vault-persistence-and-unlock.md)),
   `tests/offline.spec.ts` (after first load, going **offline** still renders the shell
   and computes the TOTP in the cached wasm), and `tests/a11y.spec.ts`
-  (`@axe-core/playwright` on setup + unlocked views). **Honest gap:** the **enrollment
-  UI is not covered by a Playwright test** — the protocol itself is proven live in Node
-  (`device-auth-interop.mjs`), and the existing UI suite still passes and asserts no page
-  errors, but nobody has driven the enroll button in a headless browser.
+  (`@axe-core/playwright` on setup + unlocked views). Phase 56 added
+  `tests/recovery.spec.ts` (the kit lifecycle, incl. restore into a **clean profile**),
+  `tests/wrap-gate.spec.ts` (a **second profile that never saw the sheet** is refused,
+  stores no envelope, and is told a wrong safety number is a mismatch),
+  `tests/leak.spec.ts` (an **enumerating** sweep of every storage key *and value*,
+  cookies, IndexedDB, Cache Storage, the DOM, every request URL/body, every console
+  message and the address bar, against four spellings of the recovery code),
+  `tests/entitlement.spec.ts` and ⭐ **`tests/cors.spec.ts` — the only spec here that
+  drives the UI against a REAL `sigild`** (it builds and boots one, enrols this browser
+  through the enrollment UI over the real contract-v3 signed path, and asserts the
+  **pre-fix** behaviour is reproduced when `SIGILD_CORS_ORIGINS` is absent). That
+  closes the earlier honest gap that no Playwright test had ever driven the enroll
+  button. **Honest gaps that remain:** every other spec here runs against a **test
+  double** (`sigil-wasm/test/fake-sigild.mjs`), and **print output is not verified** —
+  headless Chromium cannot render a printed page, so the recovery sheet's
+  `@media print` rules are by-eye.
   It carries the **same no-index stealth posture as
   marketing** (`X-Robots-Tag noindex/nofollow/noarchive`, `X-Content-Type-Options
   nosniff`, `Referrer-Policy no-referrer`, `X-Frame-Options DENY`, plus an
@@ -928,9 +944,15 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   vector `287082` at the pinned test clock `?t=59`, storage contains **only** the
   sealed container (no plaintext secret / label / password), a reload boots
   **locked** and the right password restores the vault, and the `otpauth://` +
-  migration import/export paths round-trip. **Honest gap:** like the webapp, the new
-  **enrollment UI is not covered by a Playwright test** (the protocol is proven live in
-  Node). It is **dev / UNAUDITED / not published to any store** (loaded unpacked, by
+  migration import/export paths round-trip. Phase 56 added four more specs matching the
+  webapp's — `recovery.spec.mjs`, `wrap-gate.spec.mjs`, `leak.spec.mjs` and
+  `entitlement.spec.mjs` — which do drive the enrollment UI (against the test double),
+  closing the earlier gap that no Playwright test had clicked the enroll button.
+  ⭐ **The extension never needed the CORS fix**: an MV3 page with a host permission is
+  **exempt from CORS**, so while the webapp could not reach a real `sigild` at all, the
+  extension always could — the asymmetry that kept its suite honest and hid the webapp's
+  failure ([ADR 0044](decisions/0044-opt-in-cors-allowlist.md)). It is **dev / UNAUDITED
+  / not published to any store** (loaded unpacked, by
   hand), talks to `sigild` over **loopback plain HTTP only**, and generates codes
   without verifying them (no constant-time compare, no zeroization). The reserved-stub
   ambitions
@@ -955,12 +977,17 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   server-facing half in `desktop/core/src/net.rs` (below) — and is
   `#![forbid(unsafe_code)]`; **`sigil-desktop`** (`desktop/src-tauri`) is a thin
   shell holding an `AppState { session: Mutex<Option<VaultSession>>, sync:
-  Mutex<Option<DeviceConfig>> }` and **twenty-one `#[tauri::command]`s** — the ten
+  Mutex<Option<DeviceConfig>> }` and **forty `#[tauri::command]`s** — the ten
   offline ones (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`,
-  `import`, `remove`, `export_uris`, `export_migration`) plus **eleven added in
+  `import`, `remove`, `export_uris`, `export_migration`), **eleven added in
   Phase 49** (`unlock_shared`, `set_server`, `sync_status`, `enroll`,
   `publish_hybrid`, `check_server`, `convert_to_shared`, `push`, `pull`, `share`,
-  `accept`), each of which clones the `DeviceConfig` out of the mutex *before* any
+  `accept`), the Phase 50 key-trust ones, the four Phase 52 account ones and
+  **nine added in Phase 56** (`recovery_generate`/`_cover`/`_check`/`_verify`/
+  `_restore`/`_revoke`/`_kits`, `entitlement_status`, `entitlement_refresh` — the
+  kit lifecycle and the payment warning, both over the `sigil-cli` library, with no
+  second copy of the codec, the derivation or the safety-number digest), each of
+  which clones the `DeviceConfig` out of the mutex *before* any
   network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI cannot be clicked by
   a test runner, so everything that could be wrong lives where a test can drive it.
@@ -1148,7 +1175,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
      no sync, no background worker; dev / UNAUDITED; not published to any store.
    desktop (Tauri v2): the FIRST NATIVE client — sigil-core linked as a plain Rust
      dependency, NO wasm. sigil-desktop-core (headless logic, all the tests) +
-     sigil-desktop (shell: 21 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
+     sigil-desktop (shell: 40 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
      SIGILcli container + TotpVault schema + migration codec, and shares the CLI's
      $HOME/.sigil/totp-vault.sigil, so desktop and `sigil totp` drive ONE vault file.
      Sealed-only vault persistence, in-memory password; webview does no crypto
@@ -1671,12 +1698,21 @@ authoritative list, with rationale, is the **defer ledger** in
   and since Phase 49 the **native `desktop/` client enrolls, syncs under contract v3 and
   shares vaults too** — by driving the `sigil-cli` library rather than duplicating the
   protocol ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)) — so
-  the auth story is closed across **all four** client surfaces. But the enrollment UI in
-  both browser clients is **not** covered by a Playwright test, the desktop's GUI is
-  build-and-launch verified rather than visually verified (its behaviour is proven in the
-  headless core), and none of this is TLS or audited. The **account** commands are
-  also uneven: the CLI and the desktop app can mint, list and revoke invites; the
-  webapp and the MV3 extension can only **join** and **read** the account.
+  the auth story is closed across **all four** client surfaces. ⚠️ **But until Phase 56
+  the webapp could not reach a real `sigild` at all**: every signed request carries
+  `X-Sigil-*` headers, so a browser preflights it, and `sigild` answered every preflight
+  `405` with no `Access-Control-*` header. Enrollment, sync, sharing, restore and the
+  entitlement read were all blocked **in the browser, before a byte was sent** — for
+  twelve phases, while the **MV3 extension worked fine**, because a `host_permissions`
+  page is exempt from CORS. The fix is an opt-in, allowlisted
+  `SIGILD_CORS_ORIGINS` that is explicitly **not** an authentication or CSRF control
+  ([ADR 0044](decisions/0044-opt-in-cors-allowlist.md)). The enrollment UI in both
+  browser clients is now Playwright-driven (the webapp's against a real server), the
+  desktop's GUI is still build-and-launch verified rather than visually verified (its
+  behaviour is proven in the headless core), and none of this is TLS or audited. The
+  **account** commands are still uneven: the CLI and the desktop app can mint, list and
+  revoke invites; the webapp and the MV3 extension can only **join** and **read** the
+  account.
 - **Auth, authorization and a minimal account model now exist for the dev op-log
   — an IDENTITY system does not.** The op-log is still **wide open by default**. Two opt-in contracts
   change that: legacy `SIGILD_OPLOG_PUBKEY` (a **single static** Ed25519 dev key,
@@ -1801,9 +1837,11 @@ authoritative list, with rationale, is the **defer ledger** in
   not — and sharing still has **no rotation schedule, no automatic re-wrap on
   revoke, and no key-transparency log or cross-signature** binding a
   recipient's hybrid public key to its enrolled identity (the safety number puts a
-  **human** in that loop rather than removing the loop). ⚠️ Recovery is
-  **CLI-only**: the webapp, the extension and the desktop have **no recovery UI**,
-  so a user whose only client was a browser cannot restore there today.
+  **human** in that loop rather than removing the loop). Recovery now exists on
+  **all four** client surfaces (Phase 56), so a customer whose only client was a
+  browser can restore into a fresh profile — but a kit still **cannot be created
+  after the loss**, still recovers **keys and not data**, and still opens only the
+  vaults it was told to **cover**.
 - **No live PQ-TLS proof.** `sigild` serves plain HTTP in the skeleton; the hybrid
   `X25519MLKEM768` handshake is unproven on this machine (see
   [`deployment.md`](deployment.md) §3).

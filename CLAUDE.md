@@ -700,6 +700,41 @@ public, make no security claims, until the audit completes and trademark clears.
   `ListKeyEnvelopesForRecipient` (Mem + Postgres, one conformance suite), metric
   `sigild_key_envelope_index_total`, audit `device.key_envelope_index`
   (`device_id`, `returned_count`; **no `blob_sha256`** — the route reads no blob).
+- `sigild/` ⭐ **BROWSER ORIGINS / CORS (Phase 56, ADR 0044) — the fix for a hole that made
+  the whole webapp unreachable.** Every signed request carries `X-Sigil-Device`/`-Timestamp`/
+  `-Nonce`/`-Signature`, none of which is CORS-safelisted, so **a browser preflights every
+  one of them**. `sigild` routed no `OPTIONS` and emitted **no `Access-Control-*` header
+  anywhere** (`grep -rin access-control sigild/` found NOTHING; a real preflight answered
+  **`405`**), so from a page on a different origin — i.e. the entire localhost dev topology,
+  webapp on `:3000`, sigild on `:8080` — **enroll, sync, share, restore-from-kit and the
+  entitlement read were ALL DEAD**, blocked in the browser before a byte was sent. The gap
+  is **PRE-EXISTING since Phase 44**; the **MV3 extension was never affected** (a
+  `host_permissions` page is exempt from CORS), which is why it went unnoticed. **New:**
+  `internal/api/cors.go` + `cmd/server/corsconfig.go`, hand-written stdlib —
+  **`sigild` still has EXACTLY ONE direct Go dependency (`pgx`)**.
+  **`SIGILD_CORS_ORIGINS`** is a comma-separated list of **EXACT** origins
+  (`http://127.0.0.1:3000,http://localhost:3000`), validated **fail-fast BEFORE the listener
+  binds**; a path/query/fragment/trailing slash/credentials/non-`http(s)` scheme is a boot
+  failure, and **`*` is REJECTED AT BOOT (rc=1, never binds)** rather than narrowed.
+  ⭐ **UNSET = the middleware is NOT INSTALLED at all** — byte-identical to before (a
+  verifier swept **45 responses across 9 paths × 5 methods** with an `Origin` header and
+  found **ZERO `Access-Control-*` lines**, with `OPTIONS` still `405`). When on: it
+  **ECHOES** an allowlisted origin (**never `*`**, never a value the request did not
+  present), always sends **`Vary: Origin`**, answers a preflight **`204`** with the exact
+  `X-Sigil-*` header list, exposes `X-Request-ID` + the three `X-Sigil-Entitlement*`
+  headers (without which a browser cannot read its own grace warning), caches preflights
+  **600 s**, and **NEVER sets `Access-Control-Allow-Credentials`**. It sits **innermost** so
+  a preflight it answers is still counted / request-ID'd / access-logged, and an unknown
+  origin's `OPTIONS` falls through to the mux → `405`, exactly as before (no probe
+  distinguishing "route exists" from "origin allowed"). ⭐ **THE REASONING: this is SAFE
+  because there is NO COOKIE and NO AMBIENT AUTHORITY** — every request is authenticated by
+  a **per-request Ed25519 signature over a canonical message**, so a cross-origin page
+  cannot forge one. That is also why **CORS here is NOT a CSRF control** and **not an
+  authentication control**; the allowlist exists to make the browser-side error honest and
+  the reachable surface deliberate. ⚠️ **PRODUCTION should serve the app and the API from the
+  SAME ORIGIN behind the reverse proxy and set nothing here**; this is for the localhost dev
+  topology, and the boot log says so. It constrains **browsers only** — `curl`, the CLI and
+  the desktop ignore it — and it does not make plain HTTP safe.
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
@@ -789,7 +824,32 @@ public, make no security claims, until the audit completes and trademark clears.
   a `wasm.KeyPinMismatchError` catch that **BLOCKS the share** and renders both safety
   numbers with a deliberate re-pin (`wasm.repinHybridKey`) behind it, and **rotate**
   (`wasm.rotateVaultKey`) — with `onUpdateDevice({ pins: res.pins })` re-sealing the
-  container so the pins persist. Do NOT store real 2FA secrets.
+  container so the pins persist. ⭐ **Phase 56 (ADR 0042/0043/0044) made the RECOVERY KIT
+  and the PAYMENT WARNINGS reachable:** a **`RestorePanel` on BOTH the setup and the
+  locked screens** (recovery is deliberately **NOT** behind an unlocked vault — a fresh
+  install with no local state is exactly where a printed sheet is used), a `RecoveryPanel`
+  (generate / cover / check / revoke) inside the vault, and an `EntitlementBlock` that
+  reads `GET /v1/billing/subscription` on mount (the **only** warning channel a read-only
+  client ever gets) plus `readEntitlementHeaders` on the sync path. The kit sheet is shown
+  **ONCE** — 7×8 grouped code, safety number, kit id, account, server, vaults covered as of
+  today, four warnings, print/copy — behind a *"I have written it down"* confirmation that
+  **clears it from the DOM**; it lives in React state only, never `localStorage`, never a
+  URL, never a log line. ⚠️ **A REAL LATENT BUG was fixed here:**
+  `web/packages/sigil-wasm/index.mjs` **never re-exported the `recovery_*` wasm functions**,
+  so every browser recovery call would have **thrown at runtime**; the missing `.d.ts` types
+  were a **separate** gap (types and runtime were two distinct holes). New specs:
+  `recovery.spec.ts`, `wrap-gate.spec.ts` (a **second profile that never saw the sheet** is
+  refused, stores **no envelope**, and is told a wrong safety number is a mismatch — the
+  gate was previously deletable with every spec staying green), `leak.spec.ts` (an
+  **enumerating** sweep: every localStorage/sessionStorage key AND value, cookies, every
+  IndexedDB record, every Cache Storage entry, the DOM after dismissal, every request
+  URL/body, every console message from before the first navigation, and the address bar,
+  against four spellings of the code), `entitlement.spec.ts`, and ⭐ **`cors.spec.ts` — the
+  ONLY spec that drives the UI against a REAL `sigild`** (both directions: allowlisted ⇒
+  enrols, unlisted ⇒ blocked). ⚠️ Every other spec runs against
+  `sigil-wasm/test/fake-sigild.mjs`, a **double**; ⚠️ **print output is NOT verified**
+  (headless Chromium cannot render a printed page, so `@media print` is by-eye). Do NOT
+  store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -830,6 +890,10 @@ public, make no security claims, until the audit completes and trademark clears.
   human-gated container publish lives in `.github/workflows/publish-sigild.yml`
   (`workflow_dispatch`-**only**; **private** GHCR `ghcr.io/<owner>/sigild`,
   SHA-tagged) — see [ADR 0009](docs/decisions/0009-manual-gated-deploy-and-publish.md).
+- `scripts/` — **`gate.sh`** (Phase 56), the documented way to run **everything**: it
+  enumerates every suite dynamically, counts results instead of trusting exit codes,
+  prints an inventory, and runs a **CI-drift check** asserting every node interop suite
+  and shell e2e script is named in some workflow. See *Build & test* below.
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
   **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
@@ -1058,6 +1122,20 @@ public, make no security claims, until the audit completes and trademark clears.
   un-learn what it already unwrapped. Local pin marker `PIN_ORIGIN_RECOVERY_KIT` (same
   string, different concern from the label). Proof: **`cli/tests/e2e-recovery.sh`** (twelve
   steps; **step 9c pins that SHARE and ROTATE obey the SAME rule as COVER**). ADR 0042.
+  ⭐ **Phase 56 (ADR 0043) taught the CLI to render a `402`.** It previously dumped the
+  server's raw JSON while `401`/`403`/`501` each got an explainer. **All five** explainers
+  (`explain_sync_error`, `explain_device_error`, `explain_account_error`,
+  `explain_sharing_error`, `explain_recovery_error`) gained a `402` arm via
+  `explain_payment_required`, saying it is a **BILLING state, not an authentication or
+  permission failure**, and that **reads and key recovery are unaffected** (`sigil pull`,
+  opening a vault, `sigil totp code`, collecting envelopes, enrolling, revoking, and
+  `recovery generate`/`cover` all still work while lapsed; what stops is `push` and sharing
+  to a **different** account). ⚠️ **PRECISELY:** it still prints the server's JSON **first**
+  and the prose **after**, matching this CLI's established `{e}\n  -> HTTP nnn: …`
+  convention — the dump was **explained**, not removed. Also new: **`fetch_subscription`**
+  in the library (a RAW-STRING read of `GET /v1/billing/subscription`, deliberately
+  unparsed so the `entitlement` block is interpreted in exactly one place per client) —
+  the function the desktop's grace warning needed and did not have.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.
@@ -1289,11 +1367,35 @@ public, make no security claims, until the audit completes and trademark clears.
   `RecipientsWouldBeDroppedError` and the four `TRUST_*` constants. The codec, the
   derivation and the trust rules are **MIRRORED — not shared — from `cli/src/lib.rs` +
   `libsigil/core/src/recovery.rs`** and MUST stay byte-identical (same KAT both sides;
-  `sigil-wasm/test/recovery-interop.mjs` is the guard). `web/packages/sigil-wasm/index.mjs`
-  re-exports all of `recovery.mjs`. ⚠️ **Known doc gap:** `interface SigilWasm` in
-  `web/packages/sigil-wasm/index.d.ts` was **not** extended with the `recovery_*` methods,
-  so those wasm calls are untyped at that boundary. ⚠️ **No browser client has a recovery
-  UI** — the webapp and the extension consume only the wrap gate.
+  `sigil-wasm/test/recovery-interop.mjs` is the guard). ⚠️ **Phase 56 fixed a REAL LATENT
+  BUG here:** `web/packages/sigil-wasm/index.mjs` re-exported all of `recovery.mjs` but
+  **never re-exported the six `recovery_*` WASM functions themselves**, so every browser
+  recovery call would have **thrown at runtime**; the missing `index.d.ts` types were a
+  **SEPARATE** gap (types and runtime were two distinct holes, and closing one would not
+  have closed the other). **Both are now closed**, and **both browser clients have the full
+  recovery UI** (Phase 56).
+  **Phase 56 also added the JS half of ENTITLEMENT (ADR 0043):** a NEW framework-free ESM
+  module **`sigil-wasm/entitlement.mjs`** (`getSubscription`, `entitlementState`,
+  `describeEntitlement`, `readEntitlementHeaders`, `explainSubscriptionStatus`, the three
+  `HEADER_*` constants and `PAYMENT_REQUIRED_CODE`) that reads sigild's warning headers,
+  the additive `entitlement` block and the machine-readable `402`, and says the **true**
+  thing about them — writes may be refused, **reads and same-account key recovery never
+  are**, and a `402` is a **BILLING** state, not `401` and not `403`. It does **NO
+  crypto** and holds **no state**; every request goes through the existing contract-v3
+  `signedFetch`. It **had NO caller when it was written**; it now has three
+  (`readEntitlementHeaders` is called from the webapp's and the extension's sync paths,
+  and the whole module from their entitlement blocks). Guarded by
+  **`sigil-wasm/test/entitlement-interop.mjs`** — the **only** thing in the repo that
+  parses a **real** `sigild`'s entitlement bytes with the JS reader, since the browser
+  suites use a double.
+  ⚠️ **`sigil-wasm/test/fake-sigild.mjs` (NEW, Phase 56) is a SERVER DOUBLE, not a test.**
+  It exists so a browser spec can drive a UI end to end without a Go toolchain; it verifies
+  **no signature**, enforces **no ownership or grant**, implements **no entitlement gate**
+  — it returns shapes. Everything cryptographic in those specs is still real (it relays
+  exact bytes and holds no key, exactly as sigild does). ⚠️ It sends **NO CORS header
+  unless a caller passes an explicit allowlist**: an earlier revision always sent
+  `Access-Control-Allow-Origin: *`, which made six webapp specs pass green while the real
+  path was dead. **A double must never be MORE permissive than the thing it doubles.**
 - `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
   whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
   as **WebAssembly inside the extension page** — the **second real product client
@@ -1332,9 +1434,9 @@ public, make no security claims, until the audit completes and trademark clears.
   share to a pasted recipient device id with read/write / accept a vault shared to this
   device) over a **vendored `sharing.mjs`** — `build.sh` now copies it beside
   `totp-vault.mjs` / `totp-migration.mjs` / `sync.mjs` / `device-auth.mjs` (it imports
-  two of them, so all **six** must stay siblings — `build.sh` now also vendors
-  **`recovery.mjs`**, though ⚠️ **the extension popup has NO recovery UI**; it consumes only
-  the *wrap gate* (the safety-number field and the refusal)). Storage matches the webapp: the sealed
+  two of them, so all **seven** must stay siblings — `build.sh` also vendors
+  **`recovery.mjs`** and, since Phase 56, **`entitlement.mjs`**, and the popup now has the
+  **full recovery UI and an entitlement block**, not just the *wrap gate*). Storage matches the webapp: the sealed
   device-identity container is the **v3 schema** carrying the hybrid secret, the vault
   keyring **and the Phase 50 pin store** beside the seed, so `chrome.storage.local` still
   holds only the two sealed
@@ -1360,8 +1462,21 @@ public, make no security claims, until the audit completes and trademark clears.
   extensions) and asserts the wasm instantiates in-page → RFC 6238 `287082` at
   `?t=59`, storage holds **only** the sealed container (no plaintext secret / label /
   password), reload → locked → right password restores the vault, and the
-  `otpauth://` + migration import/export paths round-trip (3 specs). ⚠️ The new
-  enrollment UI is **NOT** Playwright-covered (the protocol is proven live in Node).
+  `otpauth://` + migration import/export paths round-trip (3 tests). ⭐ **Phase 56
+  (ADR 0042/0043) added the SAME recovery + entitlement surfaces as the webapp:** a
+  restore form reachable from the **locked/setup** views (`view-restore` — a fresh
+  install is where a sheet is used), generate / cover / check / revoke, the one-shot kit
+  sheet behind a *"written it down"* confirmation that clears it, and an entitlement
+  block over the vendored `entitlement.mjs` (`build.sh` now vendors it beside
+  `totp-vault.mjs` / `totp-migration.mjs` / `sync.mjs` / `device-auth.mjs` /
+  `sharing.mjs` / `recovery.mjs`). ⭐ **The extension NEVER needed the CORS fix** — an MV3
+  page with a `host_permissions` entry is **exempt from CORS**, which is why its suite
+  stayed honest while the webapp's real path was dead (ADR 0044). Four new specs —
+  `recovery.spec.mjs`, `wrap-gate.spec.mjs` (a second profile that never saw the sheet is
+  refused and stores no envelope), `leak.spec.mjs` (the same enumerating sweep as the
+  webapp) and `entitlement.spec.mjs` — bring it to **12 tests in 5 spec files**, and they
+  DO drive the enrollment UI, closing the old "enrollment UI is not Playwright-covered"
+  gap. ⚠️ They run against the **`fake-sigild.mjs` double**, not a real server.
   **Dev / UNAUDITED / loaded unpacked / published to NO store**; sync is **loopback
   plain-HTTP only, no TLS**; generate-only (no verification / constant-time compare /
   zeroization); the reserved-stub ambitions (phishing protection, passkey provider,
@@ -1385,16 +1500,19 @@ public, make no security claims, until the audit completes and trademark clears.
   constants, **plus the whole server-facing half in `desktop/core/src/net.rs`**
   (below); **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
   an `AppState { session: Mutex<Option<VaultSession>>, sync: Mutex<Option<DeviceConfig>> }`,
-  and **thirty-one `#[tauri::command]`s** (count verified against
-  `desktop/src-tauri/src/main.rs`; this line previously said "twenty-one", which was
-  already stale before Phase 52): the ten offline ones (`status`, `unlock`,
+  and **forty `#[tauri::command]`s** (count verified against
+  `desktop/src-tauri/src/main.rs` — every one registered in `generate_handler!`; this
+  line said "twenty-one", then "thirty-one", each stale within a phase or two): the ten
+  offline ones (`status`, `unlock`,
   `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`, `export_uris`,
   `export_migration`), **ELEVEN added in Phase 49** (`unlock_shared`, `set_server`,
   `sync_status`, `enroll`, `publish_hybrid`, `check_server`, `convert_to_shared`,
   `push`, `pull`, `share`, `accept`), the Phase 50 key-trust ones (safety numbers,
   pins, re-pin, rotate) and **FOUR added in Phase 52** (`account_status`,
   `account_invite`, `account_invites`, `account_revoke_invite` — so the desktop has the
-  **full** account flow, unlike the webapp and extension), each cloning the `DeviceConfig` out of the mutex
+  **full** account flow, unlike the webapp and extension) and **NINE added in Phase 56**
+  (`recovery_generate`/`_cover`/`_check`/`_verify`/`_restore`/`_revoke`/`_kits`,
+  `entitlement_status`, `entitlement_refresh`), each cloning the `DeviceConfig` out of the mutex
   **before** any network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI can't be clicked by a
   test runner, so all behaviour lives where tests can drive it. **REUSE, NOT
@@ -1534,8 +1652,23 @@ public, make no security claims, until the audit completes and trademark clears.
   threads of ONE process — so two harnesses starting in the same second got the SAME path and
   the second one's `remove_dir_all` deleted the first one's state, surfacing as a baffling
   "No such file or directory" in the OTHER test. Fixed with an `AtomicUsize` counter in the
-  directory name. Do NOT store real 2FA
-  secrets. ADR 0032, ADR 0037, ADR 0038.
+  directory name.
+  ⭐ **Phase 56 (ADR 0042/0043) brought RECOVERY and ENTITLEMENT to the desktop, by the
+  same REUSE-DO-NOT-REIMPLEMENT rule (ADR 0037).** `desktop/core/src/recovery.rs` +
+  `entitlement.rs` and seven thin `#[tauri::command]`s (`recovery_generate` / `_cover` /
+  `_check` / `_verify` / `_restore` / `_revoke` / `_kits`, plus `entitlement_status` /
+  `entitlement_refresh` — **40 commands** now) call the `sigil-cli` library and add **NO
+  fourth copy** of the kit codec, the HKDF derivation or the safety-number digest.
+  ⚠️ **A REAL DEAD-CODE BUG was found and fixed:** the in-grace warning could never fire —
+  `EntitlementView::from_subscription_block` had **ZERO production callers**, so `writes`
+  was never `"grace"`. Root cause: the `sigil-cli` library exposed **no billing route at
+  all**. Now wired end to end — new **`fetch_subscription`** in the CLI library →
+  **`DeviceConfig::subscription()`** → the **`entitlement_refresh`** command → the UI —
+  with a **real-server** test in `server_interop.rs` proving a desktop inside grace is
+  **warned BEFORE any write is refused**. Mutation-confirmed. **`cli/` gained one function;
+  nothing else under `cli/` was edited, and there is still no second HTTP client or signing
+  path under `desktop/`.** Do NOT store real 2FA
+  secrets. ADR 0032, ADR 0037, ADR 0038, ADR 0042, ADR 0043.
 - `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
   `extension/` and `desktop/` are now real — see above.)
 
@@ -1552,6 +1685,31 @@ public, make no security claims, until the audit completes and trademark clears.
   PQ-TLS verification needs OpenSSL 3.5+ / Go 1.24.x installed explicitly first.
 
 ## Build & test (these commands are known-green)
+
+⭐ **`./scripts/gate.sh` is the documented way to run everything** (added Phase 56).
+It runs every command below, and does three things a hand-rolled sweep does not:
+
+- it **ENUMERATES** the suites **dynamically** — every Rust crate, every Go package,
+  every `sigil-wasm/test/*.mjs`, every `cli/tests/*.sh`, every Playwright spec — so a
+  newly added suite cannot be silently missed;
+- it **COUNTS results instead of trusting exit codes**, and prints a closing
+  **inventory** (a suite absent from that list is a suite nobody runs);
+- it includes a **CI-DRIFT CHECK** asserting that **every** node interop suite and
+  shell e2e script is named in **some** workflow. ⚠️ This repo has **THREE TIMES**
+  shipped a suite that no workflow ran — the nine interop tests for ~20 phases, then
+  `accounts`+`recovery`, then `entitlement` — and it was **green locally every time**.
+  The drift check is itself mutation-tested.
+
+It also encodes two traps that make a **planted mutation appear to PASS locally**:
+
+- **`sigil-wasm/test/fake-sigild.mjs` is a SERVER DOUBLE, not a test.** A naive
+  `for t in test/*.mjs` loop runs it and **hangs**. `gate.sh` skips `fake-*`.
+- It **REBUILDS the webapp and RE-VENDORS the extension first**, because webapp
+  Playwright's `reuseExistingServer` will happily serve a **stale `.next`**, and
+  `pnpm -C extension exec playwright test` **skips the `pretest` vendor hook** (use
+  `pnpm test`). CI does both correctly; a local run does not unless you force it.
+
+`./scripts/gate.sh --quick` skips the shell e2e scripts and Postgres.
 
 ```bash
 # Rust core — fmt / clippy / test / wasm
@@ -1609,22 +1767,27 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (29 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the ELEVEN Node tests below must all PASS.
+# pkg-web/pkg-node (needs wasm-pack); then the TWELVE Node tests below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/11 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/11 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/11 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/11 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/11 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/11 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/11 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/11 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
-node sigil-wasm/test/pinning-interop.mjs            # 9/11 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
-node sigil-wasm/test/accounts-interop.mjs            # 10/11 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
-node sigil-wasm/test/recovery-interop.mjs           # 11/11 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/12 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/12 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/12 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/12 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/12 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/12 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/12 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/12 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/12 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/accounts-interop.mjs            # 10/12 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
+node sigil-wasm/test/recovery-interop.mjs           # 11/12 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
+node sigil-wasm/test/entitlement-interop.mjs         # 12/12 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
+# ⚠️ sigil-wasm/test/fake-sigild.mjs is a SERVER DOUBLE for the BROWSER suites, NOT a
+# test — running it in a `test/*.mjs` loop HANGS. It sends NO CORS header unless a
+# caller passes an explicit allowlist, deliberately matching real sigild (an earlier
+# revision always sent `Access-Control-Allow-Origin: *` and hid a dead code path).
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build
@@ -1652,7 +1815,13 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium: 8 specs (wasm + offline + a11y), PASS
+corepack pnpm --filter webapp exec playwright test   # headless chromium: 19 tests in 8 spec files, PASS
+# (wasm, offline, a11y, recovery, wrap-gate, leak, entitlement, and cors.spec.ts —
+#  the ONE spec that builds + boots a REAL sigild and drives the UI against it.
+#  ⚠️ cors.spec.ts test.skip()s ITSELF without a Go toolchain, so a run with no Go
+#  is green while proving nothing about CORS; CI now installs Go for this job.)
+# ⚠️ Playwright's reuseExistingServer will serve a STALE .next — build first (or use
+# scripts/gate.sh, which does) or a planted mutation can appear to PASS.
 
 # extension — the MV3 popup authenticator. A STANDALONE pnpm project (NOT part of
 # the web/ workspace), one devDependency (@playwright/test). It needs the Rust +
@@ -1661,7 +1830,9 @@ corepack pnpm --filter webapp exec playwright test   # headless chromium: 8 spec
 # the extension can be loaded unpacked or tested). NOT wired into CI.
 corepack pnpm -C extension install
 ./extension/build.sh                          # -> extension/vendor/ (gitignored)
-corepack pnpm -C extension test               # `pretest` re-runs build.sh; 3 Playwright specs, PASS
+corepack pnpm -C extension test               # `pretest` re-runs build.sh; 12 tests in 5 spec files, PASS
+# ⚠️ Use `pnpm test`, NOT `pnpm -C extension exec playwright test`: only the former
+# runs the `pretest` vendor hook, so the latter can test a STALE extension/vendor/.
 # The suite loads the REAL unpacked extension in a full Chromium (channel:
 # "chromium" — the headless SHELL cannot load extensions) and drives
 # chrome-extension://<pinned-id>/src/popup/popup.html?t=59.
@@ -1673,7 +1844,7 @@ corepack pnpm -C extension test               # `pretest` re-runs build.sh; 3 Pl
 # perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
 cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path desktop/Cargo.toml   # 15 unit tests + 3 integration tests (2 files)
+cargo test  --manifest-path desktop/Cargo.toml   # 24 unit + 7 integration (2 files) = 31
 grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
 # Integration test 1 is THE VAULT INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
 # builds the real `sigil` binary itself and drives it against ONE shared vault file in
@@ -1721,7 +1892,11 @@ list of `.github/workflows/` (ten files):
   the two on a concurrent server whose op-log, nonce cache, rate limiter and subscription
   store are all shared mutable state with concurrency tests aimed at them.
 - **`web.yml`** — a Rust-free `build` job for marketing **plus** a `webapp` job carrying
-  the Rust + wasm-pack toolchain (`@sigil/wasm` build + the Playwright suite).
+  the Rust + wasm-pack toolchain (`@sigil/wasm` build + the Playwright suite) **and, since
+  Phase 56, `actions/setup-go`**. ⚠️ The Go step is not optional: without it
+  `tests/cors.spec.ts` **`test.skip`s itself**, so the ONLY browser-level proof of the
+  CORS fix would silently skip while the job stayed green. The marketing `build` job
+  stays toolchain-free.
 - **`extension.yml`** — Rust + wasm toolchain → `extension/build.sh`, then the
   real-extension Playwright run in chromium.
 - **`desktop.yml`** — Rust + Tauri's Linux WebKitGTK system libs → fmt/clippy/test incl.
@@ -1734,24 +1909,21 @@ list of `.github/workflows/` (ten files):
   fmt/clippy/test** — which had no CI gate either, and which includes the golden
   `SIGILcli` / `SIGILhyb` header tests guarding the constants that MUST stay
   byte-identical with `cli/src/lib.rs` — builds the bindings and the real `sigil`
-  binary, runs the Node interop tests (roundtrip, interop, hybrid-interop,
+  binary, runs **ALL TWELVE** Node interop tests (roundtrip, interop, hybrid-interop,
   sync-interop, totp-interop, migration-interop, device-auth-interop, sharing-interop,
-  pinning-interop), and re-asserts `getrandom`==0 in both lockfiles. Job 2
-  (`e2e-sharing`, Phase 51) runs **`cli/tests/e2e-sharing.sh`** — the tenth
-  cross-component proof and the only shell one, which was in the same position: run by
-  nothing. It needs Go + Rust + bash + curl + python3 and no wasm, so it is a separate,
-  parallel job. `e2e-sharing.sh` now resolves its Go as `$GO` → Homebrew → PATH (it
-  hardcoded the macOS Homebrew path), and the job sets `GO: go`.
-  ⚠️ **KNOWN CI GAP, now WIDER after Phases 52 and 54 — the workflow has NOT been updated**
-  (both briefs were code + docs, and a workflow is neither): job 1's Node-test list does
-  **not** include **`sigil-wasm/test/accounts-interop.mjs`** (the tenth) or
-  **`sigil-wasm/test/recovery-interop.mjs`** (the **eleventh**, and the only automated guard
-  on the Rust↔JS recovery-kit codec + derivation), and there is no job running
-  **`cli/tests/e2e-accounts.sh`** or **`cli/tests/e2e-recovery.sh`** (the latter being the
-  proof that the wrap gate fires on share, rotate AND cover). All four pass locally; all four
-  are currently run by **nothing in CI**. Adding them is a one-line step each (the two
-  `*-interop.mjs` beside the other nine in `interop`; the two `e2e-*.sh` beside
-  `e2e-sharing.sh`, same `GO: go` env).
+  pinning-interop, accounts-interop, recovery-interop, and **entitlement-interop** —
+  the twelfth, added in Phase 56, and the **only** thing that parses a real `sigild`'s
+  entitlement bytes with the JS reader), and re-asserts `getrandom`==0 in both
+  lockfiles. The other jobs run the **three** shell e2e scripts —
+  **`cli/tests/e2e-sharing.sh`** (added Phase 51), plus **`e2e-accounts.sh`** and
+  **`e2e-recovery.sh`**. They need Go + Rust + bash + curl + python3 and no wasm, so
+  they are separate, parallel jobs; each resolves Go as `$GO` → Homebrew → PATH and the
+  jobs set `GO: go`.
+  ✅ **The "CI gap got wider" note from the Phase 53–55 journal entry is STALE** — it
+  described the state while that work was in flight, and commit `fb3aa3f` closed it in
+  the same commit: `accounts-interop`, `recovery-interop`, `e2e-accounts.sh` and
+  `e2e-recovery.sh` are all wired. `scripts/gate.sh`'s **CI-drift check** now asserts
+  this mechanically rather than by memory.
 - **`security.yml`** — gitleaks (full history) + govulncheck + **cargo-audit across a
   matrix of ALL FOUR Rust workspaces** (`libsigil`, `cli`, `sigil-wasm`, `desktop`;
   Phase 51 — it audited `libsigil` only, which says nothing about the other three, and

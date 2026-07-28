@@ -389,6 +389,12 @@ export function pushContainerAuthed(
   baseUrl: string,
   vaultId: string,
   containerBytes: Uint8Array,
+  /**
+   * `onResponse` receives the raw Response BEFORE its body is read — the only
+   * way to see sigild's X-Sigil-Entitlement* grace warning, which rides on a
+   * write that is still being SERVED (a 2xx) and so never appears in an error.
+   */
+  opts?: { onResponse?: (res: Response) => void },
 ): Promise<PushResult>;
 
 export function pullContainersAuthed(
@@ -998,3 +1004,95 @@ export function revokeRecoveryKit(
   alreadyClear: string[];
   rotateReminder: string;
 }>;
+
+// ── entitlement (ADR 0043, read side) ───────────────────────────────────────
+//
+// sigild may refuse WRITES from an account whose subscription lapsed past its
+// grace period, with a `402`. It NEVER refuses reads, and never refuses giving a
+// device of the caller's OWN account the key to a vault (so replacing a device
+// and printing a recovery kit keep working). Say exactly that and nothing more.
+
+export const HEADER_ENTITLEMENT: string;
+export const HEADER_ENTITLEMENT_STATUS: string;
+export const HEADER_ENTITLEMENT_GRACE_ENDS: string;
+export const PAYMENT_REQUIRED_CODE: string;
+/** The sentence that must never be softened: what is NOT refused. */
+export const NEVER_REFUSED: string;
+/** What a lapsed account actually loses: new uploads only. */
+export const WHAT_IS_REFUSED: string;
+
+/** ⚠️ A refusal for PAYMENT. Never render this as 401/403. */
+export class PaymentRequiredError extends Error {
+  status: 402;
+  subscriptionStatus: string;
+  graceEndedAt: string;
+  readsAllowed: boolean;
+  keyRecoveryAllowed: boolean;
+  checkoutPath: string;
+  detail: string;
+}
+
+/** The additive block on GET /v1/billing/subscription; absent when off. */
+export interface EntitlementBlock {
+  enforced: boolean;
+  /** "allowed" | "grace" | "refused". */
+  writes: string;
+  /** ALWAYS "allowed". */
+  reads: string;
+  grace_ends_at?: string;
+}
+
+export interface SubscriptionInfo {
+  subject: string;
+  provider?: string;
+  status: string;
+  entitled: boolean;
+  current_period_end?: string;
+  updated_at?: string;
+  entitlement?: EntitlementBlock;
+}
+
+export interface EntitlementState {
+  level: "off" | "ok" | "grace" | "refused";
+  enforced: boolean;
+  status: string;
+  writes: string;
+  graceEndsAt: string;
+  entitled: boolean;
+}
+
+/** Extract the structured 402 from any thrown transport error, else null. */
+export function paymentRequiredFrom(err: unknown, what?: string): PaymentRequiredError | null;
+
+/** Read the three warning headers off a SERVED response; null when healthy. */
+export function readEntitlementHeaders(
+  res: Response,
+): { state: "grace" | "lapsed"; status: string; graceEndsAt: string } | null;
+
+/** READ this device's ACCOUNT's subscription (never gated by entitlement). */
+export function getSubscription(
+  wasm: Pick<SigilWasm, "ed25519_sign">,
+  auth: DeviceIdentity,
+  baseUrl?: string | null,
+): Promise<SubscriptionInfo>;
+
+export function explainSubscriptionStatus(status: number): string;
+
+/** Reduce a subscription response to one state; "off" means show NOTHING. */
+export function entitlementState(subscription: SubscriptionInfo | null): EntitlementState;
+
+export function formatInstant(iso: string): string;
+
+/** User-facing text for a state. tone "billing" is NOT an error. */
+export function describeEntitlement(state: EntitlementState): {
+  tone: "none" | "info" | "warning" | "billing";
+  headline: string;
+  detail: string;
+};
+
+/** User-facing text for an actual 402, from the server's own body. */
+export function describePaymentRequired(err: PaymentRequiredError): {
+  tone: "billing";
+  headline: string;
+  detail: string;
+};

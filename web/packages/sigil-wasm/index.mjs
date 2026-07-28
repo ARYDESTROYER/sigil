@@ -32,6 +32,16 @@ export const {
   hybrid_mlkem_encaps_key,
   hybrid_seal_to_container,
   hybrid_open_container,
+  // THE RECOVERY KIT codec + HKDF derivation (Phase 54). These were declared in
+  // index.d.ts but never re-exported here, so `recovery.mjs` — which is handed
+  // this module namespace as its `wasm` — called an undefined function the first
+  // time a browser client tried to generate a kit.
+  recovery_encode,
+  recovery_decode,
+  recovery_derive_ed25519_seed,
+  recovery_derive_x25519_secret,
+  recovery_derive_mlkem_seed,
+  recovery_format,
   totp,
   hotp,
   format_code,
@@ -71,3 +81,8 @@ export * from "../../../sigil-wasm/sharing.mjs";
 // render a code ONCE and never write it to localStorage, a URL, an analytics
 // event or a log line.
 export * from "../../../sigil-wasm/recovery.mjs";
+// ENTITLEMENT (Phase 55 server side, read here): sigild's warning headers, the
+// additive `entitlement` block on GET /v1/billing/subscription, and the
+// machine-readable 402. Reading it is how a client can say the TRUE thing —
+// writes may be refused, reads and same-account key recovery never are.
+export * from "../../../sigil-wasm/entitlement.mjs";

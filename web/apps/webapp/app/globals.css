@@ -11,3 +11,31 @@ body {
   margin: 0;
   padding: 0;
 }
+
+/*
+ * PRINTING A RECOVERY KIT.
+ *
+ * The kit sheet is the ONE thing in this app that is meant to leave the screen
+ * on paper. When a print region is present, print ONLY it: a printed page that
+ * also carried the rest of the UI would be noise around a credential, and could
+ * pick up a revealed export (which is 2FA secrets in the clear) from elsewhere
+ * on the same page.
+ */
+@media print {
+  body:has([data-print-region]) * {
+    visibility: hidden;
+  }
+
+  body:has([data-print-region]) [data-print-region],
+  body:has([data-print-region]) [data-print-region] * {
+    visibility: visible;
+  }
+
+  body:has([data-print-region]) [data-print-region] {
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 100%;
+    color: #000;
+    background: #fff;
+  }
+}

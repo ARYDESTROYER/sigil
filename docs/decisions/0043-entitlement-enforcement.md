@@ -332,3 +332,63 @@ password or a plaintext.
   refused/never-refused table.
 - Operator runbook: [`../deployment.md`](../deployment.md) §16.
 - Adversaries: [`../threat-model.md`](../threat-model.md).
+
+## The warning channels now have readers (added Phase 56, 2026-07-28)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+**When this ADR was written, the three warning channels it designed — the
+`X-Sigil-Entitlement*` response headers (§4), the additive `entitlement` block on
+`GET /v1/billing/subscription` (§4), and the machine-readable `402` body (§4) —
+had NO CLIENT READERS AT ALL.** Every one of them was a signal `sigild` emitted
+into silence: a customer inside their grace period was never told, and a refusal
+rendered as whatever raw text the client happened to print. Phase 56 built the
+readers.
+
+- **Webapp + MV3 extension**, over the new framework-free
+  [`../../sigil-wasm/entitlement.mjs`](../../sigil-wasm/entitlement.mjs)
+  (`getSubscription` / `entitlementState` / `describeEntitlement` /
+  `readEntitlementHeaders` / `explainSubscriptionStatus`): an entitlement block
+  reads the subscription route on mount — the **only** warning channel a
+  read-only client ever sees, since it is never refused — and the sync path reads
+  the warning headers off a successful write. A server with enforcement **off**
+  (the default) sends neither, which is reported as `off` and **renders
+  nothing**.
+- **Desktop.** §4's warning was **dead code** here: `from_subscription_block`
+  had **zero production callers**, so the `writes = "grace"` state could never be
+  reached and a desktop inside grace was never warned. The root cause was that
+  the `sigil-cli` library exposed **no billing route at all**. It is now wired end
+  to end — `fetch_subscription` (CLI library) → `DeviceConfig::subscription()` →
+  the `entitlement_refresh` Tauri command → the UI banner — with a **real-server**
+  test in `desktop/core/tests/server_interop.rs` proving a desktop inside grace is
+  warned **before** any write is refused. Per
+  [ADR 0037](0037-desktop-reuses-cli-library-for-protocol.md) this added no second
+  HTTP client and no second request-signing path.
+- **CLI.** A `402` was previously printed as a raw JSON dump while `401`, `403`
+  and `501` each got an explainer. All five explainers (`explain_sync_error`,
+  `explain_device_error`, `explain_account_error`, `explain_sharing_error`,
+  `explain_recovery_error`) gained a `402` arm stating that it is a **billing
+  state, not an authentication or permission failure**, and that reads and
+  same-account key recovery are unaffected. ⚠️ Precisely: it still prints the
+  server's body **first** and the prose **after**, matching this CLI's
+  established `{e}\n  -> HTTP nnn: …` convention — the JSON was not removed, it
+  was explained.
+
+**Conformance against the real bytes** is
+[`../../sigil-wasm/test/entitlement-interop.mjs`](../../sigil-wasm/test/entitlement-interop.mjs)
+(now wired into `interop.yml`, 12/12). It is the **only** thing in the repo that
+parses a real `sigild`'s entitlement headers, `entitlement` block and `402` body
+with the JS reader — the browser suites use a test double — so a divergence
+between `entitlementJSON` / `paymentRequiredResponse` and the JS parser would
+otherwise go red in **no** job, and the failure mode is a client telling a paying
+customer the wrong thing about their own subscription.
+
+**What is NOT retired.** Limitation 5 is **narrowed, not closed**: there is still
+**no dunning, no notification, no email, no invoice and no reconciliation**. The
+only warnings remain the response headers, the subscription block and the audit
+log — what changed is that clients now read them. Every other limitation stands
+as written, including that this is a payment gate on a security product, that a
+never-subscribed account is graced from its creation time, that enforcement is
+durable only under Postgres, and that all of it is dev-gated, plain HTTP,
+pre-audit and **UNAUDITED**.

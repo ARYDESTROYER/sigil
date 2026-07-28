@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { AccountInfo, DeviceIdentity, TotpEntry, TotpVault } from "@sigil/wasm";
 
 // The full @sigil/wasm module surface (wasm bindings + the proven JS helpers).
@@ -248,6 +248,122 @@ export default function Authenticator() {
     setPhase("setup");
   }
 
+  // ── RECOVERY: restore on a client with NO identity and NO vault ────────────
+  //
+  // ⭐ THE FLOW THAT MATTERS, and the reason it lives up here rather than in the
+  // unlocked view: a user who lost every device is looking at a FRESH INSTALL.
+  // There is no vault to unlock, no device identity, no pin store and no keyring
+  // — only the printed sheet. So restore must be reachable from the setup and
+  // locked screens, before anything exists.
+  //
+  // ⚠️ THE 56-CHARACTER CODE IS A CREDENTIAL. It is never written to
+  // localStorage, never put in a URL or query string, never logged, and never
+  // sent anywhere except the offline decode + the derivation. `restoreFromKit`
+  // decodes and checksums it BEFORE any network I/O, so a mistyped code never
+  // reaches a server; the caller clears the field as soon as this returns.
+  //
+  // ⚠️ WHAT IS PERSISTED, and it is not the code: this browser ADOPTS the kit's
+  // derived identity, sealed under a new vault password inside the existing
+  // device-identity container. That makes this browser a second copy of the
+  // paper credential, which the UI says in those words.
+  async function restoreFromRecoveryKit(args: {
+    baseUrl: string;
+    code: string;
+    deviceId: string;
+    password: string;
+  }): Promise<{ vaultId: string; accounts: number; accountId: string; notes: string[] }> {
+    if (!wasm) throw new Error("wasm not ready");
+    const baseUrl = args.baseUrl.trim();
+
+    // Offline decode + checksum happens inside restoreFromKit, before any I/O.
+    const res = await wasm.restoreFromKit(wasm, {
+      baseUrl,
+      code: args.code,
+      deviceId: args.deviceId.trim(),
+    });
+
+    const kitAuth = {
+      deviceId: res.deviceId,
+      seed: res.identity.ed25519Seed,
+      baseUrl,
+      hybrid: res.identity.hybrid,
+    };
+
+    // The kit recovers KEYS. Ciphertext still has to exist on the server, so try
+    // each recovered vault until one has content this key opens.
+    const notes: string[] = res.skipped.map((s) => `${s.vaultId}: ${s.reason}`);
+    let opened: TotpVault | null = null;
+    let openedId = "";
+    let openedKey: Uint8Array | null = null;
+    let openedContainer: Uint8Array | null = null;
+    for (const v of res.vaults) {
+      try {
+        const ops = await wasm.pullContainersAuthed(wasm, kitAuth, baseUrl, v.vaultId, 0);
+        if (ops.length === 0) {
+          notes.push(
+            `${v.vaultId}: the key was recovered, but the server holds no vault content for it`,
+          );
+          continue;
+        }
+        const container = ops[ops.length - 1].container;
+        opened = wasm.openVault(wasm, v.vaultKey, container); // throws before anything is stored
+        openedId = v.vaultId;
+        openedKey = v.vaultKey;
+        openedContainer = container;
+        break;
+      } catch (e) {
+        notes.push(`${v.vaultId}: ${msg(e)}`);
+      }
+    }
+
+    if (!opened || !openedKey || !openedContainer) {
+      // Persist NOTHING on this path: a half-restored browser (an identity with
+      // no vault) is worse than a clean refusal, and this state is the honest,
+      // documented limit — a kit recovers keys, not data.
+      throw new Error(
+        `the recovery code and device id are valid and ${res.vaults.length} vault key(s) were ` +
+          "recovered, but no vault content could be opened. A recovery kit recovers KEYS, not " +
+          "DATA: a vault whose sealed container was never pushed to this server cannot come " +
+          `back.${notes.length ? ` Details: ${notes.join("; ")}.` : ""}`,
+      );
+    }
+
+    // Adopt the kit: keep every recovered vault key and PIN the kit's own hybrid
+    // key as DERIVED (origin "recovery-kit"), so a later cover from this client
+    // wraps to a locally derived key and never asks the server for one.
+    const vaultKeys: Record<string, Uint8Array> = {};
+    for (const v of res.vaults) vaultKeys[v.vaultId] = v.vaultKey;
+    const pins = wasm.newPinStore();
+    await wasm.pinDerivedKey(
+      pins,
+      res.deviceId,
+      wasm.hybridPublicIdentity(wasm, res.identity.hybrid),
+    );
+
+    passwordRef.current = args.password;
+    // Seals the adopted identity under the NEW password — the only thing that
+    // ever reaches localStorage is that container.
+    persistDevice(wasm, {
+      deviceId: res.deviceId,
+      seed: res.identity.ed25519Seed,
+      baseUrl,
+      hybrid: res.identity.hybrid,
+      vaultKeys,
+      pins,
+    });
+    window.localStorage.setItem(STORAGE_KEY, wasm.bytesToBase64(openedContainer));
+    sealRef.current = openedKey;
+    setActiveVaultId(openedId);
+    setVault(opened);
+    setPhase("unlocked");
+    return {
+      vaultId: openedId,
+      accounts: opened.entries.length,
+      accountId: res.accountId,
+      notes,
+    };
+  }
+
   // ── sharing operations (all secrets stay sealed at rest) ───────────────────
 
   // Merge a change into the device identity and RE-SEAL it under the vault
@@ -306,9 +422,19 @@ export default function Authenticator() {
       </Card>
     );
   } else if (phase === "setup") {
-    content = <SetupPanel onCreate={createVault} />;
+    content = (
+      <div className="space-y-6">
+        <SetupPanel onCreate={createVault} />
+        {wasm && <RestorePanel wasm={wasm} onRestore={restoreFromRecoveryKit} />}
+      </div>
+    );
   } else if (phase === "locked") {
-    content = <UnlockPanel onUnlock={unlock} onForget={forget} />;
+    content = (
+      <div className="space-y-6">
+        <UnlockPanel onUnlock={unlock} onForget={forget} />
+        {wasm && <RestorePanel wasm={wasm} onRestore={restoreFromRecoveryKit} />}
+      </div>
+    );
   } else if (!wasm || !vault) {
     content = null;
   } else {
@@ -557,6 +683,244 @@ function UnlockPanel({
   );
 }
 
+// ── Restore from a printed recovery kit (setup + locked screens) ─────────────
+//
+// ⭐ THE POINT OF THIS PANEL is where it lives: on the screens a FRESH INSTALL
+// shows. A customer who lost every device has no vault, no identity and no
+// keyring — only a sheet of paper. Putting recovery behind an unlocked vault
+// would make it reachable only by people who do not need it.
+//
+// ⚠️ The 56-character code is a CREDENTIAL, not a password: whoever holds it has
+// full control of the account. It is typed here, decoded OFFLINE (so a typo never
+// reaches a server), used once, and cleared from this form the moment it works.
+// It is never persisted, never logged and never put in a URL.
+
+/** Classify a recovery failure into the four things a user can actually act on. */
+function explainRecoveryFailure(wasm: Wasm, e: unknown): { headline: string; detail: string } {
+  const text = msg(e);
+  const status = (e as { status?: number } | null)?.status;
+  if (typeof status === "number" && status >= 400) {
+    return {
+      headline: `The server refused this kit (HTTP ${status}).`,
+      detail: wasm.explainRecoveryStatus(status),
+    };
+  }
+  if (/unsupported recovery kit version/i.test(text)) {
+    return {
+      headline: "This kit was printed by a newer version of Sigil.",
+      detail:
+        "The code is intact — its checksum is correct — but this build does not understand its " +
+        "format version. Update this client; do not retype the code.",
+    };
+  }
+  if (/not a valid recovery code/i.test(text)) {
+    return {
+      headline: "That is not a valid recovery code — check for a mistyped character.",
+      detail:
+        "Nothing was sent anywhere: the code is checked on this device before any request. " +
+        "Hyphens, spaces and letter case do not matter. The letters I, L and O are never used " +
+        "(read them as 1, 1 and 0) and the letter U is never used at all.",
+    };
+  }
+  if (/nothing to recover/i.test(text)) {
+    return {
+      headline: "Valid kit, but it covers nothing on this server.",
+      detail:
+        "The code and device id are correct and the server knows this kit — it just holds no " +
+        "vault key for it. The kit was enrolled but never covered a vault, or a later rotation " +
+        "dropped it. There is nothing this client can do to recover data it was never given a " +
+        "key for.",
+    };
+  }
+  if (/recovers KEYS, not\s+DATA/i.test(text)) {
+    return { headline: "Keys recovered, but there is no vault content to open.", detail: text };
+  }
+  return { headline: "Restore failed.", detail: text };
+}
+
+function RestorePanel({
+  wasm,
+  onRestore,
+}: {
+  wasm: Wasm;
+  onRestore: (args: {
+    baseUrl: string;
+    code: string;
+    deviceId: string;
+    password: string;
+  }) => Promise<{ vaultId: string; accounts: number; accountId: string; notes: string[] }>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState("http://127.0.0.1:8080");
+  const [deviceId, setDeviceId] = useState("");
+  const [code, setCode] = useState("");
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [failure, setFailure] = useState<{ headline: string; detail: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  function submit(ev: React.FormEvent) {
+    ev.preventDefault();
+    setFailure(null);
+    if (pw.length < 1) {
+      setFailure({ headline: "Choose a password for this browser.", detail: "" });
+      return;
+    }
+    if (pw !== pw2) {
+      setFailure({ headline: "Those passwords do not match.", detail: "" });
+      return;
+    }
+    setBusy(true);
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await onRestore({ baseUrl: url, code, deviceId, password: pw });
+          // ⭐ USED — so it leaves the DOM immediately. (This component also
+          // unmounts on success, but clearing does not depend on that.)
+          setCode("");
+          setPw("");
+          setPw2("");
+        } catch (e) {
+          setFailure(explainRecoveryFailure(wasm, e));
+        } finally {
+          setBusy(false);
+        }
+      })();
+    }, 0);
+  }
+
+  if (!open) {
+    return (
+      <Card>
+        <h2 className="mb-1 text-lg font-semibold">Lost every device?</h2>
+        <p className="mb-3 text-sm text-neutral-600 dark:text-neutral-400">
+          If you printed a <strong>recovery kit</strong> before losing access, you can
+          rebuild your vault here — on this fresh install, with nothing stored yet. A
+          kit cannot be created after the fact.
+        </p>
+        <button
+          data-testid="restore-open"
+          className={btnGhost}
+          type="button"
+          onClick={() => setOpen(true)}
+        >
+          Restore from a recovery kit
+        </button>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <h2 className="mb-1 text-lg font-semibold">Restore from a recovery kit</h2>
+      <div
+        role="note"
+        className="mb-3 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+      >
+        <strong>The code on your sheet is a credential.</strong> It is checked on this
+        device before anything is sent, is used once, and is then cleared from this
+        screen. It is never stored in this browser and never appears in a web address.
+        Once this succeeds, <strong>this browser becomes a second copy of that paper</strong> —
+        keep the sheet itself somewhere else.
+      </div>
+      <form onSubmit={submit} className="space-y-3">
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">Server URL (printed on the sheet)</span>
+          <input
+            data-testid="restore-url"
+            className={`${inputCls} font-mono`}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">Kit device id (printed on the sheet)</span>
+          <input
+            data-testid="restore-device-id"
+            className={`${inputCls} font-mono`}
+            value={deviceId}
+            onChange={(e) => setDeviceId(e.target.value)}
+            placeholder="dev_…"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">Recovery code (56 characters)</span>
+          <textarea
+            data-testid="restore-code"
+            className={`${inputCls} h-20 font-mono tracking-widest`}
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX"
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <span className="mt-1 block text-xs text-neutral-600 dark:text-neutral-400">
+            Hyphens, spaces and upper/lower case are all ignored. The letters I, L and O
+            are never used — read them as 1, 1 and 0.
+          </span>
+        </label>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label className="block text-sm">
+            <span className="mb-1 block font-medium">New password for this browser</span>
+            <input
+              data-testid="restore-password"
+              className={inputCls}
+              type="password"
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+              autoComplete="new-password"
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="mb-1 block font-medium">Confirm password</span>
+            <input
+              data-testid="restore-confirm"
+              className={inputCls}
+              type="password"
+              value={pw2}
+              onChange={(e) => setPw2(e.target.value)}
+              autoComplete="new-password"
+            />
+          </label>
+        </div>
+        {failure && (
+          <div
+            data-testid="restore-error"
+            role="alert"
+            className="rounded border border-red-500 bg-red-50 p-3 text-sm text-red-800 dark:border-red-700 dark:bg-red-950 dark:text-red-200"
+          >
+            <p className="font-semibold">{failure.headline}</p>
+            {failure.detail && <p className="mt-1">{failure.detail}</p>}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-3">
+          <button data-testid="restore-submit" className={btnCls} type="submit" disabled={busy}>
+            {busy ? "Restoring…" : "Restore my vault"}
+          </button>
+          <button
+            data-testid="restore-cancel"
+            className={btnGhost}
+            type="button"
+            onClick={() => {
+              setCode("");
+              setPw("");
+              setPw2("");
+              setFailure(null);
+              setOpen(false);
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
 // ── Unlocked vault view ──────────────────────────────────────────────────────
 
 interface AddInput {
@@ -662,6 +1026,13 @@ function VaultView({
         onUpdateDevice={onUpdateDevice}
         onRekey={onRekey}
         onAdoptSharedVault={onAdoptSharedVault}
+      />
+      <RecoveryPanel
+        wasm={wasm}
+        device={device}
+        url={serverUrl}
+        vaultId={vaultId}
+        onUpdateDevice={onUpdateDevice}
       />
     </div>
   );
@@ -1263,6 +1634,9 @@ function SyncPanel({
   const [label, setLabel] = useState("this browser");
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  // ⭐ A 402 is a BILLING state, not an auth failure and not a bug. It gets its
+  // own non-error region so it can never be rendered as "unauthorized".
+  const [payment, setPayment] = useState<{ headline: string; detail: string } | null>(null);
 
   // Map any failure to a message; a device-auth failure carries the status, so
   // 401 (not authenticated) and 403 (not authorized for this vault) are called
@@ -1273,6 +1647,16 @@ function SyncPanel({
       return wasm.explainAuthStatus(status);
     }
     return msg(e);
+  }
+
+  // Returns true when the failure was PAYMENT — in which case it has already been
+  // rendered in its own region and must NOT also appear as an error.
+  function handledAsPayment(e: unknown, what: string): boolean {
+    const pay = wasm.paymentRequiredFrom(e, what);
+    if (!pay) return false;
+    setPayment(wasm.describePaymentRequired(pay));
+    setStatus(`${what} was refused pending payment. Nothing else changed.`);
+    return true;
   }
 
   async function enroll() {
@@ -1305,18 +1689,36 @@ function SyncPanel({
   async function push() {
     setBusy(true);
     setStatus("Pushing…");
+    setPayment(null);
     try {
       const stored = window.localStorage.getItem(STORAGE_KEY);
       if (!stored) throw new Error("no sealed vault to push");
       const container = wasm.base64ToBytes(stored);
+      // ⭐ THE GRACE CHANNEL. sigild sets X-Sigil-Entitlement* on a write it is
+      // still SERVING inside the grace period — a 2xx — so the warning exists
+      // ONLY in the response headers and never in a body or an error. Reading it
+      // here is what turns a lapse into a warning the user can act on instead of
+      // a refusal that arrives with no notice. (Cross-origin this needs the
+      // server's Access-Control-Expose-Headers, which sigild's CORS sets.)
+      let warn: { state: string; status: string; graceEndsAt: string } | null = null;
       const { seq } = device
-        ? await wasm.pushContainerAuthed(wasm, device, url.trim(), vaultId.trim(), container)
+        ? await wasm.pushContainerAuthed(wasm, device, url.trim(), vaultId.trim(), container, {
+            onResponse: (res) => {
+              warn = wasm.readEntitlementHeaders(res);
+            },
+          })
         : await wasm.pushContainer(url.trim(), vaultId.trim(), container);
+      const w = warn as { state: string; status: string; graceEndsAt: string } | null;
       setStatus(
-        `Pushed sealed container as op #${seq}${device ? " (signed as this device)" : ""}.`,
+        `Pushed sealed container as op #${seq}${device ? " (signed as this device)" : ""}.` +
+          (w
+            ? ` ⚠️ Subscription ${w.status || "lapsed"} — uploading new changes stops${
+                w.graceEndsAt ? ` on ${wasm.formatInstant(w.graceEndsAt)}` : " soon"
+              }. ${wasm.NEVER_REFUSED}`
+            : ""),
       );
     } catch (e) {
-      setStatus(`Push failed: ${authMsg(e)}`);
+      if (!handledAsPayment(e, "Push")) setStatus(`Push failed: ${authMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -1400,6 +1802,7 @@ function SyncPanel({
               Forget device
             </button>
             <AccountBlock wasm={wasm} device={device} url={url} vaultId={vaultId} />
+            <EntitlementBlock wasm={wasm} device={device} url={url} />
           </>
         ) : (
           <>
@@ -1452,6 +1855,21 @@ function SyncPanel({
           Pull
         </button>
       </div>
+      {/* ⭐ A REFUSED WRITE, rendered as the billing state it is. It deliberately
+          does NOT use role="alert" or error styling: the server authenticated and
+          authorized this device and then asked for money. Saying "unauthorized"
+          here would send the user to debug a key that is working perfectly. */}
+      {payment && (
+        <div
+          data-testid="entitlement-402"
+          role="status"
+          className="mt-3 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          <p className="font-semibold">{payment.headline}</p>
+          <p className="mt-1">{payment.detail}</p>
+        </div>
+      )}
+
       {status && (
         <p data-testid="sync-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
           {status}
@@ -1534,6 +1952,13 @@ function SharingPanel({
   // (nothing shared yet) are spelled out rather than shown as a generic error —
   // they mean completely different things to the user.
   function shareMsg(e: unknown): string {
+    // A 402 is BILLING, not authorization: sharing to a device of ANOTHER account
+    // is one of the two things a lapsed account loses. Never call it "forbidden".
+    const pay = wasm.paymentRequiredFrom(e, "That share");
+    if (pay) {
+      const d = wasm.describePaymentRequired(pay);
+      return `${d.headline} ${d.detail}`;
+    }
     const status = (e as { status?: number } | null)?.status;
     if (typeof status === "number" && status >= 400) return wasm.explainSharingStatus(status);
     return msg(e);
@@ -2070,5 +2495,614 @@ function SharingPanel({
         </p>
       )}
     </Card>
+  );
+}
+
+// ── Recovery kit (dev) — generate / cover / check / revoke ───────────────────
+//
+// RESTORE is deliberately NOT here: it lives on the setup and locked screens
+// (RestorePanel above), because a fresh install is where it is needed.
+//
+// ⚠️⚠️ THE KIT IS A CREDENTIAL, and stronger than a stolen locked phone: there is
+// no OS lock, no biometric and no vault password in front of it. Whoever holds
+// the 56 characters can read every vault it covers and revoke every device. It is
+// rendered ONCE, into React state only — never localStorage, never a URL, never a
+// log line — and cleared from the DOM the moment the user confirms they have it.
+
+/** The four things a printed sheet must say, in the words the CLI prints. */
+const KIT_WARNINGS = [
+  "WHOEVER HOLDS THIS CODE HAS FULL CONTROL OF THE ACCOUNT. They can read every vault it covers and revoke every device. There is no OS lock, no biometric and no vault password in front of it — the 56 characters are the whole credential.",
+  "STORE IT AWAY FROM YOUR DEVICES: a safe, a sealed envelope, a bank box. Not in a password manager you unlock with one of these devices, and not in the drawer under the laptop.",
+  "NEVER PHOTOGRAPH IT and never type it into anything but a Sigil client. It is shown once, here, for you to write down — this browser does not store it and cannot show it again.",
+  "IT RECOVERS KEYS, NOT DATA, and only for the vaults listed below AS OF TODAY. A vault created later needs covering; a vault never pushed to the server cannot come back. A kit cannot be created after you have lost access.",
+];
+
+interface GeneratedKit {
+  code: string;
+  formatted: string;
+  deviceId: string;
+  accountId: string;
+  baseUrl: string;
+  safetyNumber: string;
+  covered: { vaultId: string; fingerprint: string }[];
+  verification: { accountId: string; indexedVaults: number; unwrappedVault: string; fingerprint: string };
+}
+
+function RecoveryPanel({
+  wasm,
+  device,
+  url,
+  vaultId,
+  onUpdateDevice,
+}: {
+  wasm: Wasm;
+  device: DeviceIdentity | null;
+  url: string;
+  vaultId: string;
+  onUpdateDevice: (patch: Partial<DeviceIdentity>) => DeviceIdentity;
+}) {
+  const [kit, setKit] = useState<GeneratedKit | null>(null);
+  const [written, setWritten] = useState(false);
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [coverKitId, setCoverKitId] = useState("");
+  const [coverSafety, setCoverSafety] = useState("");
+  const [revokeKitId, setRevokeKitId] = useState("");
+  // ⛔ Set when the wrap gate refused a first-sight recovery kit. It BLOCKS the
+  // cover and tells the user to compare the printed digits — the one case where
+  // the out-of-band channel is guaranteed to exist, because it is on the sheet.
+  const [unverified, setUnverified] = useState<{ deviceId: string; presented: string } | null>(null);
+  const [coverage, setCoverage] = useState<
+    { kits: { deviceId: string; label: string; status: string }[]; vaults: { vaultId: string; kits: string[]; note: string }[] } | null
+  >(null);
+
+  if (!device) {
+    return (
+      <Card>
+        <h3 className="mb-1 text-base font-semibold">Recovery kit (dev)</h3>
+        <p data-testid="recovery-status" className="text-sm text-neutral-600 dark:text-neutral-400">
+          Enroll this browser as a device first (Sync → Device identity). A recovery kit is an
+          ordinary member device of your account whose keys come from paper, so there has to be an
+          account to add it to.
+        </p>
+      </Card>
+    );
+  }
+
+  const auth = { ...device, baseUrl: url.trim() };
+  const id = vaultId.trim();
+  const vaultKeys = Object.entries(device.vaultKeys ?? {}).map(([v, k]) => ({
+    vaultId: v,
+    vaultKey: k,
+  }));
+  const thisVaultKey = device.vaultKeys?.[id];
+
+  async function run(what: string, fn: () => Promise<void>) {
+    setBusy(true);
+    setStatus(`${what}…`);
+    try {
+      await fn();
+    } catch (e) {
+      if (e instanceof wasm.UnverifiedRecoveryKitError) {
+        setUnverified({ deviceId: e.deviceId, presented: e.presentedSafetyNumber });
+        setStatus(
+          `${what} was REFUSED: that device is a recovery kit this browser has never seen, and ` +
+            "the only thing vouching for its key is the server. Nothing was wrapped and nothing " +
+            "was uploaded.",
+        );
+      } else if (e instanceof wasm.SafetyNumberMismatchError) {
+        setStatus(
+          `${what} was REFUSED: the safety number you typed does not match the key this server is ` +
+            `serving for ${e.deviceId}. You typed ${e.expectedSafetyNumber}; the server presented ` +
+            `${e.presentedSafetyNumber}. Either it was mistyped, or the server substituted a key ` +
+            "it can decrypt with. Nothing was wrapped, nothing uploaded, no key pinned.",
+        );
+      } else if (e instanceof wasm.KeyPinMismatchError) {
+        setStatus(
+          `${what} was REFUSED: the hybrid key for ${e.deviceId} has CHANGED since this browser ` +
+            `pinned it (pinned ${e.pinnedSafetyNumber}, presented ${e.presentedSafetyNumber}). ` +
+            "Nothing was wrapped or uploaded.",
+        );
+      } else {
+        const f = explainRecoveryFailure(wasm, e);
+        setStatus(`${what} failed: ${f.headline} ${f.detail}`);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // GENERATE. Mints an invite pinned to the kit's own public key, enrolls the kit
+  // under the visible `recovery-kit` label, publishes its hybrid key, PINS the
+  // key it DERIVED (so nothing was fetched and nothing could be substituted),
+  // covers every vault key this browser holds, and then VERIFIES the whole thing
+  // end to end before returning — revoking the partial kit if any step fails.
+  function generate() {
+    void run("Generating a recovery kit", async () => {
+      const pins = device!.pins ?? wasm.newPinStore();
+      const res = await wasm.generateRecoveryKit(wasm, auth, { vaultKeys, pins });
+      onUpdateDevice({ pins: res.pins }); // the DERIVED pin, re-sealed
+      setWritten(false);
+      setKit(res);
+      setStatus(
+        `Kit ${res.deviceId} created in account ${res.accountId} and verified end to end ` +
+          `(it re-derived its own identity from the printed code, authenticated, and unwrapped ` +
+          `${res.verification.unwrappedVault || "no vault"}). Covers ${res.covered.length} vault(s).`,
+      );
+    });
+  }
+
+  // COVER one more vault, so the kit can actually open it. A kit that covers
+  // nothing recovers nothing — the likeliest real-world failure.
+  function cover() {
+    void run("Covering this vault", async () => {
+      if (!id) throw new Error("set a vault id first (Sync → Vault id)");
+      if (!thisVaultKey) {
+        throw new Error(
+          `vault "${id}" is still a PERSONAL vault sealed with your password. A recovery kit can ` +
+            "only be given a vault KEY, so convert it to a shared vault first (Sharing → Convert).",
+        );
+      }
+      const to = coverKitId.trim();
+      if (!to) throw new Error("paste the kit's device id (it is printed on the sheet)");
+      setUnverified(null);
+      const res = await wasm.coverVault(wasm, auth, {
+        kitDeviceId: to,
+        vaultId: id,
+        vaultKey: thisVaultKey,
+        pins: device!.pins ?? wasm.newPinStore(),
+        expectedSafetyNumber: coverSafety.trim() === "" ? null : coverSafety.trim(),
+      });
+      onUpdateDevice({ pins: res.pins });
+      setStatus(
+        `Vault "${id}" is now covered by kit ${to} — a ${res.envelopeBytes}-byte envelope the ` +
+          `server relays but cannot read (key sha256 ${res.fingerprint}). ` +
+          (res.derived
+            ? "The kit's key was derived locally by this browser, so nothing was fetched and " +
+              "nothing could have been substituted."
+            : "The kit's key came from the server and matched the safety number you supplied."),
+      );
+    });
+  }
+
+  // CHECK: is recovery set up, and which vaults does a kit actually cover?
+  function check() {
+    void run("Checking recovery", async () => {
+      const account = await wasm.getAccount(wasm, device!, url.trim());
+      const kits = (account.devices ?? [])
+        .filter((d) => d.label === wasm.RECOVERY_DEVICE_LABEL)
+        .map((d) => ({
+          deviceId: d.device_id,
+          label: d.label ?? "",
+          status: d.status ?? "active",
+        }));
+      const vaults: { vaultId: string; kits: string[]; note: string }[] = [];
+      for (const { vaultId: v } of vaultKeys) {
+        try {
+          const holders = await wasm.listKeyEnvelopes(wasm, auth, v);
+          vaults.push({
+            vaultId: v,
+            kits: holders.map((h) => h.deviceId).filter((d) => kits.some((k) => k.deviceId === d)),
+            note: "",
+          });
+        } catch (e) {
+          vaults.push({ vaultId: v, kits: [], note: msg(e) });
+        }
+      }
+      setCoverage({ kits, vaults });
+      const covered = vaults.filter((v) => v.kits.length > 0).length;
+      setStatus(
+        kits.length === 0
+          ? "Recovery is NOT set up: this account has no recovery kit. If every device is lost, " +
+              "the account and its vaults are unreachable — by you and by us. A kit cannot be " +
+              "created after the fact."
+          : `${kits.length} recovery kit(s) enrolled; ${covered} of ${vaults.length} vault(s) this ` +
+              "browser holds a key for are covered. A vault that is not covered cannot be " +
+              "recovered by that sheet.",
+      );
+    });
+  }
+
+  // REVOKE. Envelopes are taken back FIRST, while this device's own access is
+  // certainly intact; the kit is then refused at the door.
+  function revoke() {
+    void run("Revoking the kit", async () => {
+      const to = revokeKitId.trim();
+      if (!to) throw new Error("paste the kit's device id");
+      const res = await wasm.revokeRecoveryKit(wasm, auth, {
+        kitDeviceId: to,
+        vaultIds: vaultKeys.map((v) => v.vaultId),
+      });
+      setStatus(
+        `Revoked kit ${to}; removed its envelope for ${
+          res.removed.length ? res.removed.join(", ") : "no vault"
+        }. ${res.rotateReminder}`,
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <h3 className="mb-1 text-base font-semibold">Recovery kit (dev)</h3>
+      <p className="mb-3 text-xs text-neutral-600 dark:text-neutral-400">
+        A recovery kit is an <strong>ordinary member device of your account whose keys come from
+        paper</strong>. The server gains no concept of &ldquo;recovery&rdquo; — it sees one more
+        device, one more published public key, and one more opaque envelope per covered vault. It
+        is the only thing that gets your vaults back if every device is lost, and{" "}
+        <strong>it cannot be created after that happens</strong>.
+      </p>
+
+      {/* ── the printed sheet: shown ONCE ─────────────────────────────────── */}
+      {kit && (
+        <div
+          data-testid="recovery-sheet"
+          data-print-region=""
+          className="mb-4 rounded border-2 border-neutral-900 p-4 dark:border-neutral-100"
+        >
+          <h4 className="text-sm font-semibold">Your recovery kit — write this down now</h4>
+          <p
+            data-testid="recovery-code"
+            className="my-3 break-all font-mono text-base leading-7 tracking-widest sm:text-lg"
+          >
+            {kit.formatted}
+          </p>
+          <dl className="grid grid-cols-1 gap-1 text-xs sm:grid-cols-2">
+            <div>
+              <dt className="inline font-medium">Kit device id: </dt>
+              <dd data-testid="recovery-kit-id" className="inline break-all font-mono">
+                {kit.deviceId}
+              </dd>
+            </div>
+            <div>
+              <dt className="inline font-medium">Account: </dt>
+              <dd className="inline break-all font-mono">{kit.accountId}</dd>
+            </div>
+            <div className="sm:col-span-2">
+              <dt className="inline font-medium">Server: </dt>
+              <dd className="inline break-all font-mono">{kit.baseUrl}</dd>
+            </div>
+            <div className="sm:col-span-2">
+              <dt className="inline font-medium">Safety number: </dt>
+              <dd data-testid="recovery-safety-number" className="inline font-mono tracking-wider">
+                {kit.safetyNumber}
+              </dd>
+            </div>
+          </dl>
+          <p className="mt-2 text-xs">
+            <span className="font-medium">Vaults covered as of today: </span>
+            <span data-testid="recovery-covered" className="font-mono">
+              {kit.covered.length ? kit.covered.map((c) => c.vaultId).join(", ") : "NONE"}
+            </span>
+          </p>
+          {kit.covered.length === 0 && (
+            <p
+              data-testid="recovery-covers-nothing"
+              role="alert"
+              className="mt-2 rounded border border-red-500 bg-red-50 p-2 text-xs text-red-800 dark:border-red-700 dark:bg-red-950 dark:text-red-200"
+            >
+              <strong>This kit covers NOTHING, so it would recover nothing.</strong> It can
+              authenticate to the account, but it holds no vault key. Convert a vault to a shared
+              vault (Sharing → Convert) and then use <em>Cover this vault</em> below, or this sheet
+              is worthless.
+            </p>
+          )}
+          <ul className="mt-3 space-y-2 text-xs">
+            {KIT_WARNINGS.map((w) => (
+              <li key={w.slice(0, 24)} className="rounded bg-neutral-100 p-2 dark:bg-neutral-900">
+                {w}
+              </li>
+            ))}
+          </ul>
+          <div className="mt-3 flex flex-wrap gap-3 print:hidden">
+            <button
+              data-testid="recovery-print"
+              className={btnGhost}
+              type="button"
+              onClick={() => window.print()}
+            >
+              Print this sheet
+            </button>
+            <button
+              data-testid="recovery-copy"
+              className={btnGhost}
+              type="button"
+              onClick={() => {
+                void navigator.clipboard?.writeText(kit.formatted);
+                setStatus(
+                  "Copied to the clipboard — which other applications can read. Paste it into " +
+                    "whatever will hold it, then clear your clipboard.",
+                );
+              }}
+            >
+              Copy code
+            </button>
+          </div>
+          <label className="mt-3 flex items-start gap-2 text-xs print:hidden">
+            <input
+              data-testid="recovery-written"
+              type="checkbox"
+              checked={written}
+              onChange={(e) => setWritten(e.target.checked)}
+            />
+            <span>
+              I have written the code down and stored it away from my devices. I understand it
+              cannot be shown again.
+            </span>
+          </label>
+          <button
+            data-testid="recovery-hide"
+            className={`${btnCls} mt-3 print:hidden`}
+            type="button"
+            disabled={!written}
+            onClick={() => {
+              // ⭐ USED — clear it from the DOM. Nothing about it was persisted.
+              setKit(null);
+              setWritten(false);
+              setStatus(
+                "The recovery code has been cleared from this screen and was never stored. If you " +
+                  "did not write it down, generate a new kit and revoke the old one.",
+              );
+            }}
+          >
+            I have written it down — hide the code
+          </button>
+        </div>
+      )}
+
+      {!kit && (
+        <div className="flex flex-wrap gap-3">
+          <button
+            data-testid="recovery-generate"
+            className={btnGhost}
+            type="button"
+            onClick={generate}
+            disabled={busy}
+          >
+            Generate a recovery kit
+          </button>
+          <button
+            data-testid="recovery-check"
+            className={btnGhost}
+            type="button"
+            onClick={check}
+            disabled={busy}
+          >
+            Check recovery
+          </button>
+        </div>
+      )}
+
+      {vaultKeys.length === 0 && !kit && (
+        <p
+          data-testid="recovery-no-vault-keys"
+          role="note"
+          className="mt-3 rounded border border-amber-500 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          This browser holds no vault keys yet, so a kit generated now would cover{" "}
+          <strong>nothing</strong> — and a kit that covers nothing recovers nothing. Convert this
+          vault to a shared vault first (Sharing → Convert to a shared vault).
+        </p>
+      )}
+
+      {coverage && (
+        <div data-testid="recovery-coverage" className="mt-3 rounded border border-neutral-200 p-3 text-xs dark:border-neutral-800">
+          <p className="font-medium">
+            {coverage.kits.length === 0
+              ? "Recovery: NOT SET UP (no recovery kit in this account)"
+              : `Recovery: ${coverage.kits.length} kit(s) enrolled`}
+          </p>
+          <ul className="mt-1 space-y-1">
+            {coverage.kits.map((k) => (
+              <li key={k.deviceId} className="break-all font-mono">
+                {k.deviceId} — {k.status}
+              </li>
+            ))}
+          </ul>
+          <ul className="mt-2 space-y-1">
+            {coverage.vaults.map((v) => (
+              <li key={v.vaultId}>
+                <span className="font-mono">{v.vaultId}</span>:{" "}
+                {v.note
+                  ? `could not be checked (${v.note})`
+                  : v.kits.length
+                    ? `covered by ${v.kits.join(", ")}`
+                    : "NOT covered by any kit"}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* ⛔ The first-sight refusal, spelled out. The safety number is on the
+          sheet, which is what makes this requirement usable rather than merely
+          strict — the out-of-band channel is in the user's hand. */}
+      {unverified && (
+        <div
+          data-testid="recovery-unverified"
+          role="alert"
+          className="mt-3 rounded border border-red-500 bg-red-50 p-3 text-sm dark:border-red-700 dark:bg-red-950"
+        >
+          <p className="font-semibold">
+            REFUSED — {unverified.deviceId} is a recovery kit this browser has never seen.
+          </p>
+          <p className="mt-1">
+            Nothing was wrapped and nothing was uploaded. The only thing vouching for that kit&rsquo;s
+            key is the server, and a hostile server that substituted its own key would be handed
+            this vault&rsquo;s key. <strong>The safety number is printed on the recovery sheet.</strong>{" "}
+            Compare it with the digits below, out of band, then type it into the field and try again.
+          </p>
+          <p className="mt-2 font-mono text-xs">from server: {unverified.presented}</p>
+        </div>
+      )}
+
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">Kit device id</span>
+          <input
+            data-testid="recovery-cover-kit"
+            className={`${inputCls} font-mono`}
+            value={coverKitId}
+            onChange={(e) => setCoverKitId(e.target.value)}
+            placeholder="dev_… (printed on the sheet)"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">
+            Its safety number (required on a browser that did not print it)
+          </span>
+          <input
+            data-testid="recovery-cover-safety"
+            className={`${inputCls} font-mono`}
+            value={coverSafety}
+            onChange={(e) => setCoverSafety(e.target.value)}
+            placeholder="83791 28129 67801 50284 55242 77845"
+            spellCheck={false}
+            autoComplete="off"
+            inputMode="numeric"
+          />
+        </label>
+      </div>
+      <button
+        data-testid="recovery-cover"
+        className={`${btnGhost} mt-3`}
+        type="button"
+        onClick={cover}
+        disabled={busy}
+      >
+        Cover vault &ldquo;{id || "?"}&rdquo; with that kit
+      </button>
+
+      <div className="mt-4 border-t border-neutral-200 pt-4 dark:border-neutral-800">
+        <label className="block text-sm">
+          <span className="mb-1 block font-medium">Retire a kit (device id)</span>
+          <input
+            data-testid="recovery-revoke-kit"
+            className={`${inputCls} font-mono`}
+            value={revokeKitId}
+            onChange={(e) => setRevokeKitId(e.target.value)}
+            placeholder="dev_…"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <button
+          data-testid="recovery-revoke"
+          className={`${btnGhost} mt-3`}
+          type="button"
+          onClick={revoke}
+          disabled={busy}
+        >
+          Revoke this kit and take back its envelopes
+        </button>
+        <p className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+          Revocation stops the sheet talking to the server. It <strong>cannot un-learn</strong> a
+          vault key the kit already unwrapped — rotate each vault (Sharing → Rotate, dropping the
+          kit) so future content is unreadable to it.
+        </p>
+      </div>
+
+      {status && (
+        <p data-testid="recovery-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
+          {status}
+        </p>
+      )}
+    </Card>
+  );
+}
+
+// ── Entitlement (dev) — read what sigild says about payment, and say it back ──
+//
+// ⭐ THE MESSAGE MUST BE TRUE. sigild refuses WRITES only, and only past grace,
+// and never a key deposit to a device of the caller's OWN account (ADR 0043). So
+// this never says a user has lost access to their codes — they have not: codes
+// are generated here, in the wasm, offline, from a vault this browser already
+// holds.
+//
+// A server with enforcement OFF sends no headers and omits the `entitlement`
+// block entirely; that renders as NOTHING rather than as a reassuring message
+// nobody asked for.
+
+function EntitlementBlock({
+  wasm,
+  device,
+  url,
+}: {
+  wasm: Wasm;
+  device: DeviceIdentity;
+  url: string;
+}) {
+  const [note, setNote] = useState<{ tone: string; headline: string; detail: string } | null>(null);
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setBusy(true);
+    try {
+      const sub = await wasm.getSubscription(wasm, { ...device, baseUrl: url.trim() }, url.trim());
+      const state = wasm.entitlementState(sub);
+      const described = wasm.describeEntitlement(state);
+      setNote(described.tone === "none" ? null : described);
+      setStatus(
+        state.level === "off"
+          ? "This server does not enforce payment, so nothing here is gated."
+          : "",
+      );
+    } catch (e) {
+      setNote(null);
+      const code = (e as { status?: number } | null)?.status;
+      setStatus(
+        typeof code === "number"
+          ? `Subscription unavailable: ${wasm.explainSubscriptionStatus(code)}`
+          : `Subscription unavailable: ${msg(e)}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  }, [wasm, device, url]);
+
+  // Read it once on mount: a client that only ever READS is never refused and
+  // never sees a warning header, so this route is its only warning channel.
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  return (
+    <div className="mt-3 border-t border-neutral-200 pt-3 dark:border-neutral-800">
+      <div className="flex items-center gap-2">
+        <h5 className="text-xs font-semibold">Subscription</h5>
+        <button
+          data-testid="entitlement-refresh"
+          className={btnGhost}
+          type="button"
+          onClick={() => void refresh()}
+          disabled={busy}
+        >
+          Check
+        </button>
+      </div>
+      {note && (
+        <div
+          data-testid={note.tone === "billing" ? "entitlement-refused" : "entitlement-grace"}
+          // A billing state is NOT an error and NOT an alert: it is information
+          // the user should see and act on, not an emergency and not a fault.
+          role="status"
+          className={
+            note.tone === "warning" || note.tone === "billing"
+              ? "mt-2 rounded border border-amber-500 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+              : "mt-2 text-xs text-neutral-600 dark:text-neutral-400"
+          }
+        >
+          <p className="font-semibold">{note.headline}</p>
+          <p className="mt-1">{note.detail}</p>
+        </div>
+      )}
+      {status && (
+        <p data-testid="entitlement-status" className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+          {status}
+        </p>
+      )}
+    </div>
   );
 }

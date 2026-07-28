@@ -43,6 +43,9 @@ async function call(cmd, args = {}) {
   try {
     return await invoke(cmd, args);
   } catch (err) {
+    // A changed hybrid key gets the blocking alarm; a payment refusal gets the
+    // entitlement banner (which says what still works). Everything else toasts.
+    if (err && typeof err === "object" && err.entitlement) applyEntitlement(err.entitlement);
     if (!showKeyAlarm(err)) toast(errText(err), true);
     throw err;
   }
@@ -73,6 +76,9 @@ function applyStatus(status) {
     stopTicking();
     $("export-out").hidden = true;
     $("export-out").textContent = "";
+    // Locking wipes anything secret that was on screen — including a recovery
+    // code that was still waiting to be written down.
+    clearRecoveryCode();
   }
 }
 
@@ -237,6 +243,9 @@ function applySync(sync) {
     $("server-url").value = sync.server;
   }
   $("enroll-block").hidden = !sync.configured;
+  // Recovery needs a server but NOT an unlocked vault and NOT an enrolled
+  // device: `restore` runs on a new install, which is the whole point.
+  $("recovery-block").hidden = !sync.configured;
   // The account panel needs an ENROLLED identity: the server reads the account
   // off the signature, so an un-enrolled device has nothing to ask about.
   $("account-block").hidden = !sync.configured || !sync.enrolled;
@@ -433,6 +442,12 @@ $("push-btn").addEventListener("click", async () => {
   if (!id) return;
   const seq = await call("push", { vaultId: id });
   toast(`pushed the sealed container as seq ${seq} (the server cannot read it)`);
+  // A served write clears a stale refusal banner (and a refused one raises it,
+  // from `call`'s error path). ⭐ Then ASK: a write served INSIDE GRACE looks
+  // identical to a healthy one from here, so only the subscription read can
+  // surface the deadline.
+  await refreshEntitlement();
+  await pullEntitlementFromServer();
 });
 
 $("pull-btn").addEventListener("click", async () => {
@@ -655,6 +670,308 @@ $("unlock-shared-form").addEventListener("submit", async (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// ⭐ ENTITLEMENT (ADR 0043)
+//
+// The server may refuse WRITES from an account whose subscription lapsed past
+// its grace period. It never refuses reads, and it never refuses giving another
+// device of your own account a vault key -- including printing a recovery kit.
+// This panel exists so a refusal reads as "pay to continue", never as "your
+// codes are gone", and so the guarantees are stated every single time.
+// ---------------------------------------------------------------------------
+
+function applyEntitlement(e) {
+  const banner = $("entitlement-banner");
+  if (!e || !e.needs_attention) {
+    banner.hidden = true;
+    return;
+  }
+  const refused = e.writes === "refused";
+  banner.classList.toggle("notice", !refused);
+  $("entitlement-title").textContent = refused
+    ? "New writes are refused — this account's subscription has lapsed."
+    : "This account's subscription has lapsed. Writes still work, for now.";
+  $("entitlement-detail").textContent =
+    e.detail +
+    (e.grace_ends_at ? ` (${refused ? "writes stopped" : "writes stop"} ${e.grace_ends_at})` : "") +
+    (e.subscription_status ? ` Status: ${e.subscription_status}.` : "") +
+    (e.checkout_path ? ` Pay at ${e.checkout_path}.` : "");
+  banner.hidden = false;
+}
+
+$("entitlement-dismiss").addEventListener("click", () => {
+  // Dismiss hides the banner; it does NOT change anything on the server, and
+  // the next refused write brings it straight back.
+  $("entitlement-banner").hidden = true;
+});
+
+async function refreshEntitlement() {
+  // A purely cached, local read: it cannot fail because a server is down.
+  try {
+    applyEntitlement(await invoke("entitlement_status"));
+  } catch {
+    /* nothing observed yet */
+  }
+}
+
+// ⭐ ASK THE SERVER. This is the ONLY way this client can learn it is inside its
+// GRACE period -- lapsed, still served, with a deadline. A 402 can only ever say
+// "already too late", and the header sigild sets on a served-in-grace write is
+// dropped by the transport. Without this the "Writes still work, for now."
+// branch above was unreachable.
+//
+// Best-effort by design: it is called after a server is configured and after
+// each sync, and a failure (offline, billing off, not enrolled) leaves the
+// cached view alone rather than inventing a warning.
+async function pullEntitlementFromServer({ loud = false } = {}) {
+  try {
+    const e = await invoke("entitlement_refresh");
+    applyEntitlement(e);
+    if (loud) {
+      toast(
+        e.needs_attention
+          ? "Subscription checked — see the banner above."
+          : `Subscription checked: ${e.detail}`,
+      );
+    }
+  } catch (err) {
+    // Offline, billing switched off, or this device is not enrolled. Leave the
+    // cached view ALONE rather than inventing (or clearing) a warning.
+    if (loud) toast(errText(err), true);
+  }
+}
+
+$("check-subscription-btn").addEventListener("click", () => {
+  void pullEntitlementFromServer({ loud: true });
+});
+
+// ---------------------------------------------------------------------------
+// ⭐ THE RECOVERY KIT (ADR 0042)
+//
+// ⚠️ The 56-character code is THE WHOLE CREDENTIAL -- whoever holds it controls
+// the account. This file therefore: shows it exactly once, in one DOM node,
+// wipes that node on demand / on lock / on any other recovery action, never
+// stores it anywhere, never puts it in a URL, and clears the restore input in a
+// `finally` so a failed attempt does not leave it sitting in the window.
+// ---------------------------------------------------------------------------
+
+/** Wipe the printed code from the screen. The only copy is the paper. */
+function clearRecoveryCode() {
+  const sheet = $("recovery-sheet");
+  if (!sheet) return;
+  $("recovery-code").textContent = "";
+  $("recovery-sheet-facts").textContent = "";
+  sheet.hidden = true;
+}
+
+/** Fill the recovery facts table. Ids, counts and public digits only. */
+function putRecoveryFacts(pairs) {
+  const dl = $("recovery-facts");
+  dl.textContent = "";
+  for (const [key, value, dim] of pairs) {
+    const dt = document.createElement("dt");
+    dt.textContent = key;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (dim) dd.className = "off";
+    dl.append(dt, dd);
+  }
+}
+
+$("recovery-kits-btn").addEventListener("click", async () => {
+  clearRecoveryCode();
+  const kits = await call("recovery_kits");
+  if (kits.length === 0) {
+    putRecoveryFacts([
+      [
+        "recovery",
+        "NOT SET UP. If you lose every device in this account, its vaults are " +
+          "gone — unreadable by you and by us.",
+      ],
+    ]);
+    return;
+  }
+  putRecoveryFacts(
+    kits.map((k) => [
+      k.status === "active" ? "kit" : "revoked kit",
+      `${k.device_id} · printed ${k.created_at}`,
+      k.status !== "active",
+    ])
+  );
+});
+
+$("recovery-generate-btn").addEventListener("click", async () => {
+  clearRecoveryCode();
+  if (
+    !window.confirm(
+      "Print a recovery kit?\n\n" +
+        "You will be shown 56 characters ONCE. Write them on paper.\n\n" +
+        "⚠️ Whoever holds that paper has FULL CONTROL of this account: they can " +
+        "read every covered vault and revoke every device. There is no password " +
+        "and no lock in front of it.\n\n" +
+        "It covers the shared vaults this device holds keys for, as of now, and " +
+        "it recovers KEYS, not DATA — a vault that was never pushed cannot come back."
+    )
+  )
+    return;
+
+  const kit = await call("recovery_generate", { vaultIds: null });
+  // Shown ONCE, in the DOM only. Nothing writes it anywhere.
+  $("recovery-code").textContent = kit.code;
+  $("recovery-sheet-facts").textContent =
+    `kit device id: ${kit.device_id}   (you need this to restore)\n` +
+    `account:       ${kit.account_id}\n` +
+    `server:        ${kit.server}\n` +
+    `safety number: ${kit.safety_number}\n` +
+    `covers:        ${
+      kit.covered.length === 0
+        ? "(nothing yet — cover a vault below)"
+        : kit.covered.map((c) => `${c.vault_id} (key sha256 ${c.key_fingerprint})`).join("\n               ")
+    }\n` +
+    `verified:      unwrapped ${kit.verified_vault || "(nothing to unwrap)"} as ` +
+    `${kit.verified_account_id} before printing\n` +
+    `seats:         ${kit.seats_used} of ${kit.seat_limit} devices (the kit uses one)`;
+  $("recovery-sheet").hidden = false;
+  $("recovery-sheet").scrollIntoView({ block: "nearest" });
+  // Pre-fill the ids the next actions need. These are PUBLIC, not the code.
+  $("recovery-device").value = kit.device_id;
+  $("recovery-safety").value = kit.safety_number;
+  toast("recovery kit printed — shown once, stored nowhere. Write it down now.", true);
+  await refreshSync();
+});
+
+$("recovery-code-clear").addEventListener("click", () => {
+  clearRecoveryCode();
+  toast("cleared from the screen. The paper is now the only copy.");
+});
+
+$("recovery-cover-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearRecoveryCode();
+  const id = vaultId();
+  if (!id) return;
+  const safety = $("recovery-safety").value.trim();
+  const [fingerprint, derived] = await call("recovery_cover", {
+    deviceId: $("recovery-device").value,
+    vaultId: id,
+    // ⭐ Required on any device that did not print the kit. The native wrap gate
+    // refuses a first sight of a kit's key without it, before anything is
+    // wrapped or uploaded — so leaving it blank there is an error, not a risk.
+    safetyNumber: safety === "" ? null : safety,
+  });
+  toast(
+    `${id} is now covered by the kit (key sha256 ${fingerprint})` +
+      (derived
+        ? " — this device derived the kit's key itself, so nothing was fetched."
+        : " — the kit's key was fetched and checked against the safety number you gave.")
+  );
+});
+
+$("recovery-check-btn").addEventListener("click", async () => {
+  clearRecoveryCode();
+  const rows = await call("recovery_check", { deviceId: $("recovery-device").value });
+  if (rows.length === 0) {
+    putRecoveryFacts([["coverage", "this device holds no shared vaults to check"]]);
+    return;
+  }
+  putRecoveryFacts([
+    ["checked from", "THIS device only — a vault created elsewhere is invisible here"],
+    ...rows.map((r) => [
+      r.vault_id,
+      r.covered
+        ? r.synced
+          ? `covered ${r.covered_at} · pushed — recoverable`
+          : `covered ${r.covered_at} · ⚠️ NEVER PUSHED — the key would come back, the data would not`
+        : "NOT covered — the kit cannot open this vault",
+      !r.covered || !r.synced,
+    ]),
+  ]);
+});
+
+$("recovery-revoke-btn").addEventListener("click", async () => {
+  clearRecoveryCode();
+  const deviceId = $("recovery-device").value.trim();
+  if (!deviceId) return toast("enter the kit device id first", true);
+  if (
+    !window.confirm(
+      `Revoke recovery kit ${deviceId}?\n\n` +
+        "The printed sheet stops working and its wrapped keys are deleted.\n\n" +
+        "⚠️ This CANNOT un-learn a key the kit already unwrapped. If you think the " +
+        "paper was seen, rotate each vault afterwards — and that protects future " +
+        "content only.\n\n" +
+        "If this was your only kit, you are back to: lose every device, lose the vaults."
+    )
+  )
+    return;
+  const r = await call("recovery_revoke", { deviceId, vaultIds: null });
+  putRecoveryFacts([
+    ["revoked", r.device_id],
+    ["envelopes deleted", r.envelopes_removed.join(", ") || "none"],
+    ["already clear", r.already_clear.join(", ") || "none"],
+    ["still to do", "rotate each vault above — revocation cannot un-learn a key"],
+  ]);
+  toast(`kit ${r.device_id} revoked`, true);
+});
+
+$("recovery-verify-btn").addEventListener("click", async () => {
+  const code = $("recovery-code-in").value;
+  if (!code) return;
+  // OFFLINE: decode + checksum only. The code is not sent anywhere by this.
+  await call("recovery_verify", { code });
+  toast("that code is well-formed (checked offline — nothing was sent anywhere)");
+});
+
+$("recovery-restore-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearRecoveryCode();
+  const field = $("recovery-code-in");
+  const code = field.value;
+  const deviceId = $("recovery-restore-device").value.trim();
+  if (!code || !deviceId) return;
+  const adopt = $("recovery-adopt").checked;
+  if (
+    adopt &&
+    !window.confirm(
+      "Keep the kit's identity on this machine?\n\n" +
+        "⚠️ This machine becomes a SECOND COPY OF THE PAPER: anyone with access " +
+        "to it gains full control of the account, with no password in front of it.\n\n" +
+        "Leave it unticked to recover the vaults and nothing else."
+    )
+  )
+    return;
+
+  let r;
+  try {
+    r = await call("recovery_restore", { code, deviceId, adopt });
+  } finally {
+    // ⚠️ Whatever happened, the credential does not stay in the window.
+    field.value = "";
+  }
+  const out = $("recovery-restore-out");
+  out.textContent =
+    `restored as ${r.device_id} in account ${r.account_id}\n\n` +
+    r.vaults
+      .map(
+        (v) =>
+          `${v.vault_id}: ${v.entries} account(s) -> ${v.path}  (key sha256 ${v.key_fingerprint})`
+      )
+      .join("\n") +
+    (r.skipped.length
+      ? `\n\nnot recovered:\n${r.skipped.map(([v, why]) => `${v}: ${why}`).join("\n")}`
+      : "") +
+    (r.adopted
+      ? "\n\n⚠️ This machine now holds the kit's own keys — it is a second copy of the paper."
+      : "\n\nThe kit's identity was NOT kept on this machine.");
+  out.hidden = false;
+  toast(
+    r.vaults.length === 0
+      ? "nothing was recovered — the kit holds no vault this server can serve"
+      : `recovered ${r.vaults.length} vault(s). Open one with its vault id above.`,
+    r.vaults.length === 0
+  );
+  await refreshSync();
+});
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 
@@ -665,6 +982,12 @@ $("unlock-shared-form").addEventListener("submit", async (e) => {
     "read the screen can generate your codes.";
   applyStatus(status);
   // The Sync panel is visible whether or not the vault is unlocked: a recipient
-  // device has to enroll and accept a share BEFORE it can open anything.
+  // device has to enroll and accept a share BEFORE it can open anything — and a
+  // RESTORE runs on a machine that has no vault at all.
   await refreshSync();
+  await refreshEntitlement();
+  // ⭐ Ask the server at startup too, so a customer inside their grace period is
+  // told BEFORE they try to write — which is the entire point of a grace period.
+  // Silent on failure: offline, billing off and not-enrolled are all ordinary.
+  await pullEntitlementFromServer();
 })();

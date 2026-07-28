@@ -140,6 +140,13 @@ fn resolve_go() -> String {
 
 impl Harness {
     fn start() -> Harness {
+        Harness::start_with(&[])
+    }
+
+    /// Boot with EXTRA server environment on top of the standard dev-ops +
+    /// device-auth set — used by the entitlement proof, which needs a sigild
+    /// that actually enforces payment.
+    fn start_with(extra_env: &[(&str, &str)]) -> Harness {
         let root = repo_root();
         // The per-harness suffix MUST include a counter, not just pid+seconds.
         // `cargo test` runs the tests in this file in PARALLEL threads of ONE
@@ -206,6 +213,7 @@ impl Harness {
         let server = format!("http://{addr}");
         let log = std::fs::File::create(tmp.join("sigild.log")).expect("log file");
         let child = Command::new(&sigild)
+            .envs(extra_env.iter().copied())
             .env("SIGILD_ADDR", &addr)
             .env("SIGILD_ENABLE_DEV_OPS", "1")
             .env("SIGILD_DEVICE_AUTH", "1")
@@ -917,4 +925,697 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
     say("after a deliberate re-pin to the presented number, sharing resumes");
 
     println!("\nPASS — a substituted hybrid key is detected, refused with both safety numbers, blocks rotation, survives a wrong-number re-pin, and clears only on a deliberate one.\n");
+}
+
+// ---------------------------------------------------------------------------
+// THE RECOVERY KIT — the proof that a printed sheet is enough
+// ---------------------------------------------------------------------------
+
+/// ⭐ **THE PHASE 56 PROOF.** A recovery kit ([ADR 0042]) shipped in the `sigil`
+/// CLI only, and its own limitation 9 said the quiet part: *"the desktop has no
+/// recovery commands"* — while `restore` is precisely the flow a person runs on
+/// a NEW INSTALL after losing everything.
+///
+/// So this drives the real thing end to end, with **nothing simulated**: a real
+/// `sigild`, a real desktop device that seals a vault and pushes it, a kit
+/// printed from that device — and then the device's entire state directory is
+/// **deleted**. Identity, hybrid secret, keyring and vault file: gone, exactly
+/// as if the laptop had been stolen. What is left is the 56 characters.
+///
+/// Asserted:
+/// * the sheet verifies OFFLINE, and one flipped character does not;
+/// * a well-formed code for a DIFFERENT secret recovers **nothing**, and writes
+///   nothing to disk;
+/// * a **revoked** kit recovers nothing either;
+/// * the real code rebuilds both covered vaults on a machine that had no state
+///   at all, and one of them produces the RFC 6238 vector `94287082`;
+/// * `adopt = false` leaves no kit identity behind, and `adopt = true` makes the
+///   machine a second copy of the paper — visibly, in `0600` files.
+#[test]
+fn a_printed_sheet_recovers_the_vaults_after_every_device_is_gone() {
+    const VAULT_TWO: &str = "desktop-second-vault";
+    let h = Harness::start();
+    println!("\n=== sigild up at {} (recovery kit)", h.server);
+
+    let desktop_dir = h.tmp.join("recovery-desktop/.sigil");
+    let desktop = DeviceConfig::new(&h.server, &desktop_dir);
+    desktop
+        .enroll(TOKEN_DESKTOP, "recovery desktop")
+        .expect("enroll");
+    desktop.publish_hybrid().expect("publish hybrid");
+
+    // A vault holding the RFC seed, converted to a SHARED vault (a
+    // PASSWORD-sealed vault has no vault key, so a kit cannot cover it) and
+    // pushed — a kit recovers KEYS, and only ciphertext that exists.
+    let vault_one = desktop_dir.join("totp-vault.sigil");
+    let mut session = VaultSession::create(&vault_one, DESKTOP_PASSWORD.as_bytes())
+        .expect("create")
+        .with_params(FAST);
+    session
+        .add_secret_base32(
+            "shared-rfc",
+            Some("Phase56".into()),
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("add");
+    let fp_one = session
+        .convert_to_shared(&desktop, VAULT_FROM_DESKTOP)
+        .expect("convert");
+    desktop
+        .push_vault_file(VAULT_FROM_DESKTOP, &vault_one)
+        .expect("push");
+    drop(session);
+
+    // Before anything: "Recovery: not set up".
+    assert!(
+        desktop.recovery_kits().expect("kits").is_empty(),
+        "no kit should exist yet"
+    );
+
+    // -----------------------------------------------------------------
+    // 1. GENERATE. The sheet is printed once and verified BEFORE printing.
+    // -----------------------------------------------------------------
+    let sheet = desktop
+        .recovery_generate(&[VAULT_FROM_DESKTOP.to_string()])
+        .expect("generate a kit");
+    let kit_id = sheet.device_id.clone();
+    assert!(kit_id.starts_with("dev_"), "{kit_id}");
+
+    // 7 groups of 8 Crockford characters, hyphen-joined.
+    let groups: Vec<&str> = sheet.code.split('-').collect();
+    assert_eq!(groups.len(), 7, "printed grouping: {}", sheet.code);
+    assert!(
+        groups.iter().all(|g| g.len() == 8),
+        "printed grouping: {}",
+        sheet.code
+    );
+    // The safety number is on the sheet, which is what makes the out-of-band
+    // check usable: the channel is a piece of paper the user already holds.
+    assert_eq!(sheet.safety_number.split_whitespace().count(), 6);
+    assert_eq!(sheet.covered.len(), 1);
+    assert_eq!(sheet.covered[0].vault_id, VAULT_FROM_DESKTOP);
+    assert_eq!(sheet.covered[0].key_fingerprint, fp_one);
+    // The pre-print round trip: re-parsed, re-derived, authenticated as the kit,
+    // landed in THIS account, and unwrapped a real envelope.
+    assert_eq!(sheet.proof.unwrapped_vault, VAULT_FROM_DESKTOP);
+    assert_eq!(sheet.proof.key_fingerprint, fp_one);
+    assert_eq!(sheet.proof.account_id, sheet.account_id);
+    assert!(sheet.seats_used >= 2, "a kit consumes a seat");
+    // ⚠️ And the credential is NOT in the Debug rendering.
+    assert!(!format!("{sheet:?}").contains(&groups[0].to_string()));
+
+    // Offline: the sheet verifies, a typo does not, and neither touches a socket.
+    sigil_desktop_core::verify_recovery_code(&sheet.code).expect("the printed code verifies");
+    let mut typo: Vec<char> = sheet.code.chars().collect();
+    let i = typo
+        .iter()
+        .position(|c| c.is_ascii_alphanumeric())
+        .expect("a character");
+    typo[i] = if typo[i] == '2' { '3' } else { '2' };
+    let typo: String = typo.into_iter().collect();
+    assert!(
+        matches!(
+            sigil_desktop_core::verify_recovery_code(&typo),
+            Err(DesktopError::Recovery(_))
+        ),
+        "a mistyped sheet must be caught offline"
+    );
+
+    let kits = desktop.recovery_kits().expect("kits");
+    assert_eq!(kits.len(), 1);
+    assert_eq!(kits[0].device_id, kit_id);
+    assert_eq!(kits[0].status, "active");
+    say(&format!(
+        "kit {kit_id} printed and verified before printing (safety number {})",
+        sheet.safety_number
+    ));
+
+    // -----------------------------------------------------------------
+    // 2. COVER a vault created LATER. On the generating device the kit's key
+    //    is pinned as DERIVED, so this wraps with no fetch at all.
+    // -----------------------------------------------------------------
+    let vault_two = desktop_dir.join("second.sigil");
+    let mut second = VaultSession::create(&vault_two, DESKTOP_PASSWORD.as_bytes())
+        .expect("create second")
+        .with_params(FAST);
+    second
+        .add_secret_base32("second-rfc", None, RFC_SEED_B32, "sha1", Some(6), Some(30))
+        .expect("add");
+    let fp_two = second
+        .convert_to_shared(&desktop, VAULT_TWO)
+        .expect("convert second");
+    desktop
+        .push_vault_file(VAULT_TWO, &vault_two)
+        .expect("push second");
+    drop(second);
+
+    let (covered_fp, derived) = desktop
+        .recovery_cover(&kit_id, VAULT_TWO, None)
+        .expect("cover the second vault");
+    assert_eq!(covered_fp, fp_two);
+    assert!(
+        derived,
+        "the generating device must use its DERIVED pin and fetch nothing"
+    );
+
+    let coverage = desktop.recovery_check(&kit_id).expect("check");
+    assert_eq!(coverage.len(), 2, "{coverage:?}");
+    assert!(
+        coverage.iter().all(|c| c.covered && c.synced),
+        "both vaults should be covered AND synced: {coverage:?}"
+    );
+    say("a vault created later was covered with no fetch, and both are covered + synced");
+
+    // -----------------------------------------------------------------
+    // 3. A REVOKED sheet recovers nothing. (Proved with a second kit, so the
+    //    first one survives for the restore below.)
+    // -----------------------------------------------------------------
+    let doomed = desktop.recovery_generate(&[]).expect("second kit");
+    let report = desktop
+        .recovery_revoke(&doomed.device_id, &[])
+        .expect("revoke");
+    assert_eq!(report.device_id, doomed.device_id);
+    assert_eq!(
+        report.envelopes_removed.len(),
+        2,
+        "both envelopes should have been taken back: {report:?}"
+    );
+    let dead_dir = h.tmp.join("revoked-restore/.sigil");
+    match DeviceConfig::new(&h.server, &dead_dir).recovery_restore(
+        &doomed.code,
+        &doomed.device_id,
+        None,
+        false,
+    ) {
+        Err(DesktopError::Unauthenticated(_)) => {}
+        other => panic!("a REVOKED kit must recover nothing, got {other:?}"),
+    }
+    assert!(
+        !dead_dir.join("vault-keys.json").exists(),
+        "a refused restore must not write a keyring"
+    );
+    say("a revoked sheet is refused at the door and writes nothing");
+
+    // -----------------------------------------------------------------
+    // 4. ⚡ THE DEVICE IS GONE. Everything local is deleted.
+    // -----------------------------------------------------------------
+    std::fs::remove_dir_all(&desktop_dir).expect("destroy the device's state");
+    assert!(!desktop_dir.exists());
+    say("the device's identity, hybrid secret, keyring and vault files were DELETED");
+
+    // A brand-new machine, holding nothing.
+    let fresh_dir = h.tmp.join("new-install/.sigil");
+    let fresh = DeviceConfig::new(&h.server, &fresh_dir);
+    let before = fresh.status().expect("status");
+    assert!(!before.enrolled && before.vaults.is_empty());
+
+    // A well-formed code for a DIFFERENT secret authenticates as nobody.
+    let stranger = sigil_core::encode_recovery_kit(&[0x11u8; sigil_core::RECOVERY_SEED_LEN]);
+    let stranger = std::str::from_utf8(&stranger).expect("ascii");
+    sigil_desktop_core::verify_recovery_code(stranger).expect("it IS well-formed");
+    match fresh.recovery_restore(stranger, &kit_id, None, false) {
+        Err(DesktopError::Unauthenticated(_)) => {}
+        other => panic!("a valid-but-wrong code must recover nothing, got {other:?}"),
+    }
+    // ...and a mistyped one never even reaches the network.
+    assert!(matches!(
+        fresh.recovery_restore(&typo, &kit_id, None, false),
+        Err(DesktopError::Recovery(_))
+    ));
+    assert!(
+        !fresh_dir.join("vault-keys.json").exists(),
+        "a failed restore must not write a keyring"
+    );
+    say("a wrong sheet recovers nothing, and a mistyped one is refused before any network I/O");
+
+    // -----------------------------------------------------------------
+    // 5. ⭐ THE RESTORE. The paper alone rebuilds both vaults.
+    // -----------------------------------------------------------------
+    let restored = fresh
+        .recovery_restore(&sheet.code, &kit_id, None, false)
+        .expect("restore from the printed sheet");
+    assert_eq!(restored.device_id, kit_id);
+    assert_eq!(restored.account_id, sheet.account_id);
+    assert_eq!(restored.vaults.len(), 2, "{restored:?}");
+    assert!(restored.skipped.is_empty(), "{restored:?}");
+    assert!(!restored.adopted);
+
+    let one = restored
+        .vaults
+        .iter()
+        .find(|v| v.vault_id == VAULT_FROM_DESKTOP)
+        .expect("the first vault");
+    assert_eq!(one.key_fingerprint, fp_one, "a DIFFERENT key came back");
+    assert_eq!(one.entries, 1);
+    assert_0600(&one.path);
+    assert!(restored
+        .vaults
+        .iter()
+        .any(|v| v.vault_id == VAULT_TWO && v.key_fingerprint == fp_two));
+
+    // ⭐ THE ASSERTION THE WHOLE FEATURE EXISTS FOR: the codes are back.
+    let reopened = VaultSession::unlock_shared(&one.path, &fresh, VAULT_FROM_DESKTOP)
+        .expect("open the restored vault with the recovered key");
+    let view = reopened.entries_at(now_unix()).expect("codes");
+    assert_eq!(view[0].label, "shared-rfc");
+    assert_eq!(
+        view[0].code, RFC_CODE,
+        "the recovered vault did not reproduce the RFC 6238 vector"
+    );
+    assert_0600(&fresh.keyring_path());
+    assert_eq!(fresh.status().expect("status").vaults.len(), 2);
+
+    // DEFAULT IS EPHEMERAL: this machine recovered the vaults and is NOT the kit.
+    assert!(
+        !fresh.identity_path().exists() && !fresh.hybrid_secret_path().exists(),
+        "adopt=false must leave no kit identity behind"
+    );
+    say(&format!(
+        "⭐ restored from the sheet ALONE on a machine with no state: 2 vaults, and {} for the \
+         RFC 6238 account",
+        view[0].code
+    ));
+
+    // -----------------------------------------------------------------
+    // 6. ADOPT — the same restore, told to keep the kit's identity. This
+    //    machine becomes a SECOND COPY OF THE PAPER, and says so on disk.
+    // -----------------------------------------------------------------
+    let adopt_dir = h.tmp.join("adopted/.sigil");
+    let adopted = DeviceConfig::new(&h.server, &adopt_dir);
+    let report = adopted
+        .recovery_restore(&sheet.code, &kit_id, None, true)
+        .expect("restore with adopt");
+    assert!(report.adopted);
+    assert_0600(&adopted.identity_path());
+    assert_0600(&adopted.hybrid_secret_path());
+    let status = adopted.status().expect("status");
+    assert!(status.enrolled);
+    assert_eq!(status.device_id.as_deref(), Some(kit_id.as_str()));
+    // The kit's own key is pinned as DERIVED — established with no fetch, so
+    // there was never anything for a server to substitute.
+    assert!(
+        adopted
+            .pins()
+            .expect("pins")
+            .iter()
+            .any(|p| p.device_id == kit_id),
+        "an adopted machine must hold the kit's derived pin"
+    );
+    say("adopt=true persisted the kit identity 0600 — that machine IS the paper now");
+
+    println!(
+        "\nPASS — a printed recovery kit rebuilt both vaults on a machine that had nothing, a \
+         wrong or revoked sheet recovered nothing, and the RFC 6238 vector came back.\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// THE WRAP GATE, for a recovery kit
+// ---------------------------------------------------------------------------
+
+/// ⭐ [ADR 0042 §4] is the lesson this repo learned twice: **the requirement
+/// belongs on the wrap path, not on a command.** A recovery kit is the one
+/// credential that reconstructs a whole account, so wrapping a vault key to a
+/// kit whose public key this device has never seen — on the word of the server
+/// that serves that key — must be REFUSED, from every path, and the sheet
+/// carries the safety number that resolves it.
+///
+/// The desktop reaches that gate through the same `sigil-cli`
+/// `verify_recipient_for_wrap`, whose `VerifiedRecipient` cannot be constructed
+/// anywhere else. This proves it *fires here*, on a **sibling device** — the
+/// realistic case, since the generating device holds a derived pin and never
+/// fetches at all.
+#[test]
+fn a_sibling_device_cannot_cover_a_kit_without_the_printed_safety_number() {
+    let h = Harness::start();
+    println!("\n=== sigild up at {} (the wrap gate)", h.server);
+
+    let owner_dir = h.tmp.join("gate-owner/.sigil");
+    let sibling_dir = h.tmp.join("gate-sibling/.sigil");
+    let owner = DeviceConfig::new(&h.server, &owner_dir);
+    owner.enroll(TOKEN_DESKTOP, "owner").expect("enroll owner");
+    owner.publish_hybrid().expect("owner hybrid");
+
+    let vault_path = owner_dir.join("totp-vault.sigil");
+    let mut session = VaultSession::create(&vault_path, DESKTOP_PASSWORD.as_bytes())
+        .expect("create")
+        .with_params(FAST);
+    session
+        .add_secret_base32(
+            "rfc",
+            None,
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("add");
+    let fp = session
+        .convert_to_shared(&owner, VAULT_FROM_DESKTOP)
+        .expect("convert");
+    owner
+        .push_vault_file(VAULT_FROM_DESKTOP, &vault_path)
+        .expect("push");
+    drop(session);
+
+    let sheet = owner
+        .recovery_generate(&[VAULT_FROM_DESKTOP.to_string()])
+        .expect("kit");
+    let kit_id = sheet.device_id.clone();
+
+    // A second device of the SAME account, with write access to the vault.
+    let invite = owner.create_invite(Some(300)).expect("invite");
+    let sibling = DeviceConfig::new(&h.server, &sibling_dir);
+    sibling
+        .enroll(&invite.invite, "sibling")
+        .expect("sibling enroll");
+    sibling.publish_hybrid().expect("sibling hybrid");
+    owner
+        .share_vault(
+            VAULT_FROM_DESKTOP,
+            &sibling.status().unwrap().device_id.unwrap(),
+            "write",
+            None,
+        )
+        .expect("share to the sibling");
+    assert_eq!(
+        sibling.accept_vault(VAULT_FROM_DESKTOP).expect("accept"),
+        fp,
+        "the sibling holds the same vault key"
+    );
+
+    // ⛔ FIRST SIGHT OF A KIT, NO NUMBER. Refused — nothing wrapped, nothing
+    // uploaded, and (critically) the pin store NOT mutated: pinning a key that
+    // was then refused would let a plain retry succeed.
+    let presented = match sibling.recovery_cover(&kit_id, VAULT_FROM_DESKTOP, None) {
+        Err(DesktopError::KeyUnverified {
+            device_id,
+            presented_safety_number,
+            ..
+        }) => {
+            assert_eq!(device_id, kit_id);
+            assert_eq!(presented_safety_number, sheet.safety_number);
+            presented_safety_number
+        }
+        other => panic!("an unverified first-sight KIT wrap must be refused, got {other:?}"),
+    };
+    assert!(
+        !sibling
+            .pins()
+            .expect("pins")
+            .iter()
+            .any(|p| p.device_id == kit_id),
+        "a REFUSED wrap must not pin the key it refused"
+    );
+
+    // ⛔ A WRONG number is refused too, and still does not pin.
+    assert!(
+        matches!(
+            sibling.recovery_cover(
+                &kit_id,
+                VAULT_FROM_DESKTOP,
+                Some("11111 22222 33333 44444 55555 66666")
+            ),
+            Err(DesktopError::KeyUnverified { .. })
+        ),
+        "a wrong safety number must be refused"
+    );
+    assert!(!sibling
+        .pins()
+        .expect("pins")
+        .iter()
+        .any(|p| p.device_id == kit_id));
+    say("a sibling device is REFUSED both without a safety number and with a wrong one");
+
+    // ✅ The number PRINTED ON THE SHEET is what unlocks it.
+    let (covered_fp, derived) = sibling
+        .recovery_cover(&kit_id, VAULT_FROM_DESKTOP, Some(&presented))
+        .expect("the printed safety number must be accepted");
+    assert_eq!(covered_fp, fp);
+    assert!(
+        !derived,
+        "the sibling fetched the key, it did not derive it"
+    );
+    assert!(
+        sibling
+            .pins()
+            .expect("pins")
+            .iter()
+            .any(|p| p.device_id == kit_id),
+        "an ACCEPTED wrap pins the verified key"
+    );
+    say("with the digits from the sheet, the same cover succeeds and pins the key");
+
+    println!(
+        "\nPASS — the wrap gate refuses a first-sight recovery kit from the desktop, leaves the \
+         pin store untouched, and accepts only the safety number printed on the sheet.\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ENTITLEMENT — writes may be refused; reads and key recovery never are
+// ---------------------------------------------------------------------------
+
+/// ⭐ [ADR 0043] made `sigild` able to refuse a lapsed account, and the whole
+/// point is the **asymmetry**: this product holds a customer's second factor, so
+/// a declined card must never cost them a code they already have.
+///
+/// Until now nothing in this repo *read* those signals — a refused write reached
+/// the user as a raw HTTP status. This drives a sigild with enforcement ON and a
+/// grace window of `1ms` (so a brand-new account is already past it) and asserts
+/// the desktop renders the truth:
+///
+/// * a push is refused as [`DesktopError::PaymentRequired`] — its own kind, not
+///   a generic server error — carrying the status, the checkout route and, in
+///   the same breath, what is still available;
+/// * **reads are not refused**;
+/// * ⭐ **key recovery is not refused**: a lapsed customer can still PRINT A
+///   RECOVERY KIT, which is the difference between "inconvenienced" and "one
+///   device failure from permanent loss";
+/// * the offline flow still generates codes, because none of this touches the
+///   local vault.
+#[test]
+fn a_lapsed_account_is_refused_writes_but_never_reads_or_key_recovery() {
+    let h = Harness::start_with(&[
+        ("SIGILD_ENTITLEMENT_ENFORCE", "1"),
+        // A brand-new account's grace runs from its creation, so 1ms means
+        // "already lapsed" by the time the first write happens.
+        ("SIGILD_ENTITLEMENT_GRACE", "1ms"),
+        // Enforcement REQUIRES a subscription store to read; these are throwaway
+        // values for a loopback server that never contacts a provider.
+        ("SIGILD_BILLING_PROVIDERS", "stripe"),
+        ("SIGILD_BILLING_SUCCESS_URL", "http://127.0.0.1/paid"),
+        ("SIGILD_BILLING_CANCEL_URL", "http://127.0.0.1/cancelled"),
+        ("SIGILD_STRIPE_SECRET_KEY", "sk_test_not_a_real_key_000000"),
+        (
+            "SIGILD_STRIPE_WEBHOOK_SECRET",
+            "whsec_not_a_real_secret_0000",
+        ),
+    ]);
+    println!("\n=== sigild up at {} (entitlement enforced)", h.server);
+
+    let dir = h.tmp.join("lapsed/.sigil");
+    let device = DeviceConfig::new(&h.server, &dir);
+    device
+        .enroll(TOKEN_DESKTOP, "lapsed device")
+        .expect("enroll");
+    device.publish_hybrid().expect("publish hybrid");
+
+    let vault_path = dir.join("totp-vault.sigil");
+    let mut session = VaultSession::create(&vault_path, DESKTOP_PASSWORD.as_bytes())
+        .expect("create")
+        .with_params(FAST);
+    session
+        .add_secret_base32(
+            "rfc",
+            None,
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("add");
+    let fp = session
+        .convert_to_shared(&device, VAULT_FROM_DESKTOP)
+        .expect("convert");
+    drop(session);
+
+    // ⛔ THE WRITE. Refused as a BILLING state, with everything a UI needs.
+    let entitlement = match device.push_vault_file(VAULT_FROM_DESKTOP, &vault_path) {
+        Err(DesktopError::PaymentRequired {
+            entitlement,
+            message,
+        }) => {
+            assert!(message.contains("402"), "{message}");
+            assert!(
+                message.contains("RECOVERY KIT"),
+                "the refusal must say what still works: {message}"
+            );
+            *entitlement
+        }
+        other => panic!("expected a payment refusal, got {other:?}"),
+    };
+    assert!(entitlement.known && entitlement.needs_attention());
+    assert_eq!(entitlement.writes, "refused");
+    // ⭐ The two guarantees, as the server states them.
+    assert_eq!(entitlement.reads, "allowed");
+    assert_eq!(entitlement.key_recovery, "allowed");
+    assert_eq!(entitlement.checkout_path, "/v1/billing/checkout");
+    assert!(
+        !entitlement.subscription_status.is_empty(),
+        "the account's own status should be named: {entitlement:?}"
+    );
+    say(&format!(
+        "a push is refused as PaymentRequired (status {}), not as a generic HTTP error",
+        entitlement.subscription_status
+    ));
+
+    // ✅ READS ARE NEVER REFUSED. Nothing was ever pushed, so there is nothing
+    // to return — but the answer is "nothing there", never a 402.
+    assert!(
+        device
+            .pull_vault(VAULT_FROM_DESKTOP, 0)
+            .expect("read")
+            .is_none(),
+        "a read must not be refused"
+    );
+    device
+        .account()
+        .expect("reading the account is not a write");
+    assert!(device.check_server().expect("probe").reachable);
+
+    // ⭐ AND KEY RECOVERY IS NEVER REFUSED. A lapsed customer can still print a
+    // kit — the case ADR 0043 §3 exists for.
+    let sheet = device
+        .recovery_generate(&[VAULT_FROM_DESKTOP.to_string()])
+        .expect("a lapsed account MUST still be able to print a recovery kit");
+    assert_eq!(sheet.covered.len(), 1);
+    assert_eq!(sheet.covered[0].key_fingerprint, fp);
+
+    // ...and the honest half of that: the KEY is covered, the DATA never got
+    // pushed, so `check` says so rather than claiming the vault is recoverable.
+    let coverage = device.recovery_check(&sheet.device_id).expect("check");
+    assert_eq!(coverage.len(), 1);
+    assert!(coverage[0].covered, "{coverage:?}");
+    assert!(
+        !coverage[0].synced,
+        "a vault that could not be pushed is NOT recoverable, and must not be reported as if it were: {coverage:?}"
+    );
+    say(
+        "a lapsed account still printed a recovery kit, and `check` says the data was never synced",
+    );
+
+    // The local vault never depended on any of this.
+    let still = VaultSession::unlock_shared(&vault_path, &device, VAULT_FROM_DESKTOP)
+        .expect("offline unlock");
+    assert_eq!(
+        still.entries_at(now_unix()).expect("codes")[0].code,
+        RFC_CODE
+    );
+    say("codes still generate locally — a payment state never costs a second factor");
+
+    println!(
+        "\nPASS — a lapsed account is refused WRITES with an actionable 402, and is refused \
+         neither reads, nor key recovery, nor its own codes.\n"
+    );
+}
+
+/// ⭐ THE GRACE PERIOD — the state a customer must be TOLD about, because it is
+/// the only one they can still act on.
+///
+/// A grace period nobody is warned about is not a grace period; it is a delayed
+/// outage. `sigild` publishes the warning two ways — a response header on a
+/// served write, and the additive `entitlement` block on
+/// `GET /v1/billing/subscription` — and the desktop can only see the second: the
+/// `sigil-cli` transport returns a body and drops response headers.
+///
+/// Until this was wired, `EntitlementView::from_subscription_block` had ZERO
+/// production call sites. The only writer of desktop entitlement state was
+/// `track_write`, which yields "allowed" or "refused" and never "grace", so the
+/// UI branch that says "Writes still work, for now." was unreachable code and a
+/// desktop customer inside grace was never told.
+#[test]
+fn a_desktop_inside_its_grace_period_is_warned_before_any_write_is_refused() {
+    let h = Harness::start_with(&[
+        ("SIGILD_ENTITLEMENT_ENFORCE", "1"),
+        // A brand-new account has never subscribed, so its grace runs from its
+        // CREATION. A long window means it is inside grace for this whole test.
+        ("SIGILD_ENTITLEMENT_GRACE", "24h"),
+        ("SIGILD_BILLING_PROVIDERS", "stripe"),
+        ("SIGILD_BILLING_SUCCESS_URL", "http://127.0.0.1/paid"),
+        ("SIGILD_BILLING_CANCEL_URL", "http://127.0.0.1/cancelled"),
+        ("SIGILD_STRIPE_SECRET_KEY", "sk_test_not_a_real_key_000000"),
+        (
+            "SIGILD_STRIPE_WEBHOOK_SECRET",
+            "whsec_not_a_real_secret_0000",
+        ),
+    ]);
+    println!(
+        "\n=== sigild up at {} (entitlement enforced, 24h grace)",
+        h.server
+    );
+
+    let dir = h.tmp.join("grace/.sigil");
+    let device = DeviceConfig::new(&h.server, &dir);
+    device
+        .enroll(TOKEN_DESKTOP, "grace device")
+        .expect("enroll");
+    device.publish_hybrid().expect("publish hybrid");
+
+    // ⭐ ASK. This is the whole fix: the client learns it has lapsed BEFORE a
+    // write is ever refused.
+    let view = device
+        .subscription()
+        .expect("the subscription route is never itself gated by entitlement");
+    assert!(view.known, "{view:?}");
+    assert_eq!(view.writes, "grace", "{view:?}");
+    assert!(
+        view.needs_attention(),
+        "grace must raise the banner, not stay silent: {view:?}"
+    );
+    assert!(
+        !view.grace_ends_at.is_empty(),
+        "the customer needs the DEADLINE, not just the fact: {view:?}"
+    );
+    assert!(
+        view.detail.contains(&view.grace_ends_at),
+        "the rendered sentence must name the deadline: {view:?}"
+    );
+    // The two guarantees hold in this state as well.
+    assert_eq!(view.reads, "allowed");
+    assert_eq!(view.key_recovery, "allowed");
+    say("inside grace, the desktop is WARNED and told exactly when writes stop");
+
+    // ...and the write really is still served, which is what makes the warning a
+    // warning rather than a refusal.
+    let vault_path = dir.join("totp-vault.sigil");
+    let mut session = VaultSession::create(&vault_path, DESKTOP_PASSWORD.as_bytes())
+        .expect("create")
+        .with_params(FAST);
+    session
+        .add_secret_base32(
+            "rfc",
+            None,
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("add");
+    session
+        .convert_to_shared(&device, VAULT_FROM_DESKTOP)
+        .expect("convert");
+    drop(session);
+    device
+        .push_vault_file(VAULT_FROM_DESKTOP, &vault_path)
+        .expect("a write INSIDE grace must still be served");
+    say("the write inside grace is served — the warning is a warning, not a refusal");
+
+    println!(
+        "\nPASS — a desktop inside its grace period is warned, with a deadline, while its \
+         writes are still being served.\n"
+    );
 }

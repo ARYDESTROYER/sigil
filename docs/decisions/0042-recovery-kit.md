@@ -429,3 +429,70 @@ presentation-insensitively so spacing and grouping never cause a false alarm.
 - Adversaries: [`../threat-model.md`](../threat-model.md) — the paper holder, and
   a server that lies about device labels.
 - Operator runbook: [`../deployment.md`](../deployment.md) §17.
+
+## Limitation 9 (partial client coverage) is retired (added Phase 56, 2026-07-28)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+**Limitation 9 said:** *"CLIENT COVERAGE IS PARTIAL … There is **no
+`recovery.spec.ts` in the webapp and no `RecoveryPanel`**; the **extension has no
+recovery UI** …; the **desktop has no recovery commands** … **And since `restore`
+runs on a NEW install, a user whose only client was the browser or the extension
+cannot restore there today.**"*
+
+**That is now false.** Phase 56 built the kit lifecycle on the three remaining
+client surfaces:
+
+- **Webapp** (`web/apps/webapp/app/authenticator.tsx`) — a `RecoveryPanel`
+  (generate / cover / check / revoke) inside the unlocked vault, and a
+  **`RestorePanel` on BOTH the setup and the locked screens**. Restore is
+  deliberately **not** behind an unlocked vault: a fresh install with no local
+  state is exactly the situation the sheet exists for. New specs
+  `recovery.spec.ts`, `wrap-gate.spec.ts`, `leak.spec.ts`.
+- **MV3 extension** (`extension/src/popup/popup.{html,js,css}`) — the same flow,
+  with restore reachable from the locked/setup views, over the `recovery.mjs`
+  `build.sh` was already vendoring. New specs `recovery.spec.mjs`,
+  `wrap-gate.spec.mjs`, `leak.spec.mjs`.
+- **Desktop** (`desktop/core/src/recovery.rs` + thin `#[tauri::command]`s +
+  `desktop/ui`) — `recovery_generate` / `_cover` / `_check` / `_verify` /
+  `_restore` / `_revoke` / `_kits`, following that directory's standing rule
+  ([ADR 0037](0037-desktop-reuses-cli-library-for-protocol.md)): it calls the
+  `sigil-cli` library and adds **no fourth copy** of the codec, the derivation or
+  the safety-number digest.
+
+**The wrap gate of §4 is unchanged and is exercised from the browsers.** A
+`wrap-gate` spec in both browser clients drives a **second profile that never saw
+the kit sheet**, and asserts the refusal, that **no envelope was stored**, and
+that a wrong safety number is named as a mismatch — which also proves the first
+refusal did not silently pin the key. It exists because deleting the gate
+(`if (false && …)`) previously left every browser spec green.
+
+**Two limitations related to the kit-as-credential are now enforced by a test
+rather than by care.** A `leak` spec in both clients **enumerates** rather than
+expects: every `localStorage` and `sessionStorage` key *and value*, cookies,
+every IndexedDB record, every Cache Storage entry (the webapp is a PWA), the DOM
+after the sheet is dismissed, every outgoing request URL and body, every console
+message captured from before the first navigation, and the address bar — against
+four spellings of the code. The earlier assertions checked only `localStorage`
+and the URL, and a planted `sessionStorage.setItem` + `console.log` of the code
+stayed green.
+
+**Also fixed, and worth recording because it was latent:**
+`web/packages/sigil-wasm/index.mjs` **never re-exported the `recovery_*` wasm
+functions**, so every browser recovery call would have thrown at runtime. The
+`.d.ts` gap recorded in the *Neutral* section above was a **separate** gap —
+types and runtime were two distinct holes, and closing one would not have closed
+the other. Both are closed.
+
+**What is NOT retired.** Limitations 1–8 and 10–13 stand exactly as written: the
+paper is still a full-account credential stronger than a stolen locked phone, it
+still recovers **keys, not data**, it still opens only the vaults it was told to
+**cover**, it still **cannot be created after the loss**, the label-discovery
+residual of §5 is unchanged, and everything remains dev-gated, plain HTTP and
+**UNAUDITED**. ⚠️ **Print output is not verified** — headless Chromium cannot
+show a printed page, so the `@media print` rules are by-eye only. And the browser
+suites still run against a **test double** (`sigil-wasm/test/fake-sigild.mjs`)
+for everything except `cors.spec.ts`; real-server conformance for the kit still
+lives in `cli/tests/e2e-recovery.sh` and
+`sigil-wasm/test/recovery-interop.mjs`.

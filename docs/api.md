@@ -176,6 +176,68 @@ status` reports them (default auto-apply at boot, opt out with
 
 ---
 
+## Cross-origin requests (`SIGILD_CORS_ORIGINS`) — opt-in, OFF by default
+
+> ⚠️ **This is not an authentication control and not a CSRF control.** `sigild`
+> issues **no cookie, no session and no ambient bearer token**; every
+> authenticated request is authenticated by a **per-request Ed25519 signature**
+> over a canonical message ([contract v3](#signed-request-contract-v3)). A
+> cross-origin page holds no device key, so it cannot forge a request whatever
+> CORS says. The allowlist exists so the browser half of the product works at
+> all, so the set of pages permitted to reach a server is a deliberate operator
+> decision, and so a browser-side failure is an honest configuration error. See
+> [ADR 0044](decisions/0044-opt-in-cors-allowlist.md).
+
+Every signed request carries `X-Sigil-Device`, `X-Sigil-Timestamp`,
+`X-Sigil-Nonce` and `X-Sigil-Signature`. None of those is a CORS-safelisted
+request header, so a **browser preflights every one of them**. Before Phase 56
+`sigild` routed no `OPTIONS` and emitted no `Access-Control-*` header, so a
+preflight was answered `405` and a browser page on a different origin than the
+API could not reach it at all. (An MV3 extension page with a matching
+`host_permissions` entry is exempt from CORS and was never affected.)
+
+**Unset — the default — means no CORS at all.** The middleware is **not
+installed**: no response carries an `Access-Control-*` header, no response
+carries `Vary: Origin`, and `OPTIONS` falls through to the mux and is answered
+`405`. This is byte-identical to a pre-Phase-56 server.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SIGILD_CORS_ORIGINS` | unset ⇒ **off** | comma-separated **exact** origins (scheme + host + optional port, nothing else), e.g. `http://127.0.0.1:3000,http://localhost:3000` |
+
+Validated **fail-fast before the listener binds**. A path, query, fragment,
+trailing slash, embedded credentials, a non-`http(s)` scheme, or a value that
+leaves no origins at all is a **startup failure**. **`*` is REFUSED at boot**
+(exit code 1, the listener never binds) rather than accepted and narrowed.
+
+**Behaviour when an allowlist is configured:**
+
+| | |
+|---|---|
+| `Vary: Origin` | added to **every** response the middleware touches, allowed or not |
+| `Access-Control-Allow-Origin` | the **echoed** request origin, and only when it is on the list — never `*`, never a value the request did not present |
+| `Access-Control-Allow-Credentials` | ⛔ **never set** |
+| `Access-Control-Expose-Headers` | `X-Request-ID`, `X-Sigil-Entitlement`, `X-Sigil-Entitlement-Status`, `X-Sigil-Entitlement-Grace-Ends` — without this a browser client cannot read its own [grace warning](#warning-headers) |
+| preflight from an **allowed** origin | **`204`**, with `Access-Control-Allow-Methods` (`GET, HEAD, POST, PUT, DELETE, OPTIONS`), an explicit `Access-Control-Allow-Headers` (`Content-Type, X-Request-ID, X-Sigil-Device, X-Sigil-Timestamp, X-Sigil-Nonce, X-Sigil-Signature, X-Sigil-Enroll-Token, X-Sigil-Admin-Token`) and `Access-Control-Max-Age: 600` |
+| preflight from an **unknown** origin | falls through to the mux → `405`, exactly as before — so there is no probe distinguishing *"this route exists"* from *"your origin is allowed"* |
+| a preflight the middleware answers | reaches **no handler**: no op-log, no device registry, no rate limiter, no database |
+
+A preflight the middleware answers is still counted, still assigned an
+`X-Request-ID` and still access-logged (the middleware sits innermost in the
+chain).
+
+⚠️ **Limits.** CORS constrains **browsers and nothing else** — `curl`, the `sigil`
+CLI and the desktop app ignore it entirely, and it is **not an access control**.
+It does not make the dev transport safe: an allowlisted origin over plain
+`http://` is still cleartext. Matching is exact (no wildcards, no subdomain
+patterns), so changing the list is a restart, and an origin removed from the list
+can still have up to ten minutes of cached preflight in an already-open browser.
+No Private Network Access header is sent. **In production, serve the app and the
+API from the same origin behind the reverse proxy and set nothing here** — see
+[`deployment.md` §18](deployment.md#18-browser-origins--cors-operator-guide--opt-in).
+
+---
+
 ## Vault operation log (DEV-ONLY)
 
 > **READ THIS FIRST. This endpoint is a development scaffold, not a product.**
@@ -2124,14 +2186,19 @@ server that does not lie about labels"**, *not* "refuses first-sight kit wraps".
 - ⚠️ **A kit cannot be created after the loss.**
 - ⚠️ **A kit consumes a seat** against `SIGILD_ACCOUNT_MAX_DEVICES`, appears in
   `GET /v1/account`, and can be revoked by **any** member — membership is flat.
-- ⚠️ **Client coverage is PARTIAL.** The **`sigil` CLI has the full flow**
-  (`recovery generate | cover | check | verify | restore | revoke`). There is **no
-  recovery UI in the webapp** (no `RecoveryPanel`, no `recovery.spec.ts`) and
-  **none in the MV3 extension** (although its `build.sh` *does* vendor
-  `recovery.mjs`), and the **desktop has no recovery commands**; those surfaces
-  consume only the *wrap gate* (the safety-number field and the refusal). ⚠️ Since
-  `restore` runs on a **new install**, **a user whose only client was the browser
-  or the extension cannot restore there today.**
+- **Client coverage is now complete across all four surfaces** (Phase 56). The
+  **`sigil` CLI** (`recovery generate | cover | check | verify | restore |
+  revoke`), the **webapp** (a `RecoveryPanel` in the unlocked vault plus a
+  `RestorePanel` on **both the setup and locked screens** — restore is
+  deliberately not behind an unlocked vault, because a fresh install is where it
+  is needed), the **MV3 extension** (the same flow, restore reachable from the
+  locked/setup views) and the **desktop** (`recovery_*` commands over the
+  `sigil-cli` library — no second copy of the codec or derivation) can all
+  generate, cover, check, revoke and **restore**. ⚠️ The browser suites drive a
+  **test double**, not a real `sigild`; real-server conformance stays in
+  `cli/tests/e2e-recovery.sh` and `sigil-wasm/test/recovery-interop.mjs`. Print
+  output is **not** verified — headless Chromium cannot render a printed page, so
+  the `@media print` rules are by-eye.
 - ⚠️ **Dev-gated, plain HTTP, UNAUDITED.**
 
 ---
@@ -2729,6 +2796,30 @@ and on the `402` itself. An entitled account's responses carry none of them.
 | `X-Sigil-Entitlement` | `grace` or `lapsed` |
 | `X-Sigil-Entitlement-Status` | the billing status from the closed enum |
 | `X-Sigil-Entitlement-Grace-Ends` | RFC3339 UTC instant (omitted when unknown) |
+
+⚠️ **They are not readable cross-origin unless the server exposes them.** They are
+not CORS-safelisted response headers, so a browser client can only read them when
+[`SIGILD_CORS_ORIGINS`](#cross-origin-requests-sigild_cors_origins--opt-in-off-by-default)
+lists its origin (the middleware then sets `Access-Control-Expose-Headers`), or
+when the client is same-origin or an extension page.
+
+### Client support (Phase 56)
+
+Until Phase 56 these three channels — the headers above, the additive
+`entitlement` block on
+[`GET /v1/billing/subscription`](#get-v1billingsubscription--the-callers-own-status)
+and the `402` body — had **no client readers at all**.
+
+| Client | What it reads |
+|--------|---------------|
+| **webapp** + **MV3 extension** | `sigil-wasm/entitlement.mjs` (`getSubscription` / `entitlementState` / `describeEntitlement` / `readEntitlementHeaders` / `explainSubscriptionStatus`): the subscription route is read on mount — the only warning channel a **read-only** client ever sees, since it is never refused — and the warning headers are read off a successful write |
+| **desktop** | `DeviceConfig::subscription()` → the `entitlement_refresh` command → a banner, over the CLI library's `fetch_subscription` (no second HTTP client, no second signing path) |
+| **`sigil` CLI** | all five error explainers (sync, device, account, sharing, recovery) render a `402` as a **billing state, not an auth or permission failure**, and say that reads and same-account key recovery are unaffected — printed after the server's body, in this CLI's `{e}\n  -> HTTP nnn: …` form |
+
+A server with enforcement **off** (the default) sends no header and no
+`entitlement` block; clients report that as "not enforced" and show nothing.
+Conformance against a **real** `sigild`'s bytes is
+`sigil-wasm/test/entitlement-interop.mjs` — the browser suites use a test double.
 
 ### Where grace is measured from
 

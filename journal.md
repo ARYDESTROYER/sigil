@@ -11,8 +11,101 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 55; Phases 52–55 are complete and gated but UNCOMMITTED in
-the working tree — `main` @ origin is at `bde8115`).**
+**Where we are (through Phase 56; Phase 56 is complete and fully gated but UNCOMMITTED in
+the working tree — `main` is at `b18a438`).**
+
+**PHASE 56 — THE FEATURES REACH THE USER, AND A TWELVE-PHASE-OLD HOLE SURFACES.** Phases 54
+and 55 shipped things **users could not reach**: recovery existed only in the `sigil` CLI —
+and `restore` runs on a **NEW install**, exactly where someone who lost every device is — so
+a customer whose only client was a browser **could not recover, and their printed sheet was
+useless**; and the entitlement signals (the `X-Sigil-Entitlement*` headers, the `entitlement`
+block, the machine-readable `402`) had **ZERO readers in any client**, so a customer inside
+grace was **never told**. Phase 56 built those surfaces on the **webapp**, the **MV3
+extension** and the **desktop**: a `RestorePanel` on **BOTH the setup and locked screens**
+(recovery is deliberately NOT behind an unlocked vault), generate / cover / check / revoke, a
+one-shot kit sheet (7×8 grouped code, safety number, kit id, account, server, vaults covered,
+four warnings, print/copy) behind a *"written it down"* confirmation that **clears it from
+the DOM**, and an entitlement block. The desktop followed its standing rule — **REUSE, DO NOT
+REIMPLEMENT** — calling the `sigil-cli` library and adding **NO fourth copy** of the kit
+codec, the derivation or the safety-number digest. ⚠️ **A REAL LATENT BUG:**
+`web/packages/sigil-wasm/index.mjs` **never re-exported the `recovery_*` wasm functions**, so
+every browser recovery call would have **thrown at runtime** — a **separate** gap from the
+missing `.d.ts` types (types and runtime were two distinct holes).
+⭐⭐ **THE FINDING THAT FAILED THE FIRST BUILD: THE WEBAPP COULD NOT REACH A REAL `sigild` AT
+ALL.** Every `signedFetch` carries `X-Sigil-*` headers ⇒ every call is **preflighted**;
+`grep -rin access-control sigild/` found **NOTHING** and a real preflight answered **405**.
+Observed in a real Chromium: *"blocked by CORS policy: No 'Access-Control-Allow-Origin'
+header is present"*. So **enroll, sync, share, RESTORE-FROM-KIT and the entitlement read were
+ALL DEAD from the webapp — the phase's own headline claim.** ⚠️ **And the phase's own new
+test double hid it:** `sigil-wasm/test/fake-sigild.mjs` set `Access-Control-Allow-Origin: *`,
+so all six new webapp specs passed **while the real path was dead**. The **MV3 extension was
+unaffected** (`host_permissions` bypass CORS) and was proven working against the same server.
+The gap is **PRE-EXISTING since Phase 44**; this phase built its flagship deliverable on top
+of it. **THE FIX (ADR 0044):** opt-in, allowlisted CORS in `sigild` (`internal/api/cors.go`,
+hand-written stdlib — **still EXACTLY ONE direct Go dependency**). **`SIGILD_CORS_ORIGINS`**
+is a comma-separated list of **EXACT** origins, validated **fail-fast BEFORE the listener
+binds**. ⭐ **UNSET = no CORS headers at all, byte-identical to before** (a verifier swept
+**45 responses across 9 paths × 5 methods** with an `Origin` header: **ZERO
+`Access-Control-*` lines**, `OPTIONS` still `405`). **`*` is REJECTED AT BOOT** (rc=1, never
+binds). It **echoes** the origin only when allowlisted, **never `*`**, always sends
+**`Vary: Origin`**, answers preflight **`204`** with the exact `X-Sigil-*` headers, and
+**NEVER sets `Access-Control-Allow-Credentials`**. ⭐ **WHY THAT IS SAFE, AND WHY IT IS NOT A
+CSRF CONTROL: there is no cookie and no ambient authority** — every request is authenticated
+by a **per-request Ed25519 signature over a canonical message**, so a cross-origin page
+cannot forge one. The allowlist makes the browser-side error **honest** and the surface
+**deliberate**; it is not authentication. ⚠️ **Production should serve the app and the API
+from the SAME ORIGIN behind the reverse proxy**; this exists for the localhost dev topology.
+The double now sends no CORS header unless a test explicitly asks, so it **matches real
+sigild** — a double must never be MORE permissive than the thing it doubles.
+**THREE MORE FIX-ROUND FINDINGS:** (a) the new browser suites **could not detect DELETION of
+the recovery-kit wrap gate** (`if (false && …)` left webapp 14/14 and extension 8/8 green) ⇒
+a **`wrap-gate` spec in BOTH clients** now drives a **SECOND profile that never saw the kit
+sheet** and asserts the refusal, that **NO envelope was stored**, and that a wrong safety
+number is named as a mismatch (proving the first refusal did **not** silently pin the key) —
+mutation-confirmed red both ways; (b) the **leak assertions were narrower than the
+constraint** (only `localStorage` + the URL; a planted `sessionStorage.setItem` +
+`console.log` of the kit stayed **green**) ⇒ a **`leak` spec** in both clients now
+**ENUMERATES rather than expects**: every localStorage/sessionStorage key **AND value**,
+cookies, every IndexedDB record, every Cache Storage entry (this is a PWA), the DOM after
+dismissal, every outgoing request URL and body, every console message captured **from before
+the first navigation**, and the address bar — against four spellings of the code, with the
+console channel caught **independently** of the storage assertion; (c) the **desktop
+in-grace warning was DEAD CODE** — `from_subscription_block` had **zero production callers**,
+so `writes` was never `"grace"`, because the `sigil-cli` library exposed **no billing route**.
+Now wired end to end: **`fetch_subscription`** (CLI library) → **`DeviceConfig::subscription()`**
+→ an **`entitlement_refresh`** Tauri command → the UI, with a **real-server** test proving a
+desktop inside grace is **warned BEFORE any write is refused**. (d) The CLI rendered a `402`
+as a raw JSON dump while `401`/`403`/`501` got explainers; **all five explainers** gained a
+`402` arm stating it is a **BILLING state, not an authentication or permission failure**, and
+that reads and key recovery are unaffected — ⚠️ **precisely**: it still prints the server's
+JSON **first** and the prose **after**, matching this CLI's `{e}\n  -> HTTP nnn: …`
+convention.
+⭐ **NEW: `scripts/gate.sh`** — the documented way to run everything. It **ENUMERATES** every
+suite dynamically, **COUNTS results** instead of trusting exit codes, and includes a
+**CI-DRIFT CHECK** asserting every node interop suite and shell e2e script is named in some
+workflow (**this repo has THREE TIMES shipped a suite no workflow ran** — the nine interop
+tests for ~20 phases, then accounts+recovery, then entitlement — **green locally every
+time**). It also encodes two traps: **`fake-sigild.mjs` is a SERVER DOUBLE, not a test** (a
+naive `test/*.mjs` loop runs it and **hangs**), and it **REBUILDS the webapp and RE-VENDORS
+the extension first**, because Playwright's `reuseExistingServer` serves a **stale `.next`**
+and `pnpm -C extension exec playwright test` **skips the vendor hook** — both make a planted
+mutation appear to PASS locally. CI does both correctly. The drift check was itself
+mutation-tested. **CI additions:** `actions/setup-go` on the **webapp** job (without it
+`tests/cors.spec.ts` **`test.skip`s itself** and the only browser-level proof of the CORS fix
+silently skips while the job stays green; marketing stays toolchain-free), and
+`entitlement-interop.mjs` in `interop.yml` (**now 12/12**) — the **only** thing that parses
+sigild's real entitlement bytes with the JS reader. **NEW ADR 0044**; dated addenda on
+**0040**, **0042** and **0043**.
+✅ **VERIFIED FIRST-HAND (Phase 56): I ran `scripts/gate.sh` myself — ALL GREEN.** Invariants
+(both `Cargo.lock`s `getrandom`-free, `sigild` exactly one direct dep), all **10** workflows
+parse, Go gofmt/vet clean and **`go test -race` = 561 pass / 0 fail**, Rust fmt + clippy
+`-D warnings` + test on all four crates (**libsigil 134, cli 94, sigil-wasm 29, desktop 31**),
+**all 12** node interop suites, **webapp 19** Playwright tests, **extension 12**, marketing
+build, and **all three** shell e2e scripts. Inventory: **4 Rust crates, 4 Go test packages,
+12 node interop, 3 shell e2e, 13 Playwright spec files.** An adversarial verifier failed the
+first build over CORS, a fix round closed it, and an **independent re-verifier mutated
+production code for EVERY claim**, confirmed the spec went red, and restored it
+byte-identically.
 
 **Phases 53, 54 and 55 took the three ADR 0040 limitations that stop a paid product from
 being a paid product** — limit 12 (no rate limiting), the **data half** of limit 1 (NO
@@ -168,11 +261,15 @@ builds; both `Cargo.lock`s still `getrandom`==0; all ten workflows parse. I also
 mutation-tested the recovery choke point personally and confirmed the retired-knob boot
 warning fires **twice** on a live server.
 
-⚠️ **THE BIGGEST GAP THESE PHASES LEAVE:** ⭐ **RECOVERY IS CLI-ONLY.** No `recovery.spec.ts`
-and no `RecoveryPanel` in the webapp; **no recovery UI in the extension** (although
-`extension/build.sh` **DOES** vendor `recovery.mjs`); **no recovery commands on the desktop**.
-Since `restore` runs on a **NEW install**, **a user whose only client was the browser or the
-extension cannot restore there today.** Also: **no operator/edge rate limiting is configured
+✅ **THE BIGGEST GAP THESE PHASES LEFT — "RECOVERY IS CLI-ONLY" — WAS CLOSED BY PHASE 56**
+(above): the webapp, the extension and the desktop all have the kit lifecycle including
+**restore**, which is the one that runs on a **NEW install**. ⚠️ Still true of the kit
+itself: it **cannot be created after the loss**, it recovers **KEYS not DATA**, it opens only
+the vaults it was told to **COVER**, and whoever holds the paper holds the account. ⚠️ Also
+still true: the browser suites drive a **test double** for everything except `cors.spec.ts`
+(real-server conformance lives in the node interop suites and the shell e2e scripts), and
+**print output is NOT verified** (headless Chromium cannot render a printed page, so the
+`@media print` rules are by-eye). Also: **no operator/edge rate limiting is configured
 anywhere in `deploy/`**, and the **Postgres store suite has no per-run schema isolation** (two
 concurrent `go test ./...` runs against ONE database corrupt each other). Three stale code
 comments and one stale test header still describe the pre-fix limiter (`main.go` ~923 and
@@ -180,12 +277,16 @@ comments and one stale test header still describe the pre-fix limiter (`main.go`
 **buffers and always runs the handler**; `metrics.go`/`audit.go`/`ratelimit.go` still say
 *"three-value"* surface set, which is **two**; `abuse_test.go`'s cap test header still says
 *"fails closed"* against its own assertions), and `interface SigilWasm` in
-`web/packages/sigil-wasm/index.d.ts` lacks the `recovery_*` methods — all code follow-ups,
-deliberately not made in a documentation-only phase; `docs/api.md` and `docs/deployment.md`
-are the authority. ⚠️ **THE CI GAP IS NOW WIDER: `interop.yml` still runs NONE of
-`accounts-interop.mjs`, `recovery-interop.mjs`, `e2e-accounts.sh` or `e2e-recovery.sh`** —
-one line each, and `recovery-interop.mjs` is the ONLY automated guard on the Rust↔JS recovery
-codec. **NEW ADRs 0041, 0042, 0043** (+ dated addenda on **0031**, **0038** and
+`web/packages/sigil-wasm/index.d.ts` lacked the `recovery_*` methods (**that one is closed** —
+Phase 56 added both the types **and** the missing runtime re-exports, which were two separate
+holes); the three stale comments and the stale test header are still code follow-ups,
+deliberately not made in a documentation-only phase, and `docs/api.md` and
+`docs/deployment.md` are the authority. ✅ **THE "CI GAP IS NOW WIDER" NOTE IS STALE** — it
+described the state while Phases 53–55 were in flight, and commit `fb3aa3f` closed it in the
+same commit: `accounts-interop.mjs`, `recovery-interop.mjs`, `e2e-accounts.sh` and
+`e2e-recovery.sh` are all wired, and Phase 56 added `entitlement-interop.mjs` (12/12) plus a
+**mechanical drift check** in `scripts/gate.sh` so this is no longer tracked by memory.
+**NEW ADRs 0041, 0042, 0043** (+ dated addenda on **0031**, **0038** and
 **0040**); docs synced in the same change. Details in the Phase 53/54/55 entry below.
 
 **Phase 52 made an ACCOUNT the subject of ENTITLEMENT and the OWNER of vaults.** Sigil is a
@@ -7889,3 +7990,321 @@ honest party is worse than none.**
 - **Billing has still never been run against a live provider account**, Juspay remains
   UNVERIFIED-AGAINST-LIVE-DASHBOARD, and the whole repo remains **pre-audit and
   UNAUDITED**. Do not store real secrets.
+
+---
+
+## 2026-07-28 — Phase 56 (the features reach the user: recovery + entitlement on every client — and the CORS hole that made the webapp unreachable)
+
+### Why this phase
+
+Phases 54 and 55 shipped features that **users could not reach**.
+
+**Recovery existed only in the `sigil` CLI.** That is not a small gap, because `restore`
+runs on a **NEW install** — exactly the situation a person who lost every device is in. A
+customer whose only client was a browser **could not recover, and the sheet they printed
+was useless to them.** The mechanism was correct and the delivery was absent.
+
+**The entitlement signals had zero readers.** `sigild` set `X-Sigil-Entitlement` headers,
+added an `entitlement` block to `GET /v1/billing/subscription` and returned a
+machine-readable `402` — and **no client in this repo read any of it.** A customer inside
+their grace period was never told; a refusal rendered as whatever raw text the client
+happened to print. Every one of those channels was a signal emitted into silence.
+
+So this phase built client surfaces. It is the fourth time this repo has learned that a
+correct mechanism nobody can invoke is not a shipped feature.
+
+---
+
+### What was built
+
+**Webapp + MV3 extension** (`web/apps/webapp/app/authenticator.tsx`,
+`extension/src/popup/popup.{html,js,css}`): a **`RestorePanel` shown on BOTH the setup and
+the locked screens** — recovery is deliberately **not** behind an unlocked vault, because a
+fresh install with no local state is where a printed sheet is used — plus generate / cover /
+check / revoke and an entitlement block. The kit sheet is shown **once** (the 7×8 grouped
+code, the safety number, the kit device id, the account, the server, the vaults covered *as
+of today*, four warnings, print/copy) behind a *"I have written it down"* confirmation that
+**clears it from the DOM**. It lives in component state only: never `localStorage`, never a
+URL, never a log line.
+
+**Desktop** (`desktop/core/src/recovery.rs`, thin `#[tauri::command]`s, `desktop/ui`): the
+same flow natively, following that directory's standing rule (ADR 0037) — **REUSE, DO NOT
+REIMPLEMENT.** It calls the `sigil-cli` library and adds **no fourth copy** of the kit
+codec, the HKDF derivation or the safety-number digest.
+
+**A real latent bug, found and fixed.** `web/packages/sigil-wasm/index.mjs` **never
+re-exported the `recovery_*` wasm functions**, so every browser recovery call would have
+**thrown at runtime**. The `.d.ts` types were separately missing and had already been added:
+**types and runtime were two distinct gaps**, and closing one would not have closed the
+other.
+
+---
+
+### ⭐⭐ THE FINDING THAT FAILED THE FIRST BUILD: the webapp could not reach a real `sigild` at all
+
+An adversarial verifier returned `pass = false` on this, and it is the most important thing
+in the phase.
+
+Every `signedFetch` carries `X-Sigil-Device`, `X-Sigil-Timestamp`, `X-Sigil-Nonce` and
+`X-Sigil-Signature`. None of those is a CORS-safelisted request header, so **every call is
+preflighted**. `grep -rin access-control sigild/` found **nothing**, and a real preflight
+answered **`405`**. Observed in a real Chromium against a real server:
+
+> `blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present`
+
+So **enroll, sync, share, RESTORE-FROM-KIT and the entitlement read were all dead from the
+webapp** — including the phase's own headline claim, that a browser-only customer can now
+recover.
+
+⚠️ **And the phase's own new test double concealed it.** `sigil-wasm/test/fake-sigild.mjs`
+set `Access-Control-Allow-Origin: *` unconditionally, so **all six new webapp specs passed
+green while the real path was dead.** A test double that is more permissive than the thing
+it doubles hides exactly the failures it exists to catch.
+
+The **MV3 extension was unaffected** — an extension page with a `host_permissions` entry is
+exempt from CORS — and was proven working against the same server. That asymmetry is why
+the hole survived: the browser surface that *did* work was the one nobody suspected.
+
+⚠️ **The gap is PRE-EXISTING, from Phase 44**, when the browser clients first learned to
+sign requests. It went unnoticed for twelve phases because nothing browser-level ever talked
+to a real `sigild`: the node interop suites use a real server but are not a browser, and the
+browser suites were not using a real server. **This phase built its flagship deliverable on
+top of it.**
+
+#### The fix — a load-bearing decision, so it got its own ADR (0044)
+
+Opt-in, allowlisted CORS in `sigild` (`internal/api/cors.go` + `cmd/server/corsconfig.go`),
+hand-written stdlib — **`sigild` still has exactly ONE direct Go dependency.**
+
+- **`SIGILD_CORS_ORIGINS`** — a comma-separated list of **EXACT** origins (scheme + host +
+  optional port, nothing else), validated **fail-fast before the listener binds**.
+- ⭐ **UNSET = no CORS headers at all, byte-identical to before.** The middleware is **not
+  installed**, not merely inactive. A verifier swept **45 responses across 9 paths × 5
+  methods** with an `Origin` header present and found **zero `Access-Control-*` lines**,
+  with `OPTIONS` still returning `405`.
+- **`*` is REJECTED AT BOOT** (rc=1, the listener never binds) rather than accepted and
+  narrowed.
+- It **echoes** the origin **only** when allowlisted, **never `*`**, always sends
+  **`Vary: Origin`**, answers a preflight **`204`** with the exact `X-Sigil-*` header list,
+  exposes `X-Request-ID` + the three `X-Sigil-Entitlement*` headers (without which a browser
+  cannot read its own grace warning), and **NEVER sets
+  `Access-Control-Allow-Credentials`**.
+- It sits **innermost**, so a preflight it answers is still counted, request-ID'd and
+  access-logged; an unknown origin's `OPTIONS` falls through to the mux → `405`, exactly as
+  before, so no probe distinguishes *"route exists"* from *"origin allowed"*.
+
+⭐ **THE REASONING, which is the part that belongs in an ADR rather than a commit message:**
+this is safe because **there is no cookie and no ambient authority**. Every request is
+authenticated by a **per-request Ed25519 signature over a canonical message**. A hostile
+cross-origin page holds no device key, so it cannot forge a request whatever CORS says.
+
+> **That is also why CORS here is NOT a CSRF control.** The classic CSRF shape — a hostile
+> page causing the browser to attach *your* ambient credential to *its* request — has no
+> analogue here, because there is no ambient credential. The allowlist exists to make the
+> browser-side error **honest** and the reachable surface **deliberate**, not to
+> authenticate anything.
+
+⚠️ **Production should serve the app and the API from the SAME ORIGIN behind the reverse
+proxy**, in which case nothing needs listing and the file stays inert. `SIGILD_CORS_ORIGINS`
+exists for the localhost dev topology (webapp on `:3000`, sigild on `:8080`), and the boot
+log says so out loud.
+
+The double was corrected too: **`fake-sigild.mjs` now sends no CORS header unless a test
+explicitly asks**, so the default double matches real `sigild`. The extension suite passes
+nothing, which is the path its `host_permissions` actually take.
+
+---
+
+### The other three fix-round findings
+
+**1. The new browser suites could not detect DELETION of the recovery-kit wrap gate.**
+Replacing the gate's condition with `if (false && …)` left webapp **14/14** and extension
+**8/8** green. The derived path (covering from the browser that *printed* the kit) never
+reaches the gate at all, so only a **second profile** can exercise it. A new **`wrap-gate`
+spec in BOTH clients** now drives a profile that **never saw the kit sheet** and asserts the
+refusal, that **no envelope was stored**, and that a wrong safety number is named as a
+**mismatch** — which also proves the first refusal did **not silently pin the key**.
+Mutation-confirmed red both ways.
+
+**2. The leak assertions were narrower than the constraint they claimed.** They checked only
+`localStorage` and the URL; a planted `sessionStorage.setItem("dbg-kit", code)` plus a
+`console.log` of the kit stayed **green**. A new **`leak` spec** in both clients now
+**enumerates rather than expects**: every `localStorage`/`sessionStorage` key **and value**,
+cookies, every IndexedDB record, every Cache Storage entry (the webapp is a PWA), the DOM
+after dismissal, every outgoing request URL and body, every console message captured **from
+before the first navigation**, and the address bar — against four spellings of the code
+(raw, grouped, and both lower-cased). Mutation-confirmed, and the console channel is caught
+**independently** of the storage assertion.
+
+**3. The desktop in-grace warning was DEAD CODE.** `from_subscription_block` had **zero
+production callers**, so `writes` could never be `"grace"` — a desktop inside its grace
+period was never warned. Root cause: the `sigil-cli` library exposed **no billing route at
+all**. Now wired end to end — new **`fetch_subscription`** in the CLI library →
+**`DeviceConfig::subscription()`** → an **`entitlement_refresh`** Tauri command → the UI —
+with a **real-server** test proving a desktop inside grace is **warned BEFORE any write is
+refused**. Mutation-confirmed. Nothing else under `cli/` was edited, and there is still no
+second HTTP client and no second signing path under `desktop/`.
+
+**4. The CLI rendered a `402` as a raw JSON dump** while `401`/`403`/`501` each got an
+explainer. All five explainers gained a `402` arm stating it is a **BILLING state, not an
+authentication or permission failure**, and that reads and key recovery are unaffected.
+⚠️ **Be precise about what changed:** it still prints the server's JSON **first** and the
+prose **after**, matching this CLI's established `{e}\n  -> HTTP nnn: …` convention. The
+dump was **explained**, not replaced.
+
+---
+
+### ⭐ `scripts/gate.sh` — beyond the brief, and the reason it exists
+
+A full gate that **enumerates every suite dynamically** (Rust crates, Go packages, node
+interop, shell e2e, Playwright), **counts results instead of trusting exit codes**, prints a
+closing **inventory**, and runs a **CI-DRIFT CHECK** asserting that every node interop suite
+and every shell e2e script is named in **some** workflow.
+
+The rationale, recorded because it is a repeated failure and not a one-off:
+
+> **This repo has THREE TIMES shipped a suite that no workflow ran** — the nine interop
+> tests for ~20 phases, then accounts+recovery, then entitlement — **and it was green
+> locally every time.**
+
+The script also encodes two traps that make a **planted mutation appear to PASS locally**:
+
+- **`fake-sigild.mjs` is a SERVER DOUBLE, not a test.** A naive `for t in test/*.mjs` loop
+  runs it and **hangs**.
+- It **rebuilds the webapp and re-vendors the extension first**, because webapp Playwright's
+  `reuseExistingServer` will serve a **stale `.next`**, and `pnpm -C extension exec
+  playwright test` **skips the `pretest` vendor hook** (only `pnpm test` runs it). CI does
+  both correctly; a local run does not unless it is forced to.
+
+The drift check was itself mutation-tested.
+
+**CI additions, also beyond the brief:**
+
+- **`actions/setup-go` on the `webapp` job.** Without it `tests/cors.spec.ts`
+  **`test.skip`s itself**, so the **only** browser-level proof of the CORS fix would have
+  **silently skipped in CI while the job stayed green** — which is precisely the failure
+  mode the spec exists to catch. The marketing `build` job stays toolchain-free.
+- **`sigil-wasm/test/entitlement-interop.mjs` added to `interop.yml` (now 12/12).** It is
+  the **only** thing in the repo that parses sigild's **real** entitlement bytes with the JS
+  reader — the browser suites use a double — so a divergence between `entitlementJSON` /
+  `paymentRequiredResponse` and the JS parser would otherwise go red in **no** job, and the
+  failure mode is a client telling a paying customer the wrong thing about their own
+  subscription.
+
+---
+
+### ⚠️ The process, honestly
+
+An adversarial verifier **failed the first build** on the CORS finding — a defect that read
+fine in every diff, passed six brand-new specs, and made the phase's own headline claim
+false. A **fix round** closed it. An **independent re-verifier then mutated production code
+for EVERY claim**, confirmed the spec went red for each one, and restored the code
+byte-identically.
+
+The pattern is the same one Phases 53–55 recorded, arriving from a new direction: **a test
+that cannot fail is not a test.** Three of the four fix-round findings were *green tests
+over broken or absent behaviour* — a permissive double, a deletable gate, a narrow leak
+sweep — and the fourth was a warning path with no caller. None of them would have been
+caught by reading the diff.
+
+---
+
+### ✅ The gate (run before this entry)
+
+`scripts/gate.sh`, **ALL GREEN**:
+
+- **Invariants:** both `Cargo.lock`s `getrandom`-free; **`sigild` has exactly one direct
+  dependency**; all **10** workflows parse.
+- **Go:** gofmt clean, vet clean, **`go test -race` = 561 pass / 0 fail**.
+- **Rust:** fmt + clippy `-D warnings` + test on all four crates — **libsigil 134, cli 94,
+  sigil-wasm 29, desktop 31**.
+- **Node interop: all 12.** **Webapp Playwright 19**, **extension 12**, marketing builds.
+- **All three** shell e2e scripts.
+- **Inventory:** 4 Rust crates, 4 Go test packages, 12 node interop, 3 shell e2e, 13
+  Playwright spec files.
+- **No migration was added — `sigild_schema_version` is still 5.**
+
+---
+
+### 📄 Docs updated in the same change (the docs-stay-in-sync rule)
+
+- **`docs/decisions/0044-opt-in-cors-allowlist.md` — NEW.** Opt-in, allowlisted CORS on a
+  signature-authenticated API: why unset is byte-identical, why `*` is refused at boot, why
+  credentials mode is never enabled, ⭐ the **not-a-CSRF-control** reasoning, the
+  same-origin production guidance, and the honest limits (it constrains browsers only, it
+  does not make plain HTTP safe, the preflight cache delays removal, the browser-level proof
+  is skippable without Go). Records the permissive test double as a rejected alternative.
+- **`docs/decisions/0042-recovery-kit.md`** — a dated **addendum** retiring limitation 9
+  (partial client coverage), naming the `wrap-gate` and `leak` specs and the two distinct
+  `index.mjs` / `index.d.ts` gaps, and restating what is **not** retired (limitations 1–8 and
+  10–13, the test double, and unverified print output).
+- **`docs/decisions/0043-entitlement-enforcement.md`** — a dated **addendum** recording that
+  the three warning channels **had no client readers at all** when it was written, what each
+  client now reads, the desktop dead-code fix, the CLI's `402` arms (printed **after** the
+  server body), and that limitation 5 is **narrowed, not closed** — there is still no
+  dunning, notification, email, invoice or reconciliation.
+- **`docs/decisions/0040-account-model.md`** — a dated **addendum** on limitation 18: the
+  browser clients are no longer wrap-gate consumers only, but they **still have no UI to
+  mint, list or revoke an ordinary invite**. Limitation 1's addendum now reads differently
+  because a browser-only customer can actually use a printed sheet.
+- **`docs/decisions/README.md`** — the 0044 index row, the banner paragraph, and revision
+  notes on the 0040 / 0042 / 0043 rows.
+- **`docs/api.md`** — a new **Cross-origin requests (`SIGILD_CORS_ORIGINS`)** section (the
+  variable appeared **zero** times in `docs/` before), the preflight/response-header table,
+  that unset means no CORS headers at all, a note that the entitlement headers are
+  unreadable cross-origin unless exposed, a new **Client support** table for the entitlement
+  channels, and the corrected recovery-kit client-coverage limit.
+- **`docs/deployment.md`** — a new **§18** (operator guide for the variable, the same-origin
+  production recommendation, the verbatim boot warning, and what a misconfiguration looks
+  like — **in the browser, not the server log**), plus the corrected §17 client-coverage
+  bullet.
+- **`docs/architecture.md`** — the CORS middleware in the `sigild` component entry, the
+  webapp/extension spec inventories, ⭐ the **extension/webapp asymmetry** (host permissions
+  vs CORS) stated where the auth story is summarised, and the retired "recovery is CLI-only"
+  and "enrollment UI is not Playwright-covered" gaps.
+- **`CLAUDE.md`** — `SIGILD_CORS_ORIGINS` and the CORS bullet, the client sections (webapp /
+  extension / desktop / CLI / `sigil-wasm`), `entitlement.mjs`, the `fake-sigild.mjs`
+  double-is-not-a-test warning, **`scripts/gate.sh` as the documented way to run
+  everything**, the CI additions, and the updated counts (**12** node interop, webapp
+  **19**, extension **12**, desktop **31**).
+- **`README.md`** — recovery is no longer CLI-only, the `SIGILD_CORS_ORIGINS` caveat for
+  browser clients, and `scripts/gate.sh` in Build & test.
+
+### ⚠️ Found inaccurate beyond the brief
+
+- **The "THE CI GAP GOT WIDER" item in the Phase 53–55 entry and in the RESUME ANCHOR was
+  already stale at HEAD.** It listed `accounts-interop.mjs`, `recovery-interop.mjs`,
+  `e2e-accounts.sh` and `e2e-recovery.sh` as run by nothing — but commit **`fb3aa3f`** wired
+  all four **in the same commit**, after the entry was written. `CLAUDE.md` carried the same
+  claim in its `interop.yml` bullet. Both corrected; the mechanical drift check in
+  `scripts/gate.sh` is now what tracks this instead of memory.
+- **`CLAUDE.md`'s desktop test count was wrong even before this phase** — it said "15 unit +
+  3 integration"; the crate has **24 unit + 7 integration = 31**.
+- **The "enrollment UI is not covered by a Playwright test" gap, recorded in
+  `docs/architecture.md` for both browser clients, is closed** — and by more than expected:
+  the webapp's is now driven against a **real `sigild`** in `cors.spec.ts`, not a double.
+- **`readEntitlementHeaders` did have no caller when it was written.** It has three now (the
+  webapp's and the extension's sync paths, plus the interop suite), so the note that it was
+  dead is now historical rather than current.
+
+### ➡️ Still open (honest)
+
+- **The browser suites still run against a test double** for everything except
+  `cors.spec.ts`. Real-server conformance lives in the node interop suites and the three
+  shell e2e scripts. Nothing structurally prevents the next browser-only defect.
+- **Print output is not verified.** Headless Chromium cannot render a printed page, so the
+  recovery sheet's `@media print` rules are by-eye only.
+- **The kit is unchanged in every way that matters:** it is a credential **stronger than a
+  stolen locked phone**, it recovers **KEYS, not DATA**, it opens **only the vaults it was
+  told to COVER**, and **it cannot be created after the loss**.
+- **No invite-management UI in the browser clients** (ADR 0040 limitation 18): they can join
+  and read an account, not mint, list or revoke.
+- **No operator/edge rate limiting is configured anywhere in `deploy/`**; the Postgres store
+  suite still has no per-run schema isolation; the three stale code comments and one stale
+  test header from Phase 53 are still uncorrected (documentation-only phases again).
+- **Cross-sign the hybrid public key with the enrolled Ed25519 identity** remains the
+  highest-value follow-up, and would also close ADR 0042's label-discovery residual.
+- **Everything stays dev-gated, plain HTTP, pre-audit and UNAUDITED.** Billing has still
+  never been run against a live provider account, Juspay remains
+  UNVERIFIED-AGAINST-LIVE-DASHBOARD. Do not store real secrets.
+- `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 56**.

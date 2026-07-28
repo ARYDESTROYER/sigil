@@ -72,6 +72,16 @@ func main() {
 		burst = effectiveBurst(rate, burst)
 	}
 
+	// Browser origin allowlist, validated BEFORE binding too. OPT-IN and OFF by
+	// default: unset installs no CORS middleware and no response carries an
+	// Access-Control-* header. A malformed entry — or a wildcard — is a startup
+	// failure rather than a permissive fallback. See internal/api/cors.go.
+	corsOrigins, err := validateCORSOrigins(os.Getenv("SIGILD_CORS_ORIGINS"))
+	if err != nil {
+		logger.Error("invalid SIGILD_CORS_ORIGINS", "err", err)
+		os.Exit(1)
+	}
+
 	devOps := truthy(os.Getenv("SIGILD_ENABLE_DEV_OPS"))
 
 	// Multi-device auth model config, validated BEFORE binding. All of it is
@@ -203,6 +213,12 @@ func main() {
 		EnrollRateBurst: abuseCfg.EnrollBurst,
 		InviteRateLimit: abuseCfg.InviteRate,
 		InviteRateBurst: abuseCfg.InviteBurst,
+
+		CORSOrigins: corsOrigins,
+	}
+	if len(corsOrigins) > 0 {
+		logger.Warn("CORS ENABLED for an explicit browser origin allowlist — this is for the LOCALHOST DEV topology; in production serve the app and the API from the SAME origin behind the reverse proxy. No credentials mode is enabled and no wildcard is possible; every request is still authenticated by its own per-request signature",
+			"origins", strings.Join(corsOrigins, ","))
 	}
 	if devOps && rate > 0 {
 		logger.Warn("DEV op-log per-vault RATE LIMIT enabled — dev-only",

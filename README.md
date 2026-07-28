@@ -427,8 +427,18 @@ audited; see the status note below.)
   (`otpauth://` + Google Authenticator)/export and live codes computed by the wasm (not
   JavaScript). Accounts seal into a `SIGILcli` container (interoperable with the CLI
   vault); a **password unlock** decrypts it in memory and **only the sealed container**
-  is persisted in `localStorage` — a lost password is unrecoverable by design
-  ([ADR 0028](docs/decisions/0028-webapp-vault-persistence-and-unlock.md)). It is an
+  is persisted in `localStorage` — a lost password is unrecoverable by design, unless a
+  **recovery kit** was printed in advance
+  ([ADR 0028](docs/decisions/0028-webapp-vault-persistence-and-unlock.md),
+  [ADR 0042](docs/decisions/0042-recovery-kit.md)). It can also, **optionally**, add a
+  **passkey as a second AT-REST factor**: with protection on, both sealed containers are
+  sealed under a container master key derived from that same printed sheet, and the key is
+  wrapped in a third sealed container under a WebAuthn PRF output concatenated with the
+  password — **AND, never OR**, with the printed sheet as the only break-glass. It defends
+  **stored bytes, not a running page**, is **not retroactive**, is the **only** client with
+  this UI, and the sync server learns nothing about it — no route, header, migration or
+  dependency changed
+  ([ADR 0046](docs/decisions/0046-passkey-protected-local-containers.md)). It is an
   **installable, offline-capable, accessible** authenticator PWA — a manifest + service
   worker cache the app shell / JS / `.wasm` so codes still generate with **no network**
   (only static assets are cached; the sealed vault stays in `localStorage`), and it is

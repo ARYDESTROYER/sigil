@@ -81,6 +81,16 @@ export * from "../../../sigil-wasm/sharing.mjs";
 // render a code ONCE and never write it to localStorage, a URL, an analytics
 // event or a log line.
 export * from "../../../sigil-wasm/recovery.mjs";
+// PASSKEY-PROTECTED LOCAL CONTAINERS (ADR 0046): a second AT-REST factor for the
+// two sealed containers. It changes NOTHING on the wire — request auth is still
+// the classical Ed25519 contract-v3 signature and `sigild` never learns this
+// exists. The break-glass is the EXISTING ADR 0042 recovery sheet, so there is no
+// second paper artifact and no server involvement.
+//
+// ⚠️ Re-exported HERE **and** declared in index.d.ts. Phase 56 proved those are
+// two separate holes: `recovery_*` was typed but never re-exported, so every
+// browser recovery call threw at runtime while `tsc` stayed clean.
+export * from "../../../sigil-wasm/passkey.mjs";
 // ENTITLEMENT (Phase 55 server side, read here): sigild's warning headers, the
 // additive `entitlement` block on GET /v1/billing/subscription, and the
 // machine-readable 402. Reading it is how a client can say the TRUE thing —

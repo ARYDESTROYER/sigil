@@ -31,7 +31,14 @@
 > email, no password, no session, **no identity system** — and ⭐ **no request
 > anywhere names an account**. The only recovery is a **paper kit printed in
 > advance** ([below](#recovery-kits-dev-gated--phase-54)), which the server sees
-> as an ordinary device and has **no concept of**. A **dev-gated, opt-in
+> as an ordinary device and has **no concept of**. ⭐ **The same is true of
+> passkeys:** Phase 58 gave the webapp an optional **second at-rest factor** for its
+> local sealed containers ([ADR 0046](decisions/0046-passkey-protected-local-containers.md)),
+> and `sigild` gained **nothing at all** — no route, no header, no canonical
+> message, no migration, no table, no metric, no dependency, and no
+> `sigild_schema_version` bump. Request authentication is still the classical
+> Ed25519 contract-v3 signature. **Nothing in this reference changed for it**, and a
+> server cannot disable, weaken, detect or observe it. A **dev-gated, opt-in
 > billing layer** (hosted checkout + provider webhooks, [below](#billing--subscriptions-dev-gated-opt-in--phase-45))
 > stores subscription state but **no card data**, and has **never been run
 > against a live payment provider**; since Phase 55 it can, **opt-in**, refuse a
@@ -2120,6 +2127,14 @@ working and simply pins on next use. See
 [ADR 0036](decisions/0036-browser-sharing-secret-storage.md) and
 [ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md).
 
+⚠️ **That container is sealed under the vault password — except in the webapp with
+passkey protection on**, where both it and the TOTP vault are sealed under a
+**container master key** derived from the printed recovery seed, and the CMK itself
+is wrapped in a third sealed container under a WebAuthn PRF output concatenated with
+the password ([ADR 0046](decisions/0046-passkey-protected-local-containers.md)). That
+is an **at-rest** change on one client only. It is invisible on the wire: this server
+sees the same signed requests and the same opaque bytes either way.
+
 The pinning surface itself calls **no route**: `safetyNumber` / `pairwiseSafetyNumber`
 / `renderSafetyNumber`, `newPinStore` / `requirePinStore` / `checkAndPin` /
 `repinHybridKey` and the `KeyPinMismatchError` class are pure local computation over
@@ -2205,7 +2220,10 @@ worth knowing when reading the rest of this document:
   The CLI **and the native desktop app** keep the hybrid secret and the keyring in the
   *same* `0600` plaintext files; the browser clients seal both into the device-identity
   container (stronger at rest) but hold them **unzeroized in JS memory** while the vault
-  is unlocked. Nothing is zeroized on any client.
+  is unlocked. Nothing is zeroized on any client. Since Phase 58 the **webapp** can add a
+  second at-rest factor (a WebAuthn PRF output) to that container
+  ([ADR 0046](decisions/0046-passkey-protected-local-containers.md)); the extension and
+  the desktop cannot, so the per-client asymmetry is now three-way.
 
 ---
 

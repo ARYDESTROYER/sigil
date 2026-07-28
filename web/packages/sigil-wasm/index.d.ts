@@ -899,13 +899,25 @@ export function verifyRecoveryKit(wasm: SigilWasm, code: string): Uint8Array;
 export function deriveRecoveryIdentity(wasm: SigilWasm, seed: Uint8Array): RecoveryIdentity;
 
 /** Which vaults hold a wrapped key for a device. SELF-ONLY; metadata only. */
+export interface RecoverableVault {
+  vaultId: string;
+  senderDeviceId: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
+/**
+ * ⚠️ `truncated` reflects the route's `has_more`. The per-device index has a hard
+ * page cap and NO CURSOR, so a truncated answer means the rest is unreachable and
+ * a caller must NOT report a partial recovery as a complete one.
+ */
+export type RecoverableVaultList = RecoverableVault[] & { readonly truncated: boolean };
+
 export function listRecoverableVaults(
   wasm: SigilWasm,
   auth: SharingAuth,
   deviceId?: string | null,
-): Promise<
-  { vaultId: string; senderDeviceId: string; sizeBytes: number; createdAt: string }[]
->;
+): Promise<RecoverableVaultList>;
 
 /** Pin a key this client DERIVED itself (origin "recovery-kit"). Never replaces. */
 export function pinDerivedKey(
@@ -1093,3 +1105,145 @@ export function describePaymentRequired(err: PaymentRequiredError): {
   headline: string;
   detail: string;
 };
+
+// ── passkey-protected local containers (sigil-wasm/passkey.mjs, ADR 0046) ─────
+//
+// ⚠️ These declarations and the `export *` in index.mjs are TWO SEPARATE HOLES.
+// Phase 56 shipped `recovery_*` typed here but never re-exported at runtime, so
+// every browser call threw while `tsc` stayed clean. Keep both in step.
+
+export const PASSKEY_PRF_DOMAIN: string;
+export const HW_SLOT_VERSION: number;
+export const PRF_OUTPUT_LEN: number;
+export const CONTAINER_MASTER_KEY_LEN: number;
+export const PASSKEY_TIMEOUT_MS: number;
+export const CMK_HKDF_SALT: string;
+export const CMK_HKDF_INFO: string;
+
+export class PasskeyError extends Error {
+  code: string;
+}
+export class PrfUnavailableError extends PasskeyError {}
+
+/** Is the WebAuthn + subtle-crypto surface even present? NOT a claim that PRF works. */
+export function passkeySupport(): { available: boolean; reason: string };
+
+/** SHA-256(PASSKEY_PRF_DOMAIN) — the 32-byte PRF evaluation point. Not secret. */
+export function prfSalt(): Promise<Uint8Array>;
+
+/** BE/BS/UP/UV flags of a WebAuthn authenticatorData blob. */
+export function backupFlags(authenticatorData: ArrayBuffer | Uint8Array | null): {
+  userPresent: boolean;
+  userVerified: boolean;
+  backupEligible: boolean;
+  backupState: boolean;
+};
+
+/** The ONE sentence the UI may say about scope, from the LAST ceremony's flags. */
+export function describeProtectionScope(info: {
+  backupEligible?: boolean;
+  attachment?: string;
+}): string;
+
+export interface CreatedPasskey {
+  credentialId: string;
+  rpId: string;
+  attachment: string;
+  prfEnabled: boolean;
+  backupEligible: boolean;
+  backupState: boolean;
+}
+
+export function createPasskey(options?: {
+  rpName?: string;
+  userName?: string;
+  userDisplayName?: string;
+  userId?: Uint8Array | null;
+  timeoutMs?: number;
+}): Promise<CreatedPasskey>;
+
+export interface PrfAssertion {
+  prfOutput: Uint8Array;
+  credentialId: string;
+  backupEligible: boolean;
+  backupState: boolean;
+  userVerified: boolean;
+}
+
+/** Run ONE assertion (discoverable credential) and return its 32-byte PRF output. */
+export function evaluatePrf(options?: {
+  allowCredentials?: PublicKeyCredentialDescriptor[];
+  timeoutMs?: number;
+}): Promise<PrfAssertion>;
+
+export interface PrfProbe {
+  credentialId: string;
+  rpId: string;
+  attachment: string;
+  prfOutput: Uint8Array;
+  backupEligible: boolean;
+  backupState: boolean;
+}
+
+/** create() + get() + get() again; 32 bytes, byte-identical, or it is UNSUPPORTED. */
+export function probePrf(options?: {
+  rpName?: string;
+  userName?: string;
+  userDisplayName?: string;
+  userId?: Uint8Array | null;
+  timeoutMs?: number;
+}): Promise<PrfProbe>;
+
+/** `R ‖ utf8(password)` — fed straight to the container's own Argon2id. */
+export function hwSlotSecret(prfOutput: Uint8Array, password: string | Uint8Array): Uint8Array;
+
+/** HKDF-SHA256 over the ADR 0042 recovery seed -> the 32-byte container master key. */
+export function deriveContainerMasterKey(kitSeed: Uint8Array): Promise<Uint8Array>;
+
+export interface HwSlot {
+  version: number;
+  cmk: Uint8Array;
+  kitDeviceId: string;
+  credentialId: string;
+  rpId: string;
+  backupEligible: boolean;
+  backupState: boolean;
+  createdAt: string;
+}
+
+export function sealHwSlot(
+  wasm: Pick<SigilWasm, "seal_to_container">,
+  slot: {
+    prfOutput: Uint8Array;
+    password: string | Uint8Array;
+    cmk: Uint8Array;
+    kitDeviceId?: string;
+    credentialId?: string;
+    rpId?: string;
+    backupEligible?: boolean;
+    backupState?: boolean;
+  },
+  salt: Uint8Array,
+  nonce: Uint8Array,
+  params: Argon2Params,
+): Uint8Array;
+
+export function openHwSlot(
+  wasm: Pick<SigilWasm, "open_container">,
+  prfOutput: Uint8Array,
+  password: string | Uint8Array,
+  container: Uint8Array,
+): HwSlot;
+
+/**
+ * Passkey-specific wording. NEVER collapses into "wrong password".
+ *
+ * ⭐ Pass `{ atUnlock: true }` from an UNLOCK screen. The PRF-failure codes mean
+ * "the control refused, nothing was written" during enable and "your containers
+ * are already sealed with a key this authenticator can no longer derive" at
+ * unlock — the second must point at the recovery sheet, not reassure.
+ */
+export function explainPasskeyStatus(
+  err: unknown,
+  options?: { atUnlock?: boolean },
+): string;

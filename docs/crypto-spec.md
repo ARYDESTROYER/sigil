@@ -726,6 +726,131 @@ such. See [ADR 0042](decisions/0042-recovery-kit.md)'s addendum.
   code. Full adversary treatment in
   [`threat-model.md`](threat-model.md#recovery-kit-adversaries-dev-gated--see-adr-0042).
 
+⚠️ **A FOURTH label now hangs off the same PRK, and it does NOT live in
+`recovery.rs`.** [ADR 0046](decisions/0046-passkey-protected-local-containers.md)
+derives a **container master key** from the same seed under
+`"sigil-recovery-kit-v1/container-master-key"`. It is computed in JavaScript
+(`crypto.subtle`), not in the core — see the next section for why, and for the
+security consequence of the sheet acquiring a second job.
+
+## Passkey-protected local containers — the container master key and the slot
+
+**Status (pre-audit, UNAUDITED, dev-only; the webapp only).** Every browser client
+seals its `SIGILcli` containers with Argon2id under a **human password**, and that
+password is the only factor between an attacker who copied `localStorage` and
+everything inside. [ADR 0046](decisions/0046-passkey-protected-local-containers.md)
+adds a **second AT-REST factor**: a WebAuthn credential's **PRF output** is mixed
+into the sealing secret, so a stolen copy of the storage is useless without the
+authenticator too.
+
+⛔ **This is not request authentication and not transport.** The wire protocol is
+byte-for-byte unchanged — every signed request is still a classical Ed25519
+contract-v3 signature, and `sigild` gained no route, header, canonical message,
+migration, table, metric or dependency. A hostile server cannot disable, weaken,
+detect or observe it.
+
+### The container master key (CMK)
+
+```
+CMK = HKDF-SHA256( salt = "sigil-recovery-kit-v1",                 ← the SAME salt as above
+                   ikm  = kit_seed(32),                            ← the printed ADR 0042 sheet
+                   info = "sigil-recovery-kit-v1/container-master-key",
+                   L    = 32 )
+```
+
+With protection on, **both** containers (the TOTP vault and the device identity)
+are sealed under the CMK instead of the password.
+
+⭐ **The break-glass therefore needs NO new artifact and NO server.** The 56
+characters already printed to survive losing every device also open a protected
+local profile, offline. There is no second sheet and nothing for the server to
+hold.
+
+⚠️ **It is computed in JS, deliberately** ([`../sigil-wasm/passkey.mjs`](../sigil-wasm/passkey.mjs)) —
+one `crypto.subtle.deriveBits` call — and **not** added as a fourth label in
+[`../libsigil/core/src/recovery.rs`](../libsigil/core/src/recovery.rs). No Rust
+caller exists, so a Rust copy would be a mirror that can only drift, and a new wasm
+export would mean editing both `index.mjs` and `index.d.ts` (two separate holes, as
+Phase 56 proved). If the CLI or the desktop ever want offline local unlock, it moves
+into `recovery.rs`, single-sourced, and the JS becomes a shell.
+
+### The passkey slot
+
+```
+PRF_SALT = SHA-256("sigil-passkey-unlock-v1")        32-byte CONSTANT, not a secret
+R        = prf.results.first of a WebAuthn assertion, evaluated at PRF_SALT   32 bytes
+
+hwslot   = seal_to_container( R ‖ utf8(password), salt, nonce, Argon2 params,
+                              {"version":1,"cmk":<b64 32>,"kit_device_id":…,
+                               "credential_id":…,"rp_id":…,"backup_eligible":…,
+                               "backup_state":…,"created_at":…} )
+```
+
+The slot is the third `SIGILcli` container in `localStorage`
+(`sigil.webapp.hwslot.v1`). Two choices in the secret are load-bearing:
+
+- ⭐ **`R ‖ utf8(password)` is fed STRAIGHT to the container's own Argon2id.**
+  There is deliberately **no cheap HKDF over the password first**. An attacker who
+  can *drive the authenticator* (an unlocked device, a coerced user-verification
+  prompt) recovers `R` and then still faces Argon2id over the password; reducing
+  the password through a fast KDF first would hand that attacker an **unstretched**
+  guess.
+- ⭐ **PRF bytes FIRST.** The fixed-length 32-byte prefix makes the concatenation
+  unambiguous; password-first would let `("abc", P)` and `("abcX", P′)` collide.
+
+The credential is **discoverable** (`residentKey: "required"`), so the locked
+screen can run `get()` with an empty `allowCredentials` — the credential id lives
+*inside* the sealed slot, and no plaintext marker naming it is ever written. The
+slot is a container rather than a JSON marker precisely to keep the persisted set
+*"sealed containers only"*
+([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)); sealing public
+metadata under a hardcoded constant just to satisfy that check would be fake
+crypto.
+
+### The two doors, and the order of writes
+
+⭐ **AND, never OR.** While protection is on there is **no password-only slot**.
+The doors are **(password AND passkey)** and **(the printed sheet)**. An OR design
+is theatre: an offline attacker attacks the weaker branch and the passkey buys
+zero.
+
+⭐ **Enabling is not atomic, so the write order IS the safety property.** The
+containers are written **first** and the slot **last**, so a crash leaves
+CMK-sealed containers with **no slot** — a state the printed sheet alone recovers.
+The original order (slot first) left a slot beside still-password-sealed
+containers, and in **that** state a sheet-derived CMK cannot open a password-sealed
+container: information-theoretically true, and unfixable at the unlock end. *Make
+the last write the one whose loss costs least.*
+
+### What this does and does not give you
+
+- **It defends STORAGE, never EXECUTION.** Anything running in the origin while
+  the vault is unlocked reads the plaintext vault, the seed, the hybrid secret,
+  every vault key, the password, the PRF output **and the CMK** — exactly as
+  before.
+- ⚠️ **It is NOT retroactive.** Only containers re-sealed after protection is
+  enabled are protected; earlier copies, backups and forensic images stay
+  password-only forever.
+- ⚠️ **`R` is a keyed function's output, not an authenticator secret we hold.** We
+  never see the credential's private key, request no attestation, and therefore
+  make **no claim** about what kind of authenticator is in use. `userVerification:
+  "required"` is a policy *request* and a flag we read, not a proof.
+- ⚠️ **A backup-eligible credential syncs to a provider account**, so the factor is
+  only as strong as that account. The UI derives its scope sentence from the BE/BS
+  flags of the ceremony that just ran, never from what was true when protection was
+  switched on.
+- ⚠️ **PRF availability varies** by browser, platform and authenticator; a PRF that
+  is missing, short, or non-deterministic is treated as **unsupported**, never as
+  "retry", because a non-deterministic one would seal a container nothing could
+  reopen.
+- ⚠️ **Whoever holds the printed sheet now also holds local unlock.** The paper was
+  already a full-account credential
+  ([ADR 0042](decisions/0042-recovery-kit.md) limitation 1); its reach grew.
+- ⚠️ **Only the webapp implements this.** The MV3 extension and the native desktop
+  do not — scope, not a blocker.
+- ⚠️ **UNAUDITED**, dev-only, like everything around it. Adversary treatment in
+  [`threat-model.md`](threat-model.md).
+
 ## HOTP / TOTP one-time-password primitive (`hotp` / `totp`)
 
 **Status (pre-audit, UNAUDITED).** `sigil-core` now implements the **authenticator

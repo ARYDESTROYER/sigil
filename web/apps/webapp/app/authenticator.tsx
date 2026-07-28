@@ -23,12 +23,58 @@ const STORAGE_KEY = "sigil.webapp.vault.v1";
 // JSON so the CLI-mirrored TotpVault schema stays byte-compatible.
 const DEVICE_KEY = "sigil.webapp.device.v1";
 
+// ⭐ localStorage key holding the PASSKEY SLOT (ADR 0046) — a THIRD `SIGILcli`
+// container, present ONLY while passkey protection is on. It is sealed under
+// `PRF_output(32) ‖ utf8(password)` and its plaintext holds the 32-byte CONTAINER
+// MASTER KEY that the other two containers are then sealed under.
+//
+// ⭐ It is a sealed container rather than a plain JSON marker on purpose: the
+// browser's persisted key set stays "sealed containers only" (ADR 0036), which
+// the leak specs check by decoding every stored value and demanding the
+// `SIGILcli` magic. A `{credential_ids, rp_id}` marker would have been the first
+// non-container persisted value in this repo's history.
+const HWSLOT_KEY = "sigil.webapp.hwslot.v1";
+
 // Argon2id parameters used when (re)sealing. The container is self-describing
 // (it stores these), so open needs none and the vault stays CLI-interoperable
 // regardless. OWASP-minimum-ish interactive params for a dev build.
 const ARGON2 = { m_cost: 19456, t_cost: 2, p_cost: 1 };
 
 type Phase = "loading" | "error" | "setup" | "locked" | "unlocked";
+
+/**
+ * What is TRUE about passkey protection right now, derived from a hwslot that
+ * ACTUALLY OPENED this session. ⛔ There is deliberately no `protected: true`
+ * flag: the truth is the ciphertext, and a flag could only drift from it.
+ */
+interface ProtectionInfo {
+  /** The recovery kit whose printed sheet derives this browser's CMK. */
+  kitDeviceId: string;
+  credentialId: string;
+  /** BE flag from the LAST ceremony — a backup-eligible passkey syncs. */
+  backupEligible: boolean;
+  /** BS flag from the LAST ceremony. */
+  backupState: boolean;
+  attachment: string;
+}
+
+interface PasskeyProbeSummary {
+  backupEligible: boolean;
+  attachment: string;
+  scope: string;
+}
+
+/**
+ * A refusal BEFORE anything is written: no recovery kit, or the probe stage was
+ * skipped. Distinct from a passkey/PRF failure so the UI can route the user to
+ * the RecoveryPanel instead of blaming their authenticator.
+ */
+class PasskeyPrecondition extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PasskeyPrecondition";
+  }
+}
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -76,11 +122,43 @@ export default function Authenticator() {
 
   // The password lives ONLY in memory while unlocked (never persisted).
   const passwordRef = useRef<string>("");
-  // What SEALS the TOTP vault container: the human password for a personal vault,
-  // or the 32-byte VAULT KEY for a shared one. A SIGILcli container takes
-  // arbitrary password BYTES, so a random key drops straight in where a password
-  // goes — exactly as the `sigil vault rekey` CLI does it. Memory-only.
-  const sealRef = useRef<string | Uint8Array>("");
+  // The 32-byte VAULT KEY when this vault is SHARED; null for a personal vault.
+  // A SIGILcli container takes arbitrary password BYTES, so a random key drops
+  // straight in where a password goes — exactly as `sigil vault rekey` does it.
+  // ⭐ A container sealed under this is already immune to offline guessing, so
+  // ADR 0046 leaves it COMPLETELY ALONE: passkey protection replaces the human
+  // password as a sealing secret and nothing else.
+  const vaultKeyRef = useRef<Uint8Array | null>(null);
+  // ⭐ ADR 0046. The CONTAINER MASTER KEY while unlocked under passkey
+  // protection; null when protection is off. Memory-only, exactly like the
+  // password.
+  const cmkRef = useRef<Uint8Array | null>(null);
+  // The PRF output of the ceremony that unlocked (or enabled) this session.
+  // Memory-only. Needed to RE-SEAL the slot when the recovery kit is reprinted.
+  const prfRef = useRef<Uint8Array | null>(null);
+  // The result of the live PRF probe, between the two stages of enabling.
+  const probeRef = useRef<
+    | {
+        credentialId: string;
+        rpId: string;
+        attachment: string;
+        backupEligible: boolean;
+        backupState: boolean;
+        kitDeviceId: string;
+      }
+    | null
+  >(null);
+  // ⭐ THE PROTECTION STATE IS THE CIPHERTEXT, NOT A FLAG. This is non-null only
+  // when a hwslot container was present AND actually opened this session — there
+  // is deliberately no `protected: true` boolean anywhere that could drift from
+  // what the stored bytes really are.
+  const [protection, setProtection] = useState<ProtectionInfo | null>(null);
+  // ⚠️ A persistent, top-level warning that must OUTLIVE the screen that caused
+  // it. The break-glass replaces the locked screen with the unlocked vault the
+  // instant it succeeds, so a message rendered inside UnlockPanel would be
+  // unmounted before anyone read it — which is precisely how the orphaned
+  // device identity became silent.
+  const [notice, setNotice] = useState<string>("");
 
   const now = useUnixClock();
 
@@ -119,13 +197,37 @@ export default function Authenticator() {
     };
   }, []);
 
+  // ⭐⭐ THE ONE FUNCTION THAT PRODUCES A SEALING SECRET (ADR 0046 §"the gate").
+  //
+  // `persist()` and `persistDevice()` take ONLY its output and NEVER
+  // `passwordRef.current` directly. ADR 0042 §4 taught this the hard way: a rule
+  // that lives in a command rather than on the path it protects is a habit, and
+  // habits are what new call sites forget. JS cannot enforce it by type the way
+  // `VerifiedRecipient` does on the Rust side, so it is enforced by MUTATION
+  // PROOF M3 instead — making this fall back to the raw password while a hwslot
+  // exists must turn `passkey.spec.ts` spec 2 RED.
+  //
+  // ⛔ There is NO password-only slot while protection is on. AND, never OR: an
+  // OR design lets an offline attacker attack the weaker branch, so the passkey
+  // would buy literally zero.
+  function sealingSecret(): string | Uint8Array {
+    return cmkRef.current ?? passwordRef.current;
+  }
+
+  // What seals the TOTP VAULT container. A SHARED vault keeps its random 32-byte
+  // vault key (already immune to guessing, and peers must be able to open it);
+  // a PERSONAL vault gets whatever `sealingSecret()` says.
+  function vaultSealingSecret(): string | Uint8Array {
+    return vaultKeyRef.current ?? sealingSecret();
+  }
+
   // Seal `v` with the CURRENT seal secret (fresh salt + nonce from the CSPRNG)
   // and write the sealed container (base64) to localStorage. Only the sealed
-  // bytes are stored — never the vault, the password or a vault key.
+  // bytes are stored — never the vault, the password, a vault key or the CMK.
   function persist(m: Wasm, v: TotpVault, secret?: string | Uint8Array): void {
     const salt = crypto.getRandomValues(new Uint8Array(m.recommended_salt_len()));
     const nonce = crypto.getRandomValues(new Uint8Array(m.nonce_len()));
-    const container = m.sealVault(m, secret ?? sealRef.current, v, salt, nonce, ARGON2);
+    const container = m.sealVault(m, secret ?? vaultSealingSecret(), v, salt, nonce, ARGON2);
     window.localStorage.setItem(STORAGE_KEY, m.bytesToBase64(container));
   }
 
@@ -141,7 +243,7 @@ export default function Authenticator() {
     return draft;
   }
 
-  // Seal the device identity under the CURRENT vault password and store only the
+  // Seal the device identity under the CURRENT sealing secret and store only the
   // sealed container. Passing null forgets the identity entirely.
   function persistDevice(m: Wasm, d: DeviceIdentity | null): void {
     if (!d) {
@@ -151,86 +253,187 @@ export default function Authenticator() {
     }
     const salt = crypto.getRandomValues(new Uint8Array(m.recommended_salt_len()));
     const nonce = crypto.getRandomValues(new Uint8Array(m.nonce_len()));
-    const container = m.sealDeviceIdentity(m, passwordRef.current, d, salt, nonce, ARGON2);
+    const container = m.sealDeviceIdentity(m, sealingSecret(), d, salt, nonce, ARGON2);
     window.localStorage.setItem(DEVICE_KEY, m.bytesToBase64(container));
     setDevice(d);
   }
 
-  // Decrypt the stored device identity with the just-accepted password. A
-  // container that will not open (e.g. sealed under an older password) is
-  // treated as "no device" rather than blocking the unlock.
-  function loadDevice(m: Wasm, password: string): DeviceIdentity | null {
+  // Decrypt the stored device identity with `secret`. A container that will not
+  // open (e.g. sealed under an older password) yields null rather than blocking
+  // the unlock. Does NOT touch React state — the caller decides.
+  function openStoredDevice(m: Wasm, secret: string | Uint8Array): DeviceIdentity | null {
     const stored = window.localStorage.getItem(DEVICE_KEY);
-    if (!stored) {
-      setDevice(null);
-      return null;
-    }
+    if (!stored) return null;
     try {
-      const d = m.openDeviceIdentity(m, password, m.base64ToBytes(stored));
-      setDevice(d);
-      return d;
+      return m.openDeviceIdentity(m, secret, m.base64ToBytes(stored));
     } catch {
-      setDevice(null);
       return null;
     }
   }
 
   function createVault(password: string): void {
     if (!wasm) throw new Error("wasm not ready");
+    // ⛔⛔ CLEAR THE STALE SLOT FIRST, and this one line is a LOCKOUT FIX.
+    //
+    // The initial phase is decided from STORAGE_KEY alone, so a profile whose
+    // vault container is gone while the hwslot survives (a partial clear, a
+    // quota eviction, a botched restore) shows SETUP. Sealing a fresh vault
+    // under a NEW password beside the OLD slot closed BOTH doors: unlock ran a
+    // ceremony and then failed to open a slot sealed under the previous
+    // password, and the break-glass refused too, because the sheet-derived CMK
+    // does not open a container sealed under the brand-new password. A vault
+    // that has just been created has no passkey and no sheet behind it, so any
+    // slot lying next to it belongs to something that no longer exists.
+    window.localStorage.removeItem(HWSLOT_KEY);
+
+    // ⛔ A DEVICE IDENTITY THAT SURVIVED A MISSING VAULT MUST NOT VANISH IN
+    // SILENCE. Clearing only the vault container (a partial clear, a quota
+    // eviction, a botched restore) lands here at SETUP with the device container
+    // still present and sealed under the OLD secret — the Ed25519 seed, the
+    // hybrid secret and every accepted vault key. Sealing a fresh vault under a
+    // NEW password does not open it, and the break-glass form renders only on the
+    // LOCKED phase, so nothing would ever tell the user it was there.
+    //
+    // It is LEFT BYTE-FOR-BYTE IN PLACE — never deleted — and announced. A
+    // permanent loss a human is told about is recoverable by a human; a silent
+    // one is not. (This is the same rule the break-glass orphan guard follows.)
+    const orphanedIdentity = window.localStorage.getItem(DEVICE_KEY) !== null;
+
     const v = wasm.newVault();
+    setNotice(
+      orphanedIdentity
+        ? "A device identity from a previous vault is still stored in this browser. It is " +
+            "sealed with the OLD secret, so this new vault's password does not open it, and it " +
+            "has been LEFT IN PLACE rather than deleted. If you still have that vault's password " +
+            "or its recovery sheet, restore that vault instead of creating a new one — otherwise " +
+            "this browser will need to enrol as a new device."
+        : "",
+    );
     passwordRef.current = password;
-    sealRef.current = password;
+    vaultKeyRef.current = null;
+    cmkRef.current = null;
+    prfRef.current = null;
+    setProtection(null);
     setActiveVaultId(null);
     persist(wasm, v, password);
     setVault(v);
-    loadDevice(wasm, password);
+    setDevice(openStoredDevice(wasm, password));
     setPhase("unlocked");
   }
 
-  function unlock(password: string): void {
+  /**
+   * UNLOCK.
+   *
+   * ⭐ WITH PROTECTION ON the ceremony fires AFTER the password is submitted, so
+   * a typo never costs a WebAuthn prompt, and a ceremony that fails, is
+   * cancelled or returns different bytes throws a PASSKEY-specific error the
+   * caller renders as such. ⛔ It must never fall through to a generic "wrong
+   * password" — that is the worst possible message for someone whose passkey
+   * just died, and the recovery-sheet field is right there.
+   *
+   * ⚠️ CMK-then-password, and that is NOT a residual OR slot. Enable is not
+   * atomic (a crash can leave a hwslot beside password-sealed containers), so the
+   * password is tried as a SECOND candidate — but only once the hwslot has
+   * ACTUALLY OPENED, which already required the passkey. After a *successful*
+   * enable the ciphertext has changed, so the password path stops working by
+   * construction rather than by policy.
+   */
+  async function unlock(password: string): Promise<void> {
     if (!wasm) throw new Error("wasm not ready");
     const stored = window.localStorage.getItem(STORAGE_KEY);
     if (!stored) throw new Error("no sealed vault found");
     const container = wasm.base64ToBytes(stored);
 
-    // The device identity opens with the PASSWORD; it is what carries any vault
-    // keys, so it must be read first.
-    const d = loadDevice(wasm, password);
+    let cmk: Uint8Array | null = null;
+    let prf: Uint8Array | null = null;
+    let info: ProtectionInfo | null = null;
+    const hw = window.localStorage.getItem(HWSLOT_KEY);
+    if (hw) {
+      const assertion = await wasm.evaluatePrf();
+      prf = assertion.prfOutput;
+      const slot = wasm.openHwSlot(wasm, assertion.prfOutput, password, wasm.base64ToBytes(hw));
+      cmk = slot.cmk;
+      // ⭐ The scope claim comes from the flags of THIS ceremony, never from what
+      // happened to be true when protection was switched on.
+      info = {
+        kitDeviceId: slot.kitDeviceId,
+        credentialId: slot.credentialId,
+        backupEligible: assertion.backupEligible,
+        backupState: assertion.backupState,
+        attachment: assertion.backupEligible ? "" : "platform",
+      };
+    }
 
-    // A personal vault opens with the password. A SHARED vault is sealed under a
-    // random 32-byte vault key instead, so fall back to the keys this device
-    // holds — exactly the CLI's `--vault-id` rule, just chosen automatically.
-    let v: TotpVault;
-    let sealedUnder: string | Uint8Array = password;
+    const candidates: (string | Uint8Array)[] = cmk ? [cmk, password] : [password];
+
+    // The device identity carries any vault keys, so it must be read first.
+    let d: DeviceIdentity | null = null;
+    for (const secret of candidates) {
+      d = openStoredDevice(wasm, secret);
+      if (d) break;
+    }
+
+    // A personal vault opens with the sealing secret. A SHARED vault is sealed
+    // under a random 32-byte vault key instead, so fall back to the keys this
+    // device holds — exactly the CLI's `--vault-id` rule, chosen automatically.
+    let v: TotpVault | null = null;
+    let usedVaultKey: Uint8Array | null = null;
     let sharedAs: string | null = null;
-    try {
-      v = wasm.openVault(wasm, password, container);
-    } catch (passwordError) {
-      let opened: TotpVault | null = null;
+    let firstError: unknown = null;
+    for (const secret of candidates) {
+      try {
+        v = wasm.openVault(wasm, secret, container);
+        break;
+      } catch (e) {
+        firstError ??= e;
+      }
+    }
+    if (!v) {
       for (const [id, key] of Object.entries(d?.vaultKeys ?? {})) {
         try {
-          opened = wasm.openVault(wasm, key, container);
-          sealedUnder = key;
+          v = wasm.openVault(wasm, key, container);
+          usedVaultKey = key;
           sharedAs = id;
           break;
         } catch {
           // not this vault's key — try the next one
         }
       }
-      if (!opened) throw passwordError; // report the password failure, not the last key
-      v = opened;
+    }
+    if (!v) {
+      // ⛔ NOT "wrong password or tampered vault". A container that refuses the
+      // password is ALSO what a CMK-sealed container looks like once its slot is
+      // gone, and telling someone whose password is perfectly correct that it is
+      // wrong sends them to retype it forever while the one thing that WOULD
+      // work — the printed sheet — sits unmentioned on the same screen. The
+      // AEAD tag cannot tell the two apart, so the wording must not pretend to.
+      throw new Error(
+        "that did not open the vault stored in this browser. Either the password is wrong, or " +
+          "this vault is sealed with a key this browser no longer holds — a passkey slot that " +
+          "was deleted or overwritten, or a shared-vault key. If you have your printed recovery " +
+          "sheet, use it below: it derives the key on its own, with no passkey and no network. " +
+          `(${msg(firstError)})`,
+      );
     }
 
     passwordRef.current = password;
-    sealRef.current = sealedUnder;
+    vaultKeyRef.current = usedVaultKey;
+    cmkRef.current = cmk;
+    prfRef.current = prf;
+    setProtection(info);
+    setDevice(d);
     setActiveVaultId(sharedAs);
     setVault(v);
     setPhase("unlocked");
   }
 
   function lock(): void {
+    setNotice("");
     passwordRef.current = "";
-    sealRef.current = "";
+    vaultKeyRef.current = null;
+    cmkRef.current = null;
+    prfRef.current = null;
+    setProtection(null);
     setActiveVaultId(null);
     setVault(null);
     setDevice(null); // the seed, hybrid secret and vault keys leave memory too
@@ -238,14 +441,328 @@ export default function Authenticator() {
   }
 
   function forget(): void {
+    setNotice("");
     window.localStorage.removeItem(STORAGE_KEY);
     window.localStorage.removeItem(DEVICE_KEY);
+    window.localStorage.removeItem(HWSLOT_KEY);
     passwordRef.current = "";
-    sealRef.current = "";
+    vaultKeyRef.current = null;
+    cmkRef.current = null;
+    prfRef.current = null;
+    setProtection(null);
     setActiveVaultId(null);
     setVault(null);
     setDevice(null);
     setPhase("setup");
+  }
+
+  // ── ADR 0046: passkey protection of the two local containers ───────────────
+
+  /**
+   * STAGE 1 of enabling. In this order, because the ORDER IS THE SAFETY
+   * PROPERTY:
+   *   1. refuse unless a recovery kit already exists — NO SHEET, NO PROTECTION,
+   *      because the sheet is the only break-glass and a protected browser
+   *      without one is the single new way to lose a vault;
+   *   2. probe PRF for real (create + get + get again, 32 bytes, byte-identical).
+   *
+   * Nothing is written here.
+   */
+  async function beginPasskeyProtection(baseUrl: string): Promise<PasskeyProbeSummary> {
+    if (!wasm) throw new Error("wasm not ready");
+    if (!device) {
+      throw new PasskeyPrecondition(
+        "This browser has no recovery kit to fall back on. Enroll it (Sync → Device identity) " +
+          "and print a recovery kit below FIRST — a passkey without a printed sheet is the one " +
+          "way this feature could cost you your codes.",
+      );
+    }
+    let kitDeviceId = "";
+    try {
+      const account = await wasm.getAccount(wasm, device, baseUrl);
+      const kits = (account.devices ?? []).filter(
+        (d) => d.label === wasm.RECOVERY_DEVICE_LABEL && (d.status ?? "active") === "active",
+      );
+      if (kits.length === 0) {
+        throw new PasskeyPrecondition(
+          "This account has no recovery kit. Print one below (Recovery kit → Generate) before " +
+            "protecting this browser with a passkey: the printed sheet is the ONLY way back in " +
+            "if the passkey ever becomes unavailable.",
+        );
+      }
+      // ⚠️ WHICH kit is recorded, and why it is sometimes NONE. The CMK comes from
+      // the code the user types, but the DEVICE ID of the kit that code belongs to
+      // is not derivable offline — `GET /v1/account` carries no public key to
+      // match against. With exactly one active kit there is no ambiguity. With
+      // SEVERAL, picking one would be a guess, and a wrong guess makes the
+      // relink banner point at the wrong sheet — worse than no banner, because it
+      // would be confidently wrong. So record nothing and monitor nothing; the
+      // protection itself is unaffected, since it is keyed by the typed code.
+      kitDeviceId = kits.length === 1 ? kits[0].device_id : "";
+    } catch (e) {
+      if (e instanceof PasskeyPrecondition) throw e;
+      throw new PasskeyPrecondition(
+        "Could not confirm that this account has a recovery kit, so protection was NOT enabled " +
+          `(${msg(e)}). This check fails closed on purpose.`,
+      );
+    }
+
+    const probe = await wasm.probePrf();
+    prfRef.current = probe.prfOutput;
+    probeRef.current = { ...probe, kitDeviceId };
+    return {
+      backupEligible: probe.backupEligible,
+      attachment: probe.attachment,
+      scope: wasm.describeProtectionScope(probe),
+    };
+  }
+
+  /**
+   * STAGE 2 of enabling: the recovery code is typed back, decoded and
+   * checksummed OFFLINE (so a typo never reaches a server), and only then does
+   * anything get re-sealed.
+   *
+   * Write order is hwslot → vault → device. Enable is NOT atomic; a crash leaves
+   * a hwslot beside password-sealed containers, which unlock handles by trying
+   * CMK-then-password.
+   */
+  async function completePasskeyProtection(code: string): Promise<ProtectionInfo> {
+    if (!wasm || !vault) throw new Error("vault is locked");
+    const probe = probeRef.current;
+    if (!probe || !prfRef.current) {
+      throw new PasskeyPrecondition("run the passkey check again before protecting this browser");
+    }
+    const seed = wasm.verifyRecoveryKit(wasm, code); // offline decode + checksum
+    const cmk = await wasm.deriveContainerMasterKey(seed);
+
+    const salt = () => crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+    const nonce = () => crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+    const slotBytes = wasm.sealHwSlot(
+      wasm,
+      {
+        prfOutput: prfRef.current,
+        password: passwordRef.current,
+        cmk,
+        kitDeviceId: probe.kitDeviceId,
+        credentialId: probe.credentialId,
+        rpId: probe.rpId,
+        backupEligible: probe.backupEligible,
+        backupState: probe.backupState,
+      },
+      salt(),
+      nonce(),
+      ARGON2,
+    );
+    // ⭐ WRITE ORDER IS THE SAFETY PROPERTY: containers FIRST, slot LAST.
+    //
+    // Enabling is not atomic, so every ordering has an interruption window — the
+    // question is only which state a crash leaves behind. Writing the slot first
+    // (the original order) left a slot beside still-PASSWORD-sealed containers,
+    // and in THAT state the printed sheet alone is not a door: a sheet-derived
+    // CMK cannot open a password-sealed container, so recovery also needed the
+    // old password. That is information-theoretically true at the unlock end and
+    // cannot be fixed there — but it can be avoided here.
+    //
+    // Writing the containers first and the slot last inverts the window: a crash
+    // now leaves CMK-sealed containers with NO slot, which the break-glass opens
+    // from the sheet ALONE, exactly as the design promises. The slot is a
+    // recoverable marker; the containers are the only copy. Make the last write
+    // the one whose loss costs least.
+    cmkRef.current = cmk;
+    persist(wasm, vault);
+    if (device) persistDevice(wasm, device);
+    window.localStorage.setItem(HWSLOT_KEY, wasm.bytesToBase64(slotBytes));
+
+    const info: ProtectionInfo = {
+      kitDeviceId: probe.kitDeviceId,
+      credentialId: probe.credentialId,
+      backupEligible: probe.backupEligible,
+      backupState: probe.backupState,
+      attachment: probe.attachment,
+    };
+    setProtection(info);
+    return info;
+  }
+
+  /** Turn protection OFF: re-seal both containers under the password, drop the slot. */
+  function disablePasskeyProtection(): void {
+    if (!wasm || !vault) throw new Error("vault is locked");
+    if (!passwordRef.current) {
+      throw new PasskeyPrecondition(
+        "this browser was opened with the recovery sheet, so it has no password to fall back to",
+      );
+    }
+    cmkRef.current = null;
+    prfRef.current = null;
+    probeRef.current = null;
+    persist(wasm, vault);
+    if (device) persistDevice(wasm, device);
+    window.localStorage.removeItem(HWSLOT_KEY);
+    setProtection(null);
+  }
+
+  /**
+   * ⭐ RE-SEAL THE SLOT WHEN THE KIT IS REPRINTED.
+   *
+   * Reprinting a kit changes the 32 printed bytes and therefore the CMK. The
+   * containers stay openable by the passkey (the slot still yields the OLD CMK),
+   * so it is not a brick — it is a SILENT LOSS OF THE BREAK-GLASS, which is
+   * worse, because nothing tells you. Same failure shape as ADR 0042's
+   * `RecipientsWouldBeDropped`, so it is BUILT, not remembered.
+   */
+  async function rekeyProtectionForNewKit(code: string, kitDeviceId: string): Promise<void> {
+    if (!wasm || !vault) throw new Error("vault is locked");
+    if (!protection || !prfRef.current) return; // unprotected: nothing to re-seal
+    const seed = wasm.verifyRecoveryKit(wasm, code);
+    const cmk = await wasm.deriveContainerMasterKey(seed);
+    const slotBytes = wasm.sealHwSlot(
+      wasm,
+      {
+        prfOutput: prfRef.current,
+        password: passwordRef.current,
+        cmk,
+        kitDeviceId,
+        credentialId: protection.credentialId,
+        rpId: probeRef.current?.rpId ?? "",
+        backupEligible: protection.backupEligible,
+        backupState: protection.backupState,
+      },
+      crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
+      crypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
+      ARGON2,
+    );
+    window.localStorage.setItem(HWSLOT_KEY, wasm.bytesToBase64(slotBytes));
+    cmkRef.current = cmk;
+    persist(wasm, vault);
+    if (device) persistDevice(wasm, device);
+    setProtection({ ...protection, kitDeviceId });
+  }
+
+  /**
+   * ⭐⭐ THE BREAK-GLASS (matrix row 3), and the reason constraint 3 holds.
+   *
+   * The printed ADR 0042 sheet derives the CMK by HKDF, entirely OFFLINE — no
+   * server, no network, no passkey — so every way a passkey can become
+   * unavailable lands here and loses nothing. It also works with the WRONG
+   * password (matrix row 5): the sheet alone opens the containers, which is
+   * strictly better than today, where a forgotten password over a personal vault
+   * is fatal.
+   *
+   * On success protection is DROPPED and both containers are re-sealed under the
+   * new password: the passkey that is gone cannot re-seal a slot, and leaving a
+   * stale slot behind would brick the browser on the next reload.
+   *
+   * ⚠️ MIXED STATE, handled exactly the way `unlock()` handles it. Enabling is
+   * NOT atomic (hwslot → vault → device), so an interruption leaves the device
+   * identity sealed under the OLD PASSWORD beside a CMK-sealed vault. Trying
+   * only the CMK there left the Ed25519 seed, the hybrid secret and every
+   * accepted vault key permanently unreadable, with no message. So the candidate
+   * list is CMK → the optional current password → the new one, and when NONE of
+   * them opens it the container is left EXACTLY as it is and the caller is told.
+   */
+  async function unlockWithRecoverySheet(
+    code: string,
+    newPassword: string,
+    currentPassword = "",
+  ): Promise<{ deviceOrphaned: boolean }> {
+    if (!wasm) throw new Error("wasm not ready");
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (!stored) throw new Error("no sealed vault found");
+    const container = wasm.base64ToBytes(stored);
+
+    const seed = wasm.verifyRecoveryKit(wasm, code); // offline decode + checksum
+    const cmk = await wasm.deriveContainerMasterKey(seed);
+
+    const hadDevice = window.localStorage.getItem(DEVICE_KEY) !== null;
+    const deviceCandidates: (string | Uint8Array)[] = [cmk];
+    if (currentPassword) deviceCandidates.push(currentPassword);
+    if (newPassword && newPassword !== currentPassword) deviceCandidates.push(newPassword);
+    let d: DeviceIdentity | null = null;
+    for (const secret of deviceCandidates) {
+      d = openStoredDevice(wasm, secret);
+      if (d) break;
+    }
+
+    let v: TotpVault | null = null;
+    let usedVaultKey: Uint8Array | null = null;
+    let sharedAs: string | null = null;
+    // ⭐ THE VAULT GETS THE SAME CANDIDATE LIST AS THE DEVICE, and this is a
+    // LOCKOUT FIX, not a convenience. Enabling protection is NOT atomic: it
+    // writes the slot, then re-seals the vault, then the device. A crash BEFORE
+    // the vault re-seal leaves a slot beside a still-PASSWORD-sealed vault. In
+    // that state, once the passkey is gone, `unlock()` throws at the ceremony
+    // before it can try the password — so the sheet is the only door left. It
+    // previously tried ONLY the CMK here, so a user holding a correct sheet AND
+    // the correct old password was refused by both doors. Reproduced live.
+    //
+    // ⚠️ THIS DOES NOT BECOME AN "OR" DESIGN. The whole branch is already gated
+    // behind a valid `verifyRecoveryKit(code)`, so the door is
+    // "sheet AND (CMK OR the old password)" — the (password AND passkey) door is
+    // untouched, and nothing here opens a vault without the printed sheet.
+    for (const secret of deviceCandidates) {
+      try {
+        v = wasm.openVault(wasm, secret, container);
+        break;
+      } catch {
+        // not this secret — try the next candidate
+      }
+    }
+    if (!v) {
+      for (const [id, key] of Object.entries(d?.vaultKeys ?? {})) {
+        try {
+          v = wasm.openVault(wasm, key, container);
+          usedVaultKey = key;
+          sharedAs = id;
+          break;
+        } catch {
+          // not this vault's key — try the next one
+        }
+      }
+    }
+    if (!v) {
+      throw new Error(
+        "that recovery code is valid, but the key it derives does not open the containers stored " +
+          "in THIS browser. Either this browser was protected with a different sheet, or it was " +
+          "never protected at all — in which case unlock it with its password instead.",
+      );
+    }
+
+    passwordRef.current = newPassword;
+    vaultKeyRef.current = usedVaultKey;
+    cmkRef.current = null; // ⭐ protection is dropped: the passkey is gone
+    prfRef.current = null;
+    probeRef.current = null;
+    persist(wasm, v);
+    // ⛔ THE ORPHAN GUARD. When the identity opened, re-seal it under the new
+    // secret through the ONE gate. When it did NOT, leave the container byte-for-
+    // byte alone: it is still openable by whoever knows the previous password,
+    // and overwriting or deleting it would destroy the only copy of the seed,
+    // the hybrid secret and every accepted vault key. Either way SAY SO — a
+    // permanent loss that announces itself is recoverable by a human; a silent
+    // one is not.
+    const deviceOrphaned = hadDevice && !d;
+    if (d) persistDevice(wasm, d);
+    // Safe to drop now, and only now: the vault is password-sealed again, so a
+    // slot demanding a passkey could only produce a ceremony this profile no
+    // longer needs. Nothing still sealed depends on it — an orphaned identity is
+    // sealed under a PASSWORD, which no slot could have supplied anyway.
+    window.localStorage.removeItem(HWSLOT_KEY);
+    setProtection(null);
+    setDevice(d);
+    setActiveVaultId(sharedAs);
+    setVault(v);
+    setPhase("unlocked");
+    setNotice(
+      deviceOrphaned
+        ? "Your vault was recovered, but this browser's DEVICE IDENTITY could not be opened — it " +
+            "is still sealed under the password this browser used before, which happens when " +
+            "turning protection on was interrupted. It has been left untouched, not deleted. If " +
+            "you remember that password, unlock again with the sheet and type it into “Current " +
+            "vault password”. Otherwise enroll this browser again: the Ed25519 device key, the " +
+            "hybrid secret and any vault keys it held are not readable without it."
+        : "",
+    );
+    return { deviceOrphaned };
   }
 
   // ── RECOVERY: restore on a client with NO identity and NO vault ────────────
@@ -341,6 +858,13 @@ export default function Authenticator() {
     );
 
     passwordRef.current = args.password;
+    // ⭐ A restored profile is always UNPROTECTED: there is no local hwslot and
+    // no passkey here yet. The user may enable protection afterwards.
+    cmkRef.current = null;
+    prfRef.current = null;
+    probeRef.current = null;
+    setProtection(null);
+    window.localStorage.removeItem(HWSLOT_KEY);
     // Seals the adopted identity under the NEW password — the only thing that
     // ever reaches localStorage is that container.
     persistDevice(wasm, {
@@ -352,7 +876,7 @@ export default function Authenticator() {
       pins,
     });
     window.localStorage.setItem(STORAGE_KEY, wasm.bytesToBase64(openedContainer));
-    sealRef.current = openedKey;
+    vaultKeyRef.current = openedKey;
     setActiveVaultId(openedId);
     setVault(opened);
     setPhase("unlocked");
@@ -386,7 +910,7 @@ export default function Authenticator() {
   function rekeyVault(vaultId: string, vaultKey: Uint8Array): void {
     if (!wasm || !vault) throw new Error("vault is locked");
     updateDevice({ vaultKeys: { ...(device?.vaultKeys ?? {}), [vaultId]: vaultKey } });
-    sealRef.current = vaultKey;
+    vaultKeyRef.current = vaultKey;
     persist(wasm, vault, vaultKey);
     setActiveVaultId(vaultId);
   }
@@ -398,11 +922,19 @@ export default function Authenticator() {
     const v = wasm.openVault(wasm, vaultKey, container); // throws before anything is stored
     updateDevice({ vaultKeys: { ...(device?.vaultKeys ?? {}), [vaultId]: vaultKey } });
     window.localStorage.setItem(STORAGE_KEY, wasm.bytesToBase64(container));
-    sealRef.current = vaultKey;
+    vaultKeyRef.current = vaultKey;
     setActiveVaultId(vaultId);
     setVault(v);
     return v;
   }
+
+  // ⭐ The locked screen's own view of protection: the SLOT IS PRESENT. It cannot
+  // know more than that until the ceremony and the password have both succeeded,
+  // which is exactly right — the truth is the ciphertext.
+  const hasStoredSlot =
+    phase === "locked" && typeof window !== "undefined"
+      ? window.localStorage.getItem(HWSLOT_KEY) !== null
+      : false;
 
   let content: React.ReactNode;
   if (phase === "loading") {
@@ -431,7 +963,15 @@ export default function Authenticator() {
   } else if (phase === "locked") {
     content = (
       <div className="space-y-6">
-        <UnlockPanel onUnlock={unlock} onForget={forget} />
+        {wasm && (
+          <UnlockPanel
+            wasm={wasm}
+            hasPasskeySlot={hasStoredSlot}
+            onUnlock={unlock}
+            onBreakGlass={unlockWithRecoverySheet}
+            onForget={forget}
+          />
+        )}
         {wasm && <RestorePanel wasm={wasm} onRestore={restoreFromRecoveryKit} />}
       </div>
     );
@@ -445,6 +985,11 @@ export default function Authenticator() {
         now={now}
         device={device}
         activeVaultId={activeVaultId}
+        protection={protection}
+        onBeginPasskey={beginPasskeyProtection}
+        onCompletePasskey={completePasskeyProtection}
+        onDisablePasskey={disablePasskeyProtection}
+        onKitReprinted={rekeyProtectionForNewKit}
         onDeviceChange={(d) => persistDevice(wasm, d)}
         onUpdateDevice={updateDevice}
         onRekey={rekeyVault}
@@ -479,6 +1024,23 @@ export default function Authenticator() {
       <p data-testid="live-region" role="status" aria-live="polite" className="sr-only">
         {announce}
       </p>
+      {notice && (
+        <div
+          data-testid="global-notice"
+          role="alert"
+          className="mb-4 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          <p>{notice}</p>
+          <button
+            data-testid="global-notice-dismiss"
+            className={`${btnGhost} mt-2`}
+            type="button"
+            onClick={() => setNotice("")}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {content}
     </>
   );
@@ -612,27 +1174,97 @@ function SetupPanel({ onCreate }: { onCreate: (password: string) => void }) {
 // ── Unlock (sealed vault exists) ─────────────────────────────────────────────
 
 function UnlockPanel({
+  wasm,
+  hasPasskeySlot,
   onUnlock,
+  onBreakGlass,
   onForget,
 }: {
-  onUnlock: (password: string) => void;
+  wasm: Wasm;
+  hasPasskeySlot: boolean;
+  onUnlock: (password: string) => Promise<void>;
+  onBreakGlass: (
+    code: string,
+    newPassword: string,
+    currentPassword: string,
+  ) => Promise<{ deviceOrphaned: boolean }>;
   onForget: () => void;
 }) {
   const [pw, setPw] = useState("");
   const [error, setError] = useState("");
+  // ⛔ A PASSKEY failure is NEVER rendered as "wrong password". It gets its own
+  // region, its own wording, and points at the recovery sheet below.
+  const [passkeyError, setPasskeyError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // ⭐⭐ Break-glass fields — ALWAYS VISIBLE on the locked screen, and that is a
+  // LOCKOUT FIX, not a layout preference. They used to be gated on a stored
+  // hwslot, so DELETING `sigil.webapp.hwslot.v1` — a value that is not itself a
+  // secret and can vanish for a dozen mundane reasons — removed the only offline
+  // way out of the DOM while both containers stayed CMK-sealed. The sheet
+  // derives the CMK by HKDF with no reference to the slot whatsoever, which is
+  // the entire reason it is derived from the kit; making its form depend on a
+  // marker threw that away. It is now reachable whenever a sealed container
+  // exists, which on this screen is always.
+  const [code, setCode] = useState("");
+  const [curPw, setCurPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [newPw2, setNewPw2] = useState("");
+  const [sheetError, setSheetError] = useState("");
+  const [sheetBusy, setSheetBusy] = useState(false);
 
   function submit(ev: React.FormEvent) {
     ev.preventDefault();
     setError("");
+    setPasskeyError("");
     setBusy(true);
     setTimeout(() => {
-      try {
-        onUnlock(pw);
-      } catch (e) {
-        setError(msg(e));
-        setBusy(false);
-      }
+      void (async () => {
+        try {
+          await onUnlock(pw);
+        } catch (e) {
+          if (e instanceof wasm.PasskeyError) {
+            // ⭐ `atUnlock`: at this screen the containers are ALREADY sealed
+            // under a key the authenticator can no longer derive, so the enable
+            // flow's "Nothing was changed" would tell a locked-out person that
+            // everything is fine and never mention the sheet below.
+            setPasskeyError(wasm.explainPasskeyStatus(e, { atUnlock: true }));
+          } else {
+            setError(msg(e));
+          }
+          setBusy(false);
+        }
+      })();
+    }, 0);
+  }
+
+  function submitSheet(ev: React.FormEvent) {
+    ev.preventDefault();
+    setSheetError("");
+    if (newPw.length < 1) {
+      setSheetError("choose a new password for this browser");
+      return;
+    }
+    if (newPw !== newPw2) {
+      setSheetError("those passwords do not match");
+      return;
+    }
+    setSheetBusy(true);
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await onBreakGlass(code, newPw, curPw);
+          // ⭐ USED — so it leaves the DOM immediately.
+          setCode("");
+          setCurPw("");
+          setNewPw("");
+          setNewPw2("");
+        } catch (e) {
+          setSheetError(msg(e));
+        } finally {
+          setSheetBusy(false);
+        }
+      })();
     }, 0);
   }
 
@@ -642,6 +1274,16 @@ function UnlockPanel({
       <p className="mb-4 text-sm text-neutral-600 dark:text-neutral-400">
         A sealed vault is stored in this browser. Enter its password to decrypt it
         in memory.
+        {hasPasskeySlot && (
+          <>
+            {" "}
+            <strong data-testid="unlock-passkey-required">
+              This browser also asks for its passkey.
+            </strong>{" "}
+            The passkey prompt appears after you submit, so a typo never costs you
+            a prompt.
+          </>
+        )}
       </p>
       <form onSubmit={submit} className="space-y-3">
         <label className="block text-sm">
@@ -656,10 +1298,27 @@ function UnlockPanel({
             autoFocus
           />
         </label>
+        {/* ⛔ NO "wrong password or tampered vault" PREFIX. The AEAD tag cannot
+            distinguish a wrong password from a container sealed under a
+            CONTAINER MASTER KEY whose slot has been deleted, so a prefix that
+            asserts the first is simply false for the second — and it was shown
+            to a user whose password was perfectly correct. The message the
+            unlock path throws names both possibilities and points at the sheet
+            below. */}
         {error && (
           <p data-testid="unlock-error" className="text-sm text-red-600 dark:text-red-400">
-            wrong password or tampered vault — {error}
+            {error}
           </p>
+        )}
+        {passkeyError && (
+          <div
+            data-testid="unlock-passkey-error"
+            role="alert"
+            className="rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+          >
+            <p className="font-semibold">The passkey step did not succeed.</p>
+            <p className="mt-1">{passkeyError}</p>
+          </div>
         )}
         <div className="flex items-center gap-3">
           <button data-testid="unlock-submit" className={btnCls} type="submit" disabled={busy}>
@@ -679,6 +1338,100 @@ function UnlockPanel({
           </button>
         </div>
       </form>
+
+      {/* ⭐⭐ UNCONDITIONAL. See the comment on `code` above: gating this on the
+          stored slot made a deletable, non-secret marker the single point of
+          failure for the only offline escape. */}
+      {
+        <form
+          onSubmit={submitSheet}
+          className="mt-6 space-y-3 border-t border-neutral-200 pt-4 dark:border-neutral-800"
+        >
+          <h3 className="text-base font-semibold">Unlock with your recovery sheet</h3>
+          <p className="text-sm text-neutral-600 dark:text-neutral-400">
+            Passkey gone, or password forgotten? The 56 characters on your printed
+            recovery sheet open this vault <strong>on this device alone</strong> —
+            no passkey, no server, no network. Doing this turns passkey protection
+            off and re-seals everything under the new password you choose here.
+            It works even if this browser&rsquo;s passkey slot has been deleted or
+            damaged: the sheet derives the key on its own.
+          </p>
+          <label className="block text-sm">
+            <span className="mb-1 block font-medium">Recovery code (from the sheet)</span>
+            <input
+              data-testid="unlock-recovery-code"
+              className={`${inputCls} font-mono`}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              spellCheck={false}
+              autoComplete="off"
+              placeholder="XXXXXXXX-XXXXXXXX-…"
+            />
+          </label>
+          {/* ⚠️ OPTIONAL, and it exists for ONE state: turning protection on is
+              not atomic, so an interruption can leave this browser's device
+              identity sealed under the password it had BEFORE, while the vault
+              is already sealed under the sheet's key. Without this field that
+              identity — the Ed25519 seed, the hybrid secret and every accepted
+              vault key — is unreadable forever. */}
+          <label className="block text-sm">
+            <span className="mb-1 block font-medium">
+              Current vault password (optional)
+            </span>
+            <input
+              data-testid="unlock-recovery-current"
+              className={inputCls}
+              type="password"
+              value={curPw}
+              onChange={(e) => setCurPw(e.target.value)}
+              autoComplete="off"
+            />
+            <span className="mt-1 block text-xs text-neutral-500 dark:text-neutral-400">
+              Only needed if turning passkey protection on was interrupted. If the
+              sheet alone is refused, type this browser&rsquo;s PREVIOUS password
+              here — in one interruption window the containers are still sealed
+              under it, and the sheet cannot open them without it.
+            </span>
+          </label>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label className="block text-sm">
+              <span className="mb-1 block font-medium">New vault password</span>
+              <input
+                data-testid="unlock-recovery-password"
+                className={inputCls}
+                type="password"
+                value={newPw}
+                onChange={(e) => setNewPw(e.target.value)}
+                autoComplete="new-password"
+              />
+            </label>
+            <label className="block text-sm">
+              <span className="mb-1 block font-medium">Confirm new password</span>
+              <input
+                data-testid="unlock-recovery-confirm"
+                className={inputCls}
+                type="password"
+                value={newPw2}
+                onChange={(e) => setNewPw2(e.target.value)}
+                autoComplete="new-password"
+              />
+            </label>
+          </div>
+          {sheetError && (
+            <p data-testid="unlock-recovery-error" className="text-sm text-red-600 dark:text-red-400">
+              {sheetError}
+            </p>
+          )}
+          <button
+            data-testid="unlock-recovery-submit"
+            className={btnGhost}
+            type="submit"
+            disabled={sheetBusy}
+          >
+            {sheetBusy ? "Opening…" : "Unlock with the sheet"}
+          </button>
+        </form>
+      }
     </Card>
   );
 }
@@ -938,6 +1691,11 @@ function VaultView({
   now,
   device,
   activeVaultId,
+  protection,
+  onBeginPasskey,
+  onCompletePasskey,
+  onDisablePasskey,
+  onKitReprinted,
   onDeviceChange,
   onUpdateDevice,
   onRekey,
@@ -953,6 +1711,11 @@ function VaultView({
   now: number;
   device: DeviceIdentity | null;
   activeVaultId: string | null;
+  protection: ProtectionInfo | null;
+  onBeginPasskey: (baseUrl: string) => Promise<PasskeyProbeSummary>;
+  onCompletePasskey: (code: string) => Promise<ProtectionInfo>;
+  onDisablePasskey: () => void;
+  onKitReprinted: (code: string, kitDeviceId: string) => Promise<void>;
   onDeviceChange: (d: DeviceIdentity | null) => void;
   onUpdateDevice: (patch: Partial<DeviceIdentity>) => DeviceIdentity;
   onRekey: (vaultId: string, vaultKey: Uint8Array) => void;
@@ -1008,6 +1771,15 @@ function VaultView({
 
       <AddAccountPanel onAdd={onAdd} onImportOtpauth={onImportOtpauth} onImportMigration={onImportMigration} />
       <ExportPanel wasm={wasm} vault={vault} />
+      <PasskeyPanel
+        wasm={wasm}
+        device={device}
+        url={serverUrl}
+        protection={protection}
+        onBegin={onBeginPasskey}
+        onComplete={onCompletePasskey}
+        onDisable={onDisablePasskey}
+      />
       <SyncPanel
         wasm={wasm}
         device={device}
@@ -1016,6 +1788,8 @@ function VaultView({
         setUrl={setServerUrl}
         vaultId={vaultId}
         setVaultId={setVaultId}
+        protection={protection}
+        activeVaultId={activeVaultId}
       />
       <SharingPanel
         wasm={wasm}
@@ -1032,6 +1806,8 @@ function VaultView({
         device={device}
         url={serverUrl}
         vaultId={vaultId}
+        protection={protection}
+        onKitReprinted={onKitReprinted}
         onUpdateDevice={onUpdateDevice}
       />
     </div>
@@ -1613,6 +2389,14 @@ function AccountBlock({
   );
 }
 
+// The one sentence both refusals use, so the button state and the operation
+// guard can never say different things.
+const SYNC_REFUSAL =
+  "Sync is off for this vault in BOTH directions: it is a personal vault sealed with this " +
+  "browser's passkey, so nothing else can read what is uploaded, and the copy here is the only " +
+  "one — downloading would overwrite it. Convert it to a shared vault, or turn passkey " +
+  "protection off.";
+
 function SyncPanel({
   wasm,
   device,
@@ -1621,6 +2405,8 @@ function SyncPanel({
   setUrl,
   vaultId,
   setVaultId,
+  protection,
+  activeVaultId,
 }: {
   wasm: Wasm;
   device: DeviceIdentity | null;
@@ -1629,6 +2415,8 @@ function SyncPanel({
   setUrl: (v: string) => void;
   vaultId: string;
   setVaultId: (v: string) => void;
+  protection: ProtectionInfo | null;
+  activeVaultId: string | null;
 }) {
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("this browser");
@@ -1637,6 +2425,9 @@ function SyncPanel({
   // ⭐ A 402 is a BILLING state, not an auth failure and not a bug. It gets its
   // own non-error region so it can never be rendered as "unauthorized".
   const [payment, setPayment] = useState<{ headline: string; detail: string } | null>(null);
+  // Passkey-protected AND personal => the container is sealed under a key only
+  // this browser holds, so there is nothing useful to upload.
+  const protectedPersonal = protection !== null && activeVaultId === null;
 
   // Map any failure to a message; a device-auth failure carries the status, so
   // 401 (not authenticated) and 403 (not authorized for this vault) are called
@@ -1687,6 +2478,11 @@ function SyncPanel({
   }
 
   async function push() {
+    // A disabled button is UI, not a guard. Refuse in the operation too.
+    if (protectedPersonal) {
+      setStatus(SYNC_REFUSAL);
+      return;
+    }
     setBusy(true);
     setStatus("Pushing…");
     setPayment(null);
@@ -1725,6 +2521,19 @@ function SyncPanel({
   }
 
   async function pull() {
+    // ⛔⛔ THE DESTRUCTIVE HALF, and it was left enabled beside the disabled
+    // Push. `pull()` overwrites STORAGE_KEY with whatever the server returns,
+    // and for a protected PERSONAL vault that stored container is the ONLY copy
+    // in existence — push is refused precisely because nothing else can read it.
+    // One click therefore replaced it with either a stale pre-protection
+    // container (silently losing every account added since; the recovery kit
+    // recovers KEYS, not DATA) or, on a mistyped vault id, with bytes this
+    // browser cannot open with the CMK, the password, the sheet or any held
+    // vault key. Refused in the operation as well as the button.
+    if (protectedPersonal) {
+      setStatus(SYNC_REFUSAL);
+      return;
+    }
     setBusy(true);
     setStatus("Pulling…");
     try {
@@ -1847,11 +2656,54 @@ function SyncPanel({
         )}
       </div>
 
+      {/* ⭐ ADR 0046 SYNC REFUSAL — BOTH DIRECTIONS. `push` uploads the RAW
+          stored container. Under passkey protection a PERSONAL vault is sealed
+          under this browser's CONTAINER MASTER KEY, which no peer has and no
+          server can ever derive, so pushing would deposit ciphertext nobody
+          could ever read.
+          ⛔ Silently re-sealing it under the password for the push would move the
+          offline attack to the server copy and void the whole feature.
+          ⛔⛔ And `pull` is refused for the MIRROR-IMAGE reason, which is worse:
+          because push is off, the local container is the ONLY copy, and pull
+          OVERWRITES it with whatever the server returns. Disabling one and
+          leaving the other is how a feature that protects data becomes the
+          feature that loses it. Both escape hatches are the same two the notice
+          names — convert to a shared vault, or turn protection off — so nothing
+          is taken away, it is only made deliberate. A SHARED vault is sealed
+          under its vault key and syncs both ways exactly as before. */}
+      {protectedPersonal && (
+        <p
+          data-testid="sync-push-blocked"
+          role="status"
+          className="mt-3 rounded border border-neutral-300 p-3 text-sm text-neutral-700 dark:border-neutral-700 dark:text-neutral-300"
+        >
+          Syncing is off for this vault, <strong>in both directions</strong>. It is
+          a <strong>personal</strong> vault sealed with this browser&rsquo;s
+          passkey: nothing else could open what was uploaded, so nothing useful is
+          on the server — and because of that, the copy in this browser is the{" "}
+          <strong>only</strong> one. Downloading would replace it with something
+          older or unreadable, and a recovery sheet recovers keys, not data.
+          Convert this to a shared vault to sync it (Sharing → Convert), or turn
+          passkey protection off.
+        </p>
+      )}
       <div className="mt-3 flex gap-3">
-        <button data-testid="sync-push" className={btnGhost} type="button" onClick={push} disabled={busy}>
+        <button
+          data-testid="sync-push"
+          className={btnGhost}
+          type="button"
+          onClick={push}
+          disabled={busy || protectedPersonal}
+        >
           Push
         </button>
-        <button data-testid="sync-pull" className={btnGhost} type="button" onClick={pull} disabled={busy}>
+        <button
+          data-testid="sync-pull"
+          className={btnGhost}
+          type="button"
+          onClick={pull}
+          disabled={busy || protectedPersonal}
+        >
           Pull
         </button>
       </div>
@@ -1872,6 +2724,281 @@ function SyncPanel({
 
       {status && (
         <p data-testid="sync-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
+          {status}
+        </p>
+      )}
+    </Card>
+  );
+}
+
+// ── Passkey protection (dev) — ADR 0046 ──────────────────────────────────────
+//
+// ⭐ WHAT IT DOES: replaces the human PASSWORD as the sealing secret for this
+// browser's two containers with a 32-byte CONTAINER MASTER KEY, wrapped once
+// into a THIRD container under `PRF_output ‖ utf8(password)`. So the at-rest seal
+// takes TWO factors, and a stolen copy of localStorage is useless without the
+// authenticator.
+//
+// ⛔ IT DEFENDS STORAGE, NEVER EXECUTION. Anything running in this origin while
+// the vault is unlocked still reads everything. ⛔ It is NOT retroactive: earlier
+// copies, backups and forensic images stay password-only forever.
+//
+// ⭐ NO LOCKOUT, and this is the whole reason enabling REFUSES without a printed
+// recovery kit: the ADR 0042 sheet derives the same CMK offline, so a lost
+// passkey costs a re-enable, never a code.
+
+/** The seven states, named. The UI never implies one it is not in. */
+type PasskeyStage =
+  | "unprotected"
+  | "unavailable"
+  | "no-kit"
+  | "probing"
+  | "probe-failed"
+  | "code-required"
+  | "sealing"
+  | "protected";
+
+function PasskeyPanel({
+  wasm,
+  device,
+  url,
+  protection,
+  onBegin,
+  onComplete,
+  onDisable,
+}: {
+  wasm: Wasm;
+  device: DeviceIdentity | null;
+  url: string;
+  protection: ProtectionInfo | null;
+  onBegin: (baseUrl: string) => Promise<PasskeyProbeSummary>;
+  onComplete: (code: string) => Promise<ProtectionInfo>;
+  onDisable: () => void;
+}) {
+  const support = typeof window === "undefined" ? { available: false, reason: "" } : wasm.passkeySupport();
+  const [stage, setStage] = useState<PasskeyStage>(support.available ? "unprotected" : "unavailable");
+  const [detail, setDetail] = useState("");
+  const [status, setStatus] = useState("");
+  const [code, setCode] = useState("");
+  const [scope, setScope] = useState("");
+  // ⚠️ The break-glass sheet was REPLACED since this browser was protected.
+  const [relink, setRelink] = useState(false);
+
+  // ⭐ RELINK CHECK. Reprinting a kit changes the printed bytes and therefore the
+  // CMK. The containers stay openable by the passkey, so nothing looks wrong —
+  // the BREAK-GLASS just silently stops working. Detect it, do not remember it.
+  useEffect(() => {
+    if (!protection || !device || !protection.kitDeviceId) return;
+    let cancelled = false;
+    void (async () => {
+      // ⚠️ BOUNDED RETRY, and it is not padding. Being offline must say NOTHING
+      // rather than cry wolf — but with a single attempt one transient failure
+      // suppressed the warning FOREVER for that session, which is the same
+      // silence the banner exists to break.
+      for (let attempt = 0; attempt < 3 && !cancelled; attempt++) {
+        try {
+          const account = await wasm.getAccount(wasm, device, url.trim());
+          if (cancelled) return;
+          const live = (account.devices ?? []).some(
+            (d) => d.device_id === protection.kitDeviceId && (d.status ?? "active") === "active",
+          );
+          setRelink(!live);
+          return;
+        } catch {
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [wasm, device, url, protection]);
+
+  const effective: PasskeyStage = protection ? "protected" : stage;
+
+  function begin() {
+    setDetail("");
+    setStatus("");
+    setStage("probing");
+    void (async () => {
+      try {
+        const probe = await onBegin(url.trim());
+        setScope(probe.scope);
+        setStage("code-required");
+        setStatus(
+          "Passkey created and its derived key verified twice. Now type the code from your " +
+            "printed recovery sheet — it is checked on this device, and it is what lets you back " +
+            "in if the passkey ever stops working.",
+        );
+      } catch (e) {
+        if (e instanceof PasskeyPrecondition) {
+          setStage("no-kit");
+          setDetail(msg(e));
+        } else {
+          setStage("probe-failed");
+          setDetail(
+            e instanceof wasm.PasskeyError ? wasm.explainPasskeyStatus(e) : msg(e),
+          );
+        }
+      }
+    })();
+  }
+
+  function complete(ev: React.FormEvent) {
+    ev.preventDefault();
+    setDetail("");
+    setStage("sealing");
+    setTimeout(() => {
+      void (async () => {
+        try {
+          const info = await onComplete(code);
+          setCode(""); // ⭐ USED — out of the DOM immediately.
+          setScope(wasm.describeProtectionScope(info));
+          setStatus(
+            "This browser's stored containers are now sealed with a key that needs BOTH your " +
+              "password and this passkey. Your recovery sheet still opens them on its own.",
+          );
+        } catch (e) {
+          setStage("code-required");
+          setDetail(
+            e instanceof wasm.PasskeyError
+              ? wasm.explainPasskeyStatus(e)
+              : e instanceof wasm.RecoveryError || /recovery code/i.test(msg(e))
+                ? "That is not a valid recovery code — check for a mistyped character. Nothing " +
+                  "was sent anywhere: the code is checked on this device. The letters I, L and O " +
+                  "are never used (read them as 1, 1 and 0) and U is never used at all."
+                : msg(e),
+          );
+        }
+      })();
+    }, 0);
+  }
+
+  function disable() {
+    try {
+      onDisable();
+      setStage("unprotected");
+      setScope("");
+      setRelink(false);
+      setStatus(
+        "Passkey protection is off. Both containers are sealed with your password again.",
+      );
+    } catch (e) {
+      setDetail(msg(e));
+    }
+  }
+
+  return (
+    <Card>
+      <h3 className="mb-1 text-base font-semibold">Passkey protection (dev)</h3>
+      <p className="mb-3 text-xs text-neutral-600 dark:text-neutral-400">
+        Designed to bind this browser&rsquo;s stored vault to a passkey on
+        supported browsers (unaudited). It protects what is <strong>stored</strong>
+        , not what is running: anything with code execution in this page while the
+        vault is unlocked can still read everything. It is not retroactive —
+        copies made before you turn it on stay password-only.
+      </p>
+
+      <p data-testid="passkey-state" className="mb-2 text-sm font-medium">
+        {effective === "protected"
+          ? "Protected: password + passkey"
+          : effective === "unavailable"
+            ? "Unavailable in this browser"
+            : "Password only"}
+      </p>
+
+      {effective === "protected" && (
+        <>
+          <p data-testid="passkey-scope" className="mb-2 text-sm text-neutral-600 dark:text-neutral-300">
+            {scope || wasm.describeProtectionScope(protection ?? {})}
+          </p>
+          {relink && (
+            <div
+              data-testid="passkey-relink"
+              role="status"
+              className="mb-3 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+            >
+              <p className="font-semibold">
+                Your break-glass sheet has been replaced — re-link this browser.
+              </p>
+              <p className="mt-1">
+                The recovery kit this browser was linked to is no longer active, so
+                the sheet you are holding will <strong>not</strong> open it. Turn
+                protection off and on again (you will be asked for the code on your
+                current sheet).
+              </p>
+            </div>
+          )}
+          <button data-testid="passkey-disable" className={btnGhost} type="button" onClick={disable}>
+            Turn passkey protection off
+          </button>
+        </>
+      )}
+
+      {effective === "unavailable" && (
+        <p data-testid="passkey-detail" className="mb-2 text-sm text-neutral-600 dark:text-neutral-300">
+          This browser or authenticator cannot protect your vault with a passkey:{" "}
+          {support.reason}. Your vault is unaffected.
+        </p>
+      )}
+
+      {(effective === "unprotected" ||
+        effective === "no-kit" ||
+        effective === "probing" ||
+        effective === "probe-failed") && (
+        <>
+          {detail && (
+            <p
+              data-testid="passkey-detail"
+              className="mb-2 text-sm text-amber-800 dark:text-amber-300"
+            >
+              {detail}
+            </p>
+          )}
+          <button
+            data-testid="passkey-enable"
+            className={btnGhost}
+            type="button"
+            onClick={begin}
+            disabled={effective === "probing" || !support.available}
+          >
+            {effective === "probing" ? "Checking your passkey…" : "Protect this browser with a passkey"}
+          </button>
+        </>
+      )}
+
+      {(effective === "code-required" || effective === "sealing") && (
+        <form onSubmit={complete} className="space-y-3">
+          <label className="block text-sm">
+            <span className="mb-1 block font-medium">Recovery code (from your printed sheet)</span>
+            <input
+              data-testid="passkey-code"
+              className={`${inputCls} font-mono`}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              spellCheck={false}
+              autoComplete="off"
+              placeholder="XXXXXXXX-XXXXXXXX-…"
+            />
+          </label>
+          {detail && (
+            <p data-testid="passkey-detail" className="text-sm text-red-600 dark:text-red-400">
+              {detail}
+            </p>
+          )}
+          <button
+            data-testid="passkey-confirm"
+            className={btnCls}
+            type="submit"
+            disabled={effective === "sealing"}
+          >
+            {effective === "sealing" ? "Protecting…" : "Protect this browser"}
+          </button>
+        </form>
+      )}
+
+      {status && (
+        <p data-testid="passkey-status" className="mt-3 text-sm text-neutral-600 dark:text-neutral-300">
           {status}
         </p>
       )}
@@ -2533,12 +3660,16 @@ function RecoveryPanel({
   device,
   url,
   vaultId,
+  protection,
+  onKitReprinted,
   onUpdateDevice,
 }: {
   wasm: Wasm;
   device: DeviceIdentity | null;
   url: string;
   vaultId: string;
+  protection: ProtectionInfo | null;
+  onKitReprinted: (code: string, kitDeviceId: string) => Promise<void>;
   onUpdateDevice: (patch: Partial<DeviceIdentity>) => DeviceIdentity;
 }) {
   const [kit, setKit] = useState<GeneratedKit | null>(null);
@@ -2622,12 +3753,26 @@ function RecoveryPanel({
       const pins = device!.pins ?? wasm.newPinStore();
       const res = await wasm.generateRecoveryKit(wasm, auth, { vaultKeys, pins });
       onUpdateDevice({ pins: res.pins }); // the DERIVED pin, re-sealed
+      // ⭐⭐ SAME OPERATION, deliberately. A NEW sheet means NEW printed bytes and
+      // therefore a NEW container master key. If this browser is passkey-protected
+      // and its slot is not re-sealed right here, the containers keep opening (the
+      // slot still yields the OLD key) while the BREAK-GLASS silently dies — and
+      // nothing would tell anyone. Same failure shape as ADR 0042's
+      // `RecipientsWouldBeDropped`, so it is BUILT, not remembered.
+      let relinked = "";
+      if (protection) {
+        await onKitReprinted(res.code, res.deviceId);
+        relinked =
+          " This browser's passkey protection was re-linked to the NEW sheet in the same step, " +
+          "so the code above is the one that opens it.";
+      }
       setWritten(false);
       setKit(res);
       setStatus(
         `Kit ${res.deviceId} created in account ${res.accountId} and verified end to end ` +
           `(it re-derived its own identity from the printed code, authenticated, and unwrapped ` +
-          `${res.verification.unwrappedVault || "no vault"}). Covers ${res.covered.length} vault(s).`,
+          `${res.verification.unwrappedVault || "no vault"}). Covers ${res.covered.length} vault(s).` +
+          relinked,
       );
     });
   }

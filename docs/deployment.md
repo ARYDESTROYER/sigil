@@ -250,16 +250,19 @@ boundary. It is **not** a health probe (use `/healthz` / `/readyz` for that);
 keep it on the loopback / internal side of Caddy rather than exposing it
 publicly. Full metric list in [`api.md`](api.md#metrics).
 
-> ⚠️ **The reference Caddyfile CONTRADICTS the previous sentence, and it is worth
-> knowing before anyone applies it.** [`../deploy/caddy/Caddyfile`](../deploy/caddy/Caddyfile)
-> is a bare catch-all `reverse_proxy 127.0.0.1:8080` with **no path matcher**, so
-> in the documented topology `GET /metrics` would be **world-readable** at the
-> edge — the endpoint is always-on and never dev-gated. Nothing is deployed, so
-> this has never been observed end to end; it is a config that disagrees with its
-> own runbook. Before any real edge exists, either block `/metrics` at Caddy (a
-> path matcher returning `403`, or an `@internal` remote-IP matcher) or bind the
-> scrape to a separate internal listener. Filed here rather than "fixed" quietly
-> because the file is a **reference shape**, not an applied config.
+> ✅ **The reference Caddyfile now enforces that sentence rather than contradicting
+> it.** [`../deploy/caddy/Caddyfile`](../deploy/caddy/Caddyfile) used to be a bare
+> catch-all `reverse_proxy 127.0.0.1:8080` with **no path matcher**, so in the
+> documented topology `GET /metrics` would have been **world-readable** at the edge
+> — the endpoint is always-on and never dev-gated — publishing account counts,
+> enrolment volume, billing webhook outcomes and entitlement refusals to anyone,
+> while this runbook said to keep it internal. **Documentation is not a control.**
+> It now carries a `handle /metrics { respond 404 }` block **before** the proxy
+> (`404`, not `403`: a `403` confirms the route exists). Nothing is deployed, so
+> this has still never been observed end to end. Scrape `/metrics` from **inside**
+> the trust boundary — the loopback listener, or a private interface Prometheus can
+> reach — never through that vhost; if it ever must be exposed, replace the block
+> with an authenticated matcher rather than deleting it.
 >
 > It leaks no blob, key, signature, nonce, vault ID or device ID even if exposed —
 > but it is still an unauthenticated aggregate view of a private system, and

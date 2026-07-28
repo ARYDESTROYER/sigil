@@ -245,6 +245,14 @@ export function deriveRecoveryIdentity(wasm, seed) {
  * envelope by naming its vault.
  *
  * ⭐ METADATA ONLY. The route never returns a blob.
+ *
+ * ⚠️ THE RESULT CARRIES A `truncated` FLAG AND CALLERS MUST HONOUR IT. The route
+ * caps one page at `maxRecipientIndexRows` (500 in sigild) and reports the
+ * overflow as `has_more: true`; there is NO CURSOR, so the rest is unreachable.
+ * Every client ignored the flag, which meant a kit covering more than 500 vaults
+ * would have recovered the first 500 and REPORTED SUCCESS — a partial recovery
+ * presented as a complete one, which is the worst possible failure for a
+ * mechanism whose entire job is "did I get everything back?".
  */
 export async function listRecoverableVaults(wasm, auth, deviceId = null) {
   const target = checkId("device id", deviceId ?? auth?.deviceId);
@@ -256,12 +264,20 @@ export async function listRecoverableVaults(wasm, auth, deviceId = null) {
     );
   }
   const json = await res.json();
-  return (json.vaults ?? []).map((v) => ({
+  const vaults = (json.vaults ?? []).map((v) => ({
     vaultId: v.vaultID ?? "",
     senderDeviceId: v.sender_device_id ?? "",
     sizeBytes: v.size_bytes ?? 0,
     createdAt: v.created_at ?? "",
   }));
+  // Additive and non-enumerable so the array still behaves exactly as before for
+  // every existing caller (length, iteration, JSON) — but a caller that CARES can
+  // see it, and `restoreFromKit` below refuses to claim completeness without it.
+  Object.defineProperty(vaults, "truncated", {
+    value: json.has_more === true,
+    enumerable: false,
+  });
+  return vaults;
 }
 
 /**
@@ -604,6 +620,19 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
 
   const account = await getAccount(wasm, auth, baseUrl);
   const indexed = await listRecoverableVaults(wasm, auth, deviceId);
+  // ⛔ REFUSE RATHER THAN UNDER-REPORT. The index route has a hard page cap and no
+  // cursor, so a truncated answer means this client CANNOT know what it is
+  // missing. Restoring the visible prefix and calling it a recovery would tell a
+  // customer their vaults are back while some are silently absent — so this fails
+  // loudly instead, and names the operator action that fixes it.
+  if (indexed.truncated) {
+    throw new RecoveryError(
+      "this kit covers MORE vaults than the server will list in one page, and that route has no " +
+        "cursor — so this client cannot see all of them and refuses to report a partial recovery " +
+        "as a complete one. Nothing was restored. Reduce what this kit covers (or raise the " +
+        "server's per-device index page cap) and try again.",
+    );
+  }
   if (indexed.length === 0) {
     throw new RecoveryError(
       "valid code and device, but there is nothing to recover: this kit holds no vault key on " +

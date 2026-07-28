@@ -548,3 +548,53 @@ the authority. (The `interface SigilWasm` gap recorded in *Neutral* was closed i
 Phase 56; this is a different and still-open one.)
 
 Nothing about the kit itself changed. Limitations 1–13 stand as written.
+
+## The sheet now has a SECOND job: it derives the container master key (added Phase 58, 2026-07-29)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+[ADR 0046](0046-passkey-protected-local-containers.md) adds a **second AT-REST
+factor** to the webapp's sealed containers: with protection on they are sealed
+under a 32-byte **container master key (CMK)** rather than the password, and the
+CMK is derived from **this kit's printed seed**:
+
+```
+CMK = HKDF-SHA256( salt = "sigil-recovery-kit-v1",
+                   ikm  = kit_seed(32),
+                   info = "sigil-recovery-kit-v1/container-master-key",
+                   L    = 32 )
+```
+
+It reuses this ADR's HKDF-Extract salt (§3) with a **new, distinct `info` label**,
+which is the same domain separation that already keeps the Ed25519, X25519 and
+ML-KEM derivations apart. **§3's three labels are unchanged**, the printed format
+of §2 is unchanged, and the CMK is **not** derived by
+`libsigil/core/src/recovery.rs` — it is one `crypto.subtle.deriveBits` call in
+`sigil-wasm/passkey.mjs`, because no Rust caller exists and a Rust copy would be a
+mirror that can only drift. If the CLI or the desktop ever want offline local
+unlock, it moves into `recovery.rs` and the JS becomes a shell.
+
+**What this means for the sheet, stated plainly:**
+
+- ⭐ **One artifact, two jobs.** The same 56 characters that rebuild a lost
+  account now also open a passkey-protected local profile — so the break-glass for
+  a dead passkey needs **no second sheet, no escrow and no server**. That is the
+  property that made ADR 0046 buildable.
+- ⚠️ **Limitation 1 gets strictly heavier.** "Whoever holds the paper has full
+  control of the account" now also means *whoever holds the paper can open the
+  local containers of a protected browser profile, without its password*. Nothing
+  about the paper changed; what it reaches did.
+- ⚠️ **Limitation 4 ("a kit cannot be created after the loss") becomes a
+  precondition rather than an afterthought.** ADR 0046 **refuses to enable
+  protection** unless an active kit already exists, and the refusal fails closed
+  when the account cannot be checked.
+- **Reprinting a kit changes the CMK**, so the webapp **re-seals the passkey slot
+  in the same operation** as a reprint. Otherwise the containers would stay
+  openable by the passkey while the break-glass silently stopped working — worse
+  than a brick, because nothing tells you. Limitation 12 ("the printed sheet has no
+  revision, expiry or rotation story") is otherwise unchanged.
+- **`sigild` still has no concept of recovery, and now no concept of passkeys
+  either** — no route, no table, no migration, no metric, no dependency.
+
+Limitations 1–13 stand as written, with 1 and 4 read in the light above.

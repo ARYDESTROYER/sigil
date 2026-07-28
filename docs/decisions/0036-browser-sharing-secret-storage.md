@@ -186,3 +186,40 @@ and anything else is a finding. Mutation-proven: a dump at `/_leak` now fails wi
 Nothing about the storage decision changed. What changed is that the decision is
 now **enforced** rather than **remembered**. Every honest limitation above still
 stands, including no zeroization and every secret being decrypted together.
+
+## The webapp persists THREE containers when passkey protection is on (added Phase 58, 2026-07-29)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+**The body says a browser client "still persists exactly TWO values, both sealed
+`SIGILcli` containers".** With [ADR 0046](0046-passkey-protected-local-containers.md)
+turned on, the **webapp** persists **three** — and all three are still sealed
+`SIGILcli` containers, so the invariant this ADR exists to state is intact:
+
+| `localStorage` key | contents | sealed under |
+|---|---|---|
+| `sigil.webapp.vault.v1` | the TOTP vault | the **CMK** (was: the password) |
+| `sigil.webapp.device.v1` | the v3 device identity — seed, hybrid secret, vault keyring, pin store | the **CMK** (was: the password) |
+| `sigil.webapp.hwslot.v1` | **new** — the CMK itself, plus public passkey metadata | `PRF(32) ‖ utf8(password)` |
+
+The third value is a **container and not a JSON marker specifically because of
+this ADR**: the leak specs assert that every persisted value decodes to bytes
+beginning with the `SIGILcli` magic, and a plaintext `{credential_ids, rp_id}`
+marker would have been the first non-container persisted value in this repo's
+history. ⛔ Sealing that public metadata under a hardcoded constant just to satisfy
+the magic check was rejected as fake crypto.
+
+**What is unchanged:** the sealed-plaintext schema of the device identity (still
+v3), the `SIGILcli` format, the one-password/one-unlock lifecycle, the
+memory-only handling of every decrypted secret, and every limitation listed above
+— including no zeroization, the single-point-of-loss property, and the fact that
+the extension and the desktop are untouched (the extension still persists exactly
+two containers). The three-container shape applies to the **webapp only**.
+
+⚠️ **One limitation above is now narrower for the webapp and should be read that
+way.** *"One container is now a single point of loss … there is no recovery
+path"* was written before [ADR 0042](0042-recovery-kit.md). With a kit printed,
+the sheet derives the CMK offline and opens both containers — which is the only
+reason ADR 0046 could be built at all. Without a kit, the sentence still stands
+exactly as written, and ADR 0046 **refuses to enable protection** in that case.

@@ -852,6 +852,28 @@ cryptography of its own; see the status note above). The pieces in this repo:
   back to each held vault key**, so a shared vault re-opens after a reload; the password
   and every decrypted secret remain memory-only and are dropped on Lock / Forget /
   reload ([ADR 0036](decisions/0036-browser-sharing-secret-storage.md)).
+  ⭐ **Since Phase 58 the webapp can also protect both containers with a PASSKEY**
+  ([ADR 0046](decisions/0046-passkey-protected-local-containers.md), over the new
+  `sigil-wasm/passkey.mjs` re-exported by `@sigil/wasm`) — the **only** client with
+  this UI. With protection on, the TOTP vault and the device identity are sealed
+  under a 32-byte **container master key** instead of the password, and the CMK is
+  wrapped into a **third `SIGILcli` container** (`localStorage` key
+  `sigil.webapp.hwslot.v1`) sealed under `PRF(32) ‖ utf8(password)` — a WebAuthn
+  credential's PRF output first, then the password, fed **straight to the
+  container's own Argon2id**. The CMK is an HKDF derivation of the **existing
+  [ADR 0042](decisions/0042-recovery-kit.md) recovery-sheet seed**, so the
+  break-glass for a dead passkey is the sheet the user already printed — no new
+  artifact and **no server**. ⭐ **AND, never OR:** while protection is on there is
+  no password-only slot; the two doors are (password AND passkey) and (the sheet).
+  Enabling **refuses without an active recovery kit**, and because it cannot be
+  atomic the **containers are written first and the slot last**, so an interruption
+  leaves CMK-sealed containers with no slot — the state the sheet alone recovers.
+  A protected **personal** vault refuses sync in **both** directions (push is
+  pointless, pull would overwrite the only copy). ⭐ **`sigild` gained nothing**:
+  no route, header, canonical message, migration, table, metric or dependency, and
+  request auth is still classical Ed25519 contract v3. The persisted set is still
+  **sealed containers only** — now three of them. It defends **storage, never
+  execution**, and is **not retroactive**.
   It is now an **installable PWA that works fully OFFLINE** — a web
   **manifest** (`app/manifest.ts`) makes it installable, and a hand-rolled
   **service worker** (`public/sw.js`, registered by `app/register-sw.tsx`)
@@ -886,18 +908,32 @@ cryptography of its own; see the status note above). The pieces in this repo:
   through the enrollment UI over the real contract-v3 signed path, and asserts the
   **pre-fix** behaviour is reproduced when `SIGILD_CORS_ORIGINS` is absent). That
   closes the earlier honest gap that no Playwright test had ever driven the enroll
-  button. **Honest gaps that remain:** every other spec here runs against a **test
+  button. Phase 58 added **`tests/passkey.spec.ts` — 24 specs** driving the **real
+  WebAuthn API** through the Chrome DevTools Protocol **virtual authenticator**
+  ([ADR 0046](decisions/0046-passkey-protected-local-containers.md)): PRF present
+  (`hasPrf: true`), PRF absent (omit it), the authenticator **removed**, a
+  **different** authenticator, backup-eligible flags, both interruption states of
+  the non-atomic enable, a **deleted** slot and a **corrupted** slot. ⛔ **The origin
+  had to move to `http://localhost`** — Chrome rejects WebAuthn on an IP literal
+  (`SecurityError: This is an invalid domain.`), so `playwright.config.ts`'s
+  `127.0.0.1` would have failed every passkey spec for a reason unrelated to the
+  feature. **Honest gaps that remain:** every other spec here runs against a **test
   double** (`sigil-wasm/test/fake-sigild.mjs`), and **print output is not verified** —
   headless Chromium cannot render a printed page, so the recovery sheet's
   `@media print` rules are by-eye.
-  ⚠️ **And the double is MORE PERMISSIVE than real `sigild` on axes its header does
-  not disclaim** (found by the fourth audit): its catch-all answers **`404`**,
-  inverting the *"`501` by default, never `404`"* invariant **inside the double**;
-  and it enforces **no envelope size cap, no hybrid-key length validation and no
-  recipient existence/revocation check**. An auditor tightened all four and both
-  browser suites stayed green, so it conceals no **current** defect — but a suite
-  built on a laxer server than the real one is exactly how the CORS hole survived
-  twelve phases, and this is latent risk of the same shape.
+  ⚠️ **The double used to be MORE PERMISSIVE than real `sigild` on axes its header
+  did not disclaim** (found by the fourth audit). Four of them are now **enforced in
+  the double itself**: the catch-all answers **`501`** for unimplemented `/v1/`
+  routes (restoring the *"`501` by default, never `404`"* invariant inside the
+  double), the key-envelope `PUT` enforces the **16 KiB** cap, the hybrid-key `PUT`
+  validates **both halves' lengths** (32 / 1184), and the key-envelope `PUT` checks
+  the recipient **exists and is not revoked**. ⚠️ **What is still laxer is now stated
+  in its header rather than left to be discovered:** it verifies **no signature**,
+  enforces **no ownership/grant/authorization**, applies **no entitlement gate**
+  beyond a switch, and has **no rate limiting, no nonce/replay window, no account
+  seat cap, no hash chain and no self-only check** on the per-device envelope index.
+  A spec here proves what the **browser** does and **nothing** about what `sigild`
+  would allow.
   It carries the **same no-index stealth posture as
   marketing** (`X-Robots-Tag noindex/nofollow/noarchive`, `X-Content-Type-Options
   nosniff`, `Referrer-Policy no-referrer`, `X-Frame-Options DENY`, plus an
@@ -1191,7 +1227,7 @@ cryptography of its own; see the status note above). The pieces in this repo:
    ════════════════════╪═════════════════════════════════╪══ TRUST BOUNDARY ══
                        ▼                                  ▼  not in this repo)
    ┌───────────────────────────────────────────────────────────────────────┐
-   │  SERVER SIDE — sigild (Go)        NO CRYPTO · OPAQUE BLOBS ONLY         │
+   │  SERVER SIDE — sigild (Go)    NO CRYPTO ON VAULT CONTENT · OPAQUE BLOBS │
    │   /healthz · /readyz · /version   (probes; no secrets)                 │
    │   /metrics  → Prometheus-text counters (always on; counts only)        │
    │   /v1/vaults/{id}/ops  →  501 by default                               │
@@ -1207,6 +1243,9 @@ cryptography of its own; see the status note above). The pieces in this repo:
      unlock + localStorage persistence of the SIGILcli-sealed container, codes in wasm;
      installable, OFFLINE-capable (manifest + service worker: static assets cached, the
      sealed vault stays in localStorage), accessible/axe-clean;
+     optional PASSKEY protection of the at-rest seal (WebAuthn PRF + password -> a
+     container master key derived from the printed recovery sheet; ADR 0046) — the
+     only client with it, and the server learns nothing about it;
      client-side only; dev / no-index / UNAUDITED; not deployed.
    extension (MV3, popup): the same in-browser wasm authenticator as an extension —
      encrypted TOTP vault (add/import/export), codes in wasm, ONLY the SIGILcli-sealed
@@ -1533,7 +1572,7 @@ binary's output against the JS module's.
 | Client | Pin store | Mode / protection |
 |--------|-----------|-------------------|
 | `sigil` CLI, native desktop | `hybrid-pins.json` in the state dir (`$HOME/.sigil` by default) — **the same file**, so a CLI pin and a desktop pin are one record | `0600` file in a `0700` dir, written via the same `write_secret_file` helper as other sensitive state (created `0600` up front, `fsync`'d, re-`chmod`'d) |
-| webapp, MV3 extension | a `pins` field **inside the existing sealed device-identity container**, schema **v3** | sealed under the vault password with the same Argon2id → XChaCha20-Poly1305 `SIGILcli` construction as everything else — **the browsers still persist only sealed containers** |
+| webapp, MV3 extension | a `pins` field **inside the existing sealed device-identity container**, schema **v3** | sealed with the same Argon2id → XChaCha20-Poly1305 `SIGILcli` construction as everything else — under the vault password, or (webapp, passkey protection on) under the **container master key** of [ADR 0046](decisions/0046-passkey-protected-local-containers.md). **The browsers still persist only sealed containers** |
 
 The browser choice matters architecturally: it would have been easy to drop a JSON
 blob in `localStorage`, and that would have broken the invariant from

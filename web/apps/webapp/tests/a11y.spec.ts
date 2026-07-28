@@ -52,3 +52,57 @@ test("unlocked vault view has no serious/critical axe violations", async ({ page
 
   await expectNoSeriousA11yViolations(page);
 });
+
+// The passkey panel (ADR 0046) and — more importantly — the break-glass field on
+// the LOCKED screen. That field is what a person reaches for when their passkey
+// has just stopped working, which is not a calm moment; it must be reachable by
+// keyboard, announced, and axe-clean.
+test("the passkey panel and the locked-screen break-glass field are axe-clean", async ({
+  page,
+}) => {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("WebAuthn.enable");
+  await cdp.send("WebAuthn.addVirtualAuthenticator", {
+    options: {
+      protocol: "ctap2",
+      ctap2Version: "ctap2_1",
+      transport: "internal",
+      hasResidentKey: true,
+      hasUserVerification: true,
+      isUserVerified: true,
+      automaticPresenceSimulation: true,
+      hasPrf: true,
+    },
+  } as never);
+
+  await page.goto("/?t=59");
+  await page.getByTestId("setup-password").fill("a11y-passkey");
+  await page.getByTestId("setup-confirm").fill("a11y-passkey");
+  await page.getByTestId("setup-submit").click();
+  await expect(page.getByTestId("vault-view")).toBeVisible({ timeout: T });
+
+  // The panel in its default (unprotected) state, inside the unlocked vault.
+  await expect(page.getByTestId("passkey-state")).toBeVisible();
+  await expect(page.getByTestId("passkey-enable")).toBeVisible();
+  await expectNoSeriousA11yViolations(page);
+
+  // The locked screen WITH a passkey slot present: the break-glass form is
+  // always visible there, never hidden behind a disclosure.
+  await page.evaluate(() => {
+    // A slot-shaped value is enough to render the locked variant; opening it is
+    // covered by passkey.spec.ts.
+    window.localStorage.setItem(
+      "sigil.webapp.hwslot.v1",
+      window.localStorage.getItem("sigil.webapp.vault.v1") ?? "",
+    );
+  });
+  await page.reload();
+  await expect(page.getByTestId("unlock-recovery-code")).toBeVisible({ timeout: T });
+  await expect(page.getByTestId("unlock-passkey-required")).toBeVisible();
+  await expectNoSeriousA11yViolations(page);
+
+  // Keyboard-reachable: focus the code field directly and type into it.
+  await page.getByTestId("unlock-recovery-code").focus();
+  await page.keyboard.type("ABC");
+  await expect(page.getByTestId("unlock-recovery-code")).toHaveValue("ABC");
+});

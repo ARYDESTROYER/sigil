@@ -98,12 +98,23 @@ done
 note "=== BROWSER CLIENTS (rebuild FIRST — the local gate lies otherwise) ==="
 corepack pnpm --filter @sigil/wasm build >/dev/null 2>&1
 corepack pnpm --filter webapp build >/dev/null 2>&1 && ok "webapp build" || bad "webapp build"
+# ⚠️ SKIPS COUNT AS FAILURES HERE, for the same reason they do in the Go block
+# above: a spec that quietly stops running looks exactly like a spec that passes.
+# Playwright prints "N skipped"/"N did not run" only when there ARE any, so this
+# is silent on a healthy run. (`retries: 0` in playwright.config.ts means there is
+# no "flaky" line to worry about — a suite that needs a second attempt is a suite
+# whose failures get ignored.)
+pw() { # $1 = label, $2 = tail output
+  if printf '%s' "$2" | grep -qE "failed|did not run"; then bad "$1: $2"
+  elif printf '%s' "$2" | grep -q "skipped"; then bad "$1 SKIPPED tests: $2"
+  else ok "$1: $(printf '%s' "$2" | grep -oE '[0-9]+ passed')"; fi
+}
 r=$(corepack pnpm --filter webapp exec playwright test 2>&1 | tail -3)
-printf '%s' "$r" | grep -q "failed" && bad "webapp playwright: $r" || ok "webapp playwright: $(printf '%s' "$r" | grep -oE '[0-9]+ passed')"
+pw "webapp playwright" "$r"
 ./extension/build.sh >/dev/null 2>&1 && ok "extension vendor" || bad "extension build.sh"
 # `pnpm test` (not `exec playwright test`) — only it runs the pretest vendor hook.
 r=$(cd extension && corepack pnpm test 2>&1 | tail -3)
-printf '%s' "$r" | grep -q "failed" && bad "extension: $r" || ok "extension: $(printf '%s' "$r" | grep -oE '[0-9]+ passed')"
+pw "extension" "$r"
 corepack pnpm -C web build >/dev/null 2>&1 && ok "marketing build" || bad "marketing build"
 
 if [ "$QUICK" != "--quick" ]; then

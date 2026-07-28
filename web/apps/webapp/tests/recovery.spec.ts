@@ -12,7 +12,7 @@ const RFC_SECRET_B32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const RFC_CODE = "287082"; // RFC 6238 App B at ?t=59, 6 digits
 const VAULT_ID = "webapp-demo";
 /** The origin playwright.config.ts serves the built app on. */
-const WEBAPP_ORIGIN = "http://127.0.0.1:3210";
+const WEBAPP_ORIGIN = "http://localhost:3210";
 
 type Fake = {
   baseUrl: string;
@@ -223,4 +223,88 @@ test("a kit generated with no vault keys warns that it covers NOTHING", async ({
     { timeout: T },
   );
   await expect(page.getByTestId("recovery-covered")).toHaveText("NONE");
+});
+
+
+/**
+ * ⭐ A TRUNCATED INDEX MUST REFUSE, NOT UNDER-REPORT.
+ *
+ * `GET /v1/devices/{id}/keys` caps one page at 500 rows and has NO CURSOR, so a
+ * kit covering more than that cannot be fully enumerated. No client read
+ * `has_more`, which meant a kit over the cap would have recovered the first 500
+ * vaults and reported SUCCESS — a partial recovery presented as a complete one,
+ * on the one mechanism whose entire job is answering "did I get everything
+ * back?".
+ *
+ * The cap is shrunk here rather than minting 500 envelopes; the flag and the
+ * branch are the real ones.
+ */
+test("a recovery whose index was TRUNCATED refuses instead of restoring a prefix", async ({
+  page,
+  browser,
+}: {
+  page: Page;
+  browser: Browser;
+}) => {
+  await page.goto("/?t=59");
+  await setupVault(page, "truncation-profile-one");
+
+  await page.getByTestId("add-label").fill("rfc-vector");
+  await page.getByTestId("add-secret").fill(RFC_SECRET_B32);
+  await page.getByTestId("add-submit").click();
+  await expect(page.getByTestId("account-code")).toHaveText(RFC_CODE, { timeout: T });
+
+  await page.getByTestId("sync-url").fill(fake.baseUrl);
+  await page.getByTestId("sync-vault-id").fill("truncation-vault");
+  await page.getByTestId("device-token").fill("operator-token-0123456789abcdef");
+  await page.getByTestId("device-enroll").click();
+  await expect(page.getByTestId("sync-status")).toContainText("Enrolled as", { timeout: T });
+
+  await page.getByTestId("sharing-convert").click();
+  await expect(page.getByTestId("sharing-status")).toContainText("random 32-byte vault key", {
+    timeout: T,
+  });
+  await page.getByTestId("sync-push").click();
+  await expect(page.getByTestId("sync-status")).toContainText("Pushed sealed container", {
+    timeout: T,
+  });
+
+  await page.getByTestId("recovery-generate").click();
+  await expect(page.getByTestId("recovery-sheet")).toBeVisible({ timeout: T });
+  const formatted = ((await page.getByTestId("recovery-code").textContent()) ?? "").trim();
+  const kitDeviceId = ((await page.getByTestId("recovery-kit-id").textContent()) ?? "").trim();
+
+  // Give the kit a SECOND covered vault, then make the server's page hold one row.
+  const tuned = fake as unknown as { indexPageCap: number };
+  const previousCap = tuned.indexPageCap;
+  const decoyKey = `overflow-vault\u0000${kitDeviceId}`;
+  fake.state.envelopes.set(decoyKey, {
+    bytes: Buffer.alloc(1226),
+    sender: "dev_fake_1",
+    createdAt: new Date().toISOString(),
+  });
+  tuned.indexPageCap = 1;
+
+  try {
+    const ctx = await browser.newContext();
+    const p2 = await ctx.newPage();
+    await p2.goto("/?t=59");
+    await p2.getByTestId("restore-open").click();
+    await p2.getByTestId("restore-url").fill(fake.baseUrl);
+    await p2.getByTestId("restore-device-id").fill(kitDeviceId);
+    await p2.getByTestId("restore-password").fill("truncation-profile-two");
+    await p2.getByTestId("restore-confirm").fill("truncation-profile-two");
+    await p2.getByTestId("restore-code").fill(formatted);
+    await p2.getByTestId("restore-submit").click();
+
+    await expect(p2.getByTestId("restore-error")).toContainText("partial recovery", {
+      timeout: T,
+    });
+    // NOTHING was adopted: a half-restored browser is worse than a clean refusal.
+    expect(await p2.evaluate(() => Object.keys(window.localStorage))).toEqual([]);
+    await ctx.close();
+  } finally {
+    tuned.indexPageCap = previousCap;
+    fake.state.envelopes.delete(decoyKey);
+  }
 });

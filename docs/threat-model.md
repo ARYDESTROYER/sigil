@@ -12,7 +12,7 @@ defense, and the layer the defense lives at.
 | --- | --- | --- | --- | --- |
 | 1 | Phishing site | Lookalike domain asks for code/master password | Domain-bound autofill; extension refuses autofill + warns on mismatch | Browser ext + client |
 | 2 | Casual snooper | Glances at screen | Auto-lock (5 min default); biometric on reveal; redacted display; no widget/notification preview | Client |
-| 3 | Determined attacker w/ device | Has the phone + lock code | Master password is a separate second layer; optional passkey 2nd factor; remote-wipe invalidates device key + re-encrypts on remaining devices | Client + server |
+| 3 | Determined attacker w/ device | Has the phone + lock code | Master password is a separate second layer; optional passkey 2nd factor; remote-wipe invalidates device key + re-encrypts on remaining devices. ⚠️ **Partially real since Phase 58, and narrower than this row sounds:** the **webapp** can mix a WebAuthn PRF output into the **at-rest seal** of its containers ([ADR 0046](decisions/0046-passkey-protected-local-containers.md), [section below](#browser-profiles-protected-by-a-passkey-webapp-only--see-adr-0046)). That is a second factor on **stored bytes**, not on login and not on a live session; the extension and desktop do not have it, and there is still **no remote wipe** | Client + server |
 | 4 | Rogue Sigil employee w/ DB access | Reads production DB | Server holds only ciphertext; signed append-only audit log; two-person, time-bound prod access (operational) — architecture is the real defense | Architecture |
 | 5 | Compromised sync server | Owns the backend | Client-side decryption; ops signed by device keys (can't forge); replay/drop detected via Lamport clock + Merkle root | Architecture + crypto |
 | 6 | State-level wiretap | Captures all traffic | TLS 1.3 hybrid-PQ named group; double-layer (TLS + AEAD); forward secrecy via ephemeral X25519 + ML-KEM | Transport + crypto |
@@ -21,7 +21,7 @@ defense, and the layer the defense lives at.
 | 9 | Compromised OS reading memory | Reads memory between apps | Master key in mlock'd pages; secure enclave where available; minimal in-memory residence; wipe on lock | OS / hardware |
 | 10 | Browser malware | Reads extension state | Extension storage encrypted under master-password-derived key; user-initiated actions only; clipboard cleared after 3s; HTTPS enforced | Extension hardening |
 | 11 | Push-notification operator | Reads push payloads | Payloads carry only opaque vault ID + wake hint; approval blobs decryptable only by the user's other devices | Architecture |
-| 12 | Lost master password / lost every device | User locked out | ⚠️ **What ships is a printed 56-character recovery kit and NOTHING ELSE** ([ADR 0042](decisions/0042-recovery-kit.md), [Recovery kit](#recovery-kit-adversaries-dev-gated--see-adr-0042) below). It confers **IMMEDIATE, un-delayed, un-notified, full account takeover** to whoever holds the paper. There is **no recovery delegate**, **no delay window**, **no notification**, **no veto**, and **no passkey-bound recovery** — do not read this row as if there were. It does keep the property that **Sigil cannot decrypt unilaterally**, because the secret never reaches the server; and it must be **printed in advance** or it does not exist | Workflow + client |
+| 12 | Lost master password / lost every device | User locked out | ⚠️ **What ships is a printed 56-character recovery kit and NOTHING ELSE** ([ADR 0042](decisions/0042-recovery-kit.md), [Recovery kit](#recovery-kit-adversaries-dev-gated--see-adr-0042) below). It confers **IMMEDIATE, un-delayed, un-notified, full account takeover** to whoever holds the paper. There is **no recovery delegate**, **no delay window**, **no notification**, **no veto**, and **no passkey-bound recovery** — do not read this row as if there were. (⚠️ Phase 58 runs the dependency the OTHER way: the printed sheet is the break-glass **for** a passkey-protected profile, so a lost passkey costs nothing — but a lost sheet is still unrecoverable, and no passkey can substitute for it. See [ADR 0046](decisions/0046-passkey-protected-local-containers.md).) It does keep the property that **Sigil cannot decrypt unilaterally**, because the secret never reaches the server; and it must be **printed in advance** or it does not exist | Workflow + client |
 
 **Server-stores-opaque-blobs property.** Even where `sigild` does hold data, it
 holds **only opaque client-encrypted blobs** — never plaintext and never keys.
@@ -208,7 +208,9 @@ client side is **what a browser profile now holds**:
   `sigil.webapp.device.v1`, `sigil.extension.vault.v1` /
   `sigil.extension.device.v1`. An offline attacker with the profile directory, a
   backup, or a `localStorage` dump gets ciphertext, and unsealing costs the same
-  Argon2id work as the vault.
+  Argon2id work as the vault. ⚠️ **In the webapp, "under the vault password" is no
+  longer the whole story once passkey protection is on** — see
+  [the next subsection](#browser-profiles-protected-by-a-passkey-webapp-only--see-adr-0046).
 - **They are exposed in memory while unlocked, and are NOT zeroized.** Sharing needs
   the hybrid secret and the vault keys in the clear, so between unlock and lock they
   sit in the JS heap as `Uint8Array`s. JS offers no reliable wipe: Lock / Forget /
@@ -231,6 +233,77 @@ client side is **what a browser profile now holds**:
   never-verified device on **first** sight, and easy to click through a re-pin. The
   browsers also **fail closed** if a caller forgets to pass its pin store
   (`requirePinStore` throws) rather than silently treating every key as first-sight.
+
+### Browser profiles protected by a passkey (webapp only — see [ADR 0046](decisions/0046-passkey-protected-local-containers.md))
+
+Everything above assumes the sealing secret is a **human password**. That is the
+weak link in the client story: the PQ-hybrid wrap, the type-enforced wrap gate,
+key pinning and the paper kit are all reachable by guessing one password offline,
+at whatever rate the attacker's hardware allows against our Argon2id parameters.
+
+**The adversary this addresses: someone who has the browser profile but not the
+authenticator.** A copied `localStorage`, a stolen or synced backup, a
+disk image, a shared or resold machine, a support-tool export, a malicious sync
+extension that exfiltrates web storage — anything that yields the *stored bytes*
+without a live session.
+
+With protection on (webapp only), both containers are sealed under a 32-byte
+**container master key** rather than the password, and the CMK is wrapped in a
+third sealed container under `PRF(32) ‖ utf8(password)` — the PRF output of a
+WebAuthn credential, which never leaves the authenticator and is not derivable from
+anything on disk. That adversary must now hold **the password AND the
+authenticator**.
+
+- ⭐ **AND, never OR.** While protection is on there is **no password-only slot**.
+  The two doors are (password AND passkey) and (the printed
+  [ADR 0042](decisions/0042-recovery-kit.md) sheet). An OR design would be theatre
+  — an offline attacker would simply attack the weaker branch.
+- **The break-glass is the sheet already printed**, which derives the same CMK
+  offline. Every way a passkey becomes unavailable — lost laptop, cleared profile,
+  revoked platform credential, a browser that drops PRF, a cancelled ceremony —
+  lands there, with no server and no network. This is why enabling **refuses**
+  unless an active kit exists, and why the break-glass form is always reachable on
+  the locked screen.
+- **`sigild` gained nothing**: no route, header, canonical message, migration,
+  table, metric or dependency. A hostile server cannot disable, weaken, detect or
+  observe this. Adversary classes 4 and 5 are unchanged.
+
+**What this explicitly does NOT defend against:**
+
+- ⛔ **It defends STORAGE, never EXECUTION.** Anything running in the origin while
+  the vault is unlocked (XSS, a malicious extension, a hostile dependency) reads
+  the plaintext vault, the Ed25519 seed, the hybrid secret, every vault key, the
+  password, the PRF output **and the CMK**. This is unchanged from the rows above.
+- ⛔ **It is NOT retroactive.** Only containers re-sealed *after* protection is
+  enabled are protected. Earlier copies, backups and forensic images stay
+  password-only **forever** — so an attacker who took a snapshot before the switch
+  keeps the weaker target.
+- ⛔ **An attacker who can DRIVE the authenticator gets `R`.** An unlocked device in
+  hand, a coerced user-verification prompt, or malware on the machine at unlock time
+  yields the PRF output. What remains between them and the CMK is Argon2id over the
+  password — which is why the password is fed to Argon2id **directly** rather than
+  through a cheap KDF first.
+- ⛔ **User verification is a policy request, not a proof.** We ask for it and read
+  a flag. We cannot verify a human was verified, and a lying authenticator is
+  undetectable. No attestation is requested, so we make **no claim** about the kind
+  of authenticator in use.
+- ⛔ **A backup-eligible credential is a new third-party custodian.** It syncs to a
+  platform account or password manager, so the second factor becomes as strong as
+  that account. The UI says so, derived from the flags of the ceremony that just
+  ran; it does not prevent it.
+- ⛔ **Whoever holds the printed sheet now also holds local unlock** — without the
+  password and without the passkey. The paper was already a full-account credential
+  ([ADR 0042](decisions/0042-recovery-kit.md) limitation 1); its reach grew here.
+- ⛔ **It is not phishing resistance, not 2FA for login, and not a hardware
+  guarantee.** It is a second factor on an **at-rest seal** in one browser profile.
+- ⛔ **Only the webapp has it.** The MV3 extension and the native desktop do not, so
+  a user can hold a protected profile on one surface and an unprotected one on
+  another. That is scope, not a technical block.
+- ⛔ **A protected personal vault refuses sync in both directions**, so the local
+  copy is the only copy — a device loss is a data loss unless the vault is converted
+  to a shared one. The kit recovers **keys, not data**.
+- ⛔ **No zeroization**, as everywhere else: the CMK and the PRF output sit in JS
+  `Uint8Array`s while the vault is unlocked.
 
 ### The native desktop client (enrolls, syncs and shares — with the CLI's `0600` files)
 

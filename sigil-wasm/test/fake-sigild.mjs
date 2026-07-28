@@ -35,9 +35,51 @@
 //
 // The MV3 extension passes nothing: an extension page with a host permission is
 // exempt from CORS, so its specs prove the no-CORS path.
+//
+// ⚠️⚠️ THE RULE THIS FILE LIVES UNDER: A DOUBLE MUST NEVER BE MORE PERMISSIVE
+// THAN THE THING IT DOUBLES. That is not a style preference — the CORS default
+// above is the scar: an always-`*` fake made six browser specs green while the
+// real path was completely dead. An audit found four MORE axes where this file
+// was laxer than sigild and said so nowhere, so each is now ENFORCED here rather
+// than merely disclaimed:
+//   1. the CATCH-ALL answers 501 for unimplemented /v1/ routes (sigild's
+//      dev-gated routes are "501 by default, NEVER 404"); a 404 inside the double
+//      inverted that invariant, so a client that mistook 501 for 404 — or vice
+//      versa — would look correct here;
+//   2. key-envelope PUT enforces the 16 KiB cap (`MAX_KEY_ENVELOPE_BYTES`) -> 413;
+//   3. hybrid-key PUT validates BOTH halves' LENGTHS (32 / 1184) -> 400, which is
+//      the only look sigild ever takes at key material;
+//   4. key-envelope PUT checks the RECIPIENT EXISTS and is NOT REVOKED
+//      -> 404 device_not_found / 409 device_revoked.
+//
+// ⚠️ WHAT IS STILL LAXER, STATED EXPLICITLY SO NOBODY INFERS OTHERWISE. It
+// verifies NO SIGNATURE, enforces NO ownership/grant/authorization, applies NO
+// entitlement gate beyond the `refuseWrites` switch, has NO rate limiting, NO
+// nonce/replay window, NO account seat cap, NO hash chain and NO self-only check
+// on the per-device envelope index. A spec here can therefore prove what the
+// BROWSER does, and NOTHING about what sigild would allow. Every one of those
+// lives in the real-server suites listed above.
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
+
+// Mirrors sigild: store.MaxKeyEnvelopeBytes, api.maxHybridKeyBodyBytes,
+// store.X25519PublicKeyLen, store.MLKEM768EncapsKeyLen, api.maxRecipientIndexRows.
+const MAX_KEY_ENVELOPE_BYTES = 16 * 1024;
+const MAX_HYBRID_KEY_BODY_BYTES = 8 * 1024;
+const X25519_PUBLIC_KEY_LEN = 32;
+const MLKEM768_ENCAPS_KEY_LEN = 1184;
+const MAX_RECIPIENT_INDEX_ROWS = 500;
+
+/** Decoded byte length of a std-base64 string, or -1 when it is not one. */
+function b64len(value) {
+  if (typeof value !== "string" || value === "") return -1;
+  try {
+    return Buffer.from(value, "base64").length;
+  } catch {
+    return -1;
+  }
+}
 
 const SIGIL_HEADERS = [
   "content-type",
@@ -117,6 +159,9 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
     refuseWrites: false,
     /** Recorded request lines, for assertions like "the code never hit the wire". */
     log: [],
+    /** Page cap of the per-device envelope index. Shrinkable so a spec can reach
+     *  the has_more branch without creating 500 envelopes. */
+    indexPageCap: MAX_RECIPIENT_INDEX_ROWS,
   };
 
   const json = (res, status, body, extraHeaders = {}) => {
@@ -220,11 +265,23 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
 
     if (seg[0] === "v1" && seg[1] === "devices" && seg[3] === "hybrid-key") {
       if (method === "PUT") {
+        if (body.length > MAX_HYBRID_KEY_BODY_BYTES) {
+          return json(res, 413, { error: "too_large" });
+        }
         let parsed = {};
         try {
           parsed = JSON.parse(body.toString("utf8"));
         } catch {
           return json(res, 400, { error: "bad_request" });
+        }
+        // ⭐ THE ONLY LOOK SIGILD EVER TAKES AT KEY MATERIAL: a LENGTH CHECK on
+        // both halves. Never a curve-point parse — it holds no decapsulation key
+        // and decodes nothing.
+        if (
+          b64len(parsed.x25519_public_key) !== X25519_PUBLIC_KEY_LEN ||
+          b64len(parsed.mlkem_encaps_key) !== MLKEM768_ENCAPS_KEY_LEN
+        ) {
+          return json(res, 400, { error: "bad_hybrid_key" });
         }
         state.hybridKeys.set(seg[2], {
           x25519_public_key: parsed.x25519_public_key,
@@ -243,9 +300,17 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
     // Self-only envelope INDEX — how a restored kit learns what it can decrypt.
     if (seg[0] === "v1" && seg[1] === "devices" && seg[3] === "keys" && method === "GET") {
       const vaults = [];
+      let hasMore = false;
       for (const [k, v] of state.envelopes) {
         const [vaultId, deviceId] = k.split("\0");
         if (deviceId !== seg[2]) continue;
+        // Same hard page cap as sigild's maxRecipientIndexRows, and the same
+        // absence of a cursor. `api.indexPageCap` lets a spec shrink it so the
+        // TRUNCATION branch is reachable without minting 500 envelopes.
+        if (vaults.length >= api.indexPageCap) {
+          hasMore = true;
+          break;
+        }
         vaults.push({
           vaultID: vaultId,
           sender_device_id: v.sender,
@@ -253,7 +318,7 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
           created_at: v.createdAt,
         });
       }
-      return json(res, 200, { device_id: seg[2], vaults });
+      return json(res, 200, { device_id: seg[2], vaults, has_more: hasMore });
     }
 
     // ── vault key envelopes ──────────────────────────────────────────────────
@@ -262,6 +327,16 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
       if (method === "PUT") {
         // GATED WRITE #2 in sigild.
         if (api.refuseWrites) return paymentRequired(res);
+        // The opaque envelope has a hard size cap; over it is 413, never a store.
+        if (body.length > MAX_KEY_ENVELOPE_BYTES) {
+          return json(res, 413, { error: "too_large" });
+        }
+        // The recipient must be an ENROLLED, NON-REVOKED device. A double that
+        // accepted a deposit addressed to nobody would hide a whole class of
+        // client bug behind a cheerful 201.
+        const recipient = state.devices.get(seg[4]);
+        if (!recipient) return json(res, 404, { error: "device_not_found" });
+        if (recipient.status !== "active") return json(res, 409, { error: "device_revoked" });
         const createdAt = new Date().toISOString();
         state.envelopes.set(key, {
           bytes: Buffer.from(body),
@@ -365,6 +440,12 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
       return json(res, 200, api.subscription);
     }
 
+    // ⭐ CATCH-ALL. sigild's dev-gated surface answers 501 — never 404 — when the
+    // dev flag is off, so an UNIMPLEMENTED /v1/ route here answers 501 too. A 404
+    // would have inverted that invariant inside the double.
+    if (seg[0] === "v1") {
+      return json(res, 501, { error: "not_implemented" });
+    }
     return json(res, 404, { error: "not_found" });
   });
 

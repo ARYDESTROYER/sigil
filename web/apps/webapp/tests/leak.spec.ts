@@ -1,4 +1,4 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
+import { expect, test, type Browser, type BrowserContext, type Page } from "@playwright/test";
 // @ts-expect-error — plain .mjs test helper shared with the extension suite.
 import { startFakeSigild } from "../../../../sigil-wasm/test/fake-sigild.mjs";
 // @ts-expect-error — plain .mjs test helper shared with the extension suite.
@@ -32,7 +32,7 @@ const T = 60_000;
 const RFC_SECRET_B32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const RFC_CODE = "287082";
 const VAULT_ID = "leak-sweep-vault";
-const WEBAPP_ORIGIN = "http://127.0.0.1:3210";
+const WEBAPP_ORIGIN = "http://localhost:3210";
 
 type Fake = { baseUrl: string; close: () => Promise<void>; log: string[] };
 let fake: Fake;
@@ -354,4 +354,122 @@ test("the recovery code reaches NO store, NO log, NO request and NO URL — on b
   expectSealedOnly("after reload", s3, ["sigil.webapp.device.v1", "sigil.webapp.vault.v1"]);
 
   await ctx.close();
+});
+
+/**
+ * ⭐ THE THIRD SWEEP: a PASSKEY-PROTECTED profile (ADR 0046).
+ *
+ * Protection adds exactly ONE persisted artifact, `sigil.webapp.hwslot.v1`, and
+ * it is itself a sealed `SIGILcli` container — so `describePersistedValue` is
+ * unchanged and only the caller's EXPECTED KEY SET widens, from one permitted
+ * set (2 keys) to one of two (2 off / 3 on).
+ *
+ * ⛔ `sealedOnlyProblems` is NOT relaxed and must never become tolerant of
+ * unknown keys: that helper exists because a plaintext `sessionStorage` dump of
+ * the device seed once sailed through 19/19 green specs.
+ *
+ * The needles here are the three secrets this phase introduces or moves:
+ * the recovery code (which now also opens a protected local profile), the vault
+ * password, and ⭐ the PRF OUTPUT — re-derived through the platform API alone,
+ * which is possible precisely because the PRF is deterministic.
+ */
+test("a PROTECTED profile persists ONLY sealed containers, and leaks no code, password or PRF output", async ({
+  page,
+}: {
+  page: Page;
+}) => {
+  const w = watch(page);
+
+  const cdp: Awaited<ReturnType<BrowserContext["newCDPSession"]>> =
+    await page.context().newCDPSession(page);
+  await cdp.send("WebAuthn.enable");
+  await cdp.send("WebAuthn.addVirtualAuthenticator", {
+    options: {
+      protocol: "ctap2",
+      ctap2Version: "ctap2_1",
+      transport: "internal",
+      hasResidentKey: true,
+      hasUserVerification: true,
+      isUserVerified: true,
+      automaticPresenceSimulation: true,
+      hasPrf: true,
+    },
+  } as never);
+
+  await page.goto("/?t=59");
+  await page.getByTestId("setup-password").fill("leak-sweep-protected");
+  await page.getByTestId("setup-confirm").fill("leak-sweep-protected");
+  await page.getByTestId("setup-submit").click();
+  await expect(page.getByTestId("vault-view")).toBeVisible({ timeout: T });
+
+  await page.getByTestId("add-label").fill("rfc-vector");
+  await page.getByTestId("add-secret").fill(RFC_SECRET_B32);
+  await page.getByTestId("add-submit").click();
+  await expect(page.getByTestId("account-code")).toHaveText(RFC_CODE, { timeout: T });
+
+  await page.getByTestId("sync-url").fill(fake.baseUrl);
+  await page.getByTestId("sync-vault-id").fill("leak-sweep-protected-vault");
+  await page.getByTestId("device-token").fill("operator-token-0123456789abcdef");
+  await page.getByTestId("device-enroll").click();
+  await expect(page.getByTestId("sync-status")).toContainText("Enrolled as", { timeout: T });
+
+  await page.getByTestId("recovery-generate").click();
+  await expect(page.getByTestId("recovery-sheet")).toBeVisible({ timeout: T });
+  const formatted = ((await page.getByTestId("recovery-code").textContent()) ?? "").trim();
+  await page.getByTestId("recovery-written").check();
+  await page.getByTestId("recovery-hide").click();
+
+  await page.getByTestId("passkey-enable").click();
+  await expect(page.getByTestId("passkey-code")).toBeVisible({ timeout: T });
+  await page.getByTestId("passkey-code").fill(formatted);
+  await page.getByTestId("passkey-confirm").click();
+  await expect(page.getByTestId("passkey-state")).toHaveText("Protected: password + passkey", {
+    timeout: T,
+  });
+
+  const s = await sweepStorage(page);
+  const PROTECTED_KEYS = [
+    "sigil.webapp.device.v1",
+    "sigil.webapp.hwslot.v1",
+    "sigil.webapp.vault.v1",
+  ];
+  expect(s.localKeys).toEqual(PROTECTED_KEYS);
+  // All THREE values are sealed containers; every other surface stays empty; the
+  // Cache Storage allowlist is the SAME function, unchanged.
+  expectSealedOnly("protected profile", s, PROTECTED_KEYS);
+
+  assertAbsent("protected profile client storage", s.haystack, formatted);
+  assertAbsent("protected profile DOM", await page.content(), formatted);
+  assertAbsent("protected profile network traffic", w.wire.join("\n"), formatted);
+  assertAbsent("protected profile console output", w.logs.join("\n"), formatted);
+  assertAbsent("protected profile address bar", page.url(), formatted);
+  expect(s.haystack).not.toContain("leak-sweep-protected");
+
+  // ⭐ THE PRF OUTPUT. Re-derived with the PLATFORM API only (no app code), which
+  // works because the PRF is deterministic for a given salt — the same property
+  // the probe checks. If any of it reached a store, a log or the wire, this fails.
+  const prfHex: string = await page.evaluate(async () => {
+    const enc = new TextEncoder();
+    const salt = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", enc.encode("sigil-passkey-unlock-v1")),
+    );
+    const assertion = (await navigator.credentials.get({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        userVerification: "required",
+        allowCredentials: [],
+        extensions: { prf: { eval: { first: salt } } } as AuthenticationExtensionsClientInputs,
+      },
+    })) as PublicKeyCredential;
+    const results = (
+      assertion.getClientExtensionResults() as { prf?: { results?: { first?: ArrayBuffer } } }
+    ).prf?.results?.first;
+    return [...new Uint8Array(results!)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  });
+  expect(prfHex).toHaveLength(64);
+  for (const where of [s.haystack, w.wire.join("\n"), w.logs.join("\n"), await page.content()]) {
+    expect(where, "the PRF output must never be persisted, logged or sent").not.toContain(prfHex);
+    expect(where).not.toContain(prfHex.toUpperCase());
+  }
+  expect(w.logs.filter((l) => l.startsWith("PAGEERROR"))).toEqual([]);
 });

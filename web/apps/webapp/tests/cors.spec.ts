@@ -17,7 +17,7 @@ import path from "node:path";
  * blocked before it left the browser:
  *
  *   Access to fetch at 'http://127.0.0.1:PORT/v1/devices/enroll' from origin
- *   'http://127.0.0.1:3210' has been blocked by CORS policy: Response to
+ *   'http://localhost:3210' has been blocked by CORS policy: Response to
  *   preflight request doesn't pass access control check: No
  *   Access-Control-Allow-Origin header is present on the requested resource.
  *
@@ -36,7 +36,7 @@ import path from "node:path";
  */
 
 const T = 90_000;
-const WEBAPP_ORIGIN = "http://127.0.0.1:3210";
+const WEBAPP_ORIGIN = "http://localhost:3210";
 const ENROLL_TOKEN = "cors-proof-token-0123456789abcdef";
 // Resolve Go the way the rest of the repo does: $GO, then PATH, then the macOS
 // Homebrew path LAST. An earlier version tried only `process.env.GO ?? the

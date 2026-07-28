@@ -70,6 +70,29 @@
 
 api.example.com {
 	encode zstd gzip
+
+	# ⛔ /metrics IS NOT PUBLIC, AND THIS IS THE ONLY THING THAT MAKES THAT TRUE.
+	#
+	# sigild serves GET /metrics ALWAYS-ON and UNAUTHENTICATED — it is deliberately
+	# not dev-gated (ADR 0017), because a metrics endpoint that needs the dev flag
+	# is a metrics endpoint nobody scrapes. That is fine on a loopback listener and
+	# wrong at a public edge: the bare catch-all `reverse_proxy` below has no path
+	# matcher, so before this block existed a public deploy of the documented
+	# topology published sigild_account_devices, sigild_device_enrollments_total,
+	# sigild_billing_webhooks_total{provider,outcome} and
+	# sigild_entitlement_refused_total to the whole internet — i.e. account counts,
+	# enrolment volume and payment-refused decisions, readable by anyone, while
+	# docs/deployment.md said to keep it internal. Documentation is not a control.
+	#
+	# 404, not 403: a 403 confirms the route exists.
+	#
+	# Scrape it from INSIDE the trust boundary (the loopback listener, or a private
+	# interface Prometheus can reach), never through this vhost. If it ever must be
+	# exposed, replace this block with an authenticated matcher — not by deleting it.
+	handle /metrics {
+		respond 404
+	}
+
 	reverse_proxy 127.0.0.1:8080
 
 	header {

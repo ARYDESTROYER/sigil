@@ -25,7 +25,7 @@ import { startFakeSigild } from "../../../../sigil-wasm/test/fake-sigild.mjs";
 const T = 60_000;
 const RFC_SECRET_B32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const RFC_CODE = "287082";
-const WEBAPP_ORIGIN = "http://127.0.0.1:3210";
+const WEBAPP_ORIGIN = "http://localhost:3210";
 
 type Fake = {
   baseUrl: string;

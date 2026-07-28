@@ -762,9 +762,21 @@ public, make no security claims, until the audit completes and trademark clears.
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
-  `internal/vault` (6–7-line `doc.go` placeholders). They name future work only — note in
+  `internal/vault` (`doc.go` placeholders). They name future work only — note in
   particular that `internal/auth` is **NOT** where the real auth lives (that is
   `internal/api/deviceauth.go` + `internal/store/devicestore.go`).
+  ⚠️ **Phase 58 REWROTE those four `doc.go` files, because two of them were a reviewer
+  trap in CODE** — an auditor browsing the tree hits them before reading any document.
+  `internal/auth` said *"STATUS: not implemented"* and described **Ed25519-signed JWT
+  bearer tokens minted at device registration**, a design that was **NEVER BUILT**, while
+  ~640 lines of real request authentication live in `internal/api/deviceauth.go` (the
+  mechanism is a **per-request contract-v3 Ed25519 signature**; there is no JWT anywhere
+  in sigild). `internal/vault` said the same about the op-log while ~468 lines of it run
+  in `internal/store/oplog*.go` + `handlers.go`. Both now point at the real files and say
+  what is genuinely unbuilt (CRDT/Lamport merge semantics — the shipped log is an
+  append-only per-vault `seq`). `admin` and `push` were clarified as **reserved names**;
+  they are genuinely unbuilt. Comment-only changes; all four packages are still imported
+  by **zero** files.
 - `web/apps/marketing/` — Next.js 15 stealth splash + waitlist. No-index, wallable.
   ⚠️ **Phase 51 corrected `app/security/page.tsx`, which was UNDER-claiming but still
   FALSE.** It said "nothing below is implemented" and listed ML-KEM-768 / ML-DSA-65 as
@@ -840,7 +852,8 @@ public, make no security claims, until the audit completes and trademark clears.
   the hybrid SECRET identity, every accepted vault key **and the hybrid-key PIN STORE**
   in ONE container under the vault
   password. `localStorage` still holds exactly TWO keys, both sealed containers
-  (`sigil.webapp.vault.v1` + `sigil.webapp.device.v1`); the password and all decrypted
+  (`sigil.webapp.vault.v1` + `sigil.webapp.device.v1`) — **THREE when Phase 58's passkey
+  protection is on, all three still sealed containers**; the password and all decrypted
   secrets are memory-only and cleared on lock/forget/unload. **Unlock now opens the
   device identity FIRST, tries the password, then falls back to each held vault key**,
   so a shared vault re-opens after a reload. **Phase 50 (ADR 0038) added the key-trust UI
@@ -883,11 +896,50 @@ public, make no security claims, until the audit completes and trademark clears.
   proof silently vanished while the job stayed green — Phase 57 gave it a PATH lookup **and**
   `GO: go` on the workflow step (`actions/setup-go` alone did NOT fix it: it sets PATH, never
   `$GO`). ⚠️ Every other spec runs against
-  `sigil-wasm/test/fake-sigild.mjs`, a **double** that is MORE PERMISSIVE than real sigild
-  (catch-all 404, no envelope size cap, no hybrid-key length check, no recipient
-  existence/revocation check); ⚠️ **print output is NOT verified**
-  (headless Chromium cannot render a printed page, so `@media print` is by-eye). Do NOT
-  store real 2FA secrets.
+  `sigil-wasm/test/fake-sigild.mjs`, a **double** that used to be MORE PERMISSIVE than real
+  sigild on four axes — **Phase 58 enforced all four in the double**: the catch-all now
+  answers **501** for unimplemented `/v1/` routes (the "501 by default, never 404"
+  invariant), the envelope PUT enforces the **16 KiB** cap, the hybrid-key PUT validates
+  **both halves' lengths** (32 / 1184), and the envelope PUT checks the recipient
+  **exists and is not revoked**. ⚠️ What is STILL laxer is now spelled out in its header:
+  **no signature verification, no ownership/grant/authorization, no entitlement gate
+  beyond a switch, no rate limiting, no nonce/replay window, no seat cap, no hash chain
+  and no self-only check** on the per-device envelope index — a spec there proves what the
+  BROWSER does and NOTHING about what sigild would allow. ⚠️ **print output is NOT
+  verified** (headless Chromium cannot render a printed page, so `@media print` is by-eye).
+  ⭐ **PHASE 58 (ADR 0046): the webapp is the ONLY client that can PROTECT ITS CONTAINERS
+  WITH A PASSKEY.** New file **`sigil-wasm/passkey.mjs`** (framework-free ESM, browser-only,
+  re-exported by `@sigil/wasm` — **both** `index.mjs` AND `index.d.ts`, the two-hole trap
+  Phase 56 fell into). With protection on, BOTH `SIGILcli` containers are sealed under a
+  32-byte **CONTAINER MASTER KEY** instead of the password, where
+  `CMK = HKDF-SHA256(salt "sigil-recovery-kit-v1", ikm = the ADR 0042 kit seed, info
+  "sigil-recovery-kit-v1/container-master-key", 32)` — so the **break-glass is the sheet
+  the user ALREADY PRINTED**: no new artifact, no server. The CMK is ALSO wrapped into a
+  **THIRD container** (`localStorage` key **`sigil.webapp.hwslot.v1`**) sealed under
+  **`PRF_output(32) ‖ utf8(password)`** — ⭐ **PRF bytes FIRST** (a fixed-length prefix
+  makes the parse unambiguous) and fed **STRAIGHT to the container's own Argon2id**, NOT
+  through a cheap HKDF (an attacker who can drive the authenticator recovers `R` and must
+  still face Argon2id over the password). ⭐ **AND, NEVER OR** — while protection is on
+  there is **no password-only slot**; the two doors are (password AND passkey) and (the
+  printed sheet). ⭐ **THE WRITE ORDER IS THE SAFETY PROPERTY:** enable is not atomic, so
+  **containers are written FIRST and the slot LAST** — a crash leaves CMK-sealed containers
+  with NO slot, the state the sheet alone recovers (slot-first left a slot beside
+  password-sealed containers, where a sheet-derived CMK genuinely is not a door).
+  Enabling **REFUSES without an active recovery kit** (fail-closed), the code is decoded +
+  checksummed **offline** first, the **break-glass form renders unconditionally** on the
+  locked screen (gating it on the deletable slot was a lockout), `createVault()` **clears a
+  stale slot**, a surviving device identity is **left byte-for-byte in place and
+  announced**, a kit **reprint re-seals the slot in the same operation**, and a protected
+  **PERSONAL** vault refuses sync in **BOTH** directions (pull would overwrite the only
+  copy). ⭐ **`sigild` gained NOTHING** — no route/header/canonical message/migration/
+  table/metric/dependency; request auth is still classical Ed25519 contract v3. ⛔ Defends
+  **STORAGE, never EXECUTION**; **NOT retroactive**. ⛔⛔ **WebAuthn does NOT work on
+  `http://127.0.0.1`** (RP-ID rejects IP literals: `SecurityError: This is an invalid
+  domain.`) — `playwright.config.ts` and the affected specs moved to **`http://localhost`**,
+  and it also pins `workers: 2` (7-way contention produced ten unrelated failures) and
+  `reuseExistingServer: false`. Proven by **`tests/passkey.spec.ts` — 24 specs** over CDP's
+  **virtual authenticator** (`hasPrf: true` for the supported branch, omitting it for the
+  unsupported one). Do NOT store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -938,6 +990,14 @@ public, make no security claims, until the audit completes and trademark clears.
   human-gated container publish lives in `.github/workflows/publish-sigild.yml`
   (`workflow_dispatch`-**only**; **private** GHCR `ghcr.io/<owner>/sigild`,
   SHA-tagged) — see [ADR 0009](docs/decisions/0009-manual-gated-deploy-and-publish.md).
+  ⭐ **Phase 58 closed the audit-#4 gap where the Caddyfile CONTRADICTED its own
+  runbook:** it was a bare catch-all `reverse_proxy` with **no path matcher**, so the
+  always-on, unauthenticated `GET /metrics` would have been **world-readable** at a
+  public edge (account counts, enrolment volume, billing webhook outcomes,
+  entitlement refusals) while `docs/deployment.md` said keep it internal. It now has
+  `handle /metrics { respond 404 }` **before** the proxy — **404, not 403, because a
+  403 confirms the route exists**. Nothing is deployed, so this is still unproven end
+  to end. **Documentation is not a control.**
 - `scripts/` — **`gate.sh`** (Phase 56), the documented way to run **everything**: it
   enumerates every suite dynamically, counts results instead of trusting exit codes,
   prints an inventory, and runs a **CI-drift check** asserting every node interop suite
@@ -1458,7 +1518,17 @@ public, make no security claims, until the audit completes and trademark clears.
   recovery call would have **thrown at runtime**; the missing `index.d.ts` types were a
   **SEPARATE** gap (types and runtime were two distinct holes, and closing one would not
   have closed the other). **Both are now closed**, and **both browser clients have the full
-  recovery UI** (Phase 56).
+  recovery UI** (Phase 56). ⚠️ **Phase 58 fixed a silent under-report in `listRecoverableVaults`:**
+  the per-device index route has a hard page cap (**500**, `maxRecipientIndexRows`) and **NO
+  CURSOR**, and every client ignored `has_more` — so a kit covering more than 500 vaults would
+  have recovered the first 500 and **REPORTED SUCCESS** to the one person who cannot check it
+  against anything. The result now carries a non-enumerable **`truncated`** flag (so existing
+  callers are byte-identical) and **`restoreFromKit` REFUSES** rather than restoring a prefix.
+  ⭐ **Phase 58 also added `sigil-wasm/passkey.mjs` (ADR 0046)** — passkey protection of the
+  browser's AT-REST seal. It is **browser-only** (needs `navigator.credentials` +
+  `crypto.subtle`), does **no cryptography of its own** (SHA-256/HKDF via `crypto.subtle`,
+  AEAD + Argon2id in the wasm), touches **no wire format and no Rust**, and is used by the
+  **webapp only** — `extension/build.sh` does **NOT** vendor it, deliberately.
   **Phase 56 also added the JS half of ENTITLEMENT (ADR 0043):** a NEW framework-free ESM
   module **`sigil-wasm/entitlement.mjs`** (`getSubscription`, `entitlementState`,
   `describeEntitlement`, `readEntitlementHeaders`, `explainSubscriptionStatus`, the three
@@ -1815,16 +1885,26 @@ It also encodes two traps that make a **planted mutation appear to PASS locally*
   `*-helper.mjs`** (`sealed-store-helper.mjs` is a helper too). ⚠️ The **inventory line**
   used to exclude only `fake-*`, inflating the very count whose job is to make a missing
   suite visible; it now uses the same exclusion as the runner and the drift check.
-  ⚠️ **The double is also MORE PERMISSIVE than real `sigild`** on axes its header does not
-  disclaim: its **catch-all returns `404`**, inverting the *"501 by default, never 404"*
-  invariant inside the double, and it enforces **no envelope size cap, no hybrid-key
-  length validation and no recipient existence/revocation check**. An auditor tightened
-  all four and both browser suites stayed green — so it hides no **current** defect, but
-  it is exactly the shape that hid the CORS hole for twelve phases.
+  ⚠️ **The double USED TO BE MORE PERMISSIVE than real `sigild`** on four axes its header
+  did not disclaim (catch-all `404`, no envelope size cap, no hybrid-key length check, no
+  recipient existence/revocation check). **Phase 58 enforced all four inside the double**
+  — the catch-all now answers **`501`** for unimplemented `/v1/` routes, restoring the
+  *"501 by default, never 404"* invariant — and its header now states, in the file, what
+  is **STILL** laxer: **no signature verification, no ownership/grant/authorization, no
+  entitlement gate beyond a switch, no rate limiting, no nonce/replay window, no seat cap,
+  no hash chain, no self-only check** on the per-device envelope index. **A double must
+  never be more permissive than the thing it doubles** — that shape hid the CORS hole for
+  twelve phases.
 - It **REBUILDS the webapp and RE-VENDORS the extension first**, because webapp
   Playwright's `reuseExistingServer` will happily serve a **stale `.next`**, and
   `pnpm -C extension exec playwright test` **skips the `pretest` vendor hook** (use
   `pnpm test`). CI does both correctly; a local run does not unless you force it.
+  ⚠️ **`reuseExistingServer` is now `false`** in `web/apps/webapp/playwright.config.ts`
+  (Phase 58): binding to whatever `next start` happened to own port 3210 is a **false
+  green** of exactly the kind this script exists to catch.
+- ⭐ **Playwright SKIPS now count as FAILURES** (Phase 58), for the same reason they do in
+  the Go block: a spec that quietly stops running looks exactly like one that passes. The
+  `pw()` helper fails on `skipped` / `did not run` as well as `failed`.
 
 `./scripts/gate.sh --quick` skips the shell e2e scripts. ⚠️ Its usage line also says it
 skips Postgres — it does **not**: the throwaway container is started regardless. Set
@@ -1934,7 +2014,10 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium: 19 tests in 8 spec files, PASS
+corepack pnpm --filter webapp exec playwright test   # headless chromium: 46 tests in 9 spec files, PASS
+# ⛔ It serves on http://localhost:3210, NOT 127.0.0.1 — Chrome refuses WebAuthn on an IP
+# literal, so every passkey spec (ADR 0046) fails there for a reason unrelated to the code.
+# `workers: 2` and `reuseExistingServer: false` are also deliberate (see the config's comments).
 # (wasm, offline, a11y, recovery, wrap-gate, leak, entitlement, and cors.spec.ts —
 #  the ONE spec that builds + boots a REAL sigild and drives the UI against it.
 #  ⚠️ cors.spec.ts test.skip()s ITSELF without a Go toolchain, so a run with no Go

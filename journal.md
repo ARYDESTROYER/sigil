@@ -11,111 +11,126 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 57 / audit #4; Phase 57 is complete and fully gated but
-UNCOMMITTED in the working tree — `main` is at `ab37e05`, which is Phase 56).**
+**Where we are (through Phase 58; Phase 58 is complete and fully gated but UNCOMMITTED in
+the working tree — `main` is at `2f3ff93`, which is Phase 57).**
 
-**PHASE 57 — AUDIT #4: THE CODE HELD UP; THE VERIFICATION LAYER DID NOT.** A fourth
-full-repo adversarial audit ran against `ab37e05` with **six independent lenses, each in its
-OWN GIT WORKTREE** (so one lens's mutation testing could not perturb another's tree), then a
-**triage pass that re-verified every finding**. What held: **17 of 18 authorization
-mutations, 7 of 9 storage mutations and 33 of 38 test-integrity mutations went RED**; a full
-secret hunt across a `pg_dump`, **every** `bytea` column and the server log found **ZERO
-hits with a working positive control**; the hash chain caught every tamper shape on **both**
-backends; the **`VerifiedRecipient` type gate held**; native file modes were correct.
-⚠️⚠️ **THREE VERIFICATION BLIND SPOTS, TWO OF THEM IN WORK I HAD JUST WRITTEN.** (1)
-**`scripts/gate.sh` began with a HARDCODED ABSOLUTE `cd`**, so run from a git **worktree** it
-built and tested the **MAIN checkout** — a planted `getrandom` stanza in a worktree lockfile
-still printed `✓ getrandom==0`, and **it bit the audit itself**: one lens reported ALL GREEN
-about a tree it was not auditing. Fixed — it resolves the repo from the script's own location
-and **prints `gating: <path> (<sha>)`**. (2) **`gate.sh` never set `SIGILD_TEST_POSTGRES`**,
-so ~30 tests skipped, and it counted only PASS/FAIL so the skips were **invisible**; **two
-real regressions survive a DSN-less run** (deleting migration `0005`'s ownership backfill;
-dropping the active-device filter from the seat count — the Phase 52 account-bricking
-defect). Fixed — it starts a throwaway **`postgres:16`** and **FAILS on any skip**; the Go
-line went from **561 pass / 30 skip** to **640 pass / 0 fail / 0 skip**. (3)
-**`web/apps/webapp/tests/cors.spec.ts` resolved Go with NO PATH lookup**, so in CI it
-**`test.skip`ped ITSELF** and the only browser-level proof of Phase 56's CORS fix silently
-vanished while the job stayed green. ⚠️ **My earlier "fix" of adding `actions/setup-go` did
-NOT work — `setup-go` sets PATH and never sets `$GO`.** Fixed with a PATH lookup **plus**
-`GO: go` on the step (which `interop.yml` already did right).
-⭐ **ONE GENUINE SERVER DEFECT (ADR 0045): a request the server REJECTED still PERMANENTLY
-CLAIMED the vault**, because trust-on-first-write fired during authorization, **before** the
-empty-body check. Live: **50 empty-bodied POSTs across 50 distinct vault ids → `{400: 50}`,
-zero ops stored, `sigild_vault_claims_total` +50**, the rate limiter **never fired** (it keys
-on the vault id the attacker varies), and a second device was then **permanently 403 on its
-own genuine first write**. ⚠️ Aggravating: **vault ids are LOW-ENTROPY AND HUMAN-CHOSEN** —
-the webapp defaults to the literal `"webapp-demo"`. FIX: `claimPrecondition` +
-`authorizeOpsWrite` (`deviceauth.go`) evaluate a cheap **vault-independent** predicate and
-downgrade **`needWrite` → `needWriteNoClaim`** when the request is going to be rejected, so
-it can never reach `ClaimVault`; applied to `opsAppend` and `keyEnvelopePut`. ⚠️ **DELIBERATE
-BEHAVIOUR CHANGE:** an empty/malformed write to an **UNOWNED** vault now answers **403** (no
-grant, no ownership earned) instead of 400; on a vault the caller may already write it still
-answers 400/404/409. Verified live: 25 rejected appends → **0 claims**, then a different
-device claimed all 25 with genuine writes. ⚠️ **RESIDUAL: well-formed squatting is still
-unbounded — there is NO per-account claim budget**, only a code comment naming it.
-**FOUR TEST-INTEGRITY DEFECTS**, each mutation-proven both ways: (a) the recovery-kit device
-**LABEL** was an untested mirror in **THREE** places — renaming it in both JS files left
-every suite green, and that label is the **only** signal making a kit wrap obey the mandatory
-safety-number rule; now de-duplicated to one per language, driven against the **real `sigil`
-binary**, and — after a verifier showed a **COORDINATED rename still passed** — pinned to a
-**GOLDEN LITERAL**, because the label is a **WIRE value** older clients compare against; (b)
-**NO test asserted browsers persist ONLY sealed containers (ADR 0036)** — a planted plaintext
-`sessionStorage` write dumped the Ed25519 seed, the hybrid secret and every vault key while
-webapp passed 19/19 and extension 12/12; both now assert **positively** (every value decodes
-to `SIGILcli` magic, every other surface EMPTY), ⚠️ and a verifier caught that the **first fix
-still exempted Cache Storage** (it filtered only CROSS-origin entries — vacuous, since every
-plausible leak is same-origin, and the extension caught the identical plant), now constrained
-by an **ALLOWLIST** (`/`, `/_next/`, static assets); (c) **`requirePinStore`'s fail-closed
-behaviour had NO test** — reverting it to fail open left everything green; (d) **`/metrics`
-split `unauthorized_vault` vs `forbidden_account`, a VAULT-EXISTENCE ORACLE** on an always-on
-unauthenticated surface, despite ADR 0040 limit 11 saying that oracle was deliberately not
-widened — **collapsed on the metric**, audit log still distinguishes them (a **narrowing, not
-a closure**: `not_vault_owner` / `forbidden_device` / `vault_owner_unresolved` stay).
-⭐ **A SUPERSEDED CHOKE POINT DELETED:** `fetch_hybrid_key_pinned` (Rust, **zero callers**) /
-`fetchHybridKeyPinned` (JS, **one** — a test) were ADR 0038's gate, superseded in Phase 54 by
-`verify_recipient_for_wrap` / `verifyRecipientForWrap`. The surviving Rust `pub fn`
-fetched-and-pinned **without the recovery-kit refusal and without the safety-number check** —
-a ready-made **bypass of the type gate** for whoever reached for the name **the docs still
-recommended**. Both deleted with tombstone comments; the JS test's call **moved onto the real
-gate**. **A superseded choke point is not harmless dead code.**
-**ALSO FIXED:** the extension rendered a **402** as an anonymous `HTTP 402` (no JS explainer
-had a 402 case) — now explained like the webapp; and `gate.sh`'s **inventory line miscounted
-node suites** (it excluded `fake-*` but not `*-helper.mjs`), inflating the one number whose
-job is to make a missing suite visible.
-⚠️ **THE DOCS THAT WERE FALSE, and this is the part that mattered most:** the status blocks
-an external reviewer reads FIRST (`api.md`, `architecture.md`, `deployment.md`) said sigild
-**"performs no cryptography, holds no keys"** and **"runs no auth"** — while
-`grep -rE 'crypto/(ed25519|hmac|sha256|subtle|rand)' sigild` excluding tests returns **29
-hits**. They would have **scoped sigild's cryptography out of review.** Corrected everywhere:
-**no crypto ON VAULT CONTENT, no key that can DECRYPT a vault** — it does plenty of crypto
-for **authentication, hash-chaining and webhook verification**, and holds device public keys,
-published hybrid public keys and webhook secrets. Also corrected: `crypto-spec.md` called the
-recovery construction a two-implementation **mirror** (it is **single-sourced** in
-`libsigil/core/src/recovery.rs`); `api.md` said "eleven routes" / "the six" (the router
-registers **twelve**: 5 device + 7 sharing); `SECURITY.md` said `security.txt` **"is
-published"** (nothing is deployed, no domain registered → **"will be"**); `threat-model.md`
-called vault IDs **"high-entropy"**; and `CLAUDE.md` said `server_interop.rs` holds **two**
-tests (it holds **six**).
-✅ **VERIFIED FIRST-HAND: I ran `scripts/gate.sh` myself — ALL GREEN**, printing
-`gating: /Users/ary/Documents/GitHub/sigil (ab37e05)`. Both `Cargo.lock`s `getrandom`-free;
-`sigild` exactly one direct dep; all **10** workflows parse; **go -race 640 pass / 0 fail /
-0 skip** against a throwaway `postgres:16` with an explicit *"Postgres-gated suite RAN (0
-skips)"*; Rust **libsigil 134 / cli 94 / sigil-wasm 29 / desktop 31**, all fmt+clippy clean;
-**all 12** node interop suites; **webapp 19** Playwright specs; **extension 12**; marketing
-build; **all 3** shell e2e scripts; **CI-drift check clean**. Inventory: 4 Rust crates, 4 Go
-test packages, 12 node interop, 3 shell e2e, 13 Playwright specs. **No migration —
-`sigild_schema_version` is still 5.**
-➡️ **STILL OPEN AFTER THIS PASS:** well-formed vault-id squatting is unbounded (no
-per-account claim budget); `sigild migrate adopt`'s transaction is real but **untested**;
-`fake-sigild.mjs` is **more permissive than real sigild** (catch-all **404** inverting the
-"501, never 404" invariant inside the double, no envelope cap, no hybrid-key length check, no
-recipient existence/revocation check) and its header does not disclaim it; **no client reads
-`has_more`** on `GET /v1/devices/{deviceID}/keys`, so a kit covering **>500 vaults silently
-recovers the first 500 and reports success**; the deploy **Caddyfile is a bare catch-all
-`reverse_proxy`**, so `/metrics` would be world-readable in the documented topology while the
-runbook says keep it internal; and the stale code comments (a **webhook** rate-limit surface
-ADR 0041 removed, the "rejects before the body is read" enroll-limiter comments, the
-`abuse_test.go` header) survive yet another documentation-only phase.
+**PHASE 58 — PASSKEYS, PROTECTING THE BROWSER CLIENTS AT REST (ADR 0046).** Both browser
+clients sealed their two `SIGILcli` containers under a **human password alone** — the weak
+link in an otherwise strong story (PQ-hybrid wrapping, a type-enforced wrap gate, key
+pinning, a paper recovery kit), since all of it was reachable by guessing one password
+offline. **THE CONSTRUCTION:** with protection on, both containers are sealed under a
+32-byte **CONTAINER MASTER KEY**, `CMK = HKDF-SHA256(salt "sigil-recovery-kit-v1", ikm =
+the ADR 0042 kit seed, info "sigil-recovery-kit-v1/container-master-key", 32)` — ⭐ so the
+**break-glass is the sheet the user ALREADY PRINTED: no new artifact, no server**. The CMK
+is ALSO wrapped into a **THIRD container** (`sigil.webapp.hwslot.v1`) under
+**`PRF_output(32) ‖ utf8(password)`** — ⭐ **PRF bytes FIRST** (a fixed-length prefix makes
+the parse unambiguous), fed **STRAIGHT to the container's own Argon2id** rather than
+through a cheap HKDF, so the password keeps its stretching against an attacker who can
+drive the authenticator. New file **`sigil-wasm/passkey.mjs`**; the **webapp is the only
+client with the UI**. ⭐ **AND, NEVER OR:** while protection is on there is **no
+password-only slot** — the two doors are (password AND passkey) and (the printed sheet); an
+OR design is theatre, because the attacker attacks the weaker branch. ⭐ **`sigild` gained
+NOTHING:** no route, header, canonical message, migration, table, metric or dependency; the
+wire protocol is unchanged and a hostile server cannot disable, weaken, detect or observe
+it.
+**THREE BLOCKERS SETTLED BY EXPERIMENT BEFORE ANY CODE:** (1) the CDP virtual authenticator
+**DOES** support PRF via `hasPrf: true` — 32 bytes, byte-identical across two assertions,
+so WebAuthn is testable headlessly and **an untested path has no excuse**; (2) omitting
+`hasPrf` gives the **"PRF unsupported"** branch for free; (3) ⛔ **`http://127.0.0.1` cannot
+do WebAuthn at all** (the RP-ID rule rejects IP literals; `http://localhost` works) — and
+`playwright.config.ts` was pinned to `127.0.0.1`, so **every passkey spec would have failed
+for a reason unrelated to the feature**. The config + affected specs moved to `localhost`.
+It also **DISPROVED** a design claim that Chrome hides WebAuthn from `chrome-extension://`
+pages — it does not; the extension is scoped out **deliberately, not blocked**.
+⚠️ **NO LOCKOUT WAS THE ACCEPTANCE CRITERION, AND IT TOOK THREE ROUNDS — verifiers FAILED
+this build twice.** Five ways a user holding a correct password OR a correct sheet could
+still lose their vault, all now closed and specced: (1) ⭐⭐ **the headline invariant had NO
+TEST** — dropping `utf8(password)` from the sealing secret (degrading to **passkey-only,
+where ANY password opens a protected vault**) left all 37 specs green; **spec 15** now pins
+it, and re-running that mutation turns the suite **RED, 4 of 24**; (2) a **stale slot
+survived `createVault()`**, bricking a brand-new vault (both doors refused); (3) ⛔
+**DELETING the slot key bricked a protected vault even with the correct password AND
+sheet** — because the break-glass form only rendered when the slot was present, while
+**CORRUPTING** the same value was recoverable; the sheet derives the CMK **independently of
+the slot**, so gating its form on a deletable non-secret marker threw the property away
+(now renders unconditionally); (4) **Pull stayed enabled while Push was disabled**, so one
+click could replace the only copy of a protected personal vault with a stale or unopenable
+container (**both** directions now refused); (5) the **break-glass could ORPHAN the device
+identity** in the interrupted-enable state, silently and permanently. **Two fixed directly:**
+the break-glass tried `[cmk, currentPassword, newPassword]` for the DEVICE but only `[cmk]`
+for the VAULT (now shared — ⚠️ **not an OR design**: the branch is gated behind a valid
+`verifyRecoveryKit(code)`, so the door is **"sheet AND (cmk OR old password)"**;
+mutation-proven, reverting turns **spec 22 RED**); and clearing only the vault container
+silently orphaned a CMK-sealed identity — now **left byte-for-byte in place, never deleted,
+and announced** (**spec 23**).
+⭐⭐ **THE WRITE ORDER IS NOW THE SAFETY PROPERTY.** Enabling cannot be atomic, so the only
+question is which state a crash leaves. Writing the **slot FIRST** left it beside
+still-password-sealed containers, and **in that state the sheet alone is genuinely not a
+door** (a sheet-derived CMK cannot open a password-sealed container — information-
+theoretically true and unfixable at the unlock end). **Containers are now written FIRST and
+the slot LAST**, so a crash leaves CMK-sealed containers with **NO slot** — the exact state
+**spec 17** already proves the sheet alone recovers. **Rule: make the last write the one
+whose loss costs least.** A line of helper copy claiming *"Leave blank if you do not know it
+— your vault is recovered either way"* was **false in exactly the state that field exists
+for**, and is gone.
+⚠️ **A MEASUREMENT DEFECT THAT COST A WHOLE ROUND:** a verifier reported the break-glass
+decrypting correctly and then never rendering. Live instrumentation confirmed every step —
+decrypt, re-seal, persist — with no exception and no page error. The defect was in the
+**measurement**: the spec sampled with `locator.isVisible({ timeout })`, and Playwright's
+own typings mark that option **ignored** (*"does not wait… returns immediately"*). ⚠️ **My
+earlier attempt to rule out timing by raising that number was therefore a NO-OP EDIT
+PRODUCING A NO-OP RESULT, WHICH I READ AS EVIDENCE.** No product code was broken. Every
+terminal assertion in the new specs now uses **`toBeVisible`**, and both browser suites were
+swept (`web/apps/webapp/tests/` has zero remaining uses; the two in the extension are
+`if (await …isVisible())` branch selectors over settled state, which is legitimate). ⚠️ Be
+precise: an independent verifier later ran that same spec **verbatim and it PASSED**, so the
+bad line is a **race**, not a structural impossibility — a timing component **cannot be
+ruled out either**.
+**ALSO IN THIS COMMIT (audit-#4 follow-ups):** `sigild/internal/auth/doc.go` and
+`internal/vault/doc.go` **rewritten** — they **asserted "not implemented" about implemented
+functionality** (~640 lines of request auth in `internal/api/deviceauth.go`, ~468 lines of
+op-log in `internal/store/oplog*.go`) and `auth` described **JWT bearer tokens that were
+NEVER BUILT** when the real mechanism is the contract-v3 per-request Ed25519 signature — a
+**reviewer trap in CODE**, hit before any document is read; `admin` and `push` clarified as
+reserved names; all four still imported by zero files; comment-only, `go build`/`go vet`
+clean. `docs/README.md` gained a **"If you are here to review the security of this system,
+start here"** section (reading order, the load-bearing ADRs, an honest real-vs-not
+inventory, our own sharp edges as **findings-in-waiting**, and *reproduce our claims* via
+`scripts/gate.sh` — **if a claim is not backed by something that command runs, treat it as
+unproven**). `deploy/caddy/Caddyfile` now has **`handle /metrics { respond 404 }`** before
+the proxy (404 not 403 — a 403 confirms the route exists), closing the config that
+contradicted its own runbook; `sigil-wasm/test/fake-sigild.mjs` no longer sends CORS by
+default and **enforces four axes it used to be laxer on** (catch-all **501**, 16 KiB
+envelope cap, hybrid-key length check, recipient existence/revocation), with the remaining
+laxness stated in its header; `sigil-wasm/recovery.mjs` gained **truncation detection** on
+the recipient index (>500 vaults would have **recovered the first 500 and reported
+success**), and `restoreFromKit` now **refuses**; `scripts/gate.sh` now **fails on Playwright
+skips**.
+⚠️ **HONEST LIMITS:** **only the webapp has the passkey UI** (extension + desktop do not,
+even though WebAuthn provably works from an extension origin — scope, not a blocker);
+enabling **requires a kit to exist first** and **a kit cannot be created after the loss**;
+whoever holds the sheet has **full account control** and now local unlock too, and the kit
+recovers **KEYS, not DATA**, only for covered vaults; **PRF availability varies** and the UI
+must never claim protection it does not have; a **protected personal vault cannot be synced
+in either direction**; it defends **STORAGE, never EXECUTION** and is **NOT retroactive**;
+everything stays dev-gated, plain HTTP, pre-audit and **UNAUDITED**.
+✅ **VERIFIED FIRST-HAND: I ran `scripts/gate.sh` myself — ALL GREEN**, gating the right
+tree. Both `Cargo.lock`s `getrandom`-free; `sigild` exactly one direct dep; all **10**
+workflows parse; **go -race 640 pass / 0 fail / 0 skip** against a throwaway `postgres:16`
+with an explicit *"Postgres-gated suite RAN (0 skips)"*; Rust **libsigil 134 / cli 94 /
+sigil-wasm 29 / desktop 31**, fmt+clippy clean; **all 12** node interop suites; **webapp 46**
+Playwright specs (up from 19); **extension 12**; marketing build; **all 3** shell e2e
+scripts; **CI-drift check clean**. Inventory: 4 Rust crates, 4 Go test packages, 12 node
+interop, 3 shell e2e, **14** Playwright spec files. **No migration — `sigild_schema_version`
+is still 5.**
+➡️ **STILL OPEN AFTER THIS PASS:** passkey protection exists on **ONE of four clients**;
+well-formed vault-id squatting is unbounded (no per-account claim budget); `sigild migrate
+adopt`'s transaction is real but **untested**; **`gate.sh --quick` still does not do what
+its usage line says** (it skips the shell e2e but starts the throwaway Postgres regardless);
+the **`isVisible` race is understood but not fully explained**; and the stale code comments
+(a **webhook** rate-limit surface ADR 0041 removed, the "rejects before the body is read"
+enroll-limiter comments, the `abuse_test.go` header) survive yet another
+documentation-only phase.
 
 ---
 
@@ -8805,3 +8820,372 @@ gating: /Users/ary/Documents/GitHub/sigil  (ab37e05)
 - **Everything remains dev-gated, plain HTTP, pre-audit and UNAUDITED.** Billing has still
   never been run against a live provider account; Juspay remains
   UNVERIFIED-AGAINST-LIVE-DASHBOARD. Do not store real secrets.
+
+---
+
+## 2026-07-29 — Phase 58 (PASSKEYS: a second AT-REST factor for the browser clients, whose break-glass is the sheet already printed)
+
+**Where this started.** Every browser client sealed both of its `SIGILcli` containers —
+the TOTP vault and the device identity — with Argon2id under a **human password**, and
+nothing else. That password was the only factor between an attacker who copied
+`localStorage` and every TOTP secret, the Ed25519 device seed, the hybrid secret
+identity, every accepted vault key, and the pin store. It was the weak link in an
+otherwise careful story: the wrap of a vault key is PQ-hybrid, the recipient gate is
+enforced by a Rust type, key substitution is refused at a choke point, and recovery is a
+paper key the server never sees — **all of it reachable by guessing one password
+offline.**
+
+The reason it had not been fixed is that a second factor is the single easiest way to
+build a **lockout** into a product whose entire recovery story is "we cannot help you".
+
+### The construction (ADR 0046)
+
+With protection on, both containers are sealed under a 32-byte **container master key**
+instead of the password:
+
+```
+CMK = HKDF-SHA256( salt = "sigil-recovery-kit-v1",                 ← the SAME salt as ADR 0042
+                   ikm  = kit_seed(32),                            ← the PRINTED sheet
+                   info = "sigil-recovery-kit-v1/container-master-key",
+                   L    = 32 )
+```
+
+⭐ **That single choice is why the break-glass needs NO new artifact and NO server.** The
+56 characters a user already printed to survive losing every device also open a protected
+local profile — offline, with no network and no passkey. There is no second sheet to keep,
+no escrow, and nothing for `sigild` to hold.
+
+The CMK is **also** wrapped into a **THIRD `SIGILcli` container**
+(`localStorage` key `sigil.webapp.hwslot.v1`), sealed under:
+
+```
+PRF_SALT = SHA-256("sigil-passkey-unlock-v1")           32-byte constant, NOT a secret
+R        = prf.results.first of a WebAuthn assertion     32 bytes
+hwslot   = seal_to_container( R ‖ utf8(password), … )    ⭐ PRF BYTES FIRST
+```
+
+- ⭐ **`R ‖ utf8(password)` is fed STRAIGHT to the container's own Argon2id.** There is
+  deliberately no cheap HKDF over the password first: an attacker who can *drive the
+  authenticator* (an unlocked device, a coerced UV prompt) recovers `R` and must still
+  face Argon2id over the password. Reducing the password through a fast KDF would hand
+  that attacker an **unstretched guess** — throwing away the only defence left in exactly
+  the scenario where it matters.
+- ⭐ **PRF bytes FIRST.** The fixed-length 32-byte prefix makes the parse unambiguous;
+  password-first would let `("abc", P)` and `("abcX", P′)` collide.
+- The slot is a **container, not a JSON marker**, precisely so the persisted set stays
+  *"sealed containers only"* (ADR 0036) — the leak specs check every stored value's magic
+  bytes, and a plaintext `{credential_ids, rp_id}` marker would have been the first
+  non-container persisted value in this repo's history. Sealing public metadata under a
+  hardcoded constant to satisfy that check would be fake crypto, which `CLAUDE.md` forbids
+  by name. Discoverable credentials (`residentKey: "required"`) remove the need entirely:
+  the credential id lives *inside* the sealed slot the locked screen is trying to open.
+
+New file **`sigil-wasm/passkey.mjs`**; the **webapp is the only client with the UI**.
+
+⭐ **AND, NEVER OR.** While protection is on there is **no password-only slot**. The two
+doors are **(password AND passkey)** and **(the printed sheet)**. An OR design is theatre:
+an offline attacker simply attacks the weaker branch and the passkey buys exactly zero.
+
+⭐ **`sigild` gained NOTHING.** No route, no header, no canonical message, no migration, no
+table, no metric, no dependency, no `sigild_schema_version` bump. Request authentication is
+still the classical Ed25519 contract-v3 signature. A hostile server cannot disable, weaken,
+detect or even observe this.
+
+---
+
+### THREE BLOCKERS SETTLED BY EXPERIMENT, BEFORE ANY CODE
+
+Recording these because they are the reason the phase is testable at all, and each was
+assumed to be the opposite at some point:
+
+1. **The CDP virtual authenticator DOES support the PRF extension** — `hasPrf: true` on
+   `WebAuthn.addVirtualAuthenticator`. Verified live: `prf.enabled === true` at creation,
+   **32 bytes, byte-identical across two assertions**. So WebAuthn is drivable headlessly,
+   and **an untested branch of this feature has no excuse**.
+2. **Omitting `hasPrf` gives the "PRF unsupported" branch for free** — Chrome answers
+   `prf.enabled === false` and returns no `results`. The negative case is as real as the
+   positive one.
+3. ⛔ **`http://127.0.0.1` cannot do WebAuthn at all.** An RP ID must be a registrable
+   domain; Chrome rejects an IP literal with `SecurityError: This is an invalid domain.`,
+   with or without an explicit `rp.id`. `http://localhost` works. **`playwright.config.ts`
+   was pinned to `127.0.0.1`**, so every passkey spec would have failed for a reason
+   unrelated to the feature — and nothing else in the suite had ever noticed, because both
+   are secure contexts. The config and the affected specs moved to `localhost`.
+
+The same session **disproved a design claim we had written down**: that Chrome hides
+WebAuthn from `chrome-extension://` pages. **It does not.** The MV3 extension is still
+scoped out — deliberately, not because it is blocked.
+
+---
+
+### ⚠️ NO LOCKOUT WAS THE ACCEPTANCE CRITERION, AND IT TOOK THREE ROUNDS
+
+Adversarial verifiers **FAILED this build twice**. That is the most instructive part of
+the phase, so it is recorded as process and not just as a list of fixes.
+
+**Five ways a user holding a correct password OR a correct recovery sheet could still lose
+their vault — all found by verification, all now closed and specced:**
+
+1. ⭐⭐ **The headline invariant had NO TEST.** Dropping `utf8(password)` from the sealing
+   secret — degrading the whole thing to **passkey-only, where any password opens a
+   protected vault** — left all **37** specs green. **Spec 15 now pins it.** I re-ran that
+   mutation myself afterwards: the suite goes **RED, 4 of 24 passing**.
+2. **A stale slot survived `createVault()`**, bricking a brand-new vault: unlock ran a
+   ceremony and then failed to open a slot sealed under the *previous* password, and the
+   break-glass refused too, because a sheet-derived CMK does not open a container sealed
+   under the brand-new one. **Both doors closed.** The slot is now cleared first — a vault
+   that has just been created has no passkey and no sheet behind it.
+3. ⛔ **DELETING the slot key bricked a protected vault even with the correct password AND
+   the correct sheet**, because the break-glass form only rendered when the slot was
+   present — while **CORRUPTING** the same value was recoverable. The sheet derives the CMK
+   **independently of the slot**, which is the entire reason it is derived from the kit;
+   gating its form on a **deletable, non-secret marker** threw that property away. The form
+   now renders unconditionally on the locked screen. **Specs 17 and 18 pin that the two
+   cases behave identically.**
+4. ⛔ **Pull stayed enabled while Push was disabled.** One click could replace the only copy
+   of a protected personal vault with a stale pre-protection container (silently losing
+   every account added since — the kit recovers **keys, not data**) or, on a mistyped vault
+   id, with bytes this browser cannot open with the CMK, the password, the sheet or any
+   held vault key. **Pull is now refused too**, in the operation and not only on the button,
+   with one notice covering both directions.
+5. **The break-glass could ORPHAN the device identity** in the interrupted-enable state —
+   silently and permanently, taking the Ed25519 seed, the hybrid secret and every accepted
+   vault key with it.
+
+**Two I fixed directly, after reproducing them:**
+
+- **The break-glass tried `[cmk, currentPassword, newPassword]` for the DEVICE but only
+  `[cmk]` for the VAULT**, so the "current vault password" field helped one container and
+  not the other. The vault now shares the candidate list. ⚠️ **This does NOT become an OR
+  design:** the whole branch is gated behind a valid `verifyRecoveryKit(code)`, so the door
+  is **"sheet AND (CMK OR the old password)"** — nothing there opens anything without the
+  printed sheet, and the (password AND passkey) door is untouched. Mutation-proven:
+  reverting to `[cmk]` turns **spec 22 RED**.
+- **Clearing only the vault container silently orphaned a CMK-sealed identity.** It is now
+  left **byte-for-byte in place, never deleted, and announced** (**spec 23**). A permanent
+  loss a human is told about is recoverable by a human; a silent one is not.
+
+---
+
+### ⭐ THE WRITE ORDER IS THE SAFETY PROPERTY
+
+This deserves prominence because it generalises well beyond passkeys.
+
+Enabling protection touches three stored values and **cannot be made atomic**. So the only
+question is **which state a crash leaves behind**.
+
+The original order wrote the **slot first**. A crash there left a slot beside two
+still-**password-sealed** containers — and **in that state the printed sheet alone is
+genuinely not a door**: a sheet-derived CMK cannot open a password-sealed container. That
+is information-theoretically true and **unfixable at the unlock end** by any amount of
+candidate-trying.
+
+The order is now **containers FIRST, slot LAST**:
+
+```
+1. re-seal the TOTP vault under the CMK        ← the only copy of the data
+2. re-seal the device identity under the CMK   ← the only copy of the keys
+3. write the passkey slot                      ← a recoverable marker
+```
+
+A crash now leaves **CMK-sealed containers with NO slot** — the exact state **spec 17**
+already proves the sheet alone recovers. **The dangerous window collapses into the safe
+one.**
+
+> **The rule, written down so it is reused: make the last write the one whose loss costs
+> least.**
+
+A line of helper copy — *"Leave blank if you do not know it — your vault is recovered
+either way"* — was **false in exactly the state that field exists for**, and is gone.
+
+---
+
+### ⚠️ A MEASUREMENT DEFECT, AND MY OWN NO-OP EDIT — this cost a whole round
+
+A verifier reported the break-glass **decrypting correctly and then never rendering**.
+Live instrumentation confirmed every step — decrypt, re-seal, persist — with **no
+exception and no page error**.
+
+The defect was in the **measurement**. The attack spec sampled the outcome with
+`locator.isVisible({ timeout })`, and **Playwright's own typings mark that option
+`@deprecated This option is ignored` — "does not wait… returns immediately"**. It read the
+DOM in the same tick as the click, before the break-glass had begun its first Argon2id
+derivation.
+
+⚠️ **And my own earlier attempt to rule out timing made it worse:** I raised that number to
+"prove" timing was innocent. Because the number is never read, that was a **no-op edit
+producing a no-op result — and I read it as evidence.** No product code was broken by any
+of it.
+
+Every terminal assertion in the new specs now uses **`toBeVisible`**, never `isVisible`,
+and both browser suites were swept for the same hazard: `web/apps/webapp/tests/` has **zero**
+remaining uses, and the two in the extension are `if (await …isVisible())` **branch
+selectors over already-settled state**, which is legitimate.
+
+⚠️ **Be precise about the mechanism, because I cannot fully close it:** an independent
+verifier later ran that same spec **verbatim and it PASSED**. So the bad line is a
+**race**, not a structural impossibility — which means a timing component **cannot be ruled
+out either**. Do not overstate it.
+
+---
+
+### Also in this commit (audit-#4 follow-ups)
+
+- ⭐ **`sigild/internal/auth/doc.go` and `internal/vault/doc.go` rewritten — a reviewer trap
+  in CODE**, where an auditor browsing the tree hits it *before* reading any document. Both
+  **asserted "not implemented" about implemented functionality**: there are ~640 lines of
+  request authentication in `internal/api/deviceauth.go` and ~468 lines of op-log in
+  `internal/store/oplog*.go`. Worse, `auth` described **Ed25519-signed JWT bearer tokens
+  minted at device registration** — a design that was **never built**; the real mechanism is
+  the **per-request contract-v3 Ed25519 signature**, and there is no JWT anywhere in sigild.
+  A reader who opened that package to learn how sigild authenticates was misdirected twice.
+  Both now point at the real files and name what is genuinely unbuilt (CRDT / Lamport merge
+  semantics — the shipped log is an append-only per-vault `seq`). `admin` and `push` were
+  clarified as **reserved names**; they are genuinely unbuilt. All four packages are still
+  imported by **zero** files. Comment-only; `go build` and `go vet` clean.
+- **`docs/README.md` gained "If you are here to review the security of this system, start
+  here"** — reading order, the load-bearing ADRs, an honest real-vs-not inventory, our own
+  sharp edges framed as **findings-in-waiting**, and *reproduce our claims* via
+  `scripts/gate.sh` — including the line that **if a claim is not backed by something that
+  command runs, treat it as unproven and tell us**. Extended in this pass for 0046 and
+  re-checked for accuracy.
+- **`deploy/caddy/Caddyfile`** — the audit-#4 finding that the reference config
+  **contradicted its own runbook**: a bare catch-all `reverse_proxy` with no path matcher
+  would have published the always-on, unauthenticated `GET /metrics` (account counts,
+  enrolment volume, billing webhook outcomes, entitlement refusals) at a public edge while
+  `docs/deployment.md` said keep it internal. Now `handle /metrics { respond 404 }` before
+  the proxy — **404, not 403, because a 403 confirms the route exists**. Nothing is
+  deployed, so this is still unproven end to end. **Documentation is not a control.**
+- **`sigil-wasm/test/fake-sigild.mjs`** — the test double **no longer sends CORS by
+  default**, and four axes on which it was **laxer than real sigild** are now **enforced
+  inside the double**: the catch-all answers **`501`** for unimplemented `/v1/` routes
+  (restoring *"501 by default, never 404"* inside the double), the envelope PUT enforces the
+  **16 KiB** cap, the hybrid-key PUT validates **both halves' lengths** (32 / 1184), and the
+  envelope PUT checks the recipient **exists and is not revoked**. What is **still** laxer is
+  now stated in its header rather than left to be discovered — no signature verification, no
+  ownership/grant/authorization, no entitlement gate beyond a switch, no rate limiting, no
+  nonce/replay window, no seat cap, no hash chain, no self-only check on the per-device
+  envelope index. **A double must never be more permissive than the thing it doubles.**
+- **`sigil-wasm/recovery.mjs`** — truncation detection on the recipient index. The route has
+  a hard page cap (**500**) and **no cursor**, and every client ignored `has_more`, so a kit
+  covering more than 500 vaults would have **recovered the first 500 and reported success**
+  — to the one person who by definition cannot check it against anything. The result now
+  carries a non-enumerable **`truncated`** flag (existing callers unchanged) and
+  `restoreFromKit` **REFUSES** rather than restoring a prefix.
+- **`scripts/gate.sh`** — **Playwright skips now count as failures**, for the same reason
+  they do in the Go block: a spec that quietly stops running looks exactly like a spec that
+  passes.
+
+---
+
+### ⚠️ Honest limits — do NOT read any of these as closed
+
+- **Only the webapp has the passkey UI.** The MV3 extension and the desktop do not, **even
+  though WebAuthn provably works from an extension origin**. Scoped out deliberately, not
+  blocked — so a user can hold a protected profile on one surface and an unprotected one on
+  another.
+- **Enabling requires a recovery kit to exist first** ("no sheet ⇒ no protection"), and **a
+  kit cannot be created after the loss**.
+- **Whoever holds the printed sheet has full account control** — and now local unlock too.
+  The kit recovers **KEYS, not DATA**, and only for the vaults it was told to cover.
+- **PRF availability varies** by browser, platform and authenticator; the UI must never
+  claim protection it does not have, which is why capability is only reported from a probe
+  that just ran, and why a non-deterministic PRF is called **unsupported**, never "retry".
+- **A protected personal vault cannot be synced in either direction** — the local copy is
+  the only copy.
+- **It defends STORAGE, never EXECUTION**, and it is **NOT retroactive**: earlier copies,
+  backups and forensic images stay password-only forever.
+- **Everything remains dev-gated, plain HTTP, pre-audit and UNAUDITED.**
+
+---
+
+### ✅ The gate
+
+`scripts/gate.sh`, run by me, **ALL GREEN**, and gating the right tree (the first line
+prints the path and sha).
+
+- **Invariants:** both `Cargo.lock`s `getrandom`-free; **`sigild` exactly one direct
+  dependency**; all **10** workflows parse.
+- **Go:** `go test -race` = **640 pass / 0 fail / 0 skip** against a throwaway `postgres:16`,
+  with an explicit **`Postgres-gated suite RAN (0 skips)`**.
+- **Rust:** fmt + clippy `-D warnings` + test on all four crates — **libsigil 134, cli 94,
+  sigil-wasm 29, desktop 31**.
+- **Node interop: all 12.** **Webapp Playwright 46** (up from 19), **extension 12**,
+  marketing builds. **All 3** shell e2e scripts. **CI-drift check clean.**
+- **Inventory:** 4 Rust crates, 4 Go test packages, 12 node interop, 3 shell e2e, **14**
+  Playwright spec files.
+- **No migration was added — `sigild_schema_version` is still 5.**
+
+---
+
+### 📄 Docs updated in the same change (the docs-stay-in-sync rule)
+
+- **`docs/decisions/0046-passkey-protected-local-containers.md` — NEW.** The
+  CMK-from-recovery-seed construction and why it needs no new artifact; `PRF ‖ password` fed
+  to Argon2id and **why not an HKDF**; **AND-never-OR** with the reason an OR design is
+  rejected; ⭐ **the write order as the safety property**; the three experimentally-settled
+  blockers; the rejected alternatives (**passkey as the request credential** — origin-bound,
+  would put a WebAuthn verifier in `sigild` and break CLI/desktop; and **Sigil as a passkey
+  provider for other sites**); and thirteen honest limitations.
+- **`docs/decisions/0036-…`** — dated addendum: browser storage is **three containers** when
+  protection is on, **still sealed-only**, with the table of what each holds and why the
+  slot is a container.
+- **`docs/decisions/0042-…`** — dated addendum: the sheet now **also derives the CMK** — one
+  artifact, two jobs — plus what that does to limitations 1 and 4, and why the derivation
+  lives in JS rather than in `recovery.rs`.
+- **`docs/decisions/README.md`** — the 0046 row, the banner paragraph, and revision notes on
+  the 0036 / 0042 rows.
+- **`docs/api.md`** — the status block records that **nothing changed server-side** (and
+  that a server cannot see or disable it), plus the correction that a browser's
+  device-identity container is sealed under the vault password **except** in the webapp with
+  protection on.
+- **`docs/architecture.md`** — the webapp section, the storage/pin table, the client-surface
+  legend, the passkey spec + the `localhost` constraint, and the corrected fake-sigild
+  paragraph.
+- **`docs/threat-model.md`** — a **new adversary section**: *someone with the browser profile
+  but not the authenticator*, with an explicit list of what this does **not** defend (an
+  attacker who can drive the authenticator; UV as a policy request, not a proof;
+  backup-eligible credentials as a new custodian; not retroactive; storage not execution),
+  and the two table rows (3 and 12) that mention passkeys corrected.
+- **`docs/crypto-spec.md`** — a new section for the CMK derivation and the slot
+  construction, plus a pointer from the recovery-kit derivation to the **fourth label that
+  does not live in `recovery.rs`**.
+- **`docs/deployment.md`** — the `/metrics` warning box replaced with the fix that now exists.
+- **`docs/README.md`**, **`README.md`**, **`CLAUDE.md`** — the reviewer section, the webapp
+  bullet, the `sigil-wasm/passkey.mjs` entry, the doc.go rewrite, the Caddyfile fix, the
+  updated counts (**webapp 46 specs in 9 files**, 14 Playwright spec files) and the
+  `localhost`/WebAuthn constraint.
+
+### ⚠️ Found inaccurate beyond the brief
+
+- **`docs/architecture.md`'s ASCII diagram still said `NO CRYPTO · OPAQUE BLOBS ONLY`** for
+  `sigild` — the **exact over-scoping claim Phase 57 corrected in the prose status blocks**
+  and missed in the picture directly above them. An auditor reads the diagram first.
+  Corrected in place to `NO CRYPTO ON VAULT CONTENT`.
+- **`README.md` said a lost webapp password is "unrecoverable by design"** with no mention of
+  the recovery kit. That has been false since Phase 54. Corrected.
+- **`docs/deployment.md`, `docs/architecture.md` and `CLAUDE.md` all described
+  `fake-sigild.mjs` and the Caddyfile as still-broken** — accurate when written, stale the
+  moment this commit landed. All three corrected.
+- **`docs/decisions/0036`'s "exactly TWO values" is now conditional**, which is why it got an
+  addendum rather than a silent edit.
+
+### ➡️ Still open (honest)
+
+- ⚠️ **Passkey protection exists on ONE of four clients.** The extension and the desktop are
+  unprotected at rest by comparison, and the extension case is **scope, not a blocker**.
+- ⚠️ **Well-formed vault-id squatting is still unbounded** — no per-account claim budget.
+- **`sigild migrate adopt`'s transaction is real but untested.**
+- ⚠️ **`scripts/gate.sh --quick` still does not do what its usage line says** (it skips the
+  shell e2e but starts the throwaway Postgres regardless).
+- ⚠️ **The `isVisible` race is understood but not fully explained** — an independent verifier
+  ran the offending spec verbatim and it passed, so a timing component cannot be ruled out.
+  The hazard is removed from the suites either way.
+- **The stale code comments survive yet another documentation-only phase:**
+  `sigild/internal/api/audit.go` (and `metrics.go`, `ratelimit.go`) still describe a
+  **webhook** rate-limit surface that ADR 0041 **removed**; `cmd/server/main.go` and
+  `router.go` still say the enroll limiter "rejects before the body is read"; and
+  `abuse_test.go`'s header still contradicts its own assertions. `docs/api.md` and
+  `docs/deployment.md` document the real behaviour and are the authority.
+- **Everything remains dev-gated, plain HTTP, pre-audit and UNAUDITED.** Billing has still
+  never been run against a live provider account. Do not store real secrets.

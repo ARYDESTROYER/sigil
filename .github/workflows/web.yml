@@ -85,3 +85,8 @@ jobs:
       - run: corepack pnpm --filter webapp build
       - run: corepack pnpm --filter webapp exec playwright install --with-deps chromium
       - run: corepack pnpm --filter webapp exec playwright test
+        # Belt and braces with the PATH lookup in cors.spec.ts: setup-go puts `go`
+        # on PATH but sets no GO variable, and that spec used to skip itself when
+        # GO was unset — leaving the CORS fix with zero browser-level CI proof.
+        env:
+          GO: go

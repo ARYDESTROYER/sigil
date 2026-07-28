@@ -46,6 +46,7 @@ import {
   generateDeviceSeed,
   enrollDevice,
   createAccountInvite,
+  getAccount,
   pushContainerAuthed,
   pullContainersAuthed,
 } from "../device-auth.mjs";
@@ -492,6 +493,154 @@ try {
     assert(code === RFC_CODE, `(b) the browser produced ${code}, want ${RFC_CODE}`);
     console.log(
       `  (b) OK: ⭐ the browser recovered the CLI's vault from the CLI's paper -> ${code} at T=${RFC_T}`,
+    );
+  }
+
+  // =====================================================================
+  // ⭐⭐ (g) THE RECOVERY-KIT LABEL IS ONE LABEL ACROSS TWO LANGUAGES.
+  //
+  //  THE DEFECT THIS PINS (Phase 57): the string "recovery-kit" existed as THREE
+  //  independent literals — cli/src/lib.rs::RECOVERY_DEVICE_LABEL,
+  //  recovery.mjs::RECOVERY_DEVICE_LABEL and a private copy inside sharing.mjs —
+  //  and it is the ONLY signal driving recipientIsRecoveryKit /
+  //  `recipient_is_recovery_kit`, i.e. the arm that makes `vault share --to
+  //  <kitID>` obey ADR 0042's MANDATORY safety number instead of ordinary TOFU.
+  //  Renaming it in ONE language left this suite fully green while the wrap
+  //  quietly proceeded to a first-sight kit key — exactly the Phase 54 defect
+  //  ADR 0042 records as fixed. The suite even IMPORTED the constant and never
+  //  used it, so the one thing that looked like a guard was not one.
+  //
+  //  This asserts it ACROSS implementations, in BOTH directions: the enroller and
+  //  the refuser are different languages each time, so a one-language rename
+  //  cannot stay green.
+  // =====================================================================
+  {
+    // Direction 1 — JS ENROLLED the kit, the REAL `sigil` BINARY must refuse to
+    // wrap to it. Put a CLI device in the JS client's account so it can see the
+    // kit in its own account listing (which is where the label is read from).
+    const inviteForCli = await createAccountInvite(
+      wasm,
+      { deviceId: devJs.deviceId, seed: seedJs },
+      base,
+      {},
+    );
+    const kitHome = join(work, "cli-label");
+    mkdirSync(kitHome, { recursive: true });
+    sigil(["device", "enroll", "--token", inviteForCli.invite, "--label", "cli-in-js-account"], kitHome);
+    sigil(["device", "hybrid-publish"], kitHome);
+    sigil(["totp", "add", "x", "--secret", RFC_SEED_B32], kitHome, {
+      SIGIL_PASSWORD: "label probe password",
+    });
+    sigil(["vault", "rekey", "--vault", "labelvault", "--publish"], kitHome, {
+      SIGIL_PASSWORD: "label probe password",
+    });
+
+    let cliRefusal = "";
+    try {
+      sigil(["vault", "share", "--vault", "labelvault", "--to", kit.deviceId], kitHome);
+    } catch (e) {
+      cliRefusal = `${e.stdout ?? ""}${e.stderr ?? ""}${e.message ?? ""}`;
+    }
+    assert(
+      /REFUSING TO WRAP/i.test(cliRefusal) && cliRefusal.includes(kit.deviceId),
+      "⛔ THE REAL sigil BINARY WRAPPED A VAULT KEY TO A RECOVERY KIT IT HAS NEVER SEEN.\n" +
+        "   The kit was enrolled by the JS client under recovery.mjs's RECOVERY_DEVICE_LABEL;\n" +
+        "   the CLI decides via cli/src/lib.rs::RECOVERY_DEVICE_LABEL. If those two strings\n" +
+        "   disagree the kit is treated as an ordinary device and gets the live vault key on\n" +
+        `   first-sight TOFU. Output was:\n${cliRefusal}`,
+    );
+
+    // Direction 2 — the CLI ENROLLED the kit, the JS client must refuse. A JS
+    // device joins the CLI's account so it can see the CLI-written label.
+    const inviteForJs = sigil(["account", "invite"], cliHome).split("\n")[0].trim();
+    assert(inviteForJs.length > 8, `could not parse an invite from the CLI: ${inviteForJs}`);
+    const jsInCliSeed = generateDeviceSeed();
+    const jsInCli = await enrollDevice(wasm, {
+      baseUrl: base,
+      token: inviteForJs,
+      label: "js-in-cli-account",
+      seed: jsInCliSeed,
+    });
+    const jsInCliAuth = {
+      baseUrl: base,
+      deviceId: jsInCli.deviceId,
+      seed: jsInCliSeed,
+      hybrid: generateHybridIdentity(),
+      pins: newPinStore(),
+    };
+    await publishHybridKey(wasm, jsInCliAuth);
+    const probeVault = "jslabelvault";
+    const probeKey = generateVaultKey();
+    {
+      const v = newVault();
+      addEntry(v, {
+        label: "p",
+        secretBytes: base32Decode(RFC_SEED_B32),
+        algorithm: "sha1",
+        digits: 8,
+        period: 30,
+      });
+      const salt = webcrypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+      const nonce = webcrypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+      await pushContainerAuthed(
+        wasm,
+        jsInCliAuth,
+        base,
+        probeVault,
+        sealVault(wasm, probeKey, v, salt, nonce, ARGON2),
+      );
+    }
+    let jsThrew = null;
+    try {
+      await shareVault(wasm, jsInCliAuth, {
+        vaultId: probeVault,
+        recipientDeviceId: cliKitId,
+        vaultKey: probeKey,
+      });
+    } catch (e) {
+      jsThrew = e;
+    }
+    assert(
+      jsThrew instanceof UnverifiedRecoveryKitError,
+      "⛔ THE JS CLIENT WRAPPED A VAULT KEY TO A CLI-ENROLLED RECOVERY KIT IT HAS NEVER SEEN.\n" +
+        "   The kit was enrolled by the real `sigil` binary under\n" +
+        "   cli/src/lib.rs::RECOVERY_DEVICE_LABEL; the JS client decides via\n" +
+        `   recovery.mjs::RECOVERY_DEVICE_LABEL. Got: ${jsThrew}`,
+    );
+    assert(
+      jsInCliAuth.pins.pins[cliKitId] === undefined,
+      "the refused share PINNED the kit's key; a retry would then read 'match' and proceed",
+    );
+
+    // Direct, cheap corroboration: the label the REAL CLI wrote for its kit is
+    // byte-identical to the JS constant. If this ever needs relaxing, the two
+    // refusals above are the assertions that actually matter.
+    const cliAccount = await getAccount(wasm, jsInCliAuth, base);
+    const cliKitRow = (cliAccount.devices ?? []).find((d) => d.device_id === cliKitId);
+    assert(cliKitRow, `the CLI's kit ${cliKitId} is not in the account listing`);
+    // ⭐ PIN AGAINST A GOLDEN LITERAL, NOT AGAINST THE CONSTANT UNDER TEST.
+    // Comparing cliKitRow.label to RECOVERY_DEVICE_LABEL alone only catches a
+    // ONE-language rename: an auditor renamed the label in BOTH cli/src/lib.rs
+    // and recovery.mjs and this assertion stayed green, because both sides had
+    // moved together. The label is also a WIRE value — the server stores it and
+    // older clients compare against it — so it is not free to change even
+    // "consistently". The literal below is the contract; changing it is a
+    // deliberate, breaking act that must fail here first.
+    const GOLDEN_RECOVERY_LABEL = "recovery-kit";
+    assert(
+      RECOVERY_DEVICE_LABEL === GOLDEN_RECOVERY_LABEL,
+      `LABEL DRIFT (JS): recovery.mjs uses ${JSON.stringify(RECOVERY_DEVICE_LABEL)} but the ` +
+        `wire contract is ${JSON.stringify(GOLDEN_RECOVERY_LABEL)}`,
+    );
+    assert(
+      cliKitRow.label === GOLDEN_RECOVERY_LABEL,
+      `LABEL DRIFT (RUST): the real CLI enrolled its kit as ${JSON.stringify(cliKitRow.label)} ` +
+        `but the wire contract is ${JSON.stringify(GOLDEN_RECOVERY_LABEL)}`,
+    );
+    console.log(
+      "  (g) OK: ⭐ ONE recovery-kit label across Rust and JS — the real sigil binary REFUSED a\n" +
+        "        JS-enrolled kit, the JS client REFUSED a CLI-enrolled kit, and the label the CLI\n" +
+        "        writes equals recovery.mjs's constant",
     );
   }
 

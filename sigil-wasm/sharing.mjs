@@ -75,6 +75,11 @@ import {
   explainAuthStatus,
 } from "./device-auth.mjs";
 import { bytesToBase64, base64ToBytes } from "./totp-vault.mjs";
+// ⭐ ONE recovery-kit label per language. This module used to redefine the string
+// locally; see the note above recipientIsRecoveryKit for why that was dangerous.
+// (recovery.mjs imports this module too — an ESM cycle that is safe because
+// neither file touches the other's bindings at module-evaluation time.)
+import { RECOVERY_DEVICE_LABEL as RECOVERY_KIT_DEVICE_LABEL } from "./recovery.mjs";
 
 // ── sizes (mirrored from cli/src/lib.rs + sigil-core) ────────────────────────
 
@@ -293,9 +298,11 @@ export async function publishHybridKey(wasm, auth, secretIdentity = null) {
  *
  * ⚠️ THIS IS THE RAW FETCH AND IT ENFORCES NOTHING. It returns whatever the
  * server says. A hostile registry could substitute its own key here and receive
- * the vault key wrapped to itself. Prefer {@link fetchHybridKeyPinned}, which
- * pins on first sight and REFUSES a changed key — every share/rotate path in
- * this module uses that one. Use this bare version only for DISPLAY (e.g.
+ * the vault key wrapped to itself. Prefer {@link verifyRecipientForWrap}, which
+ * pins on first sight, REFUSES a changed key and REFUSES an unverified recovery
+ * kit — every share/rotate path in this module goes through that one, and it is
+ * the only thing that produces a value a wrap will accept. Use this bare version
+ * only for DISPLAY (e.g.
  * computing a {@link safetyNumber} to read aloud), never to wrap a key.
  */
 export async function fetchHybridKey(wasm, auth, deviceId) {
@@ -929,27 +936,20 @@ export async function repinHybridKey(pins, deviceId, identity) {
   };
 }
 
-/**
- * ⭐ FETCH a device's hybrid public key AND enforce the pin, in one call.
- *
- *   await fetchHybridKeyPinned(wasm, auth, deviceId, pins = auth.pins)
- *     -> { identity, pinStatus, safetyNumber }
- *
- * This is what every share/rotate path uses instead of the bare
- * {@link fetchHybridKey}: a pin store nothing consults is worthless, so the
- * enforcement rides on the same call that gets the key. `pins` defaults to
- * `auth.pins` — the pin store that came out of the sealed device-identity
- * container — so an unlocked browser client enforces automatically.
- *
- * @throws {KeyPinMismatchError} when the published key changed.
- */
-export async function fetchHybridKeyPinned(wasm, auth, deviceId, pins = null) {
-  checkAuth(auth);
-  const store = requirePinStore(pins ?? auth.pins);
-  const identity = await fetchHybridKey(wasm, auth, deviceId);
-  const outcome = await checkAndPin(store, deviceId, identity);
-  return { identity, pinStatus: outcome.status, safetyNumber: outcome.safetyNumber, pins: store };
-}
+// ⚠️ `fetchHybridKeyPinned` USED TO LIVE HERE and is DELETED ON PURPOSE
+// (Phase 57), mirroring the deletion of `fetch_hybrid_key_pinned` in
+// cli/src/lib.rs. It was ADR 0038's choke point — fetch a hybrid public key and
+// pin-check it in one call — and Phase 54 SUPERSEDED it with
+// {@link verifyRecipientForWrap}, which additionally refuses an unverified
+// recovery kit and honours a caller-supplied safety number. It then survived
+// with exactly ONE caller (a test) while the docs still recommended it by name:
+// an exported fetch-and-pin WITHOUT the recovery-kit refusal is a ready-made
+// bypass of the wrap gate for whoever reaches for the familiar name next.
+//
+// Need a key for a wrap? `verifyRecipientForWrap` — every wrap path goes through
+// it, and it is what shareVault / rotateVaultKey / coverVault call. Need a key
+// for DISPLAY only (a safety number, a deliberate re-pin)? The bare
+// {@link fetchHybridKey}, which wraps nothing.
 
 // ===========================================================================
 // ⭐⭐ THE WRAP GATE — MIRRORS cli/src/lib.rs::verify_recipient_for_wrap
@@ -966,11 +966,20 @@ export async function fetchHybridKeyPinned(wasm, auth, deviceId, pins = null) {
 // coverVault checked, shareVault and rotateVaultKey did not. Both sides now
 // funnel every wrap through ONE function.
 
-// The device label a recovery kit enrols under. Deliberately NOT exported: the
-// same name is exported by recovery.mjs, and the `@sigil/wasm` barrel re-exports
-// both with `export *` — two star-exports of one name make it ambiguous and it
-// silently disappears from the barrel. Mirrors `cli/src/lib.rs::RECOVERY_DEVICE_LABEL`.
-const RECOVERY_KIT_DEVICE_LABEL = "recovery-kit";
+// The device label a recovery kit enrols under. ⭐ IMPORTED, NOT REDEFINED
+// (Phase 57): this file used to carry its own `RECOVERY_KIT_DEVICE_LABEL =
+// "recovery-kit"` beside recovery.mjs's `RECOVERY_DEVICE_LABEL`, so ONE label
+// existed as THREE independent string literals (here, recovery.mjs,
+// cli/src/lib.rs) with nothing tying them together. That label is the ONLY signal
+// driving `recipientIsRecoveryKit`, i.e. the arm that makes a wrap to a kit obey
+// ADR 0042's mandatory-safety-number rule instead of ordinary TOFU — so a rename
+// in one place silently downgrades the kit to first-sight TOFU.
+//
+// There are now TWO literals, one per language, and `recovery-interop.mjs` asserts
+// them equal END TO END by driving the REAL `sigil` binary against a kit this
+// client enrolled (and vice versa). It is NOT re-exported here: the `@sigil/wasm`
+// barrel star-exports both modules, and two star-exports of one name make it
+// ambiguous and silently drop it. (The import itself is at the top of the file.)
 
 /** How trust in a recipient's key was established. Mirrors `RecipientTrust`. */
 export const TRUST_DERIVED = "derived";

@@ -57,13 +57,14 @@ import {
   hybridPublicIdentity,
   publishHybridKey,
   fetchHybridKey,
-  fetchHybridKeyPinned,
+  verifyRecipientForWrap,
   shareVault,
   safetyNumber,
   pairwiseSafetyNumber,
   renderSafetyNumber,
   hybridSafetyDigest,
   newPinStore,
+  requirePinStore,
   checkAndPin,
   repinHybridKey,
   KeyPinMismatchError,
@@ -566,8 +567,18 @@ http
   // 4d. ⭐ THE BROWSER CLIENT REFUSES TOO, with the catchable typed error.
   //     The JS device pins B's real key against the honest server, then tries to
   //     share through the lying proxy.
+  //
+  //     ⭐ The pin is established through THE REAL WRAP GATE
+  //     (verifyRecipientForWrap), not through a convenience wrapper that no
+  //     product path uses — the superseded fetchHybridKeyPinned was deleted in
+  //     Phase 57 precisely because a test-only choke point proves nothing about
+  //     the choke point the product actually goes through.
   const authJsPinned = { ...authJs, baseUrl: direct, pins: newPinStore() };
-  await fetchHybridKeyPinned(wasm, authJsPinned, ids.B);
+  const firstSight = await verifyRecipientForWrap(wasm, authJsPinned, ids.B);
+  assert(
+    firstSight.safetyNumber === bNumberJs,
+    "the wrap gate must pin the HONEST key on first sight",
+  );
   const authJsProxied = { ...authJsPinned, baseUrl: base };
   let jsRefused = null;
   try {
@@ -595,6 +606,69 @@ http
   // And the attacker's key was NOT pinned by the failed attempt.
   const stillPinned = authJsPinned.pins.pins[ids.B].safety_number;
   assert(stillPinned === bNumberJs, "a failed check must NOT re-pin — the store was mutated");
+
+  // 4e. ⭐ requirePinStore FAILS CLOSED — with an assertion, not a comment.
+  //     This control has already degraded into a no-op once: it used to return
+  //     a fresh empty store for null/undefined, so a caller that forgot its pins
+  //     silently got "every key is first-sight" and pinning stopped protecting
+  //     anything. Nothing in the tree asserted the throw, and an auditor reverted
+  //     it to the fail-OPEN version with every suite still green. So: assert it
+  //     directly, AND assert that a real WRAP PATH refuses rather than proceeds.
+  for (const absent of [null, undefined]) {
+    let threw = null;
+    try {
+      requirePinStore(absent);
+    } catch (e) {
+      threw = e;
+    }
+    assert(
+      threw !== null,
+      `requirePinStore(${absent}) MUST THROW — a missing pin store must never ` +
+        `default to empty, which silently turns every key into a first sight`,
+    );
+    assert(
+      /pin store is required/i.test(threw.message),
+      `requirePinStore(${absent}) threw the wrong error: ${threw.message}`,
+    );
+  }
+  // The wrap path itself must refuse, not proceed to an unpinned first sight.
+  for (const [what, brokenAuth] of [
+    ["no pins at all", { ...authJs, baseUrl: direct, pins: null }],
+    ["undefined pins", { ...authJs, baseUrl: direct, pins: undefined }],
+  ]) {
+    let wrapThrew = null;
+    try {
+      await shareVault(wasm, brokenAuth, {
+        vaultId: `js-nopins-${VAULT}`,
+        recipientDeviceId: ids.B,
+        vaultKey: generateVaultKey(),
+      });
+    } catch (e) {
+      wrapThrew = e;
+    }
+    assert(
+      wrapThrew !== null && /pin store is required/i.test(wrapThrew.message),
+      `shareVault with ${what} MUST REFUSE (got ${wrapThrew && wrapThrew.message}) — ` +
+        `a wrap with no pin store is an unpinned first sight, i.e. the control is off`,
+    );
+  }
+  // ...and verifyRecipientForWrap, the gate every wrap goes through, refuses too.
+  {
+    let gateThrew = null;
+    try {
+      await verifyRecipientForWrap(wasm, { ...authJs, baseUrl: direct, pins: null }, ids.B);
+    } catch (e) {
+      gateThrew = e;
+    }
+    assert(
+      gateThrew !== null && /pin store is required/i.test(gateThrew.message),
+      `verifyRecipientForWrap with no pin store MUST REFUSE; got ${gateThrew && gateThrew.message}`,
+    );
+  }
+  console.log(
+    "  (4e) OK: requirePinStore FAILS CLOSED — null/undefined throw, and shareVault +\n" +
+      "        verifyRecipientForWrap refuse rather than falling back to an empty store",
+  );
 
   setAttack({ on: false });
   console.log(

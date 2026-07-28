@@ -4,10 +4,18 @@
 > for `sigild`, the Sigil sync server. Nothing here has been provisioned,
 > applied, or exposed to the public internet. The artifacts under
 > [`../deploy/`](../deploy/) are reference shapes, and `sigild` itself is a
-> skeleton that performs **no cryptography and runs no auth** (vault ops default
-> to `501`; an opt-in `SIGILD_ENABLE_DEV_OPS` dev-only, unauthenticated store of
-> opaque client-encrypted blobs — in-memory, file-backed, or durable Postgres —
-> exists for local wiring only, never expose it). Treat every "production" word below as
+> skeleton that performs **no cryptography on vault content** and **runs no auth
+> in its default configuration** (vault ops default to `501`; an opt-in
+> `SIGILD_ENABLE_DEV_OPS` dev-only store of opaque client-encrypted blobs —
+> in-memory, file-backed, or durable Postgres — exists for local wiring only,
+> never expose it). ⚠️ **Both halves of that sentence used to be stated
+> unqualified and both were false.** `sigild` verifies Ed25519 request signatures,
+> hash-chains the op-log with SHA-256, digests enrollment/admin tokens and
+> verifies provider webhook HMACs in constant time — it holds no key that can
+> **decrypt a vault**, which is the actual property. And it has had real request
+> auth since Phase 41 (contract v3: a device registry, per-vault authorization,
+> revocation and, since Phase 52, accounts) — **opt-in and dev-gated**, but
+> emphatically built. Treat every "production" word below as
 > *future, unbuilt, unaudited*. See [`sprint-72h.md`](sprint-72h.md) for the
 > wall-clock gates and the defer ledger this descends from.
 
@@ -242,6 +250,22 @@ boundary. It is **not** a health probe (use `/healthz` / `/readyz` for that);
 keep it on the loopback / internal side of Caddy rather than exposing it
 publicly. Full metric list in [`api.md`](api.md#metrics).
 
+> ⚠️ **The reference Caddyfile CONTRADICTS the previous sentence, and it is worth
+> knowing before anyone applies it.** [`../deploy/caddy/Caddyfile`](../deploy/caddy/Caddyfile)
+> is a bare catch-all `reverse_proxy 127.0.0.1:8080` with **no path matcher**, so
+> in the documented topology `GET /metrics` would be **world-readable** at the
+> edge — the endpoint is always-on and never dev-gated. Nothing is deployed, so
+> this has never been observed end to end; it is a config that disagrees with its
+> own runbook. Before any real edge exists, either block `/metrics` at Caddy (a
+> path matcher returning `403`, or an `@internal` remote-IP matcher) or bind the
+> scrape to a separate internal listener. Filed here rather than "fixed" quietly
+> because the file is a **reference shape**, not an applied config.
+>
+> It leaks no blob, key, signature, nonce, vault ID or device ID even if exposed —
+> but it is still an unauthenticated aggregate view of a private system, and
+> [`api.md`](api.md#denial-reasons-audit--metrics-only) records the residual
+> correlation oracle its denial labels carry.
+
 **Fail-fast config validation at boot.** `sigild` **validates its configuration
 at startup and refuses to boot on a malformed value** (e.g. a bad
 `SIGILD_ADDR`, a non-numeric `SIGILD_OPLOG_RATE_LIMIT` / `SIGILD_OPLOG_RATE_BURST`, or
@@ -256,13 +280,23 @@ surfaces immediately as a failed unit start, not as silent misbehaviour.
 
 To avoid any over-claim, the honest gaps:
 
-- **`sigild` does no cryptography and runs no auth.** The vault operation log
+- **`sigild` does no cryptography ON VAULT CONTENT, and its DEFAULT
+  configuration runs no auth.** ⚠️ Read both clauses precisely — the unqualified
+  version of this bullet was **false** and would have scoped the server's
+  cryptography out of an external review. `sigild` verifies Ed25519 request
+  signatures, hash-chains ops with SHA-256, digests enrollment/admin tokens and
+  verifies webhook HMACs in constant time (§§13–14), and it stores devices'
+  **public** Ed25519 and hybrid keys plus provider webhook **secrets** in config.
+  What it holds is no key that can **decrypt a vault**. Likewise "no auth" means
+  *not configured by default*: the multi-device contract v3 and the account model
+  are real, tested, opt-in and dev-gated (§14). The vault operation log
   (`/v1/vaults/{id}/ops`) **defaults to `501`** and stays that way in any
   production configuration. It can be turned on **only as a dev scaffold** by
-  setting the environment variable **`SIGILD_ENABLE_DEV_OPS`**; when enabled it
-  is an **in-memory, non-durable, UNAUTHENTICATED** store of **opaque
-  client-encrypted blobs** — the server does no crypto and never sees plaintext
-  or keys (POST → `201 {vaultID, seq}`; GET → the stored blobs base64-encoded,
+  setting the environment variable **`SIGILD_ENABLE_DEV_OPS`**; when enabled and
+  with no auth contract configured it is an **in-memory, non-durable,
+  UNAUTHENTICATED** store of **opaque
+  client-encrypted blobs** — the server does no crypto on them and never sees
+  plaintext or vault keys (POST → `201 {vaultID, seq}`; GET → the stored blobs base64-encoded,
   **paginated** via `?limit` (default 500, max 1000) + a `has_more` flag).
   Oversized bodies are capped at 64 KiB and rejected with **`413`**. Appends can
   optionally be **rate-limited per vault** with **`SIGILD_OPLOG_RATE_LIMIT`**
@@ -270,8 +304,20 @@ To avoid any over-claim, the honest gaps:
   stdlib token-bucket that returns `429` + `Retry-After` when exceeded, **off by
   default**; these are **dev-op knobs** that apply only when
   `SIGILD_ENABLE_DEV_OPS` is set and do not change the production `501` default.
-  There is still **no auth, no durability, no Postgres**, and no real op/CRDT
-  semantics.
+  ⚠️ **This bullet used to end "There is still no auth, no durability, no
+  Postgres" — three claims that stopped being true at Phases 41, 25 and 24
+  respectively.** What is actually true: auth, durability and the Postgres backend
+  all exist, are tested, and are **opt-in and dev-gated**; none of them is
+  configured by default; and there is still **no real op/CRDT merge semantics**,
+  no account/session/identity system and no production change-management around
+  any of it.
+  **A rejected write no longer claims a vault** ([ADR 0045](decisions/0045-claim-precondition-rejected-writes-never-claim.md)):
+  before Phase 57 an empty-bodied append answered `400` while permanently taking
+  ownership of the vault id it named, and the per-vault rate limiter could not
+  bound it because a squatter varies the vault id. Operationally the thing to know
+  is that an empty/malformed write to an **unowned** vault now answers **`403`**,
+  and that **no per-account claim budget exists** — an authenticated device can
+  still squat ids with well-formed writes.
   **Do NOT set `SIGILD_ENABLE_DEV_OPS` on any exposed instance** — the dev
   op-log must never be reachable from the public internet, and no real secrets
   may be stored in it. This honours the "stub with `501` rather than poison the
@@ -514,8 +560,19 @@ backends have no database and no migrations, and the whole thing is inert unless
 >
 > **Phase 54 added no migration.** The recovery kit needed none — a kit is an
 > ordinary device, and its self-only envelope index reuses the
-> `sigil_vault_key_envelopes_by_recipient` index created by `0004`. Phase 53 and
-> Phase 55 added none either. **`sigild_schema_version` is still `5`.**
+> `sigil_vault_key_envelopes_by_recipient` index created by `0004`. Phase 53,
+> Phase 55, Phase 56 and Phase 57 added none either. **`sigild_schema_version` is
+> still `5`.**
+>
+> ⭐ **Run the gated suite. Do not let it skip.** Without `SIGILD_TEST_POSTGRES`
+> roughly **30 tests skip silently**, and the fourth audit showed **two real
+> regressions survive a DSN-less run** while going red with one: deleting
+> `0005`'s ownership backfill, and dropping the active-device filter from the seat
+> count (which is the account-bricking defect Phase 52 recorded). `scripts/gate.sh`
+> now starts a **throwaway `postgres:16` on a free port** when no DSN is set and
+> **FAILS if any test skipped** — the count went from *561 pass / 30 skip* to
+> **640 pass / 0 fail / 0 skip**. A green run that skipped a third of the storage
+> layer is not a green run.
 
 ### 11.1 `sigild migrate adopt` — the account backfill, and when you need it
 
@@ -562,7 +619,12 @@ The check never blocks a boot: a read failure, or a schema older than the accoun
 model, is logged at debug and ignored.
 
 **The repair.** Idempotent, one transaction, and a no-op when there is nothing to
-do:
+do — ⚠️ **but "one transaction" is asserted, not tested.** The fourth audit
+rewrote `adopt` to run its three steps **non-transactionally** and every suite
+stayed green, so nothing would catch a partial repair (some devices adopted, no
+ownership recorded) if that atomicity were ever lost. The transaction is real in
+the code as it stands; the guarantee simply has no test behind it. Treat a failed
+`adopt` as *verify before assuming it did nothing*.
 
 ```bash
 SIGILD_OPLOG_POSTGRES="$DSN" sigild migrate adopt

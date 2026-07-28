@@ -143,3 +143,46 @@ Consequences of that shape, all deliberate:
 - **A non-extractable WebCrypto key or the Credential Management API** — neither can
   hold an X25519 secret and an ML-KEM seed for use by our wasm, which needs the raw
   bytes to hand to `hybrid_open_container`.
+
+## The sealed-only invariant is now ASSERTED by tests (added Phase 57, 2026-07-28)
+
+This ADR's central claim is that a browser client persists **only** sealed
+`SIGILcli` containers. Until Phase 57 **nothing tested it.**
+
+The fourth full-repo audit planted one line in each client's `persistDevice` —
+
+```js
+sessionStorage.setItem("sigil.webapp.cache", JSON.stringify(device));
+```
+
+— dumping the raw Ed25519 device seed, the hybrid secret identity and every
+accepted vault key **in the clear**, and both suites stayed fully green (webapp
+19/19, extension 12/12). The existing leak specs were **needle** tests: they swept
+the stores into one haystack and asserted the recovery code and one password were
+absent from it. The single structural assertion was on localStorage **key names**,
+so a value could be anything, and `sessionStorage`, `chrome.storage.session` /
+`sync` / `managed`, IndexedDB and Cache Storage were unconstrained.
+
+Both clients now assert the invariant **positively**, over a shared helper
+(`sigil-wasm/test/sealed-store-helper.mjs`):
+
+- **every persisted value must base64-decode to bytes beginning with the
+  `SIGILcli` magic** — not merely "the key name is one we expect";
+- **every other surface must be EMPTY.** Emptiness catches a leak nobody thought
+  to write a needle for, which is the whole failure mode above.
+
+⚠️ **The first version of that fix was itself too narrow, and a verifier caught
+it.** The webapp is a PWA, so Cache Storage is the one surface allowed to be
+non-empty, and the fix exempted it by filtering only **cross-origin** entries —
+vacuous against the threat, because every plausible leak (a regression, an
+attacker-controlled write, the service worker itself) is **same-origin**. A
+same-origin plaintext dump of the whole device identity passed 19/19 while the
+extension, which has no such exemption, caught the identical plant. Cache Storage
+is now constrained by an **allowlist of what the service worker legitimately
+holds** — the shell `/`, `/_next/` build output, and static asset extensions —
+and anything else is a finding. Mutation-proven: a dump at `/_leak` now fails with
+`Cache Storage holds a NON-SHELL entry`.
+
+Nothing about the storage decision changed. What changed is that the decision is
+now **enforced** rather than **remembered**. Every honest limitation above still
+stands, including no zeroization and every secret being decrypted together.

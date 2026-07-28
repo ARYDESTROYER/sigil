@@ -6,7 +6,10 @@
 
 Email **security@sigilapp.io** (working-name address; provisional pending domain
 registration). Please include reproduction steps and your assessment of impact.
-A `/.well-known/security.txt` (RFC 9116) is published on the marketing site.
+A `/.well-known/security.txt` (RFC 9116) **will be published** on the marketing
+site. It exists in this repository, but **nothing is deployed and no domain is
+registered**, so there is no URL to fetch it from yet — and the address above is
+a working name for the same reason.
 
 We aim to acknowledge reports within 3 business days. As a tiny pre-launch team
 this is best-effort, not a contractual SLA.

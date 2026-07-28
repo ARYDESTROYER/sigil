@@ -771,18 +771,10 @@ export function verifyRecipientForWrap(
   pins: HybridPinStore;
 }>;
 
-/** FETCH a hybrid key AND enforce the pin. Throws KeyPinMismatchError. */
-export function fetchHybridKeyPinned(
-  wasm: SigilWasm,
-  auth: SharingAuth,
-  deviceId: string,
-  pins?: HybridPinStore | null,
-): Promise<{
-  identity: HybridPublicIdentity;
-  pinStatus: "first-sight" | "match";
-  safetyNumber: string;
-  pins: HybridPinStore;
-}>;
+// fetchHybridKeyPinned was DELETED in Phase 57 (see sharing.mjs). It was ADR
+// 0038's choke point, superseded by verifyRecipientForWrap above, and an
+// exported fetch-and-pin WITHOUT the recovery-kit refusal is a ready-made bypass
+// of the wrap gate. Use verifyRecipientForWrap to wrap, fetchHybridKey to display.
 
 /** LIST which devices hold an envelope for a vault (owner, WRITE; metadata only). */
 export function listKeyEnvelopes(
@@ -860,6 +852,11 @@ export function encodeMigrationUri(entries: TotpEntry[]): string;
 export const PIN_ORIGIN_RECOVERY_KIT: "recovery-kit";
 
 /** The visible device label a recovery kit enrolls under. */
+// ⚠️ THIS LITERAL TYPE IS A THIRD HAND-WRITTEN COPY of the label and it drifts
+// SILENTLY: a coordinated rename in cli/src/lib.rs and sigil-wasm/recovery.mjs
+// leaves this declaration contradicting the runtime value while `tsc` stays
+// clean. The golden assertion in sigil-wasm/test/recovery-interop.mjs is what
+// actually pins the value; keep this in step with it.
 export const RECOVERY_DEVICE_LABEL: "recovery-kit";
 
 /** Bytes in a raw recovery secret. */

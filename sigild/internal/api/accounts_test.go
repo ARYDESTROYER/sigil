@@ -19,9 +19,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -814,6 +817,114 @@ func TestAccountDenialBodiesAreCoarse(t *testing.T) {
 	}
 }
 
+// TestAuthDenyMetricIsNotAVaultExistenceOracle pins the Phase 57 fix for a real
+// oracle: /metrics is UNAUTHENTICATED and ALWAYS ON, and it used to move a
+// DIFFERENT counter depending on whether the probed vault existed —
+// forbidden_account for a vault owned by another account, unauthorized_vault for
+// a vault id that had never existed — even though the client-visible answer was
+// byte-identical in both cases (403 {"error":"forbidden"}).
+//
+// A scrape before and after one request therefore answered "does this vault id
+// exist?". The two now share ONE coarse label; the fine reason still reaches the
+// audit log (asserted below), which is the pattern the enroll path already used.
+func TestAuthDenyMetricIsNotAVaultExistenceOracle(t *testing.T) {
+	var logs bytes.Buffer
+	devices := store.NewMemDeviceStore()
+	for _, tok := range []string{"tok-a-0000000000000000", "tok-b-0000000000000000"} {
+		if err := devices.RegisterEnrollmentToken(context.Background(),
+			EnrollTokenHash(tok), time.Now().UTC(), time.Time{}); err != nil {
+			t.Fatalf("RegisterEnrollmentToken: %v", err)
+		}
+	}
+	env := &deviceEnv{devices: devices, router: NewRouter(Config{
+		Version:       "test",
+		Logger:        slog.New(slog.NewJSONHandler(&logs, nil)),
+		DevOpsEnabled: true,
+		Devices:       devices,
+		EnrollTokenHashes: []string{
+			EnrollTokenHash("tok-a-0000000000000000"),
+			EnrollTokenHash("tok-b-0000000000000000"),
+		},
+	})}
+	devA := enrollDevice(t, env, "tok-a-0000000000000000", "A")
+	devB := enrollDevice(t, env, "tok-b-0000000000000000", "B")
+	if rec := v3Post(t, env, devA, "/v1/vaults/vaultExists/ops", []byte("first")); rec.Code != http.StatusCreated {
+		t.Fatalf("A claim = %d", rec.Code)
+	}
+
+	scrape := func() map[string]int {
+		rec := httptest.NewRecorder()
+		env.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		out := map[string]int{}
+		for _, line := range strings.Split(rec.Body.String(), "\n") {
+			if !strings.HasPrefix(line, "sigild_oplog_auth_denied_total{") {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) != 2 {
+				continue
+			}
+			var n int
+			if _, err := fmt.Sscanf(parts[1], "%d", &n); err == nil {
+				out[parts[0]] = n
+			}
+		}
+		return out
+	}
+	delta := func(before, after map[string]int) []string {
+		var moved []string
+		for k, v := range after {
+			if v != before[k] {
+				moved = append(moved, k)
+			}
+		}
+		sort.Strings(moved)
+		return moved
+	}
+
+	// Probe a vault that EXISTS (owned by another account).
+	b1 := scrape()
+	if rec := v3Get(t, env, devB, "/v1/vaults/vaultExists/ops"); rec.Code != http.StatusForbidden {
+		t.Fatalf("probe of an existing vault = %d, want 403", rec.Code)
+	}
+	existsMoved := delta(b1, scrape())
+
+	// Probe a vault id that has NEVER existed.
+	b2 := scrape()
+	if rec := v3Get(t, env, devB, "/v1/vaults/vaultNeverExisted/ops"); rec.Code != http.StatusForbidden {
+		t.Fatalf("probe of a never-existent vault = %d, want 403", rec.Code)
+	}
+	missingMoved := delta(b2, scrape())
+
+	if len(existsMoved) == 0 || len(missingMoved) == 0 {
+		t.Fatalf("no counter moved at all (exists=%v missing=%v)", existsMoved, missingMoved)
+	}
+	if !reflect.DeepEqual(existsMoved, missingMoved) {
+		t.Fatalf("/metrics distinguishes an EXISTING vault from a never-existent one: "+
+			"exists moved %v, missing moved %v — that is a vault-existence oracle on an "+
+			"unauthenticated, always-on endpoint", existsMoved, missingMoved)
+	}
+	if strings.Contains(scrapeBody(t, env.router), `reason="forbidden_account"`) {
+		t.Fatalf("forbidden_account is still an exported metric label")
+	}
+
+	// The operator has NOT lost the signal: the fine reason is in the audit log.
+	text := logs.String()
+	for _, want := range []string{"forbidden_account", "unauthorized_vault"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("audit log lost the fine-grained reason %q:\n%s", want, text)
+		}
+	}
+}
+
+// scrapeBody returns the raw /metrics text for a router.
+func scrapeBody(t *testing.T, router http.Handler) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return rec.Body.String()
+}
+
 // TestAccountFullNeedsAValidCredentialFirst: account_full is a distinct 409, and
 // it is reachable ONLY after a resolved invite AND a valid proof of possession —
 // exactly like device_exists. A prober with no invite learns nothing.
@@ -1061,7 +1172,6 @@ func TestAccountMetricsCarryNoIdentifiers(t *testing.T) {
 		"sigild_account_invites_revoked_total",
 		"sigild_account_joins_total",
 		`sigild_oplog_auth_denied_total{reason="missing_account"}`,
-		`sigild_oplog_auth_denied_total{reason="forbidden_account"}`,
 		`sigild_device_enroll_denied_total{reason="account_full"}`,
 	} {
 		if !strings.Contains(body, want) {

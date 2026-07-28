@@ -347,3 +347,36 @@ and the kit rule inherits a dependency of its own: recognising that a recipient
 *is* a kit uses a device **label** served by `GET /v1/account`, so a server that
 renames or hides it degrades a kit wrap back to ordinary first-sight TOFU. See
 [ADR 0042](0042-recovery-kit.md) §5 for the exact claim that can honestly be made.
+
+## The superseded choke point has been DELETED (added Phase 57, 2026-07-28)
+
+§1 above names `fetch_hybrid_key_pinned` (Rust) / `fetchHybridKeyPinned` (JS) as
+the function every wrap path goes through. Per the addendum rule that text stays
+as written; this records that **both functions no longer exist**.
+
+The addendum above replaced them as the gate in Phase 54. What it did not do was
+remove them. The Rust one was left as a public `pub fn` with **zero callers and
+zero tests**; the JS one survived with exactly **one** caller, a test. Meanwhile
+this ADR, `crypto-spec.md`, `architecture.md`, `threat-model.md`, `api.md` and
+`CLAUDE.md` all still recommended them by name.
+
+The fourth full-repo audit named that for what it was: a **ready-made bypass of
+the type gate**. `fetch_hybrid_key_pinned` fetches and pins, but it does **not**
+refuse an unverified recovery kit and does **not** honour a caller-supplied
+safety number — so the next caller who reached for the familiar, still-documented
+name would have gotten a wrap that skipped two of the three refusals, silently
+and without touching the gate at all. **A superseded choke point is not harmless
+dead code.**
+
+Both are deleted, each leaving a tombstone comment at its old location naming the
+replacement:
+
+- **to WRAP** — `verify_recipient_for_wrap` / `verifyRecipientForWrap`, the only
+  thing that can produce a `VerifiedRecipient`, which is the only thing the
+  wrap→deposit→grant path accepts;
+- **to DISPLAY** (a safety number, a reachability probe, a deliberate re-pin) —
+  the bare `fetch_hybrid_key` / `fetchHybridKey`, which wraps nothing.
+
+The JS test's single call was **moved onto the real gate** rather than deleted, so
+what it proves is now what the product does. Nothing about the trust model in this
+ADR changed: the same refusals, in the same order, on the same path.

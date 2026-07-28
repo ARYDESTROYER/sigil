@@ -11,8 +11,113 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 56; Phase 56 is complete and fully gated but UNCOMMITTED in
-the working tree — `main` is at `b18a438`).**
+**Where we are (through Phase 57 / audit #4; Phase 57 is complete and fully gated but
+UNCOMMITTED in the working tree — `main` is at `ab37e05`, which is Phase 56).**
+
+**PHASE 57 — AUDIT #4: THE CODE HELD UP; THE VERIFICATION LAYER DID NOT.** A fourth
+full-repo adversarial audit ran against `ab37e05` with **six independent lenses, each in its
+OWN GIT WORKTREE** (so one lens's mutation testing could not perturb another's tree), then a
+**triage pass that re-verified every finding**. What held: **17 of 18 authorization
+mutations, 7 of 9 storage mutations and 33 of 38 test-integrity mutations went RED**; a full
+secret hunt across a `pg_dump`, **every** `bytea` column and the server log found **ZERO
+hits with a working positive control**; the hash chain caught every tamper shape on **both**
+backends; the **`VerifiedRecipient` type gate held**; native file modes were correct.
+⚠️⚠️ **THREE VERIFICATION BLIND SPOTS, TWO OF THEM IN WORK I HAD JUST WRITTEN.** (1)
+**`scripts/gate.sh` began with a HARDCODED ABSOLUTE `cd`**, so run from a git **worktree** it
+built and tested the **MAIN checkout** — a planted `getrandom` stanza in a worktree lockfile
+still printed `✓ getrandom==0`, and **it bit the audit itself**: one lens reported ALL GREEN
+about a tree it was not auditing. Fixed — it resolves the repo from the script's own location
+and **prints `gating: <path> (<sha>)`**. (2) **`gate.sh` never set `SIGILD_TEST_POSTGRES`**,
+so ~30 tests skipped, and it counted only PASS/FAIL so the skips were **invisible**; **two
+real regressions survive a DSN-less run** (deleting migration `0005`'s ownership backfill;
+dropping the active-device filter from the seat count — the Phase 52 account-bricking
+defect). Fixed — it starts a throwaway **`postgres:16`** and **FAILS on any skip**; the Go
+line went from **561 pass / 30 skip** to **640 pass / 0 fail / 0 skip**. (3)
+**`web/apps/webapp/tests/cors.spec.ts` resolved Go with NO PATH lookup**, so in CI it
+**`test.skip`ped ITSELF** and the only browser-level proof of Phase 56's CORS fix silently
+vanished while the job stayed green. ⚠️ **My earlier "fix" of adding `actions/setup-go` did
+NOT work — `setup-go` sets PATH and never sets `$GO`.** Fixed with a PATH lookup **plus**
+`GO: go` on the step (which `interop.yml` already did right).
+⭐ **ONE GENUINE SERVER DEFECT (ADR 0045): a request the server REJECTED still PERMANENTLY
+CLAIMED the vault**, because trust-on-first-write fired during authorization, **before** the
+empty-body check. Live: **50 empty-bodied POSTs across 50 distinct vault ids → `{400: 50}`,
+zero ops stored, `sigild_vault_claims_total` +50**, the rate limiter **never fired** (it keys
+on the vault id the attacker varies), and a second device was then **permanently 403 on its
+own genuine first write**. ⚠️ Aggravating: **vault ids are LOW-ENTROPY AND HUMAN-CHOSEN** —
+the webapp defaults to the literal `"webapp-demo"`. FIX: `claimPrecondition` +
+`authorizeOpsWrite` (`deviceauth.go`) evaluate a cheap **vault-independent** predicate and
+downgrade **`needWrite` → `needWriteNoClaim`** when the request is going to be rejected, so
+it can never reach `ClaimVault`; applied to `opsAppend` and `keyEnvelopePut`. ⚠️ **DELIBERATE
+BEHAVIOUR CHANGE:** an empty/malformed write to an **UNOWNED** vault now answers **403** (no
+grant, no ownership earned) instead of 400; on a vault the caller may already write it still
+answers 400/404/409. Verified live: 25 rejected appends → **0 claims**, then a different
+device claimed all 25 with genuine writes. ⚠️ **RESIDUAL: well-formed squatting is still
+unbounded — there is NO per-account claim budget**, only a code comment naming it.
+**FOUR TEST-INTEGRITY DEFECTS**, each mutation-proven both ways: (a) the recovery-kit device
+**LABEL** was an untested mirror in **THREE** places — renaming it in both JS files left
+every suite green, and that label is the **only** signal making a kit wrap obey the mandatory
+safety-number rule; now de-duplicated to one per language, driven against the **real `sigil`
+binary**, and — after a verifier showed a **COORDINATED rename still passed** — pinned to a
+**GOLDEN LITERAL**, because the label is a **WIRE value** older clients compare against; (b)
+**NO test asserted browsers persist ONLY sealed containers (ADR 0036)** — a planted plaintext
+`sessionStorage` write dumped the Ed25519 seed, the hybrid secret and every vault key while
+webapp passed 19/19 and extension 12/12; both now assert **positively** (every value decodes
+to `SIGILcli` magic, every other surface EMPTY), ⚠️ and a verifier caught that the **first fix
+still exempted Cache Storage** (it filtered only CROSS-origin entries — vacuous, since every
+plausible leak is same-origin, and the extension caught the identical plant), now constrained
+by an **ALLOWLIST** (`/`, `/_next/`, static assets); (c) **`requirePinStore`'s fail-closed
+behaviour had NO test** — reverting it to fail open left everything green; (d) **`/metrics`
+split `unauthorized_vault` vs `forbidden_account`, a VAULT-EXISTENCE ORACLE** on an always-on
+unauthenticated surface, despite ADR 0040 limit 11 saying that oracle was deliberately not
+widened — **collapsed on the metric**, audit log still distinguishes them (a **narrowing, not
+a closure**: `not_vault_owner` / `forbidden_device` / `vault_owner_unresolved` stay).
+⭐ **A SUPERSEDED CHOKE POINT DELETED:** `fetch_hybrid_key_pinned` (Rust, **zero callers**) /
+`fetchHybridKeyPinned` (JS, **one** — a test) were ADR 0038's gate, superseded in Phase 54 by
+`verify_recipient_for_wrap` / `verifyRecipientForWrap`. The surviving Rust `pub fn`
+fetched-and-pinned **without the recovery-kit refusal and without the safety-number check** —
+a ready-made **bypass of the type gate** for whoever reached for the name **the docs still
+recommended**. Both deleted with tombstone comments; the JS test's call **moved onto the real
+gate**. **A superseded choke point is not harmless dead code.**
+**ALSO FIXED:** the extension rendered a **402** as an anonymous `HTTP 402` (no JS explainer
+had a 402 case) — now explained like the webapp; and `gate.sh`'s **inventory line miscounted
+node suites** (it excluded `fake-*` but not `*-helper.mjs`), inflating the one number whose
+job is to make a missing suite visible.
+⚠️ **THE DOCS THAT WERE FALSE, and this is the part that mattered most:** the status blocks
+an external reviewer reads FIRST (`api.md`, `architecture.md`, `deployment.md`) said sigild
+**"performs no cryptography, holds no keys"** and **"runs no auth"** — while
+`grep -rE 'crypto/(ed25519|hmac|sha256|subtle|rand)' sigild` excluding tests returns **29
+hits**. They would have **scoped sigild's cryptography out of review.** Corrected everywhere:
+**no crypto ON VAULT CONTENT, no key that can DECRYPT a vault** — it does plenty of crypto
+for **authentication, hash-chaining and webhook verification**, and holds device public keys,
+published hybrid public keys and webhook secrets. Also corrected: `crypto-spec.md` called the
+recovery construction a two-implementation **mirror** (it is **single-sourced** in
+`libsigil/core/src/recovery.rs`); `api.md` said "eleven routes" / "the six" (the router
+registers **twelve**: 5 device + 7 sharing); `SECURITY.md` said `security.txt` **"is
+published"** (nothing is deployed, no domain registered → **"will be"**); `threat-model.md`
+called vault IDs **"high-entropy"**; and `CLAUDE.md` said `server_interop.rs` holds **two**
+tests (it holds **six**).
+✅ **VERIFIED FIRST-HAND: I ran `scripts/gate.sh` myself — ALL GREEN**, printing
+`gating: /Users/ary/Documents/GitHub/sigil (ab37e05)`. Both `Cargo.lock`s `getrandom`-free;
+`sigild` exactly one direct dep; all **10** workflows parse; **go -race 640 pass / 0 fail /
+0 skip** against a throwaway `postgres:16` with an explicit *"Postgres-gated suite RAN (0
+skips)"*; Rust **libsigil 134 / cli 94 / sigil-wasm 29 / desktop 31**, all fmt+clippy clean;
+**all 12** node interop suites; **webapp 19** Playwright specs; **extension 12**; marketing
+build; **all 3** shell e2e scripts; **CI-drift check clean**. Inventory: 4 Rust crates, 4 Go
+test packages, 12 node interop, 3 shell e2e, 13 Playwright specs. **No migration —
+`sigild_schema_version` is still 5.**
+➡️ **STILL OPEN AFTER THIS PASS:** well-formed vault-id squatting is unbounded (no
+per-account claim budget); `sigild migrate adopt`'s transaction is real but **untested**;
+`fake-sigild.mjs` is **more permissive than real sigild** (catch-all **404** inverting the
+"501, never 404" invariant inside the double, no envelope cap, no hybrid-key length check, no
+recipient existence/revocation check) and its header does not disclaim it; **no client reads
+`has_more`** on `GET /v1/devices/{deviceID}/keys`, so a kit covering **>500 vaults silently
+recovers the first 500 and reports success**; the deploy **Caddyfile is a bare catch-all
+`reverse_proxy`**, so `/metrics` would be world-readable in the documented topology while the
+runbook says keep it internal; and the stale code comments (a **webhook** rate-limit surface
+ADR 0041 removed, the "rejects before the body is read" enroll-limiter comments, the
+`abuse_test.go` header) survive yet another documentation-only phase.
+
+---
 
 **PHASE 56 — THE FEATURES REACH THE USER, AND A TWELVE-PHASE-OLD HOLE SURFACES.** Phases 54
 and 55 shipped things **users could not reach**: recovery existed only in the `sigil` CLI —
@@ -8308,3 +8413,395 @@ caught by reading the diff.
   never been run against a live provider account, Juspay remains
   UNVERIFIED-AGAINST-LIVE-DASHBOARD. Do not store real secrets.
 - `journal.md` — this entry + RESUME ANCHOR bumped to **through Phase 56**.
+
+---
+
+## 2026-07-28 — Phase 57 / Audit #4 and its fixes (`ab37e05` + working tree): the code held up; the verification layer did not
+
+### The method, because it is why the findings are trustworthy
+
+A fourth full-repo adversarial audit ran against `ab37e05` (Phase 56, uncommitted at the
+time). **Six independent lenses, each in its OWN GIT WORKTREE** — authorization, storage
+and secrets, client trust, test integrity, docs-versus-code, and operations — so that one
+lens planting a mutation could not perturb another lens's tree. A **triage pass then
+re-verified every finding** against the real tree before anything was written down.
+
+That isolation mattered more than expected, for a reason recorded below: it is exactly
+what exposed the first blind spot.
+
+---
+
+### ⭐ THE VERDICT, in one line
+
+**THE CODE HELD UP; THE VERIFICATION LAYER DID NOT.**
+
+What held, and how it was shown to hold:
+
+- **Authorization: 17 of 18 mutations went RED.** Deleting a permission check, loosening a
+  need level, removing the self-only test on the envelope index, dropping the revocation
+  check ahead of signature verification — all caught.
+- **Storage: 7 of 9 mutations went RED.**
+- **Test integrity: 33 of 38 mutations went RED.**
+- **A full secret hunt found ZERO hits** — across a `pg_dump`, **every** `bytea` column,
+  and the server log — **with a working positive control**, i.e. the hunt was proven able
+  to find a secret that was really there.
+- **The hash chain caught every tamper shape on BOTH backends** (alter, insert, delete,
+  reorder).
+- **The `VerifiedRecipient` type gate held.** There is no way to reach a wrap without
+  passing the gate.
+- **Native file modes were correct** (`0600` files in a `0700` state dir).
+
+The five and one and two that did **not** go red are the entire rest of this entry.
+
+---
+
+### ⚠️⚠️ THREE VERIFICATION BLIND SPOTS — TWO OF THEM IN WORK I HAD JUST WRITTEN
+
+This is the uncomfortable part and it belongs at the top. Phase 56's two headline
+process improvements — `scripts/gate.sh` and a CI fix — **both had holes, and both holes
+were of the exact shape the thing was built to prevent.**
+
+**1. `scripts/gate.sh` gated the WRONG TREE.** It opened with a hardcoded absolute
+`cd /Users/ary/Documents/GitHub/sigil`. Run from a git **worktree** it therefore built and
+tested the **main checkout** while appearing to gate the caller's tree. Reproduced
+directly: a `getrandom` stanza planted in a worktree's `Cargo.lock` still printed
+`✓ getrandom==0`.
+
+> ⭐ **It bit the audit itself.** One lens, running in its own worktree, reported ALL GREEN
+> about a tree it was not auditing. A gate that reports green about a tree it is not
+> looking at is worse than no gate — it converts "untested" into "verified".
+
+Fixed: it resolves the repo **from the script's own location** and its first line is now
+`gating: <path>  (<short sha>)`. Read that line.
+
+**2. `scripts/gate.sh` never ran the Postgres-gated suite, and hid that it hadn't.** It
+never set `SIGILD_TEST_POSTGRES`, so ~30 tests skipped — and it counted only PASS and FAIL,
+so the skips were **invisible**. Two real regressions were shown to survive a DSN-less run
+while going red with one:
+
+- deleting migration `0005`'s **ownership backfill**;
+- dropping the **active-device filter** from the seat count — which is the
+  **account-bricking defect** Phase 52 recorded and fixed.
+
+Fixed: with no DSN set it starts a **throwaway `postgres:16`** on a free port, and it
+**FAILS if any test skipped** (`Postgres-gated suite RAN (0 skips)`). The Go line moved
+from **561 pass / 30 skip** to **640 pass / 0 fail / 0 skip**.
+
+**3. `web/apps/webapp/tests/cors.spec.ts` skipped ITSELF in CI.** It resolved Go as
+`process.env.GO ?? "/opt/homebrew/bin/go"` with **no PATH lookup**, so on a GitHub runner
+it `test.skip`ped — meaning **the only browser-level proof of Phase 56's CORS fix silently
+vanished while the job stayed green.** That is precisely the failure the spec exists to
+catch, and precisely the failure Phase 56's own journal entry said it had prevented.
+
+> ⚠️ **My earlier "fix" did not work.** Phase 56 added `actions/setup-go` to the webapp job
+> and recorded that as closing the gap. `setup-go` puts `go` on **PATH** and **never sets
+> `$GO`** — so the spec kept skipping. Adding a toolchain is not the same as making a test
+> find it.
+
+Fixed twice over: a **PATH lookup first** in the spec, plus **`GO: go`** on the workflow
+step — which `interop.yml` had been doing correctly all along.
+
+**The pattern:** all three are the same defect wearing different clothes — *a check that
+believes it ran.* Phases 53–56 kept finding "a test that cannot fail is not a test"; this
+one is the tier above it, **a gate that cannot see the thing it is gating.**
+
+---
+
+### ⭐ ONE GENUINE SERVER DEFECT: a request the server REJECTED still CLAIMED the vault
+
+**The shape.** Trust-on-first-write fired **inside the authorization step**, which runs
+before a handler's cheap request-shape checks. So a request the server was about to
+**reject** took permanent ownership on its way to the rejection.
+
+**The live reproduction**, against a real `sigild` with dev ops + device auth v3:
+
+- one enrolled device sent **50 empty-bodied `POST /v1/vaults/{id}/ops`**, each naming a
+  different, never-seen vault id;
+- responses: **`{400: 50}`**. Ops stored: **zero**.
+- `sigild_vault_claims_total` rose by **50**;
+- the rate limiter **never fired once** — `SIGILD_OPLOG_RATE_LIMIT` keys on the vault id,
+  and a squatter varies the vault id every request;
+- a **second device** then made a **genuine** first write to one of those ids and got
+  **`403`** — permanently, on a vault it had every right to.
+
+**Aggravating, and worth stating plainly: vault ids are LOW-ENTROPY AND HUMAN-CHOSEN.**
+The threat model called them "client-chosen high-entropy identifiers". They are not: the
+webapp's default is the literal string **`"webapp-demo"`**. Guessing is not required.
+
+`PUT /v1/vaults/{vaultID}/keys/{deviceID}` had the same shape through its empty-body,
+unknown-recipient and revoked-recipient rejections.
+
+**The fix (ADR 0045).** A new `claimPrecondition` + `authorizeOpsWrite` in
+`sigild/internal/api/deviceauth.go`: a **cheap, VAULT-INDEPENDENT** predicate supplied by
+the handler is evaluated after authentication and before authorization, and when it says
+"this request is going to be refused" the required level is downgraded **`needWrite` →
+`needWriteNoClaim`**, so it can never reach `ClaimVault`. Applied to `opsAppend` and to
+`keyEnvelopePut` (whose three shape checks were factored into `checkKeyEnvelopePut` and
+**memoised**, so the verdict that gated the claim is the same one that writes the
+response). The verify **order is unchanged**; only the claim side effect moved.
+
+> ⚠️ **A DELIBERATE BEHAVIOUR CHANGE, DOCUMENTED AS SUCH:** an empty or malformed write to
+> an **UNOWNED** vault now answers **`403`** — it holds no grant and no longer earns
+> ownership on the way past — instead of `400`. On a vault the caller **may already
+> write**, it still answers `400` / `404` / `409` exactly as before. That is why this got
+> an ADR and not a bug-fix line: it changes a documented status.
+
+**Verified live, both directions:** 25 rejected appends → **0 claims**, after which a
+**different** device claimed all 25 with genuine writes; and legitimate
+trust-on-first-write still claims normally. `sigild/internal/api/claimsquat_test.go` pins
+both handlers by scraping `sigild_vault_claims_total` off `/metrics`.
+
+> ⚠️ **HONEST RESIDUAL:** this removes the **free** path to a claim, not squatting. A
+> determined device can still squat ids with **genuinely well-formed** writes — each one
+> stored, entitlement-checked and audited, so it costs something, but nothing bounds the
+> total. **There is no per-account claim budget**; there is a code comment naming it as the
+> real bound and nothing else. It must never be keyed on the vault id, which the attacker
+> controls. **Trust-on-first-write remains a dev ownership model, not an account model.**
+>
+> This is the **sibling** of audit #3's finding, which was a *read-shaped* route wired to
+> `needWrite`. That one created the `needWriteNoClaim` level. This one found the level
+> existed and nothing was using it for the case where the write itself was never going to
+> be applied.
+
+---
+
+### FOUR TEST-INTEGRITY DEFECTS (each mutation-proven in both directions)
+
+**1. The recovery-kit device LABEL was an untested cross-language mirror in THREE places.**
+`"recovery-kit"` lived as independent literals in `cli/src/lib.rs`, `sigil-wasm/recovery.mjs`
+**and** `sigil-wasm/sharing.mjs`. Renaming it in **both** JS files left every suite green —
+and that label is the **only** signal that makes a wrap to a kit obey ADR 0042's mandatory
+safety-number rule instead of ordinary TOFU, so a rename silently downgrades a kit wrap to
+first-sight trust-on-first-use.
+
+Fixed: the two JS constants are **de-duplicated to one** (`sharing.mjs` imports it), and
+`recovery-interop.mjs` drives the **REAL `sigil` binary in both directions** expecting a
+refusal. ⭐ **Then a verifier showed a COORDINATED rename still passed** — two languages
+agreeing on a new spelling satisfies an equality check — so the assertion now pins both
+languages against a **GOLDEN LITERAL**. The reasoning matters: **the label is a WIRE value**
+the server stores on the device row and older clients compare against, so it is **not free
+to change even "consistently"**. A third hand-written copy in
+`web/packages/sigil-wasm/index.d.ts` is a literal *type* that `tsc` cannot cross-check; it
+is annotated as drifting silently.
+
+**2. NO test asserted that browsers persist ONLY sealed containers (ADR 0036).** One
+planted line —
+
+```js
+sessionStorage.setItem("sigil.webapp.cache", JSON.stringify(device));
+```
+
+— dumped the **Ed25519 device seed, the hybrid secret identity and every vault key in the
+clear**, and the webapp passed **19/19** and the extension **12/12**. The existing leak
+specs were **needle** tests (is the recovery code absent from this haystack?); the one
+structural assertion was on localStorage **key names**.
+
+Fixed: both clients now assert **positively**, over a shared
+`sigil-wasm/test/sealed-store-helper.mjs` — **every persisted value must decode to bytes
+beginning with the `SIGILcli` magic**, and **every other surface must be EMPTY**. Emptiness
+catches the leak nobody thought to write a needle for.
+
+> ⚠️ **And a verifier then found the first fix STILL EXEMPTED Cache Storage on the webapp.**
+> It filtered only **cross-origin** entries — vacuous, because every plausible leak (a
+> regression, an attacker-controlled write, the service worker itself) is **same-origin**.
+> A same-origin plaintext dump of the whole device identity passed 19/19 while the
+> **extension caught the identical plant**, which is what named it. Cache Storage is now
+> constrained by an **ALLOWLIST of what the service worker legitimately holds** — the shell
+> `/`, `/_next/` build output, and static asset extensions — and anything else is a
+> finding. Mutation-proven: a dump at `/_leak` now fails with
+> `Cache Storage holds a NON-SHELL entry`.
+
+**3. `requirePinStore`'s fail-closed behaviour had NO test.** Reverting it to fail **open**
+— i.e. a caller that forgot its pins silently gets "every key is first-sight", the control
+degraded into a no-op — left every suite green. Now asserted in `pinning-interop.mjs`,
+including that **`shareVault` and `verifyRecipientForWrap` refuse** rather than proceeding
+to an unpinned first sight.
+
+**4. `/metrics` split `unauthorized_vault` vs `forbidden_account` — a VAULT-EXISTENCE
+ORACLE.** The client answer is byte-identical in both cases (same `403`, same
+`{"error":"forbidden"}`), but the **metric delta** was not: a probe of a vault that exists
+and belongs to someone else moved one counter, a probe of a vault that never existed moved
+the other. Scraping the always-on, **unauthenticated** `/metrics` before and after one
+request therefore answered *"does this vault id exist?"* — despite ADR 0040 limitation 11
+saying this phase "deliberately does not widen" that oracle. (The enrollment side had been
+collapsed for exactly this reason; the auth-deny side was missed.)
+
+Fixed: collapsed on the **metric** (`authDenyMetricReason`); the **audit log still
+distinguishes them**, which is the pattern the enroll path already used. Verified live:
+identical status, byte-identical body, identical metric deltas. `not_vault_owner` /
+`forbidden_device` stay split (they describe the caller's own relationship to a resource it
+already reached) and so does `vault_owner_unresolved` (a repair state an operator must
+see) — a **narrowing, not a closure**, and recorded that way.
+
+---
+
+### ⭐ A SUPERSEDED CHOKE POINT, DELETED
+
+`fetch_hybrid_key_pinned` (Rust, **zero callers**) and `fetchHybridKeyPinned` (JS, **one**
+caller — a test) were ADR 0038's original choke point, superseded in Phase 54 by
+`verify_recipient_for_wrap` / `verifyRecipientForWrap`.
+
+They were left in place. The surviving Rust `pub fn` fetched-and-pinned **without the
+recovery-kit refusal and without the safety-number check** — a **ready-made bypass of the
+`VerifiedRecipient` type gate** for the next caller who reached for the name **the docs
+still recommended**. Six documents named it as the live gate.
+
+Both are deleted, each with a tombstone comment naming the replacement (*wrap* →
+`verify_recipient_for_wrap`; *display only* → the bare `fetch_hybrid_key`). ⭐ **The JS
+test's one call was MOVED onto the real gate**, so its coverage is no longer illusory.
+
+**A superseded choke point is not harmless dead code.**
+
+---
+
+### Also fixed
+
+- **The extension rendered a `402` as an anonymous `HTTP 402`.** No JS explainer had a 402
+  arm, so a lapsed-account cross-account share printed a bare status. `popup.js`'s
+  `authErr` now routes 402 through `explainAuthStatus`, and both it and
+  `explainRecoveryStatus` say plainly that a 402 is a **BILLING state**, not an
+  authentication or permission failure, and that **reading is never refused**. This is the
+  same gap Phase 56 closed in the CLI and the webapp and missed here.
+- **`gate.sh`'s inventory line miscounted the node suites** — it excluded `fake-*` but not
+  `*-helper.mjs`, inflating **the very number whose job is to make a missing suite
+  visible**. It now uses the same exclusion as the runner loop and the drift check.
+
+---
+
+### ⚠️ The process, honestly
+
+Two of the three verification blind spots were in work I had written **in the phase
+immediately before**, and one of them was in the thing I had just described in this journal
+as the fix for a recurring failure. The gate script was built because this repo had three
+times shipped a suite no workflow ran; it then gated the wrong tree and hid thirty skips.
+The CI change was made because a spec could skip itself; it did not stop the spec skipping
+itself.
+
+Then a **verifier round on the fixes themselves** caught two more: the Cache Storage
+exemption (a leak assertion that still could not see the leak) and the coordinated-rename
+gap (a mirror test that still could not see a mirror break). Both were fixed a second time.
+
+**The lesson, stated so it is not re-learned:** when you build a control that watches
+something, the next thing to test is **the control's own blind spot**, not the thing it
+watches. Every finding in this pass sat there.
+
+---
+
+### ✅ The gate
+
+`scripts/gate.sh`, run by me, **ALL GREEN** — and now printing what it gated:
+
+```
+gating: /Users/ary/Documents/GitHub/sigil  (ab37e05)
+```
+
+- **Invariants:** both `Cargo.lock`s `getrandom`-free; **`sigild` exactly one direct
+  dependency**; all **10** workflows parse.
+- **Go:** gofmt clean, vet clean, **`go test -race` = 640 pass / 0 fail / 0 skip** against
+  a throwaway `postgres:16`, with an explicit **`Postgres-gated suite RAN (0 skips)`**
+  (was 561 pass / 30 skip).
+- **Rust:** fmt + clippy `-D warnings` + test on all four crates — **libsigil 134, cli 94,
+  sigil-wasm 29, desktop 31**.
+- **Node interop: all 12.** **Webapp Playwright 19**, **extension 12**, marketing builds.
+- **All three** shell e2e scripts. **CI-drift check clean.**
+- **Inventory:** 4 Rust crates, 4 Go test packages, 12 node interop, 3 shell e2e, 13
+  Playwright spec files.
+- **No migration was added — `sigild_schema_version` is still 5.**
+
+---
+
+### 📄 Docs updated in the same change (the docs-stay-in-sync rule)
+
+- **`docs/decisions/0045-claim-precondition-rejected-writes-never-claim.md` — NEW.** The
+  defect with its live reproduction, the precondition's four deliberate properties, the
+  `403`-instead-of-`400` change **and why answering `400` anyway was rejected**, and the
+  honest residual (no per-account claim budget).
+- **`docs/decisions/0038-…`** — a dated addendum: the choke point it names by function
+  **no longer exists**, why a superseded gate is a bypass, and what to call instead.
+- **`docs/decisions/0036-…`** — a dated addendum: the sealed-only invariant is now
+  **asserted**, with the planted `sessionStorage` dump that proved it wasn't, and the Cache
+  Storage allowlist that a verifier forced.
+- **`docs/decisions/0040-…`** — a dated addendum on limitation 11: what the oracle was, what
+  was collapsed, what was **deliberately not** collapsed, and that this is a narrowing.
+- **`docs/decisions/0042-…`** — a dated addendum: the construction is **single-sourced**
+  (the *Neutral* section's "mirrored" claim was wrong and self-contradicting), the LABEL is
+  the real mirror, the golden-literal pin and the **wire-value** reasoning, and the third
+  literal in `index.d.ts`.
+- **`docs/decisions/README.md`** — the 0045 row, the banner paragraph, and revision notes on
+  the 0036 / 0038 / 0040 / 0042 rows.
+- **`docs/api.md`** — the corrected status block; **twelve** dev-gated routes, not eleven;
+  the claim precondition on both claiming routes with the `403`-instead-of-`400` note; the
+  missing `400 empty_op` row; the collapsed metric label with the oracle explained; and the
+  `has_more`-nobody-reads gap on `GET /v1/devices/{deviceID}/keys`.
+- **`docs/architecture.md`** — the corrected status block and §1 framing, the wrap gate
+  renamed with the deletion recorded, both browser leak specs, and the **test double's
+  extra permissiveness**.
+- **`docs/deployment.md`** — the corrected status block and §7 bullet (three claims that
+  stopped being true at Phases 41, 25 and 24), the claim precondition as an operator note,
+  ⚠️ **the Caddyfile that would expose `/metrics` while the runbook says keep it internal**,
+  the run-the-gated-suite instruction, and that `sigild migrate adopt`'s transaction is
+  **untested**.
+- **`docs/crypto-spec.md`** — the wrap gate renamed with a *do-not-reach-for-this* box, and
+  the recovery-construction paragraph corrected from "MIRRORED — NOT SHARED" to
+  **single-sourced**, with the label named as the mirror that actually existed.
+- **`docs/threat-model.md`** — the server-crypto sentence qualified, the wrap-gate names
+  (rows for the desktop and adversary **X**), ⚠️ **vault ids are NOT high-entropy**, a new
+  bullet for the rejected-write claim with its residual, and the >500-vault kit truncation.
+- **`docs/README.md`**, **`README.md`**, **`SECURITY.md`** — the corrected posture, the
+  claim-precondition caveat, `gate.sh`'s two fixed blind spots, and `security.txt`
+  **"will be published"** (nothing is deployed and no domain is registered).
+- **`CLAUDE.md`** — the deleted choke point in all three places it was named, `gate.sh` with
+  both blind spots and the Postgres/skip behaviour, the claim precondition and the collapsed
+  metric, the golden-literal label, the browser leak assertions, the extension's 402 arm,
+  the `cors.spec.ts` PATH lookup, and the corrected desktop counts.
+
+### ⚠️ Found inaccurate beyond the brief
+
+- **`docs/threat-model.md` called vault IDs "client-chosen high-entropy identifiers"** as
+  the *reason* trust-on-first-write was tolerable pre-audit. They are neither
+  server-assigned nor high-entropy — the webapp ships `"webapp-demo"` — so the mitigation
+  argument that bullet rested on was false. Corrected in place.
+- **`docs/api.md`'s ops-append error table had no `400 empty_op` row at all**, so the very
+  status the claim-precondition change alters was undocumented before it changed.
+- **`scripts/gate.sh --quick` does not do what its usage line says.** The comment says it
+  skips "the shell e2e + Postgres"; the `QUICK` check only guards the shell e2e, and the
+  throwaway Postgres container starts regardless. Recorded in `CLAUDE.md`; not edited,
+  because this pass is documentation-only.
+- **`docs/api.md` said the sharing set was "the six in the next section"** in one place and
+  **"seven"** in another, while heading the whole surface "all eleven routes". The router
+  registers **twelve** (5 device + 7 sharing). The omitted one was
+  `GET /v1/devices/{deviceID}/keys` — added in Phase 54 and never counted.
+- **`CLAUDE.md` said `desktop/core/tests/server_interop.rs` "now holds TWO tests"** and that
+  "the two tests run in PARALLEL threads". It holds **six**; the count had not been redone
+  since Phase 51. Other desktop counts were stale in the same way.
+
+### ➡️ Still open (honest)
+
+- ⚠️ **Vault-id squatting with well-formed writes is unbounded.** No per-account claim
+  budget exists. This is the largest thing this pass names and does not close.
+- **`sigild migrate adopt`'s transaction is real but untested** — a non-transactional
+  rewrite stayed green, so a lost atomicity guarantee would not be caught.
+- ⚠️ **`sigil-wasm/test/fake-sigild.mjs` is MORE PERMISSIVE than real `sigild`** on axes its
+  header does not disclaim: its **catch-all returns `404`**, inverting the *"501 by default,
+  never 404"* invariant **inside the double**, and it enforces **no envelope size cap, no
+  hybrid-key length validation and no recipient existence/revocation check**. An auditor
+  tightened all four and both browser suites stayed green, so it conceals **no current
+  defect** — but a double laxer than the thing it doubles is how the CORS hole survived
+  twelve phases. The header should say so.
+- ⚠️ **No client reads `has_more` on `GET /v1/devices/{deviceID}/keys`**, and there is no
+  cursor. **A recovery kit covering >500 vaults would silently recover the first 500 and
+  report success** — to a person who by definition cannot check it against anything.
+- ⚠️ **The deploy Caddyfile is a bare catch-all `reverse_proxy` with no path matcher**, so
+  in the documented topology `GET /metrics` would be **world-readable** while
+  `docs/deployment.md` says to keep it internal. Nothing is deployed, so this is unproven
+  end to end — but the config contradicts its own runbook.
+- **The stale code comments survive another documentation-only phase:**
+  `sigild/internal/api/audit.go` (and `metrics.go`, `ratelimit.go`) still describe a
+  **webhook** rate-limit surface that ADR 0041 **removed** — the closed set is **two**
+  (enroll, invite); `cmd/server/main.go` and `router.go` still say the enroll limiter
+  "rejects before the body is read"; and `abuse_test.go`'s header still contradicts its own
+  assertions. `docs/api.md` and `docs/deployment.md` document the real behaviour and are the
+  authority.
+- **Everything remains dev-gated, plain HTTP, pre-audit and UNAUDITED.** Billing has still
+  never been run against a live provider account; Juspay remains
+  UNVERIFIED-AGAINST-LIVE-DASHBOARD. Do not store real secrets.

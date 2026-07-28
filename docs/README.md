@@ -22,7 +22,12 @@ independent audit completes and trademark clears (brief, GTM Phase 1).
   the billing routes and their opt-in **entitlement enforcement** (`402` on
   writes only) — all dev-gated and all `501` by default — plus the opt-in
   **browser-origin allowlist** (`SIGILD_CORS_ORIGINS`), which is off by default
-  and is deliberately *not* an authentication control.
+  and is deliberately *not* an authentication control. ⚠️ Its status block was
+  **corrected in Phase 57**: `sigild` does no cryptography **on vault content**
+  and holds no key that can **decrypt a vault**, but it does verify Ed25519
+  request signatures, hash-chain ops with SHA-256 and verify webhook HMACs — the
+  unqualified "performs no cryptography" it used to open with was false and would
+  have scoped its own cryptography out of a review.
 - [`deployment.md`](deployment.md) — the (not-yet-applied) `sigild` deployment
   runbook: topology, secrets posture, PQ-TLS nuance, and an honest
   what-is-not-deployable / validation-status accounting.
@@ -42,3 +47,13 @@ product-level layer is still missing — an **identity** system (no email, no
 password, no operator break-glass; the only recovery is a **paper kit printed in
 advance**, and it **cannot be created after the loss**), session/token issuance,
 device-key rotation, and mobile.
+
+A fourth full-repo adversarial audit (six independent lenses, each in its own git
+worktree, then a triage pass that re-verified every finding) ran against
+`ab37e05`. Its verdict is worth reading before these documents: **the code held
+up; the verification layer did not.** One genuine server defect came out of it —
+a request the server **rejected** still permanently claimed the vault it named
+([ADR 0045](decisions/0045-claim-precondition-rejected-writes-never-claim.md)) —
+alongside three blind spots in the tooling that was supposed to notice, and a set
+of status lines in these very documents that were false. `journal.md` has the
+full account.

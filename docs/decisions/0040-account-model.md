@@ -654,3 +654,44 @@ addendum). Two consequences for this ADR:
   remains a CLI and desktop capability. Do not read limitation 18 as done.
 
 Every other limitation in this ADR stands as written.
+
+## Limitation 11 (the `/metrics` oracle) is NARROWED, not closed (added Phase 57, 2026-07-28)
+
+Per this repo's addendum rule the text above is left untouched.
+
+**What was wrong.** Limitation 11 says this phase "deliberately does **not**
+widen" the `/metrics` oracle. It did — on the request-auth side, which nobody
+re-read. The two account-model reasons it added to
+`sigild_oplog_auth_denied_total{reason}` were `forbidden_account` (the vault
+exists and belongs to another account) and, already present,
+`unauthorized_vault` (no sufficient grant, including a vault that has never
+existed). **The client cannot tell those apart** — the same `403`, the same
+byte-identical `{"error":"forbidden"}` body — **but the metric could.** Scraping
+`/metrics` before and after a single request answered *"does this vault id
+exist?"*, on an always-on, unauthenticated surface. The enrollment side was
+collapsed for exactly this reason (`enrollDenyReasons`); the auth-deny side was
+missed.
+
+**What changed.** `forbidden_account` is collapsed onto `unauthorized_vault`
+**at the metric only** (`authDenyMetricReason`, the last step before a counter is
+incremented). The **audit log still records the fine-grained reason** — it is
+server-side, and it is where an operator does forensics. Verified live: the two
+cases now produce an identical status, a byte-identical body **and** identical
+metric deltas.
+
+**What is deliberately NOT collapsed, and why that is honest rather than
+convenient:**
+
+- `not_vault_owner` and `forbidden_device` describe the **caller's own
+  relationship to a resource it already reached**. They do not signal the
+  existence of something the caller guessed at, so they leak nothing it did not
+  already hold.
+- `vault_owner_unresolved` names a **server-side data-repair state** — a pre-0005
+  ownership grant needing the `sigild migrate adopt` backfill — that an operator
+  **must** be able to see, and reaching it requires that legacy row to already
+  exist.
+
+So limitation 11's pre-existing framing stands: `/metrics` remains a **weak
+correlatable oracle**, and this is a narrowing, not a closure. The rule the
+collapse encodes is worth stating plainly: **`/metrics` must never distinguish
+two outcomes the client is told nothing apart about.**

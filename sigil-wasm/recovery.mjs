@@ -115,6 +115,14 @@ export function explainRecoveryStatus(status) {
         "authenticated, but not permitted: a kit may read only its OWN envelope index and only " +
         "the envelopes addressed to it."
       );
+    case 402:
+      // A kit GENERATION wraps and deposits, i.e. it is a gated write. A 402 is
+      // BILLING and must never be read as "your code is wrong" or "not permitted".
+      return (
+        "payment required: this is a BILLING state, not a bad code and not a permission problem. " +
+        "The server authenticated and authorized this device and THEN asked for payment. " +
+        "RESTORING from an existing kit is never refused — only creating new material is."
+      );
     case 404:
       return "nothing there: no envelope is waiting for this kit for that vault.";
     case 501:

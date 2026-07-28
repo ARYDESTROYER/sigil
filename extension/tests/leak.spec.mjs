@@ -29,6 +29,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startFakeSigild } from "../../sigil-wasm/test/fake-sigild.mjs";
+import { sealedOnlyProblems, emptyProblems } from "../../sigil-wasm/test/sealed-store-helper.mjs";
 
 const EXT_DIR = path.dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
 const RFC_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
@@ -154,8 +155,79 @@ async function sweepStorage(page) {
       parts.push("cache:unavailable");
     }
 
-    return { haystack: parts.join("\n"), localKeys: localKeys.sort() };
+    // ⭐ The STRUCTURAL view, beside the needle haystack. This used to return
+    // only `localKeys` (key NAMES of chrome.storage.local), which is why a
+    // plaintext `chrome.storage.session.set({...device})` — the raw Ed25519
+    // seed, the hybrid secret and every vault key — sailed through 12/12 green.
+    const areas = {};
+    for (const area of ["local", "sync", "session", "managed"]) {
+      try {
+        areas[area] = await chrome.storage[area].get(null);
+      } catch {
+        areas[area] = "unavailable";
+      }
+    }
+    const localStore = {};
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      localStore[k] = window.localStorage.getItem(k) ?? "";
+    }
+    const sessionStore = {};
+    for (let i = 0; i < window.sessionStorage.length; i++) {
+      const k = window.sessionStorage.key(i);
+      sessionStore[k] = window.sessionStorage.getItem(k) ?? "";
+    }
+    const idbNames = [];
+    try {
+      for (const meta of (await indexedDB.databases?.()) ?? []) {
+        if (meta.name) idbNames.push(meta.name);
+      }
+    } catch {
+      /* enumeration unsupported; the haystack sweep above still ran */
+    }
+    const cacheNames = globalThis.caches ? await caches.keys().catch(() => []) : [];
+
+    return {
+      haystack: parts.join("\n"),
+      localKeys: localKeys.sort(),
+      areas,
+      localStore,
+      sessionStore,
+      cookie: document.cookie,
+      idbNames,
+      cacheNames,
+    };
   });
+}
+
+/**
+ * ⭐ ADR 0036, ASSERTED POSITIVELY: `chrome.storage.local` holds EXACTLY the two
+ * sealed `SIGILcli` containers (magic bytes checked after base64-decoding), and
+ * EVERY other storage surface the popup can reach is EMPTY —
+ * chrome.storage.sync/session/managed, the page's own localStorage and
+ * sessionStorage, cookies, IndexedDB and Cache Storage.
+ *
+ * The old spec pinned `chrome.storage.local` KEY NAMES and swept everything else
+ * for one needle (the recovery code). A verifier added a single
+ * `chrome.storage.session.set({...})` to the extension's persistDevice, dumping
+ * the raw 32-byte device seed, the hybrid secret and every vault key in the
+ * clear, and the suite stayed 12/12 green. Emptiness catches the leak nobody
+ * wrote a needle for.
+ */
+function expectSealedOnly(where, swept, expectedKeys) {
+  const localArea = swept.areas.local === "unavailable" ? {} : swept.areas.local;
+  const problems = [
+    ...sealedOnlyProblems(localArea, expectedKeys),
+    ...emptyProblems("chrome.storage.sync", swept.areas.sync),
+    ...emptyProblems("chrome.storage.session", swept.areas.session),
+    ...emptyProblems("chrome.storage.managed", swept.areas.managed),
+    ...emptyProblems("page localStorage", swept.localStore),
+    ...emptyProblems("page sessionStorage", swept.sessionStore),
+    ...emptyProblems("cookies", swept.cookie),
+    ...emptyProblems("IndexedDB", swept.idbNames),
+    ...emptyProblems("Cache Storage", swept.cacheNames),
+  ];
+  expect(problems, `${where}: ADR 0036 says browsers persist ONLY sealed containers`).toEqual([]);
 }
 
 function needles(formatted) {
@@ -229,6 +301,12 @@ test("profile 1: printing a kit leaks the code into no store, log, request or UR
       "sigil.extension.device.v1",
       "sigil.extension.vault.v1",
     ]);
+    // ⭐ ...and asserted POSITIVELY: those values ARE sealed containers, and
+    // every other storage surface is EMPTY.
+    expectSealedOnly("profile 1", swept, [
+      "sigil.extension.device.v1",
+      "sigil.extension.vault.v1",
+    ]);
     expect(swept.haystack).not.toContain("ext-leak-one");
     expect(logs.filter((l) => l.startsWith("PAGEERROR"))).toEqual([]);
   } finally {
@@ -264,6 +342,10 @@ test("profile 2: RESTORING with the code leaks it into no store, log, request or
       "sigil.extension.device.v1",
       "sigil.extension.vault.v1",
     ]);
+    expectSealedOnly("restored profile", swept, [
+      "sigil.extension.device.v1",
+      "sigil.extension.vault.v1",
+    ]);
     expect(swept.haystack).not.toContain("ext-leak-two");
     expect(logs.filter((l) => l.startsWith("PAGEERROR"))).toEqual([]);
 
@@ -274,6 +356,10 @@ test("profile 2: RESTORING with the code leaks it into no store, log, request or
     const again = await sweepStorage(page);
     assertAbsent("client storage after reload", again.haystack, kitCode);
     assertAbsent("DOM after reload", await page.content(), kitCode);
+    expectSealedOnly("after reload", again, [
+      "sigil.extension.device.v1",
+      "sigil.extension.vault.v1",
+    ]);
   } finally {
     await context.close();
     await rm(userDataDir, { recursive: true, force: true });

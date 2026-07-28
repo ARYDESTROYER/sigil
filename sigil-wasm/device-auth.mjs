@@ -467,6 +467,13 @@ export function explainAuthStatus(status) {
       return "401 unauthorized — this device is not authenticated (unknown, revoked, bad signature, clock skew over 300s, or a replayed request).";
     case 403:
       return "403 forbidden — this device IS authenticated but is not permitted. Either it is not authorized for that vault (ask a device in the owning account to grant it access), or it carries NO ACCOUNT at all — which happens only when a pre-account-model server enrolled it against an already-migrated database, and which an operator repairs with `sigild migrate adopt`. The two are deliberately indistinguishable from here.";
+    // ⭐ A 402 is a BILLING state, and it must never read as an auth failure.
+    // This arm exists so that EVERY surface that can receive one explains it:
+    // explainSharingStatus falls through to here, and the extension's popup
+    // rendered a lapsed-account cross-account share as an anonymous "HTTP 402".
+    // The wording matches the webapp's billing region and entitlement.mjs.
+    case 402:
+      return "402 payment required — this is a BILLING state, not a sign-in problem and not a bug. The server authenticated and authorized this device and THEN asked for payment. Reading is never refused: existing codes, pulls and already-shared keys keep working. Renew the subscription to resume uploading new changes.";
     case 404:
       return "404 not found — no such open invite in YOUR account. An invite belonging to another account is deliberately indistinguishable from one that never existed.";
     case 409:

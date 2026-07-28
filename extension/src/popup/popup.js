@@ -345,7 +345,13 @@ function renderSharing() {
  */
 function authErr(e) {
   const status = e && typeof e.status === "number" ? e.status : 0;
-  if (status === 401 || status === 403 || status === 501) return explainAuthStatus(status);
+  // 402 is included deliberately: it is a BILLING state, and rendering it as a
+  // bare "HTTP 402" (the old default arm) told the user nothing. It is still NOT
+  // 401/403 — explainAuthStatus spells out that the device authenticated and was
+  // authorized, and that reading is never refused.
+  if (status === 401 || status === 402 || status === 403 || status === 501) {
+    return explainAuthStatus(status);
+  }
   return err(e);
 }
 

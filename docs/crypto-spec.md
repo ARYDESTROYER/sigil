@@ -477,11 +477,23 @@ A safety number only helps if someone reads it. **Pinning** is the zero-effort h
 that works from the **second** contact onward: the first hybrid public key a client
 sees for a device is recorded, and every later fetch is compared against it.
 
-The enforcement lives at **the fetch itself** — `fetch_hybrid_key_pinned` (Rust) /
-`fetchHybridKeyPinned` (JS) get the key and check the pin in **one call**, and every
-wrap path (share *and* rotate, in both implementations) goes through it. The bare
+The enforcement lives at **the fetch itself** — `verify_recipient_for_wrap` (Rust) /
+`verifyRecipientForWrap` (JS) get the key and check the pin (and the safety number,
+and the recovery-kit rule) in **one call**, and every wrap path (share, rotate *and*
+recovery-kit cover, in both implementations) goes through it. In Rust it is the
+**only** constructor of a `VerifiedRecipient`, and the wrap path accepts nothing
+else, so the rule is enforced by type rather than by discipline. The bare
 `fetch_hybrid_key` / `fetchHybridKey` survive only on paths that **do not wrap**:
 displaying a safety number, the deliberate re-pin, and the desktop's `check_server`.
+
+> ⚠️ **The names to *not* reach for: `fetch_hybrid_key_pinned` /
+> `fetchHybridKeyPinned`.** They were this construction's original choke point,
+> superseded in Phase 54 and **deleted in Phase 57** because they pin but do not
+> refuse an unverified recovery kit and do not honour a supplied safety number —
+> a fetch-and-pin left exported next to a stricter gate is a ready-made bypass for
+> the next caller. Both are gone, with tombstone comments at their old locations.
+> See [ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)'s
+> addenda.
 
 Three outcomes, and there is deliberately **no fourth**:
 
@@ -668,13 +680,30 @@ vault keys.
 - The derived-key struct's `Debug` prints exactly `RecoveryKeys { <redacted> }`, so
   a stray `{:?}` cannot leak it.
 
-The construction is **MIRRORED — NOT SHARED** across the two client
-implementations this repo already maintains: `cli/src/lib.rs` (used by the CLI
-*and* the native desktop app) and
-[`../sigil-wasm/recovery.mjs`](../sigil-wasm/recovery.mjs) (used by the browser
-surfaces), with the **same known-answer vector on both sides** and a Node
-cross-tool test. The wasm bindings add **no cryptography and no codec** — the
-`recovery_*` exports are thin shells over `sigil-core`.
+⭐ **The construction is SINGLE-SOURCED, not mirrored** — this paragraph used to
+claim the opposite and then contradict itself two sentences later. The Crockford
+codec, the checksum and all three HKDF derivations live in **one file**,
+[`../libsigil/core/src/recovery.rs`](../libsigil/core/src/recovery.rs). The CLI
+(and, through it, the native desktop app) imports `encode_recovery_kit` /
+`decode_recovery_kit` / `derive_recovery_keys` directly; the browser surfaces
+reach the same code through one-line `#[wasm_bindgen]` shells, so the wasm
+bindings add **no cryptography and no codec** and
+[`../sigil-wasm/recovery.mjs`](../sigil-wasm/recovery.mjs) implements none of it.
+There is no second implementation to drift, and the known-answer vector exists on
+both sides only as a cheap end-to-end check.
+
+⚠️ **The mirror that genuinely exists — and had no test at all until Phase 57 —
+is the kit's device LABEL.** `"recovery-kit"` is the only signal that makes a wrap
+to a kit obey the mandatory-safety-number rule instead of ordinary
+trust-on-first-use, and it lived as **three** hand-written literals (`cli/src/lib.rs`,
+`sigil-wasm/recovery.mjs`, `sigil-wasm/sharing.mjs`). Renaming it in both JS files
+left every suite green. The two JS copies are now one, and
+`sigil-wasm/test/recovery-interop.mjs` drives the **real `sigil` binary** in both
+directions — pinning both languages against the **golden literal**, because a
+label the server stores and older clients compare against is a **wire value** and
+is not free to change even "consistently". A third literal type in
+`web/packages/sigil-wasm/index.d.ts` still drifts silently and is annotated as
+such. See [ADR 0042](decisions/0042-recovery-kit.md)'s addendum.
 
 ### What this does and does not give you
 

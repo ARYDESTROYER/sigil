@@ -134,8 +134,37 @@ var authDenyReasons = []authReason{
 	reasonBadAdminToken,
 	reasonStoreUnavailable,
 	reasonMissingAccount,
-	reasonForbiddenAccount,
 	reasonVaultOwnerUnresolved,
+}
+
+// authDenyMetricReason collapses request-auth reasons that a CLIENT CANNOT TELL
+// APART onto ONE coarse metric label, and is the last step before a counter is
+// incremented. The FINE-GRAINED reason still goes to the audit log unchanged —
+// that surface is server-side and authenticated by being server-side; /metrics is
+// UNAUTHENTICATED AND ALWAYS ON.
+//
+// ⭐ WHY (Phase 57). The client-visible answer to "I am not allowed on this
+// vault" is byte-identical in both cases — the same 403, the same
+// {"error":"forbidden"} — but the METRIC delta was not: a probe of a vault that
+// EXISTS and belongs to somebody else moved forbidden_account, while a probe of a
+// vault that has never existed moved unauthorized_vault. Scraping /metrics before
+// and after a single request therefore answered "does this vault id exist?", which
+// is precisely the oracle ADR 0040 limitation 11 says this model deliberately does
+// not widen. The enrollment side was collapsed for exactly this reason
+// (enrollDenyReasons); the auth-deny side was missed.
+//
+// DELIBERATELY NOT COLLAPSED: not_vault_owner and forbidden_device describe the
+// CALLER's own relationship to a resource it already reached, not the existence of
+// something it guessed at, so they leak nothing a prober did not already hold.
+// vault_owner_unresolved is retained too — it names a server-side DATA-REPAIR
+// state (a pre-0005 ownership grant needing the backfill) that an operator must be
+// able to see, and reaching it requires that legacy row to already exist. That is
+// an honest, narrow residue, not a claim that the oracle is fully closed.
+func authDenyMetricReason(reason authReason) authReason {
+	if reason == reasonForbiddenAccount {
+		return reasonUnauthorizedVault
+	}
+	return reason
 }
 
 // enrollDenyReasons is the fixed set of enrollment-denial reasons, in a stable
@@ -308,11 +337,14 @@ func (m *Metrics) incEntitlement(outcome entitlementOutcome) {
 	}
 }
 
-// incAuthDenied records one request auth/authz denial by reason. An unknown
-// reason (should not occur — reason comes from the fixed enum) is ignored rather
-// than mutating the map concurrently.
+// incAuthDenied records one request auth/authz denial by reason. The reason is
+// first collapsed through authDenyMetricReason so this UNAUTHENTICATED, always-on
+// surface never distinguishes two denials the client is told nothing apart about
+// (the audit log keeps the fine-grained reason). An unknown reason (should not
+// occur — reason comes from the fixed enum) is ignored rather than mutating the
+// map concurrently.
 func (m *Metrics) incAuthDenied(reason authReason) {
-	if c := m.authDenied[reason]; c != nil {
+	if c := m.authDenied[authDenyMetricReason(reason)]; c != nil {
 		c.Add(1)
 	}
 }

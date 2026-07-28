@@ -43,6 +43,7 @@ package api
 // key does not re-wrap already-delivered envelopes.
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -194,6 +195,33 @@ func (h *handlers) deviceHybridKeyFetch(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// checkKeyEnvelopePut is the cheap, VAULT-INDEPENDENT shape validation of a
+// key-envelope PUT: a non-empty body, and a recipient that is an enrolled, ACTIVE
+// device (depositing a key for an unknown or revoked device is refused rather
+// than silently stored). It returns (0, "", "") when the request is well-formed,
+// otherwise the status/code/detail to answer with.
+//
+// It is factored out so it can serve as a claimPrecondition — evaluated before
+// the trust-on-first-write claim — and then be REUSED to write the response,
+// rather than existing twice and drifting.
+func (h *handlers) checkKeyEnvelopePut(ctx context.Context, blob []byte, recipientID string) (int, string, string) {
+	if len(blob) == 0 {
+		return http.StatusBadRequest, "empty_envelope", "envelope body must not be empty"
+	}
+	recipient, err := h.devices.GetDevice(ctx, recipientID)
+	if err != nil {
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			return http.StatusNotFound, "device_not_found", "no such device"
+		}
+		return http.StatusInternalServerError, "internal", ""
+	}
+	if !recipient.Active() {
+		return http.StatusConflict, "device_revoked",
+			"cannot deposit a key envelope for a revoked device"
+	}
+	return 0, "", ""
+}
+
 // keyEnvelopePut deposits an OPAQUE wrapped vault key addressed to one device.
 //
 // The request body is the RAW envelope bytes (application/octet-stream) — the
@@ -224,8 +252,26 @@ func (h *handlers) keyEnvelopePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ⭐ THE CLAIM PRECONDITION (Phase 57), the same fix as opsAppend. Every check
+	// below that can REJECT this request — an empty body, an unknown recipient, a
+	// revoked recipient — is cheap and VAULT-INDEPENDENT, so it is evaluated as a
+	// claim precondition: a PUT that is going to be refused must not take
+	// ownership of an unowned vault on its way out. The verdict is memoised and
+	// reused after authorization, so each check runs at most once and the response
+	// ordering (auth -> entitlement -> shape) is unchanged.
+	var rejStatus int
+	var rejCode, rejDetail string
+	rejChecked := false
+	wellFormed := func() bool {
+		if !rejChecked {
+			rejStatus, rejCode, rejDetail = h.checkKeyEnvelopePut(r.Context(), blob, recipientID)
+			rejChecked = true
+		}
+		return rejStatus == 0
+	}
+
 	// Signature covers the body, so authenticate/authorize AFTER reading it.
-	dev, out := h.authorizeOpsRequestDevice(r, blob, vaultID, needWrite)
+	dev, out := h.authorizeOpsWrite(r, blob, vaultID, wellFormed)
 	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
 		return
@@ -247,25 +293,12 @@ func (h *handlers) keyEnvelopePut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(blob) == 0 {
-		writeError(w, http.StatusBadRequest, "empty_envelope", "envelope body must not be empty")
-		return
-	}
-
-	// The recipient must be an enrolled, ACTIVE device — depositing a key for an
-	// unknown or revoked device is refused rather than silently stored.
-	recipient, err := h.devices.GetDevice(r.Context(), recipientID)
-	if err != nil {
-		if errors.Is(err, store.ErrDeviceNotFound) {
-			writeError(w, http.StatusNotFound, "device_not_found", "no such device")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal", "")
-		return
-	}
-	if !recipient.Active() {
-		writeError(w, http.StatusConflict, "device_revoked",
-			"cannot deposit a key envelope for a revoked device")
+	// The memoised shape verdict from above: an empty body (400), an unknown
+	// recipient (404) or a revoked recipient (409). Already computed as the claim
+	// precondition on the device-auth path; computed here on the legacy path,
+	// which never claims anything.
+	if !wellFormed() {
+		writeError(w, rejStatus, rejCode, rejDetail)
 		return
 	}
 

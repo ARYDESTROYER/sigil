@@ -496,6 +496,61 @@ func (h *handlers) authorizeOpsRequestDevice(r *http.Request, body []byte, vault
 	return store.Device{}, authOutcome{Reason: h.authorizeOps(r, body)}
 }
 
+// claimPrecondition reports whether a WRITE request is well-formed enough to be
+// APPLIED. It is evaluated AFTER authentication and BEFORE authorization, and it
+// has exactly ONE effect: when it is false, needWrite is downgraded to
+// needWriteNoClaim so the request cannot take ownership of an unowned vault.
+//
+// ⭐ WHY (Phase 57). Trust-on-first-write fired inside the authorization step,
+// which runs before a handler's cheap request-shape checks — so a request the
+// server was about to REJECT still claimed the vault on its way out. One
+// enrolled device sending 50 EMPTY-bodied appends, one per made-up vault id,
+// took ownership of 50 vault ids while every response was a 400 and no op was
+// ever stored. The per-vault rate limiter cannot bound that: it keys on the very
+// vault id the attacker varies each request. Vault ids are low-entropy and
+// human-chosen (the webapp's default is the literal string "webapp-demo"), so a
+// squatted id is a permanent 403 for its rightful owner.
+//
+// A precondition MUST be CHEAP and VAULT-INDEPENDENT — a body-shape check, or a
+// lookup of a device named in the path — so that downgrading the need level can
+// never itself become an oracle for the vault's ownership state.
+//
+// HONEST LIMIT, deliberately not over-built: this removes the FREE path to a
+// claim, not claiming itself. A determined device can still squat vault ids by
+// sending genuinely well-formed writes — each of which is stored, entitled and
+// audited, i.e. costs the attacker something. Bounding that properly means an
+// abuse limiter keyed on the ACCOUNT (never on the vault id, which the attacker
+// controls); see the note at opsAppend. Trust-on-first-write remains a dev
+// ownership model, not an account model.
+type claimPrecondition func() bool
+
+// authorizeOpsWrite is authorizeOpsRequestDevice for a WRITE, with the
+// trust-on-first-write CLAIM suppressed when wellFormed() reports false.
+//
+// The verify ORDER is unchanged: authentication still precedes authorization,
+// authorization still precedes the handler's answer, and a caller that is not
+// authorized still learns only the coarse 401/403. The precondition changes only
+// whether the vault is CLAIMED, never whether the request is allowed.
+//
+// wellFormed is called ONLY on the device-auth path, and only after the
+// signature verified. In the legacy v2 / no-auth modes nothing ever claims, so
+// there is nothing to suppress and it is not called at all.
+func (h *handlers) authorizeOpsWrite(r *http.Request, body []byte, vaultID string, wellFormed claimPrecondition) (store.Device, authOutcome) {
+	if !h.deviceAuthEnabled() {
+		// Legacy v2 (or disabled) path, unchanged — no registry, no claims.
+		return store.Device{}, authOutcome{Reason: h.authorizeOps(r, body)}
+	}
+	dev, out := h.authenticateDevice(r, body)
+	if !out.allowed() {
+		return store.Device{}, out
+	}
+	need := needWrite
+	if wellFormed != nil && !wellFormed() {
+		need = needWriteNoClaim
+	}
+	return dev, h.authorizeVault(r, dev, vaultID, need)
+}
+
 // writeAuthError maps a denial reason to its response. The error CODE and DETAIL
 // are deliberately coarse — "unauthorized" for every credential failure and
 // "forbidden" for an authorization failure — so a prober learns only the status

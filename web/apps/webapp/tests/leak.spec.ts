@@ -1,6 +1,8 @@
 import { expect, test, type Browser, type Page } from "@playwright/test";
 // @ts-expect-error — plain .mjs test helper shared with the extension suite.
 import { startFakeSigild } from "../../../../sigil-wasm/test/fake-sigild.mjs";
+// @ts-expect-error — plain .mjs test helper shared with the extension suite.
+import { sealedOnlyProblems, emptyProblems } from "../../../../sigil-wasm/test/sealed-store-helper.mjs";
 
 /**
  * ⭐ THE RECOVERY CODE IS A BEARER CREDENTIAL FOR THE WHOLE ACCOUNT (ADR 0042).
@@ -124,8 +126,112 @@ async function sweepStorage(page: Page) {
       parts.push("cache:unavailable");
     }
 
-    return { haystack: parts.join("\n"), localKeys: localKeys.sort() };
+    // ⭐ The STRUCTURAL view, beside the needle haystack. sweepStorage used to
+    // return only `localKeys` (key NAMES), which is why a plaintext
+    // sessionStorage dump of the device seed sailed through 19/19 green specs.
+    const local: Record<string, string> = {};
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i)!;
+      local[k] = window.localStorage.getItem(k) ?? "";
+    }
+    const session: Record<string, string> = {};
+    for (let i = 0; i < window.sessionStorage.length; i++) {
+      const k = window.sessionStorage.key(i)!;
+      session[k] = window.sessionStorage.getItem(k) ?? "";
+    }
+    const idbNames: string[] = [];
+    try {
+      const dbs = (await (
+        indexedDB as IDBFactory & { databases?: () => Promise<{ name?: string }[]> }
+      ).databases?.()) ?? [];
+      for (const meta of dbs) if (meta.name) idbNames.push(meta.name);
+    } catch {
+      /* enumeration unsupported: the haystack sweep above still ran */
+    }
+    const cacheUrls: string[] = [];
+    try {
+      if (globalThis.caches) {
+        for (const name of await caches.keys()) {
+          const cache = await caches.open(name);
+          for (const req of await cache.keys()) cacheUrls.push(req.url);
+        }
+      }
+    } catch {
+      /* ditto */
+    }
+
+    return {
+      haystack: parts.join("\n"),
+      localKeys: localKeys.sort(),
+      local,
+      session,
+      cookie: document.cookie,
+      idbNames,
+      cacheUrls,
+      origin: window.location.origin,
+    };
   });
+}
+
+type Swept = Awaited<ReturnType<typeof sweepStorage>>;
+
+/**
+ * ⭐ ADR 0036, ASSERTED POSITIVELY: every persisted value is a sealed `SIGILcli`
+ * container, and every OTHER client-side store is EMPTY.
+ *
+ * The old spec pinned localStorage KEY NAMES and nothing else, so a value could
+ * be anything and sessionStorage / IndexedDB / Cache Storage were unconstrained.
+ * A verifier proved that by adding one plaintext
+ * `sessionStorage.setItem("sigil.webapp.cache", JSON.stringify(device))` to
+ * persistDevice — dumping the raw device seed, the hybrid secret and every vault
+ * key — with the whole suite still green.
+ *
+ * Cache Storage is the one surface allowed to be non-empty: this app is a PWA
+ * whose service worker precaches its own shell. It is constrained STRUCTURALLY
+ * instead — every cached entry must be a SAME-ORIGIN asset URL, so a sync
+ * response (or anything else cross-origin) can never be sitting in it.
+ */
+function expectSealedOnly(where: string, s: Swept, expectedKeys: string[]) {
+  const problems = [
+    ...sealedOnlyProblems(s.local, expectedKeys),
+    ...emptyProblems("sessionStorage", s.session),
+    ...emptyProblems("cookies", s.cookie),
+    ...emptyProblems("IndexedDB", s.idbNames),
+    ...s.cacheUrls.filter((u) => !isPrecacheableShellAsset(u, s.origin)).map(
+      (u) => `Cache Storage holds a NON-SHELL entry: ${u}`,
+    ),
+  ];
+  expect(problems, `${where}: ADR 0036 says browsers persist ONLY sealed containers`).toEqual([]);
+}
+
+/**
+ * Is this Cache Storage entry something the service worker is ALLOWED to hold?
+ *
+ * ⚠️ THIS USED TO BE `!url.startsWith(origin)` — i.e. it only ever flagged
+ * CROSS-origin entries, which made it vacuous against the threat it exists to
+ * catch: every plausible leak (a regression, an attacker-controlled write, the
+ * service worker itself) is SAME-origin. An auditor proved it by writing a full
+ * plaintext dump of the device identity — Ed25519 seed, hybrid secret and every
+ * vault key — to a same-origin Cache Storage entry, and this suite still passed
+ * 19/19 while the extension caught the identical plant.
+ *
+ * The service worker (public/sw.js) caches only same-origin GET responses, and
+ * only the app SHELL plus static assets. So the honest constraint is an
+ * ALLOWLIST of what the shell legitimately contains, not an origin check:
+ * anything else in that cache is state the app put there, which is exactly what
+ * ADR 0036 forbids.
+ */
+function isPrecacheableShellAsset(rawUrl: string, origin: string): boolean {
+  if (!rawUrl.startsWith(origin)) return false; // cross-origin: never legitimate
+  let path: string;
+  try {
+    path = new URL(rawUrl).pathname;
+  } catch {
+    return false;
+  }
+  if (path === "/") return true; // the shell itself (SHELL = ["/"] in sw.js)
+  if (path.startsWith("/_next/")) return true; // Next.js build output
+  return /\.(js|mjs|css|wasm|png|svg|ico|webmanifest|json|woff2?)$/.test(path);
 }
 
 /** Every casing/grouping a leak could plausibly take. */
@@ -199,6 +305,9 @@ test("the recovery code reaches NO store, NO log, NO request and NO URL — on b
   assertAbsent("profile 1 address bar", page.url(), formatted);
   // Only sealed containers are at rest — enumerated, not assumed.
   expect(s1.localKeys).toEqual(["sigil.webapp.device.v1", "sigil.webapp.vault.v1"]);
+  // ⭐ ...and asserted POSITIVELY: those values ARE `SIGILcli` containers, and
+  // every other store is empty.
+  expectSealedOnly("profile 1", s1, ["sigil.webapp.device.v1", "sigil.webapp.vault.v1"]);
   expect(w1.logs.filter((l) => l.startsWith("PAGEERROR"))).toEqual([]);
 
   // ── profile 2: a clean install RESTORES with the code ──────────────────────
@@ -226,6 +335,10 @@ test("the recovery code reaches NO store, NO log, NO request and NO URL — on b
   assertAbsent("restore console output", w2.logs.join("\n"), formatted);
   assertAbsent("restored address bar", p2.url(), formatted);
   expect(s2.localKeys).toEqual(["sigil.webapp.device.v1", "sigil.webapp.vault.v1"]);
+  expectSealedOnly("restored profile", s2, [
+    "sigil.webapp.device.v1",
+    "sigil.webapp.vault.v1",
+  ]);
   expect(w2.logs.filter((l) => l.startsWith("PAGEERROR"))).toEqual([]);
 
   // The new password is memory-only too.
@@ -238,6 +351,7 @@ test("the recovery code reaches NO store, NO log, NO request and NO URL — on b
   const s3 = await sweepStorage(p2);
   assertAbsent("client storage after reload", s3.haystack, formatted);
   assertAbsent("DOM after reload", await p2.content(), formatted);
+  expectSealedOnly("after reload", s3, ["sigil.webapp.device.v1", "sigil.webapp.vault.v1"]);
 
   await ctx.close();
 });

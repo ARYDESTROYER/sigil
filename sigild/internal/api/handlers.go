@@ -195,7 +195,21 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 	// single-key signature check; with no auth configured it always allows. Must
 	// run AFTER the body is read (it is part of the signed message) and BEFORE we
 	// append.
-	dev, out := h.authorizeOpsRequestDevice(r, blob, vaultID, needWrite)
+	//
+	// ⭐ THE CLAIM PRECONDITION (Phase 57): an EMPTY body is rejected below with a
+	// 400, so such a request must not be able to CLAIM an unowned vault on its way
+	// to that rejection. Passing it here downgrades needWrite to needWriteNoClaim,
+	// which is the whole fix — the authorization checks themselves are untouched
+	// and still run first. On an unowned vault the empty write therefore answers
+	// 403 (it holds no grant and earned no ownership) rather than 400; on a vault
+	// the caller may write it still answers 400. Either way: nothing is claimed.
+	//
+	// The abuse limiter cannot substitute for this ordering: SIGILD_OPLOG_RATE_LIMIT
+	// keys on the vault id, and a squatter varies the vault id every request. A
+	// per-ACCOUNT claim budget is the real bound and is NOT implemented — see
+	// claimPrecondition for the honest limit.
+	bodyEmpty := len(blob) == 0
+	dev, out := h.authorizeOpsWrite(r, blob, vaultID, func() bool { return !bodyEmpty })
 	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
 		return
@@ -214,7 +228,7 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 	if !h.requireEntitlement(w, r, dev, entitlementSurfaceOpsAppend) {
 		return
 	}
-	if len(blob) == 0 {
+	if bodyEmpty {
 		writeError(w, http.StatusBadRequest, "empty_op", "operation body must not be empty")
 		return
 	}

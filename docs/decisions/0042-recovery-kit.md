@@ -496,3 +496,55 @@ suites still run against a **test double** (`sigil-wasm/test/fake-sigild.mjs`)
 for everything except `cors.spec.ts`; real-server conformance for the kit still
 lives in `cli/tests/e2e-recovery.sh` and
 `sigil-wasm/test/recovery-interop.mjs`.
+
+## The kit's device LABEL is now pinned to a golden literal (added Phase 57, 2026-07-28)
+
+Per this repo's addendum rule the text above is left untouched. Two things in it
+need correcting or completing.
+
+### 1. The construction is SINGLE-SOURCED. The LABEL is the mirror — and it was untested.
+
+The *Neutral* section says the construction is "mirrored, not shared, across the
+two implementations". **That is not what the code does, and the sentence
+immediately after it says so.** The Crockford codec, the checksum and the three
+HKDF derivations live in **one place**, `libsigil/core/src/recovery.rs`; the CLI
+imports `encode_recovery_kit` / `decode_recovery_kit` / `derive_recovery_keys`
+directly, and the JS calls them through one-line `#[wasm_bindgen]` shells. There
+is no second implementation to drift.
+
+**What genuinely was a mirror — and had no test at all — is the device LABEL.**
+`"recovery-kit"` existed as **three independent string literals**:
+`cli/src/lib.rs::RECOVERY_DEVICE_LABEL`, `sigil-wasm/recovery.mjs`'s
+`RECOVERY_DEVICE_LABEL`, and a **third** copy inside `sigil-wasm/sharing.mjs`. The
+audit renamed it in **both** JS files and every suite stayed green.
+
+That matters because the label is the **only** signal driving
+`recipientIsRecoveryKit` — the arm that makes a wrap to a kit obey §5's mandatory
+safety-number rule instead of ordinary TOFU. A rename in one place silently
+downgrades a kit wrap to first-sight trust-on-first-use.
+
+### 2. The fix, and why "consistent" is not good enough
+
+- **The two JS literals are de-duplicated to one**: `sharing.mjs` now imports the
+  label from `recovery.mjs` instead of redefining it. Two literals remain, one per
+  language.
+- **`sigil-wasm/test/recovery-interop.mjs` drives the REAL `sigil` binary in both
+  directions** against a kit the other language enrolled, expecting the refusal.
+- ⚠️ **A verifier then showed a *coordinated* rename still passed** — both
+  languages agreeing on a new spelling satisfies a cross-language equality check.
+  So the assertion now pins **both languages against a GOLDEN LITERAL**,
+  `"recovery-kit"`. **The label is a WIRE value**: the server stores it on the
+  device row and older clients compare against it, so it is **not free to change
+  even consistently**. A cross-language agreement test is the wrong shape for a
+  value whose compatibility extends to already-deployed clients.
+
+### 3. A third hand-written copy remains, and drifts silently
+
+`RECOVERY_DEVICE_LABEL` in `web/packages/sigil-wasm/index.d.ts` is a **literal
+type**, hand-written a third time. A coordinated rename in the two runtime files
+leaves that declaration contradicting the runtime value while `tsc` stays clean —
+no test can see it. It is annotated in place pointing at the golden assertion as
+the authority. (The `interface SigilWasm` gap recorded in *Neutral* was closed in
+Phase 56; this is a different and still-open one.)
+
+Nothing about the kit itself changed. Limitations 1–13 stand as written.

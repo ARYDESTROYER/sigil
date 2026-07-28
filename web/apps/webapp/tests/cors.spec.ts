@@ -38,7 +38,27 @@ import path from "node:path";
 const T = 90_000;
 const WEBAPP_ORIGIN = "http://127.0.0.1:3210";
 const ENROLL_TOKEN = "cors-proof-token-0123456789abcdef";
-const GO = process.env.GO ?? "/opt/homebrew/bin/go";
+// Resolve Go the way the rest of the repo does: $GO, then PATH, then the macOS
+// Homebrew path LAST. An earlier version tried only `process.env.GO ?? the
+// Homebrew path`, so on a CI runner — where setup-go puts `go` on PATH but sets
+// no GO variable — this file `test.skip`ped ITSELF and the job stayed green while
+// proving nothing. That is exactly the regression this spec exists to catch, so
+// the resolution order matters as much as the assertions do.
+// (interop.yml sets `GO: go` explicitly; desktop/core/tests/server_interop.rs
+// resolves the same way and PANICS rather than skipping.)
+const GO = process.env.GO ?? (whichGo() ?? "/opt/homebrew/bin/go");
+
+function whichGo(): string | null {
+  for (const candidate of ["go", "/usr/local/go/bin/go", "/opt/homebrew/bin/go"]) {
+    try {
+      execFileSync(candidate, ["version"], { stdio: "ignore" });
+      return candidate;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return null;
+}
 const SIGILD_DIR = path.resolve(__dirname, "../../../../sigild");
 
 function haveGo(): boolean {

@@ -7,8 +7,14 @@
 > UNAUDITED** cryptographic building blocks — an Argon2id KDF, an
 > XChaCha20-Poly1305 + HKDF-SHA256 AEAD, a composed `seal_record`/`open_record`,
 > and a C-ABI over them — that are **not wired into a finished
-> account/key-management product**. `sigild` performs **no cryptography** and
-> stores only opaque blobs. No security claims hold yet: nothing here is
+> account/key-management product**. `sigild` performs **no cryptography on vault
+> content** and stores only opaque blobs — ⚠️ **which is not the same as "no
+> cryptography", and this line used to say the wrong one.** `sigild` really does
+> verify Ed25519 request signatures, hash the op-log chain with SHA-256, digest
+> enrollment tokens and verify provider webhook HMACs in constant time, and it
+> really does hold **public** device keys, published **public** hybrid keys and
+> webhook **secrets**. What it holds none of is a key that can **decrypt a
+> vault**. No security claims hold yet: nothing here is
 > "audited", "secure", "post-quantum secure", "SOC 2", or unqualified
 > "end-to-end encrypted". **Do not store real secrets.**
 >
@@ -27,7 +33,9 @@
 ## 1. Component map
 
 Sigil splits cleanly into a **client-side cryptographic core** (which does all
-the crypto) and a **server skeleton** (which does none). The pieces in this repo:
+the crypto **on user data**) and a **server skeleton** (which does none of
+*that* — but which does authenticate, hash-chain and verify webhooks with real
+cryptography of its own; see the status note above). The pieces in this repo:
 
 - **`libsigil/core`** ([`../libsigil/core/`](../libsigil/core/)) — the Rust
   crypto core. `#![forbid(unsafe_code)]`, `no_std` (uses `core` + `alloc`), and
@@ -746,8 +754,19 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   ([`decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md`](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)).
   Billing touches **nothing** in `sigil_vault_ops` and performs no cryptography
   on vault contents, so the trust boundary is unchanged.
-  `sigild` performs **no cryptography** on vault contents and never sees plaintext
-  or vault keys. Full contract in [`api.md`](api.md).
+  `sigild` performs **no cryptography on vault contents** and never sees plaintext
+  or vault keys — but it is **not** crypto-free: it verifies Ed25519 request
+  signatures, chains ops with SHA-256, digests enrollment and admin tokens, and
+  verifies provider webhook HMACs in constant time. The distinction that matters
+  is that **none of those keys can decrypt a vault**. Full contract in
+  [`api.md`](api.md).
+  **A rejected write never claims a vault** ([ADR 0045](decisions/0045-claim-precondition-rejected-writes-never-claim.md)):
+  trust-on-first-write used to fire inside authorization, ahead of a handler's
+  request-shape checks, so a request answered `400` still took permanent ownership
+  of the vault id it named. A cheap, vault-independent precondition now downgrades
+  the access level of a request that is going to be refused, so it cannot claim —
+  at the cost of one documented status change (an empty write to an **unowned**
+  vault answers `403`, not `400`).
 - **`web/apps/marketing`** ([`../web/apps/marketing/`](../web/apps/marketing/)) —
   Next.js 15 stealth splash + early-access waitlist. No-index, wallable, no
   product surface.
@@ -855,7 +874,13 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   stores no envelope, and is told a wrong safety number is a mismatch),
   `tests/leak.spec.ts` (an **enumerating** sweep of every storage key *and value*,
   cookies, IndexedDB, Cache Storage, the DOM, every request URL/body, every console
-  message and the address bar, against four spellings of the recovery code),
+  message and the address bar, against four spellings of the recovery code — and,
+  since Phase 57, ⭐ **the POSITIVE assertion of [ADR 0036](decisions/0036-browser-sharing-secret-storage.md)**:
+  every persisted value must decode to bytes beginning with the `SIGILcli` magic
+  and every other surface must be **empty**, with Cache Storage constrained by an
+  **allowlist** of what the service worker legitimately holds — the shell `/`,
+  `/_next/` output and static asset extensions — because filtering only
+  *cross-origin* entries was vacuous against a same-origin plant),
   `tests/entitlement.spec.ts` and ⭐ **`tests/cors.spec.ts` — the only spec here that
   drives the UI against a REAL `sigild`** (it builds and boots one, enrols this browser
   through the enrollment UI over the real contract-v3 signed path, and asserts the
@@ -865,6 +890,14 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   double** (`sigil-wasm/test/fake-sigild.mjs`), and **print output is not verified** —
   headless Chromium cannot render a printed page, so the recovery sheet's
   `@media print` rules are by-eye.
+  ⚠️ **And the double is MORE PERMISSIVE than real `sigild` on axes its header does
+  not disclaim** (found by the fourth audit): its catch-all answers **`404`**,
+  inverting the *"`501` by default, never `404`"* invariant **inside the double**;
+  and it enforces **no envelope size cap, no hybrid-key length validation and no
+  recipient existence/revocation check**. An auditor tightened all four and both
+  browser suites stayed green, so it conceals no **current** defect — but a suite
+  built on a laxer server than the real one is exactly how the CORS hole survived
+  twelve phases, and this is latent risk of the same shape.
   It carries the **same no-index stealth posture as
   marketing** (`X-Robots-Tag noindex/nofollow/noarchive`, `X-Content-Type-Options
   nosniff`, `Referrer-Policy no-referrer`, `X-Frame-Options DENY`, plus an
@@ -948,6 +981,12 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   webapp's — `recovery.spec.mjs`, `wrap-gate.spec.mjs`, `leak.spec.mjs` and
   `entitlement.spec.mjs` — which do drive the enrollment UI (against the test double),
   closing the earlier gap that no Playwright test had clicked the enroll button.
+  Since Phase 57 `leak.spec.mjs` also asserts [ADR 0036](decisions/0036-browser-sharing-secret-storage.md)
+  **positively**: every value in `chrome.storage.local` must be a sealed `SIGILcli`
+  container and `chrome.storage.session` / `sync` / `managed`, `sessionStorage`,
+  cookies and IndexedDB must all be **empty**. That is the assertion the extension
+  suite had never made either — a planted plaintext dump of the device seed, the
+  hybrid secret and every vault key had passed 12/12.
   ⭐ **The extension never needed the CORS fix**: an MV3 page with a host permission is
   **exempt from CORS**, so while the webapp could not reach a real `sigild` at all, the
   extension always could — the asymmetry that kept its suite honest and hid the webapp's
@@ -1450,7 +1489,7 @@ place an answer to a lying server can live.
   │             pinned_at, repins}│           ║        ▼
   └───────────────┬───────────────┘           ║   whatever the server chooses to say
                   │                           ║        │
-                  ▼   fetch_hybrid_key_pinned / fetchHybridKeyPinned  ◀───┘
+                  ▼  verify_recipient_for_wrap / verifyRecipientForWrap ◀───┘
         ┌─────────────────────┐               ║
         │ compare RAW bytes   │               ║   ⚠️ the request is authenticated;
         │  first sight → PIN  │  ⚠️ + warn    ║      the RESPONSE is not. Nothing
@@ -1460,12 +1499,27 @@ place an answer to a lying server can live.
 ```
 
 **Where the choke point is.** Enforcement rides on **the fetch itself** —
-`fetch_hybrid_key_pinned` (Rust) / `fetchHybridKeyPinned` (JS) return a key only
-after checking it — and **every** wrap path, share and rotate, in both
-implementations, goes through it. That is deliberate: a trust store that some code
-path forgets to consult is worthless. The unchecked `fetch_hybrid_key` /
-`fetchHybridKey` survive only where nothing is wrapped — displaying a safety number,
-the deliberate re-pin, and the desktop's `check_server`.
+`verify_recipient_for_wrap` (Rust) / `verifyRecipientForWrap` (JS) return a
+recipient only after checking it — and **every** wrap path (share, rotate and
+recovery-kit cover), in both implementations, goes through it. That is deliberate:
+a trust store that some code path forgets to consult is worthless. In Rust the
+rule is enforced **by type**: the gate is the only constructor of a
+`VerifiedRecipient`, and the wrap→deposit→grant path accepts nothing else
+([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)
+addenda, [ADR 0042](decisions/0042-recovery-kit.md)). The unchecked
+`fetch_hybrid_key` / `fetchHybridKey` survive only where nothing is wrapped —
+displaying a safety number, the deliberate re-pin, and the desktop's
+`check_server`.
+
+⚠️ **The earlier gate was DELETED, not merely bypassed.** `fetch_hybrid_key_pinned`
+(Rust) / `fetchHybridKeyPinned` (JS) were this ADR's original choke point.
+Phase 54 superseded them and Phase 57 removed them: the Rust one had **zero
+callers** and the JS one had exactly **one** (a test), while every document —
+including this one — still recommended them by name. They pin, but they do **not**
+refuse an unverified recovery kit and do **not** honour a supplied safety number,
+so the next caller reaching for the familiar name would have gotten a wrap that
+skipped two of the three refusals. A superseded choke point is a ready-made bypass,
+not harmless dead code.
 
 **Two implementations, not four.** The Rust `sigil-cli` library serves the CLI **and**
 the desktop app ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md));

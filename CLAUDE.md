@@ -288,12 +288,36 @@ public, make no security claims, until the audit completes and trademark clears.
   **AUTHORIZATION:** grants are `(vaultID, deviceID) -> read|write` (write implies read);
   ownership is **TRUST-ON-FIRST-WRITE** — the first device to authenticate a WRITE to an
   unclaimed vault becomes owner (atomic: mutex in mem, partial UNIQUE index in Postgres);
-  reads never claim (403 on an unowned vault); only the owner may grant. **401 =
-  unauthenticated, 403 = authorized-not-permitted**, but the client body is only
+  reads never claim (403 on an unowned vault); only the owner may grant.
+  ⭐ **AND A REJECTED WRITE NEVER CLAIMS (Phase 57, ADR 0045).** The claim fired inside
+  authorization, which runs BEFORE a handler's cheap shape checks, so a request the server
+  was about to REJECT still took the vault: **50 empty-bodied appends across 50 made-up
+  vault ids → 50× 400, 0 stored ops, 50 CLAIMS**, and a second device was then permanently
+  403 on its own genuine first write. The per-vault rate limiter cannot bound it — it keys
+  on the vault id the attacker varies, and vault ids are LOW-ENTROPY AND HUMAN-CHOSEN (the
+  webapp defaults to the literal `"webapp-demo"`). Fix: a **`claimPrecondition`** +
+  **`authorizeOpsWrite`** (`deviceauth.go`) evaluate a cheap, VAULT-INDEPENDENT predicate
+  and downgrade `needWrite` → `needWriteNoClaim` when the request is going to be rejected,
+  so it can never reach `ClaimVault`. Applied to `opsAppend` (empty body) and
+  `keyEnvelopePut` (empty body / unknown recipient / revoked recipient, factored into
+  `checkKeyEnvelopePut` and memoised so the verdict cannot drift from the response).
+  ⚠️ **DELIBERATE BEHAVIOUR CHANGE:** an empty/malformed write to an **UNOWNED** vault now
+  answers **403** (no grant, no ownership earned) instead of 400 — on a vault the caller may
+  already write it still answers 400/404/409 exactly as before. ⚠️ **HONEST RESIDUAL:** a
+  determined device can still squat ids with genuinely well-formed writes; **there is no
+  per-account claim budget**, only a code comment naming it as the real bound.
+  **401 = unauthenticated, 403 = authorized-not-permitted**, but the client body is only
   `{"error":"unauthorized"}` / `{"error":"forbidden"}` — the typed reason
   (`unknown_device`/`revoked_device`/`unauthorized_vault`/`not_vault_owner`/
   `forbidden_device`/`bad_admin_token`/`bad_proof`/`enrollment_token_used`/… ) goes ONLY to
-  the audit log + metrics, so **there is no auth oracle**. Optional
+  the audit log + metrics, so **there is no auth oracle**. ⚠️ **`/metrics` carries a NARROWER
+  label set than the audit log (Phase 57):** `forbidden_account` (vault exists, other
+  account) is **collapsed onto `unauthorized_vault`** by `authDenyMetricReason`, because the
+  two are byte-identical to a client while the METRIC delta answered *"does this vault id
+  exist?"* on an always-on unauthenticated surface. `not_vault_owner` / `forbidden_device`
+  (the caller's own relationship to a resource it already reached) and
+  `vault_owner_unresolved` (a repair state an operator must see) are deliberately kept —
+  a narrowing, not a closure. Optional
   **`SIGILD_ADMIN_TOKEN`** (≥16 chars) gates the operator routes (list all / revoke any);
   **unset ⇒ those routes are permanently 401 — there is NO implicit open-admin mode**. All
   four env vars are validated **fail-fast before the listener binds**.
@@ -844,10 +868,24 @@ public, make no security claims, until the audit completes and trademark clears.
   **enumerating** sweep: every localStorage/sessionStorage key AND value, cookies, every
   IndexedDB record, every Cache Storage entry, the DOM after dismissal, every request
   URL/body, every console message from before the first navigation, and the address bar,
-  against four spellings of the code), `entitlement.spec.ts`, and ⭐ **`cors.spec.ts` — the
+  against four spellings of the code — and, since Phase 57, ⭐ **the POSITIVE assertion of
+  ADR 0036**: every persisted value must decode to bytes starting with the `SIGILcli` magic
+  and every other surface must be EMPTY, because a planted plaintext `sessionStorage` write
+  dumped the Ed25519 seed, the hybrid secret and every vault key while this suite passed
+  19/19. ⚠️ Cache Storage — the one surface allowed to be non-empty, this being a PWA — is
+  constrained by an **ALLOWLIST** (`/`, `/_next/`, static asset extensions); the first fix
+  filtered only CROSS-origin entries, which was vacuous, since every plausible leak is
+  same-origin and the extension caught the identical plant),
+  `entitlement.spec.ts`, and ⭐ **`cors.spec.ts` — the
   ONLY spec that drives the UI against a REAL `sigild`** (both directions: allowlisted ⇒
-  enrols, unlisted ⇒ blocked). ⚠️ Every other spec runs against
-  `sigil-wasm/test/fake-sigild.mjs`, a **double**; ⚠️ **print output is NOT verified**
+  enrols, unlisted ⇒ blocked). ⚠️ It resolved Go as `process.env.GO ?? "/opt/homebrew/bin/go"`
+  with **no PATH lookup**, so in CI it **`test.skip`ped itself** and that only browser-level
+  proof silently vanished while the job stayed green — Phase 57 gave it a PATH lookup **and**
+  `GO: go` on the workflow step (`actions/setup-go` alone did NOT fix it: it sets PATH, never
+  `$GO`). ⚠️ Every other spec runs against
+  `sigil-wasm/test/fake-sigild.mjs`, a **double** that is MORE PERMISSIVE than real sigild
+  (catch-all 404, no envelope size cap, no hybrid-key length check, no recipient
+  existence/revocation check); ⚠️ **print output is NOT verified**
   (headless Chromium cannot render a printed page, so `@media print` is by-eye). Do NOT
   store real 2FA secrets.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
@@ -879,7 +917,17 @@ public, make no security claims, until the audit completes and trademark clears.
   so marketing typecheck/lint/build and CI are unchanged and stay Rust-free (ADR 0027).
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
-  Architecture Decision Records (Nygard-style ADRs for load-bearing choices).
+  Architecture Decision Records (Nygard-style ADRs for load-bearing choices; latest is
+  **0045**, the claim precondition). ⚠️ **Audit #4 found the STATUS BLOCKS an external
+  reviewer reads FIRST were false** and would have scoped sigild's cryptography out of
+  review: `api.md`, `architecture.md` and `deployment.md` each opened with *"performs no
+  cryptography / holds no keys / runs no auth"* while `grep -rE
+  'crypto/(ed25519|hmac|sha256|subtle|rand)' sigild --exclude '*_test.go'` returns **29
+  hits** across `cmd/server` and `internal/{api,billing,store}`. Corrected everywhere: the
+  true statement is **no crypto ON VAULT CONTENT and no key that can DECRYPT a vault** —
+  sigild does plenty of crypto for **authentication, hash-chaining and webhook
+  verification**, and it holds device public keys, published hybrid public keys and
+  provider webhook secrets.
 - `deploy/` — Terraform / Nomad / Caddy / systemd skeletons, **plus `local/`** (a
   loopback-only `docker compose` Caddy→sigild topology smoke — no real TLS; brought
   up + torn down, **not a deployment**) **and `preflight.sh`** (a read-only GO/NO-GO
@@ -893,7 +941,15 @@ public, make no security claims, until the audit completes and trademark clears.
 - `scripts/` — **`gate.sh`** (Phase 56), the documented way to run **everything**: it
   enumerates every suite dynamically, counts results instead of trusting exit codes,
   prints an inventory, and runs a **CI-drift check** asserting every node interop suite
-  and shell e2e script is named in some workflow. See *Build & test* below.
+  and shell e2e script is named in some workflow. ⚠️ **Audit #4 (Phase 57) found TWO
+  blind spots in it, both fixed:** it began with a **hardcoded absolute `cd`**, so run
+  from a git **worktree** it built and tested the MAIN checkout (a planted `getrandom`
+  stanza in a worktree lockfile still printed `✓ getrandom==0`, and it bit the audit
+  itself — one lens reported ALL GREEN about a tree it was not auditing); and it **never
+  set `SIGILD_TEST_POSTGRES`**, so ~30 tests skipped while it counted only PASS/FAIL. It
+  now resolves the repo **from its own location** and **prints the tree + commit it is
+  gating**, starts a throwaway `postgres:16` on a free port, and **FAILS if any test
+  skipped**. See *Build & test* below.
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
   **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
@@ -1028,9 +1084,16 @@ public, make no security claims, until the audit completes and trademark clears.
   ⭐ Also **`sigil device safety-number|pins|repin`** and **`sigil vault rotate`** —
   **KEY VERIFICATION + ROTATION** (Phase 50, ADR 0038), the client-side answer to a
   **key-substituting server**. ⚠️ **THE CHOKE POINT is the FETCH:**
-  `fetch_hybrid_key_pinned(server, device_id, auth, pins_path)` fetches a hybrid public
-  key **and pin-checks it in ONE call**, and **EVERY wrap path (share AND rotate) goes
-  through it**; the bare `fetch_hybrid_key` survives only where nothing is wrapped
+  **`verify_recipient_for_wrap`** fetches a hybrid public key, **pin-checks it, checks any
+  supplied safety number and refuses an unverified recovery kit — all in ONE call** — and
+  **EVERY wrap path (share, rotate AND recovery cover) goes through it**, enforced BY TYPE
+  (it is the only constructor of `VerifiedRecipient`, and the wrap path accepts nothing
+  else). ⚠️ **`fetch_hybrid_key_pinned` NO LONGER EXISTS** — it was this rule's original
+  choke point, superseded in Phase 54 and **DELETED in Phase 57** (audit #4) after sitting
+  as a public `pub fn` with **zero callers** while every doc still recommended it by name:
+  it pins but does NOT refuse a kit and does NOT honour a supplied safety number, so the
+  next caller reaching for the familiar name got a weaker gate. A tombstone comment marks
+  the spot. The bare `fetch_hybrid_key` survives only where nothing is wrapped
   (safety-number display, the deliberate re-pin, desktop `check_server`). `check_and_pin`
   compares **decoded RAW bytes of BOTH halves**: unseen ⇒ `PinStatus::FirstSight` (pins,
   proceeds, **warns**); identical ⇒ `Match` (proceeds silently); **DIFFERENT ⇒
@@ -1113,6 +1176,19 @@ public, make no security claims, until the audit completes and trademark clears.
   first-sight kit wraps against a server that does not lie about labels"**, **NOT** "refuses
   first-sight kit wraps". (A verifier judged this consistent with ADR 0038's accepted
   TOFU-on-first-contact limit and asked that the ADR say it in exactly those words.)
+  ⭐ **THAT LABEL IS THE ONE REAL MIRROR IN THE RECOVERY WORK — and it had NO TEST until
+  Phase 57.** The codec + derivation are **SINGLE-SOURCED** in `libsigil/core/src/recovery.rs`
+  (the CLI imports them; the wasm exports are one-line shells), so `docs/crypto-spec.md`'s old
+  "MIRRORED — NOT SHARED" line about the construction was wrong. The LABEL, though, existed as
+  **THREE** hand-written literals (`cli/src/lib.rs`, `sigil-wasm/recovery.mjs`,
+  `sigil-wasm/sharing.mjs`) — renaming it in BOTH JS files left every suite green. Now: the
+  two JS copies are **one** (`sharing.mjs` imports it), and `recovery-interop.mjs` drives the
+  **REAL `sigil` binary in both directions** expecting a refusal ⚠️ **pinned against a GOLDEN
+  LITERAL** (`"recovery-kit"`), because a coordinated rename still passed a
+  cross-language equality check — and the label is a **WIRE value** the server stores and
+  older clients compare against, so it is **not free to change even "consistently"**.
+  ⚠️ A **third** literal type in `web/packages/sigil-wasm/index.d.ts` still drifts silently
+  (annotated in place; `tsc` cannot see it).
   ⚠️ **OTHER HONEST LIMITS:** whoever holds the paper has **FULL CONTROL of the account**
   (read every covered vault, revoke every device) — **stronger than a stolen locked phone**,
   since there is no OS lock and no vault password, and the kit's nominal `read` grant is
@@ -1340,9 +1416,14 @@ public, make no security claims, until the audit completes and trademark clears.
   `hybridSafetyDigest` / `renderSafetyNumber` (+ `SAFETY_NUMBER_PREFIX` /
   `SAFETY_NUMBER_PAIR_PREFIX` / `SAFETY_NUMBER_GROUPS` / `SAFETY_NUMBER_BYTES_PER_GROUP`),
   `newPinStore` / `requirePinStore` / `checkAndPin` / `repinHybridKey` /
-  `HYBRID_PIN_STORE_VERSION`, the ⭐ choke point **`fetchHybridKeyPinned(wasm, auth,
-  deviceId, pins = auth.pins)`** (fetch + pin-check in ONE call; **every** wrap path —
-  `shareVault` AND `rotateVaultKey` — goes through it), the catchable
+  `HYBRID_PIN_STORE_VERSION`, the ⭐ choke point **`verifyRecipientForWrap(wasm, auth,
+  deviceId, opts)`** (fetch + pin-check + safety-number check + recovery-kit refusal in ONE
+  call; **every** wrap path — `shareVault`, `rotateVaultKey` AND `coverVault` — goes through
+  it). ⚠️ **`fetchHybridKeyPinned` NO LONGER EXISTS**: superseded in Phase 54, **DELETED in
+  Phase 57** (audit #4) — it survived with exactly ONE caller (a test) while the docs still
+  named it as the gate, and an exported fetch-and-pin without the kit refusal is a
+  ready-made bypass. The test's one call was **moved onto the real gate**, so its coverage
+  is no longer illusory. Also the catchable
   **`KeyPinMismatchError`** (carries `deviceId` + BOTH safety numbers), the transport
   `listKeyEnvelopes` / `deleteKeyEnvelope`, and **`rotateVaultKey`** (pin-check EVERY
   recipient FIRST → fresh key → re-seal → wrap+upsert per recipient → delete every other
@@ -1352,7 +1433,11 @@ public, make no security claims, until the audit completes and trademark clears.
   would make two people comparing digits wrongly conclude they were under attack). ⚠️
   **`requirePinStore` FAILS CLOSED** — a missing store **throws** rather than defaulting
   to empty, because the old fallback meant a caller that forgot its pins silently got
-  "every key is first-sight", i.e. the control degraded into a no-op. Proven by
+  "every key is first-sight", i.e. the control degraded into a no-op. ⚠️ **That behaviour
+  had NO TEST until Phase 57** — reverting it to fail open left every suite green — and is
+  now asserted in **`sigil-wasm/test/pinning-interop.mjs`**, including that `shareVault`
+  and `verifyRecipientForWrap` **refuse** rather than proceeding to an unpinned first
+  sight. Proven by
   **`sigil-wasm/test/pinning-interop.mjs`** (below). It does **NO crypto itself** (SHA-256
   via `crypto.subtle`, KEM/AEAD in the wasm), so `Cargo.lock`s stay `getrandom`==0.
   **Phase 54 added the JS half of the RECOVERY KIT (ADR 0042):** six thin-shell wasm exports
@@ -1474,9 +1559,16 @@ public, make no security claims, until the audit completes and trademark clears.
   stayed honest while the webapp's real path was dead (ADR 0044). Four new specs —
   `recovery.spec.mjs`, `wrap-gate.spec.mjs` (a second profile that never saw the sheet is
   refused and stores no envelope), `leak.spec.mjs` (the same enumerating sweep as the
-  webapp) and `entitlement.spec.mjs` — bring it to **12 tests in 5 spec files**, and they
-  DO drive the enrollment UI, closing the old "enrollment UI is not Playwright-covered"
+  webapp — plus, since Phase 57, the **positive ADR 0036 assertion**: every value in
+  `chrome.storage.local` must be a sealed `SIGILcli` container and
+  `chrome.storage.session`/`sync`/`managed`, `sessionStorage`, cookies and IndexedDB must
+  all be EMPTY) and `entitlement.spec.mjs` — bring it to **12 tests in 5 spec files**, and
+  they DO drive the enrollment UI, closing the old "enrollment UI is not Playwright-covered"
   gap. ⚠️ They run against the **`fake-sigild.mjs` double**, not a real server.
+  Phase 57 also gave `popup.js`'s `authErr` a **402 arm** — it rendered a lapsed-account
+  cross-account share as an anonymous `HTTP 402`, because no JS explainer had a 402 case;
+  `explainAuthStatus` / `explainRecoveryStatus` now spell out that a 402 is a **BILLING
+  state**, not an authentication or permission failure, and that reading is never refused.
   **Dev / UNAUDITED / loaded unpacked / published to NO store**; sync is **loopback
   plain-HTTP only, no TLS**; generate-only (no verification / constant-time compare /
   zeroization); the reserved-stub ambitions (phishing protection, passkey provider,
@@ -1610,7 +1702,9 @@ public, make no security claims, until the audit completes and trademark clears.
   is still **no QR scanning, no code verification, no hardened zeroization**; the
   other native platforms (**mobile especially**) remain unbuilt. **Phase 50 (ADR 0038)
   reached the desktop for free, by the same reuse rule:** `net.rs` calls the library's
-  `fetch_hybrid_key_pinned` / `rotate_vault_key` / `repin_hybrid_key` and keeps its pins
+  `verify_recipient_for_wrap` (the typed gate; it called `fetch_hybrid_key_pinned` before
+  Phase 54, and that function no longer exists) / `rotate_vault_key` / `repin_hybrid_key`
+  and keeps its pins
   in **the SAME `hybrid-pins.json`** in the same state dir (so a desktop pin and a
   `sigil` pin are ONE record — no second pin store, no second safety-number
   implementation), exposing `DeviceConfig::{peer_safety_number, pairwise_safety_number,
@@ -1692,8 +1786,22 @@ It runs every command below, and does three things a hand-rolled sweep does not:
 - it **ENUMERATES** the suites **dynamically** — every Rust crate, every Go package,
   every `sigil-wasm/test/*.mjs`, every `cli/tests/*.sh`, every Playwright spec — so a
   newly added suite cannot be silently missed;
+- it **RESOLVES THE REPO FROM ITS OWN LOCATION** and **prints `gating: <path> (<sha>)`**
+  as its first line. ⚠️ It used to `cd` to a hardcoded absolute path, so running it from a
+  git **worktree** gated the MAIN checkout instead — a planted `getrandom` stanza in the
+  worktree's lockfile still printed `✓ getrandom==0`. That is not hypothetical: it
+  **misled audit #4's own worktree-isolated lenses**, one of which reported ALL GREEN
+  about a tree it was not looking at. **Check that first line matches the tree you meant.**
 - it **COUNTS results instead of trusting exit codes**, and prints a closing
   **inventory** (a suite absent from that list is a suite nobody runs);
+- ⭐ it **RUNS THE POSTGRES-GATED SUITE AND FAILS ON SKIPS.** Without a DSN ~30 tests
+  skip, and PASS/FAIL counting hid that completely: **two real regressions survive a
+  DSN-less run** (deleting migration `0005`'s ownership backfill, and dropping the
+  active-device filter from the seat count — the Phase 52 account-bricking defect). It
+  now starts a throwaway `postgres:16` on a free port when `SIGILD_TEST_POSTGRES` is
+  unset, reports the skip count either way, and requires **`Postgres-gated suite RAN (0
+  skips)`**. The Go numbers moved from *561 pass / 30 skip* to **640 pass / 0 fail /
+  0 skip**;
 - it includes a **CI-DRIFT CHECK** asserting that **every** node interop suite and
   shell e2e script is named in **some** workflow. ⚠️ This repo has **THREE TIMES**
   shipped a suite that no workflow ran — the nine interop tests for ~20 phases, then
@@ -1703,13 +1811,24 @@ It runs every command below, and does three things a hand-rolled sweep does not:
 It also encodes two traps that make a **planted mutation appear to PASS locally**:
 
 - **`sigil-wasm/test/fake-sigild.mjs` is a SERVER DOUBLE, not a test.** A naive
-  `for t in test/*.mjs` loop runs it and **hangs**. `gate.sh` skips `fake-*`.
+  `for t in test/*.mjs` loop runs it and **hangs**. `gate.sh` skips `fake-*` **and
+  `*-helper.mjs`** (`sealed-store-helper.mjs` is a helper too). ⚠️ The **inventory line**
+  used to exclude only `fake-*`, inflating the very count whose job is to make a missing
+  suite visible; it now uses the same exclusion as the runner and the drift check.
+  ⚠️ **The double is also MORE PERMISSIVE than real `sigild`** on axes its header does not
+  disclaim: its **catch-all returns `404`**, inverting the *"501 by default, never 404"*
+  invariant inside the double, and it enforces **no envelope size cap, no hybrid-key
+  length validation and no recipient existence/revocation check**. An auditor tightened
+  all four and both browser suites stayed green — so it hides no **current** defect, but
+  it is exactly the shape that hid the CORS hole for twelve phases.
 - It **REBUILDS the webapp and RE-VENDORS the extension first**, because webapp
   Playwright's `reuseExistingServer` will happily serve a **stale `.next`**, and
   `pnpm -C extension exec playwright test` **skips the `pretest` vendor hook** (use
   `pnpm test`). CI does both correctly; a local run does not unless you force it.
 
-`./scripts/gate.sh --quick` skips the shell e2e scripts and Postgres.
+`./scripts/gate.sh --quick` skips the shell e2e scripts. ⚠️ Its usage line also says it
+skips Postgres — it does **not**: the throwaway container is started regardless. Set
+`SIGILD_TEST_POSTGRES` yourself to point at an existing database instead.
 
 ```bash
 # Rust core — fmt / clippy / test / wasm
@@ -1851,16 +1970,21 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop
 # both directions, so it needs no setup (~20 s: real Argon2id + a CLI build).
 cargo test  --manifest-path desktop/Cargo.toml --test cli_interop -- --nocapture
 # Integration test file 2 is THE NETWORK PROOF (desktop/core/tests/server_interop.rs) and
-# now holds TWO tests: it builds a REAL sigild (go build ./cmd/server; GO=… overrides
+# holds SIX tests (CLAUDE.md said TWO until Phase 57 — it had not been recounted since
+# Phase 51): it builds a REAL sigild (go build ./cmd/server; GO=… overrides
 # /opt/homebrew/bin/go) AND the real `sigil` binary, boots sigild on a free loopback port
 # with dev ops + device auth v3, and proves (a) desktop<->CLI sharing BOTH ways (94287082
-# each way) plus the 403 / NotEnrolled / Unreachable negatives, and (b) Phase 51's
+# each way) plus the 403 / NotEnrolled / Unreachable negatives, (b) Phase 51's
 # KEY-SUBSTITUTION ALARM: a device republishes a DIFFERENT hybrid key under the SAME id
 # (`sigil device hybrid-publish --regenerate`), the share is refused as
 # DesktopError::KeyPinMismatch carrying BOTH safety numbers, rotation is refused too, a
-# re-pin to a WRONG number is refused, and only a deliberate re-pin resumes sharing.
-# No setup, no mocks (~40 s). The two tests run in PARALLEL threads of one process, which
-# is why Harness::start() now puts an AtomicUsize counter in its temp-dir name.
+# re-pin to a WRONG number is refused, and only a deliberate re-pin resumes sharing,
+# (c) a printed sheet recovering the vaults after every device is gone, (d) a sibling
+# device refused a kit cover without the printed safety number, (e) a lapsed account
+# refused WRITES but never reads or key recovery, and (f) a desktop inside its grace
+# period WARNED before any write is refused.
+# No setup, no mocks. The tests run in PARALLEL threads of one process, which
+# is why Harness::start() puts an AtomicUsize counter in its temp-dir name.
 cargo test  --manifest-path desktop/Cargo.toml --test server_interop -- --nocapture
 # The applicable build is cargo --release; `tauri build` (the .app bundler) has NOT
 # been run, and the binary is unsigned / unnotarized / undistributed.
@@ -1943,8 +2067,14 @@ after the journal entry that flagged it — this note was stale until Phase 51 c
 `resolve_go()` resolves **`$GO` → `go` on PATH → `/opt/homebrew/bin/go`**, and **PANICS
 rather than skipping** when Go is genuinely absent (a suite that silently skips reads green
 while proving nothing — a failure mode this repo has already been bitten by). `desktop.yml`
-still runs a bare `cargo test`, which now picks up **both** `server_interop` tests; that is
-intended. `desktop.yml` was **not** modified in Phase 51 (only `sigild.yml`, `security.yml`
+still runs a bare `cargo test`, which picks up **all six** `server_interop` tests; that is
+intended. ⭐ **`resolve_go()`'s `$GO` → PATH → Homebrew order is the pattern the webapp's
+`cors.spec.ts` was MISSING** — that spec resolved Go as `process.env.GO ?? "/opt/homebrew/bin/go"`
+with **no PATH lookup**, so on CI it **`test.skip`ped ITSELF** and the only browser-level proof
+of the Phase 56 CORS fix silently vanished while the job stayed green. ⚠️ **The earlier "fix"
+of adding `actions/setup-go` to the webapp job did NOT work**: `setup-go` puts `go` on PATH and
+**never sets `$GO`**. Phase 57 gave the spec a PATH lookup **and** set `GO: go` on the workflow
+step (which `interop.yml` already did correctly). `desktop.yml` was **not** modified in Phase 51 (only `sigild.yml`, `security.yml`
 and `interop.yml` were). The separate `$GO` → Homebrew → PATH resolver added in Phase 51 is
 in **`cli/tests/e2e-sharing.sh`**, which had the macOS Homebrew path hardcoded.
 

@@ -1,7 +1,19 @@
 # sigild HTTP API reference
 
-> **STATUS: pre-audit skeleton.** `sigild` is the Sigil sync-server skeleton. It
-> performs **no cryptography**, holds **no keys**, and stores **no plaintext**.
+> **STATUS: pre-audit skeleton.** `sigild` is the Sigil sync-server skeleton.
+> ⭐ **Be precise about what it does and does not do with cryptography, because an
+> earlier version of this line was simply false.** `sigild` performs **no
+> cryptography on vault content**, holds **no key that can decrypt a vault**, and
+> stores **no plaintext**: it never decodes a blob or an envelope, and it has no
+> decapsulation key. It does, however, perform **real cryptography for
+> authentication and integrity** — Ed25519 signature verification on every
+> authenticated request, SHA-256 for the op-log hash chain, enrollment/admin token
+> digests, and constant-time HMAC verification of provider webhooks — and it
+> **does hold keys of a kind**: devices' Ed25519 **public** keys, devices'
+> published hybrid **public** keys, and provider webhook **secrets** in its
+> configuration. None of those can open a vault. That distinction is the whole
+> trust boundary; "no cryptography" full stop is not the claim.
+>
 > The only stateful surface — the vault operation log — is a **dev-only,
 > opt-in** store of **opaque client-encrypted blobs** the
 > server never decrypts or interprets (in-memory by default, with optional
@@ -115,7 +127,7 @@ the source of truth for the exact strings):
 | `sigild_http_requests_total{class="…"}` | counter | total HTTP responses served, by status class (`1xx`…`5xx`) |
 | `sigild_oplog_appends_total` | counter | op-log appends accepted (`POST …/ops`) |
 | `sigild_oplog_verify_total` | counter | chain verifies run (`GET …/ops/verify`) |
-| `sigild_oplog_auth_denied_total{reason="…"}` | counter | request auth/authz denials, **labelled by reason** (the fixed enum below) |
+| `sigild_oplog_auth_denied_total{reason="…"}` | counter | request auth/authz denials, **labelled by reason** (the fixed enum below). ⚠️ The label set is **narrower than the audit log's**: reasons a client cannot tell apart are **collapsed** here — see the note under [Denial reasons](#denial-reasons-audit--metrics-only) |
 | `sigild_oplog_authz_denied_total` | counter | requests denied by **per-vault authorization** (HTTP `403`) — a subset of the above, broken out so an operator can alert on `403`s alone |
 | `sigild_oplog_ratelimit_rejected_total` | counter | appends rejected with `429` by the per-vault rate limiter |
 | `sigild_abuse_ratelimit_rejected_total{surface="…"}` | counter | requests rejected with `429` by an **abuse-bound** limiter, over the closed set `enroll` / `invite` ([below](#abuse-rate-limiting-enrollment--invite-minting)). Counts only — **no address, account or key label**, so a scrape cannot learn *who* was limited |
@@ -320,9 +332,37 @@ Append one opaque, client-encrypted blob to the named vault's log.
 
   | Status | `error` code | When |
   |--------|--------------|------|
+  | `400 Bad Request` | `empty_op` | the body is empty — **but see the claim precondition below: on an *unowned* vault this is `403`, not `400`** |
   | `413 Request Entity Too Large` | `payload_too_large` | body exceeds the 64 KiB per-operation cap |
   | `429 Too Many Requests` | `rate_limited` | the per-vault append rate limit is exceeded (only when `SIGILD_OPLOG_RATE_LIMIT` is set); the response carries a `Retry-After` header (seconds) |
   | `501 Not Implemented` | `not_implemented` | `SIGILD_ENABLE_DEV_OPS` is unset (the default) |
+
+  Under device auth v3 the usual `401` / `403` / `402` also apply (see
+  [`401` vs `403`](#401-vs-403-and-the-absence-of-an-auth-oracle) and
+  [Entitlement enforcement](#entitlement-enforcement-opt-in--phase-55)).
+
+  ⭐ **THE CLAIM PRECONDITION — a rejected write never claims a vault
+  ([ADR 0045](decisions/0045-claim-precondition-rejected-writes-never-claim.md)).**
+  This route is one of the two that take **trust-on-first-write** ownership. The
+  claim used to fire inside the authorization step, which runs **before** the
+  handler's cheap request-shape checks — so an **empty-bodied** append answered
+  `400` and stored nothing while still taking **permanent** ownership of the vault
+  id it named. Reproduced live: 50 empty appends across 50 made-up vault ids
+  produced 50× `400`, zero stored ops and **50 claims**, after which a second
+  device was `403` forever on its own genuine first write. The per-vault rate
+  limiter cannot bound that — it keys on the very vault id the attacker varies.
+  A well-formedness check is now evaluated **before** the claim, and a request
+  that fails it is authorized at a level that cannot claim.
+  > ⚠️ **The observable change:** an **empty** append to an **UNOWNED** vault now
+  > answers **`403` forbidden** (the caller holds no grant and no longer earns
+  > ownership on the way past) instead of `400`. On a vault the caller may already
+  > write, it still answers **`400 empty_op`**, unchanged. Ownership is not taken
+  > either way.
+  >
+  > **Honest limit:** this removes the *free* path to a claim, not squatting. A
+  > determined device can still squat ids with genuinely well-formed writes, each
+  > of which is stored, entitlement-checked and audited. **There is no per-account
+  > claim budget.**
 
   **Optional per-vault rate limit.** By default appends are unthrottled. When
   `sigild` is started with **`SIGILD_OPLOG_RATE_LIMIT`** set (a positive
@@ -933,6 +973,27 @@ and for enrollment: `bad_enrollment_token`, `enrollment_token_used`,
 `enrollment_token_expired`, `bad_proof`, `malformed_key`, `device_exists`,
 `account_full`.
 
+> ⭐ **`forbidden_account` reaches the AUDIT LOG only — on `/metrics` it is
+> collapsed onto `unauthorized_vault`.** The two are byte-identical from a client
+> (the same `403`, the same `{"error":"forbidden"}`), but the metric distinguished
+> them: `forbidden_account` means the vault **exists and belongs to another
+> account**, `unauthorized_vault` covers a vault that has **never existed**. So
+> scraping the always-on, unauthenticated `/metrics` before and after one request
+> answered *"does this vault id exist?"* — a **vault-existence oracle**, and
+> exactly the widening [ADR 0040](decisions/0040-account-model.md) limitation 11
+> says this model deliberately does not do. The enrollment side was already
+> collapsed for this reason; the auth-deny side was missed. The rule:
+> **`/metrics` must never distinguish two outcomes the client is told nothing
+> apart about.**
+>
+> Deliberately **not** collapsed: `not_vault_owner` and `forbidden_device`
+> describe the caller's own relationship to a resource it **already reached**, so
+> they signal no existence the caller did not already hold; and
+> `vault_owner_unresolved` names a server-side **data-repair** state an operator
+> must be able to see (§ `sigild migrate adopt`). This is a **narrowing, not a
+> closure** — `/metrics` remains a weak correlatable oracle, as
+> [ADR 0040](decisions/0040-account-model.md) limitation 11 already said.
+
 Account-**invite** failures carry a second, **finer** cause that goes to the
 **audit log only** — never a response body, never a metric label:
 `invite_unknown`, `invite_revoked`, `inviter_inactive`, `invite_used`,
@@ -1258,13 +1319,14 @@ boots a **real** sigild with `SIGILD_DEVICE_AUTH=1` and drives the JS client
 against it (enroll, claim, grant, revoke, tamper, stale, token reuse). Same
 **dev-only, plain-HTTP, UNAUDITED** posture as the CLI: no TLS, loopback only.
 
-### Default posture (all eleven routes)
+### Default posture (all twelve routes)
 
 With **`SIGILD_ENABLE_DEV_OPS` unset** — the default and the only
-production-safe setting — **every** device route **and every vault-sharing route**
-(the six in the [next section](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46)
-— the original four plus the two Phase 50 rotation routes)
-returns:
+production-safe setting — **every** device route (the **five** above) **and every
+vault-sharing route** (the **seven** in the
+[next section](#device-to-device-vault-sharing-dev-gated-opt-in--phase-46) — the
+original four, the two Phase 50 rotation routes, and the Phase 54 per-device
+envelope index `GET /v1/devices/{deviceID}/keys`) returns:
 
 ```json
 { "error": "not_implemented", "detail": "device enrollment, per-vault authorization and vault sharing are not enabled on this server" }
@@ -1787,6 +1849,20 @@ append — the server never decodes it.
   | `413 Payload Too Large` | `payload_too_large` | body over 16 KiB |
   | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
 
+  ⭐ **THE CLAIM PRECONDITION applies here too**
+  ([ADR 0045](decisions/0045-claim-precondition-rejected-writes-never-claim.md)).
+  This is the **second** claiming route, so the same defect applied: a deposit the
+  server was going to refuse — empty body, unknown recipient, revoked recipient —
+  still took ownership of an unowned vault on its way to the refusal. Those three
+  checks are cheap and **vault-independent**, so they are now evaluated **before**
+  the claim, and a request that fails any of them is authorized at a level that
+  cannot claim.
+  > ⚠️ **The observable change is the same:** on an **UNOWNED** vault those three
+  > cases now answer **`403`** rather than `400` / `404` / `409`. On a vault the
+  > caller may already write, the statuses above are **unchanged**. The verdict is
+  > computed once and reused to write the response, so the refusal cannot drift
+  > from the precondition that gated it.
+
 ### `GET /v1/vaults/{vaultID}/keys/{deviceID}` — collect my envelope
 
 Returns the envelope **byte-for-byte as it was uploaded**.
@@ -1918,6 +1994,14 @@ hold a wrapped key addressed to me?"*
   `has_more` is `true`. ⚠️ There is deliberately **no cursor** — a device with
   more than 500 covered vaults cannot page past the first 500.
 
+  > ⚠️ **AND NO CLIENT IN THIS REPO READS `has_more` ON THIS ROUTE** (found by the
+  > fourth audit). A **recovery kit covering more than 500 vaults would silently
+  > recover the first 500 and report success** — the worst shape a truncation can
+  > take, because the person using it is by definition unable to check against
+  > anything else. The server is honest; the clients ignore the flag. No cursor
+  > exists to fix it with, so closing this properly means adding one. Until then,
+  > treat 500 covered vaults as the kit's real ceiling.
+
 - **Errors:**
 
   | Status | `error` code | When |
@@ -2007,10 +2091,10 @@ its vendored copy). It covers all four routes, plus the two composed operations:
 | `fetchHybridKey(wasm, auth, deviceId)` | `GET /v1/devices/{deviceID}/hybrid-key` |
 | `putKeyEnvelope(wasm, auth, vaultId, recipientDeviceId, envelopeBytes)` | `PUT /v1/vaults/{vaultID}/keys/{deviceID}` |
 | `getKeyEnvelope(wasm, auth, vaultId, deviceId?)` | `GET /v1/vaults/{vaultID}/keys/{deviceID}` (defaults to `auth.deviceId`) |
-| `fetchHybridKeyPinned(wasm, auth, deviceId, pins?)` | `GET /v1/devices/{deviceID}/hybrid-key` **plus the pin check in the same call** — the choke point every wrap path uses. `pins` defaults to `auth.pins`. **Throws `KeyPinMismatchError`** on a changed key |
+| `verifyRecipientForWrap(wasm, auth, deviceId, opts?)` | `GET /v1/devices/{deviceID}/hybrid-key` **plus the pin check, the safety-number check and the recovery-kit refusal, in one call** — ⭐ **the gate every wrap path goes through**, and the only thing that produces a value the wrap accepts. `pins` defaults to `auth.pins`. **Throws `KeyPinMismatchError`** on a changed key. (The older `fetchHybridKeyPinned` / `fetch_hybrid_key_pinned` were **superseded in Phase 54 and DELETED in Phase 57** — they pinned but did not refuse an unverified recovery kit, so a caller reaching for the familiar name got a weaker gate; see [ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)'s addenda) |
 | `listKeyEnvelopes(wasm, auth, vaultId)` | `GET /v1/vaults/{vaultID}/keys` — metadata only |
 | `deleteKeyEnvelope(wasm, auth, vaultId, deviceId)` | `DELETE /v1/vaults/{vaultID}/keys/{deviceID}` — returns `false` on a `404` rather than raising |
-| `shareVault(wasm, auth, {vaultId, recipientDeviceId, vaultKey, permission, pins?})` | `GET …/hybrid-key` **through `fetchHybridKeyPinned`**, then `PUT …/keys/{to}`, then `POST …/grants` — the same composition as `sigil vault share`, so authorization and key distribution cannot drift. Returns `pinStatus` + `safetyNumber` so a UI can say whether the key has ever been human-verified |
+| `shareVault(wasm, auth, {vaultId, recipientDeviceId, vaultKey, permission, pins?})` | `GET …/hybrid-key` **through `verifyRecipientForWrap`**, then `PUT …/keys/{to}`, then `POST …/grants` — the same composition as `sigil vault share`, so authorization and key distribution cannot drift. Returns `pinStatus` + `safetyNumber` so a UI can say whether the key has ever been human-verified |
 | `acceptVault(wasm, auth, {vaultId, secretIdentity?})` | `GET …/keys/{deviceID}` — collect, unwrap, return the 32-byte key |
 | `rotateVaultKey(wasm, auth, {vaultId, recipientDeviceIds, sealedVault, oldVaultKey, params, pins?})` | pin-checks **every** recipient first, then `PUT …/keys/{to}` per recipient, then `GET …/keys` + `DELETE …/keys/{deviceID}` for everyone else. Returns the new key and the re-sealed container — **the caller persists and pushes them** |
 
@@ -2074,7 +2158,9 @@ worth knowing when reading the rest of this document:
 - **Contract selection is the CLI's rule**, unchanged: v3 when enrolled, legacy v2 for
   an identity with no device id, unsigned with no identity.
 - **Phase 50 came for free, for the same reason.** The desktop calls
-  `fetch_hybrid_key_pinned`, `rotate_vault_key` and `repin_hybrid_key` from the same
+  `verify_recipient_for_wrap` (the gate; it called the since-deleted
+  `fetch_hybrid_key_pinned` before Phase 54), `rotate_vault_key` and
+  `repin_hybrid_key` from the same
   library and keeps its pins in the **same `hybrid-pins.json`** in the same state dir,
   so there is no second pin store and no second safety-number implementation to keep in
   sync. `DeviceConfig::{peer_safety_number, pairwise_safety_number, pins, repin_device,

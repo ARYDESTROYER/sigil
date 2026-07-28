@@ -3540,26 +3540,21 @@ pub fn repin_hybrid_key(
     Ok((previous.map(|p| p.safety_number), new_number))
 }
 
-/// ⭐ FETCH a device's hybrid public key AND enforce the pin in one call.
-///
-/// This is what every share/rotate path uses instead of the bare
-/// [`fetch_hybrid_key`]: a pin store nothing consults is worthless, so the
-/// enforcement lives on the same call that gets the key.
-///
-/// # Errors
-/// - [`CliError::PinMismatch`] when the published key changed — the caller MUST
-///   NOT proceed, and this function has already made sure nothing was wrapped.
-/// - Everything [`fetch_hybrid_key`] can return.
-pub fn fetch_hybrid_key_pinned(
-    server: &str,
-    device_id: &str,
-    auth: &RequestAuth<'_>,
-    pins_path: &std::path::Path,
-) -> Result<(HybridPublicIdentity, PinStatus), CliError> {
-    let identity = fetch_hybrid_key(server, device_id, auth)?;
-    let status = check_and_pin(pins_path, device_id, &identity)?;
-    Ok((identity, status))
-}
+// ⚠️ `fetch_hybrid_key_pinned` USED TO LIVE HERE and is DELETED ON PURPOSE
+// (Phase 57). It was ADR 0038's choke point — fetch a hybrid public key and
+// pin-check it in one call — and Phase 54 SUPERSEDED it with
+// `verify_recipient_for_wrap`, which additionally refuses an unverified recovery
+// kit and honours a caller-supplied safety number. It then sat here with ZERO
+// callers and zero tests while the docs still recommended it by name: a public
+// `pub fn` that fetches-and-pins WITHOUT the recovery-kit refusal is a
+// ready-made bypass of the `VerifiedRecipient` type gate for whoever reaches for
+// the familiar name next. A superseded choke point is not harmless dead code.
+//
+// Need a key for a wrap? Call `verify_recipient_for_wrap` — it is the only thing
+// that can construct a `VerifiedRecipient`, and `share_vault_to_known_key`
+// accepts nothing else. Need a key for DISPLAY only (a safety number, a
+// reachability probe, a deliberate re-pin)? Call the bare `fetch_hybrid_key`,
+// which wraps nothing.
 
 // ===========================================================================
 // ⭐⭐ THE WRAP GATE — the single choke point EVERY vault-key wrap passes
@@ -4795,8 +4790,9 @@ pub fn recovery_check(
 ///   `origin = "recovery-kit"`, so the DERIVED identity is used directly and
 ///   nothing is fetched. There is no substitution window at all.
 /// * **On any OTHER device** there is no derived pin, so the key comes from the
-///   server through [`fetch_hybrid_key_pinned`] — which on a first sight would
-///   be plain trust-on-first-use. This is STRICTER than ADR 0038 here, because
+///   server through [`verify_recipient_for_wrap`] — which on a first sight would
+///   otherwise be plain trust-on-first-use. This is STRICTER than ADR 0038 here,
+///   because
 ///   the out-of-band channel is guaranteed present: the safety number is printed
 ///   on the sheet in the user's own hand. `expected_safety_number` is therefore
 ///   REQUIRED on that path, and a mismatch is refused. A warning would not be

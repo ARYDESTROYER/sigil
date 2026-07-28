@@ -223,7 +223,11 @@ audited; see the status note below.)
   every other member and run checkout) and **immutable** (no transfer, merge or deletion);
   membership grants **authorization, never decryption** (a joined device reads nothing
   until an existing member shares a vault key to it); an unpinned invite is a **bearer
-  secret** over plain HTTP; trust-on-first-write moved up a level rather than going away;
+  secret** over plain HTTP; trust-on-first-write moved up a level rather than going away
+  (⚠️ and a **rejected** write used to claim a vault anyway — an empty-bodied append
+  answered `400` while taking the vault id permanently; fixed in Phase 57, though
+  **nothing bounds squatting with well-formed writes**, see
+  [ADR 0045](docs/decisions/0045-claim-precondition-rejected-writes-never-claim.md));
   and every device enrolled before the migration was adopted into its **own** account, so
   an existing two-device setup becomes two accounts. Dev-gated, `501` by default,
   **UNAUDITED**. See [`docs/api.md`](docs/api.md) and
@@ -523,7 +527,11 @@ in **separate repositories** and consume `libsigil` as a versioned binary artifa
 `./scripts/gate.sh` runs all of the below plus the Node interop suites, the shell
 end-to-end scripts and the browser suites — enumerating them dynamically, counting
 results rather than trusting exit codes, and checking that every suite on disk is
-actually run by some CI workflow. The individual commands:
+actually run by some CI workflow. It resolves the repository **from its own
+location** (so it gates the tree you ran it from, and prints which one), starts a
+throwaway `postgres:16` when no `SIGILD_TEST_POSTGRES` is set, and **fails if any
+test skipped** — a green run that skipped the storage layer is not a green run.
+The individual commands:
 
 ```bash
 # Rust crypto core

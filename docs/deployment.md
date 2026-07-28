@@ -18,7 +18,7 @@ Terraform, and Nomad were then installed via `brew` and their **native offline
 validators** run against the IaC, and a **loopback-only** local compose stack
 was brought up as a topology smoke; only `systemd-analyze` remains unavailable on
 macOS, so the systemd unit is still by-eye — see the
-[validation status table](#validation-status)).
+[validation status table](#8-validation-status)).
 
 ---
 
@@ -285,11 +285,14 @@ To avoid any over-claim, the honest gaps:
   Juspay scheme is explicitly **UNVERIFIED-AGAINST-LIVE-DASHBOARD**. A
   subscription now keys off the buying device's **ACCOUNT**
   ([§14](#14-account-model-operator-guide--dev-gated)) rather than the device —
-  but an account is **not an identity**: no email, no password, **no recovery**,
-  and every device enrolled before migration `0005` was adopted into its **own**
-  account, so an existing two-device customer has **two** billing subjects. There
-  is no entitlement
-  enforcement, no recurring-subscription creation for the India adapters, no
+  but an account is **not an identity**: no email, no password, no operator
+  break-glass — the only recovery is a **paper kit printed in advance**
+  ([§17](#17-recovery-kits-operator-guide--dev-gated)) — and every device enrolled
+  before migration `0005` was adopted into its **own** account, so an existing
+  two-device customer has **two** billing subjects. Entitlement **can** now be
+  enforced ([§16](#16-entitlement-enforcement-operator-guide--opt-in)), but it is
+  **off by default**, refuses **writes only**, and **never refuses reads**. There
+  is no recurring-subscription creation for the India adapters, no
   fraud/chargeback/refund/proration/tax handling, and **no PCI attestation**
   (hosted checkout keeps card data out of the process entirely, which minimizes
   scope but certifies nothing). Operator guide and the mandatory-TLS requirement:
@@ -499,6 +502,20 @@ backends have no database and no migrations, and the whole thing is inert unless
 > intact). This is a real, ordered, tracked migration system for the **dev**
 > Postgres backend; it is **not** a production change-management pipeline (no
 > down-migrations, no online/zero-downtime rewrites, no managed rollout tooling).
+
+> ⚠️ **Testing caveat — the Postgres store suite has NO per-run schema
+> isolation.** `SIGILD_TEST_POSTGRES` points the gated store/integration tests at
+> a real database, and they share one schema with no per-run namespace, prefix or
+> temporary schema. **Two concurrent `go test ./...` runs against ONE database
+> corrupt each other** (and will produce confusing, non-deterministic failures
+> rather than a clean error). Give each concurrent run its **own database**, or
+> serialize them. The same applies to running the gated suite while
+> `cli/tests/e2e-accounts.sh` or `e2e-sharing.sh` is pointed at that DSN.
+>
+> **Phase 54 added no migration.** The recovery kit needed none — a kit is an
+> ordinary device, and its self-only envelope index reuses the
+> `sigil_vault_key_envelopes_by_recipient` index created by `0004`. Phase 53 and
+> Phase 55 added none either. **`sigild_schema_version` is still `5`.**
 
 ### 11.1 `sigild migrate adopt` — the account backfill, and when you need it
 
@@ -866,14 +883,21 @@ carry no secret, but the endpoint is still not meant for the public internet.
 - **An ACCOUNT is the subject since Phase 52 — but it is not an identity.** A
   subscription keys off the **account** of the device that ran checkout (§14), so
   one human's devices share one subject. There is still no user record, no email,
-  no seat model, no transfer and **no recovery**; ⚠️ every device enrolled before
-  migration `0005` was adopted into its **own** account, so an existing two-device
-  customer has **two** subjects (§11.1).
-- **No entitlement enforcement** — `entitled` is reported by
-  `GET /v1/billing/subscription` and consulted by nothing.
+  no seat model, no transfer and no recovery beyond a **paper kit printed in
+  advance** (§17); ⚠️ every device enrolled before migration `0005` was adopted
+  into its **own** account, so an existing two-device customer has **two**
+  subjects (§11.1).
+- **Entitlement enforcement is available but OFF by default** (§16). Turned on, it
+  refuses a lapsed account's **writes** with `402` past a grace period and ⭐
+  **never refuses reads or same-account key recovery**. Left off, `entitled` is
+  reported by `GET /v1/billing/subscription` and consulted by nothing.
 - **No fraud, chargeback, refund, proration, tax, dunning or reconciliation
-  handling**, no billing admin surface, and no rate limiting on the webhook
-  endpoint (only the 64 KiB body cap).
+  handling**, and no billing admin surface.
+- ⛔ **No rate limiting on the webhook endpoint, deliberately** — only the 64 KiB
+  body cap and the cost of one HMAC. `SIGILD_WEBHOOK_RATE_LIMIT` /
+  `SIGILD_WEBHOOK_RATE_BURST` **were built in Phase 53 and REMOVED**; setting
+  either now logs a boot WARNING and does nothing. See
+  [§15.3](#153-why-the-webhook-route-is-not-rate-limited).
 - **No PCI attestation** — hosted checkout minimizes scope; it certifies nothing.
 
 ---
@@ -950,17 +974,20 @@ enrollment-token field (neither can *mint* one; the CLI and the desktop app can)
   run checkout, and administer every account-owned vault. Revoking a compromised
   device does **not** revoke the devices it invited — the audit log names the
   inviter (`account.device_joined`), but nothing prevents it.
-- ⚠️ **THERE IS NO RECOVERY.** Lose or revoke **every** device in an account and
-  the account, its vaults and its subscription are permanently unreachable — by
-  the customer and by us. Tell customers to **keep two devices enrolled**. This is
-  a mitigation, not a fix, and **it must be settled before anyone charges real
-  money**.
+- ⚠️ **RECOVERY EXISTS ONLY IF IT WAS PRINTED IN ADVANCE.** Lose or revoke
+  **every** device in an account **without having printed a recovery kit** (§17)
+  and the account, its vaults and its subscription are permanently unreachable —
+  by the customer and by us. **A kit cannot be created after the loss.** Tell
+  customers to **keep two devices enrolled AND print a kit**. There is still no
+  email, no password and no operator break-glass.
 - **Membership is immutable**: no transfer, no merge, no split, no account
   deletion. A device in the wrong account can only be revoked and re-enrolled.
-- **No rate limiting** on `POST /v1/devices/enroll` or
-  `POST /v1/account/invites`, and **no sweep job** for expired invite rows.
-- **Nothing here is enforced against payment.** Entitlement is reported, never
-  enforced.
+- **Rate limiting on `POST /v1/devices/enroll` and `POST /v1/account/invites` is
+  opt-in and is a BACKSTOP** (§15) — behind a reverse proxy the enrollment bucket
+  is global, only failures are charged, and the handler still runs. There is still
+  **no sweep job** for expired invite rows.
+- **Payment enforcement is opt-in** (§16) and refuses **writes only**. Left off,
+  entitlement is reported and never enforced.
 
 ### 14.4 What to watch
 
@@ -971,3 +998,262 @@ enrollment-token field (neither can *mint* one; the CLI and the desktop app can)
 | `sigild_oplog_auth_denied_total{reason="missing_account"\|"vault_owner_unresolved"}` | `GET /metrics` — **non-zero means run `sigild migrate adopt`** (§11.1) |
 | `account.created` / `account.device_joined` / `account.invite_created` / `account.invite_revoked` | the structured audit log — metadata only, **never** an invite secret or digest |
 | `ACCOUNT BACKFILL INCOMPLETE` | a boot WARN — the only signal that stranded rows exist (§11.1) |
+
+---
+
+## 15. Abuse bounds (operator guide — opt-in)
+
+> **Off by default, and stdlib-only** — no new dependency; `sigild` still has
+> exactly one direct Go require (`pgx`). See
+> [ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md) and
+> [`api.md` → Abuse rate limiting](api.md#abuse-rate-limiting-enrollment--invite-minting).
+
+### 15.1 The two limiters
+
+| Variable | Default | What it bounds |
+|----------|---------|----------------|
+| `SIGILD_ENROLL_RATE_LIMIT` | unset ⇒ **no limiter installed** | **failed** `POST /v1/devices/enroll` attempts per second, keyed on the **socket peer address** (IPv4 full address, IPv6 **/64 prefix**) |
+| `SIGILD_ENROLL_RATE_BURST` | `ceil(rate)`, minimum 1 | bucket depth |
+| `SIGILD_INVITE_RATE_LIMIT` | unset ⇒ no limiter installed | `POST /v1/account/invites` per second, keyed **per account** (siblings share one bucket) |
+| `SIGILD_INVITE_RATE_BURST` | `ceil(rate)`, minimum 1 | bucket depth |
+
+All four are validated **fail-fast before the listener binds** (a non-numeric,
+negative, NaN or infinite rate, or a non-integer/negative burst, exits non-zero
+with a message naming both variables of the pair). Over-rate is `429` with a
+typed `rate_limited` body and a `Retry-After` header in whole seconds.
+
+Unlike `SIGILD_ACCOUNT_*`, these deliberately **do not require**
+`SIGILD_ENABLE_DEV_OPS` / `SIGILD_DEVICE_AUTH`. Setting one without the dev gate
+is a **boot WARNING** saying nothing is being limited, not a boot error: a
+protective knob that has become moot should not take a server down, while
+anything that *changes behaviour* still fails fast.
+
+**Boot output to expect** when any limiter is on:
+
+```
+WARN ABUSE RATE LIMITS ENABLED (per-process, in-memory token buckets) — these bound
+     REQUEST VOLUME; the SIGILD_ACCOUNT_* caps bound stored STATE. A multi-instance
+     deploy divides each budget across instances (there is no shared limiter store)
+WARN ABUSE: the enrollment limiter keys on the SOCKET PEER ADDRESS and IGNORES
+     X-Forwarded-For … BEHIND A REVERSE PROXY — THE ONLY TOPOLOGY THIS REPO SHIPS —
+     ALL ENROLMENTS SHARE ONE BUCKET, so this is a BACKSTOP, not a defence …
+```
+
+### 15.2 Read this before you rely on it
+
+- ⚠️ **It is a BACKSTOP, not a defence.** The only topology this repo documents
+  (`deploy/caddy/Caddyfile`, `deploy/local/Caddyfile.local`) is a **reverse
+  proxy**, so every request reaches `sigild` from **one** address and the
+  enrollment limiter degrades to a **single global bucket**. `X-Forwarded-For` is
+  deliberately ignored — without a trusted-proxy configuration it is
+  attacker-supplied text, and keying on it would let one client mint unlimited
+  buckets. Two properties keep the degraded case safe: the bucket is charged
+  **only on the denial path** (so **a valid, unspent credential with a valid proof
+  can never be refused by it**), and the limiter **fails open** at its 10,000-key
+  cap. An earlier revision did neither and was reproduced **refusing a legitimate
+  customer** — a global account-creation off switch.
+- ⚠️ **It does not reduce load.** The handler always runs, including its database
+  work; the limiter replaces only the response.
+- ⚠️ **Per-process and in-memory.** A multi-instance deploy divides each budget
+  across instances; there is no shared limiter store.
+- ⭐ **Real per-source limiting belongs at the EDGE**, which is the component that
+  actually knows the peer. **Nothing in `deploy/` configures it today** — no Caddy
+  `rate_limit`, no firewall rule, no fail2ban. If you expose anything, that is the
+  gap to close first.
+
+### 15.3 Why the webhook route is NOT rate limited
+
+⛔ **`SIGILD_WEBHOOK_RATE_LIMIT` and `SIGILD_WEBHOOK_RATE_BURST` were built in
+Phase 53 and REMOVED.** Setting either now logs, at every boot:
+
+```
+WARN RETIRED SETTING IGNORED: this variable is set but is no longer read. The webhook
+     rate limiter was REMOVED because its only possible key is the provider name, which
+     forged traffic also controls, so an anonymous flood spent authentic deliveries'
+     quota and destroyed payment events. THE WEBHOOK ROUTE IS NOT RATE LIMITED — bound
+     it at the edge, where sources are distinguishable   setting=SIGILD_WEBHOOK_RATE_LIMIT
+```
+
+It **warns rather than failing boot** — a protective knob that has become moot
+must not take a payments server down — but **remove it from your
+`EnvironmentFile`**, because carrying it forward while believing the route is
+protected is the most dangerous possible misunderstanding of the removal.
+
+The reason it was removed, stated plainly: limiting
+`POST /v1/billing/webhook/{provider}` **before** signature verification keys on
+the provider name — the only key available at that point, and one **forged
+traffic controls too**. A verifier reproduced the consequence live: one
+unauthenticated thread at ~137 forged requests/second caused **15 of 15 genuine,
+correctly-signed Stripe deliveries to be shed with `429`**; a longer flood shed
+roughly **2,000 consecutive genuine retries**; **zero payment events were
+applied**. A provider's retry budget is **finite**, so those events are lost
+**permanently**. Limiting *after* verification is no better, because an authentic
+burst is exactly what must never be dropped.
+
+What bounds that route instead: the **64 KiB body cap** and the cost of **one
+HMAC over a size-capped buffer** — no database round trip, no state created,
+before the signature verifies. **Volume protection for it belongs at the edge.**
+
+### 15.4 What to watch
+
+| Signal | Where |
+|--------|-------|
+| `sigild_abuse_ratelimit_rejected_total{surface="enroll"\|"invite"}` | `GET /metrics` — counts only; **no address, account or key label** |
+| `abuse.rate_limited` | the structured audit log (`surface`, `subject`). ⚠️ The **source address is deliberately never logged**, and `subject` is empty on the enroll surface — this server holds no personal data anywhere, and the proxy that would actually block already has the address |
+| `RETIRED SETTING IGNORED` | a boot WARN — a retired webhook knob is still set |
+
+---
+
+## 16. Entitlement enforcement (operator guide — opt-in)
+
+> ⚠️ **This is the one setting in this server that can stop serving a paying
+> customer.** It is **off by default**, and with it unset **no handler reads the
+> subscription store, no header is set, no audit line is written and no metric
+> moves**. See [ADR 0043](decisions/0043-entitlement-enforcement.md) and
+> [`api.md` → Entitlement enforcement](api.md#entitlement-enforcement-opt-in--phase-55).
+
+### 16.1 Turning it on
+
+| Variable | Default | Bounds | Notes |
+|----------|---------|--------|-------|
+| `SIGILD_ENTITLEMENT_ENFORCE` | unset ⇒ **OFF** | `1` / `true` | **Requires `SIGILD_ENABLE_DEV_OPS`, `SIGILD_DEVICE_AUTH` and `SIGILD_BILLING_PROVIDERS`** — each missing one is a **boot error** naming why |
+| `SIGILD_ENTITLEMENT_GRACE` | **14 days** (`336h`) | `(0, 365d]`, a Go duration | How long after entitlement lapses writes keep working (**warned, not refused**). Setting it **without** the enforce flag is a **boot error** |
+
+Unlike the abuse limiters, these prerequisites are **hard**. A rate limit that is
+silently moot is harmless; a payment gate that is silently moot is a business and
+support hazard, and an operator who set a grace period believes writes are being
+enforced.
+
+The default is deliberately generous. The cost of being too lenient is that
+somebody uses the product free for two extra weeks. The cost of being too strict
+is that somebody cannot log in to their bank. Those are not comparable.
+
+At boot with enforcement on, `sigild` logs a single **WARN** spelling out exactly
+what will and will not be refused, plus the grace value. It is a Warn even on the
+happy path, on purpose.
+
+### 16.2 What enforcement means operationally
+
+| Past grace | Behaviour |
+|------------|-----------|
+| `POST /v1/vaults/{id}/ops` | **`402 payment_required`** |
+| `PUT /v1/vaults/{id}/keys/{dev}` | **`402` only when `{dev}` belongs to ANOTHER account** |
+| `POST /v1/vaults/{id}/grants` | **`402` only when the grantee belongs to ANOTHER account** |
+| **everything else** | **served, unchanged** |
+
+⭐ **What a lapsed customer can always still do:** read every op in every vault
+they hold (i.e. generate **every 2FA code they already have**), collect every key
+envelope, enumerate which vaults hold a key for them, publish a hybrid key,
+**enroll** a device, **revoke** a device, delete a stale envelope, mint an invite,
+read their account and subscription, **run checkout to pay** — and ⭐ **deposit a
+wrapped vault key (with its grant) to a device of their OWN account**, which is
+what makes replacing a dead phone and **printing a recovery kit** (§17) work while
+lapsed.
+
+Other things worth knowing before you switch it on:
+
+- **`past_due` is still ENTITLED.** A declined card starts the provider's retry
+  window, not a cutoff — so a genuinely failed card buys that window *plus* the
+  grace period.
+- **Grace runs from the LATER of the subscription's `updated_at` and its
+  `current_period_end`**, so a mid-period cancellation keeps working until the
+  period already paid for ends.
+- ⚠️ **An account that NEVER subscribed is graced from its creation time**, which
+  makes the grace period double as the **buy-in window**. There is **no separate
+  trial mechanism** in this server.
+- **Every uncertainty FAILS OPEN** — a subscription-store fault, an unreadable
+  account row, no anchor date, or a device with no account all **serve** the
+  request. ⚠️ Watch `entitlement.fail_open` (logged at **error** level): it means
+  enforcement is silently **not** happening and free service is going out.
+- ⚠️ **The in-memory subscription store is non-durable.** A restart loses every
+  subscription, and every account then fails open. Use the Postgres backend.
+- **There is no dunning, notification, email, invoice or per-account override.**
+  The only warnings are the response headers, the additive `entitlement` block on
+  `GET /v1/billing/subscription`, and this server's own audit log.
+- **Refusal is never destructive.** Nothing is deleted, nothing expires; a lapsed
+  account's data stays exactly where it is.
+
+### 16.3 What to watch
+
+| Signal | Where |
+|--------|-------|
+| `sigild_entitlement_enforcing` | `GET /metrics` — `1` means it really is on. Check this rather than trusting the config |
+| `sigild_entitlement_decisions_total{outcome="entitled"\|"grace"\|"refused"\|"fail_open"}` | `GET /metrics` — counts only, **no account label** |
+| `entitlement.grace` | audit log (**warn**) — advance notice that this account will start being refused |
+| `entitlement.refused` | audit log (**warn**) — a customer was told to pay, naming which write surface |
+| `entitlement.fail_open` | audit log (**error**) — ⚠️ enforcement is not happening; investigate the store |
+
+---
+
+## 17. Recovery kits (operator guide — dev-gated)
+
+> ⭐ **`sigild` has NO concept of "recovery".** There is no recovery table, no
+> recovery flag, no recovery configuration, and **no migration** —
+> `sigild_schema_version` stays **5**. There is nothing here for an operator to
+> turn on, and nothing to back up separately. See
+> [ADR 0042](decisions/0042-recovery-kit.md).
+
+A **recovery kit** is a member device whose Ed25519 and hybrid private keys are
+HKDF-SHA256 derivations of **32 bytes of client CSPRNG printed on paper** — never
+transmitted, and **never derivable from anything this server holds**. On the wire
+it enrolls, publishes a hybrid public key, receives opaque envelopes and signs
+contract-v3 requests exactly like a phone. It enrolls under the device label
+`"recovery-kit"`, which is visible in `GET /v1/account`.
+
+**Customer guidance to give, in this order:**
+
+```bash
+# on a device already in the account, after at least one vault exists
+sigil recovery generate            # covers every vault in the local keyring
+                                   #   -> prints the sheet ONCE, to stdout
+sigil recovery verify              # type the code back to confirm the print is readable
+sigil recovery check --device-id <kitID>    # what the kit can currently reach
+
+# later, for a vault created after the print
+sigil recovery cover --device-id <kitID> --vault <id>
+
+# on a NEW install after losing everything
+sigil recovery restore --device-id <kitID>      # prompts for the code; --adopt to keep it
+```
+
+### 17.1 Operational cautions
+
+- ⚠️ **WHOEVER HOLDS THE SHEET HOLDS THE ACCOUNT** — read every covered vault and
+  **revoke every device**, immediately, with no delay, no notification and no
+  veto. It is **stronger than a stolen locked phone**: no OS lock, no biometric
+  and **no vault password** stands in front of it, and its nominal `read` grant is
+  **cosmetic** because account ownership authorizes it anyway. Treat the sheet as
+  the account: safe, envelope, off-site — not a photo on a phone.
+- ⚠️ **It recovers KEYS, not DATA.** A vault never synced to this server is gone.
+- ⚠️ **It only opens the vaults it was told to COVER**, as of the print date. Tell
+  customers to re-run `recovery cover` after creating a vault; **nothing reminds
+  them**.
+- ⚠️ **A kit cannot be created after the loss.**
+- ⚠️ **A kit consumes a seat** against `SIGILD_ACCOUNT_MAX_DEVICES`, and **any
+  member may revoke it** (membership is flat).
+- ⚠️ **`vault rotate` will refuse** to silently drop a kit from a vault's recipient
+  set; dropping one is an explicit `--drop`, and it means the printed sheet no
+  longer recovers that vault.
+- ⚠️ **`--code` puts the secret in `argv`** (readable via `/proc/<pid>/cmdline`,
+  and recorded in shell history). It warns on stderr. Prefer the interactive
+  prompt or `--code-stdin`. **There is deliberately no environment variable.**
+- ⚠️ **Client coverage is PARTIAL.** Only the **`sigil` CLI** has the kit
+  lifecycle. The webapp has **no recovery UI**, the MV3 extension has **none**
+  (though its `build.sh` vendors `recovery.mjs`), and the desktop has **no
+  recovery commands**. Since `restore` runs on a **new install**, **a customer
+  whose only client was the browser or the extension cannot restore there today**
+  — they need the CLI.
+- **Entitlement never blocks it.** Printing or extending a kit is a same-account
+  key deposit, which §16 exempts, so a lapsed customer can still create one.
+
+### 17.2 What to watch
+
+There is no recovery-specific metric or audit event, by design — a kit is an
+ordinary device. What you will see:
+
+| Signal | Where |
+|--------|-------|
+| `device.enrolled` with a `"recovery-kit"` label | the audit log — a kit joined an account |
+| `vault.key_envelope_put` addressed to the kit | the audit log — a vault was covered |
+| `sigild_key_envelope_index_total` / `device.key_envelope_index` | `GET /metrics` and the audit log — a device asked which vaults hold a key for it (the restore path uses this) |
+| `device.revoked` naming the kit | the audit log — a sheet was retired |

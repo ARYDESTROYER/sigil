@@ -345,6 +345,32 @@ Two clarifications, because they touch text above rather than replace it:
 See [ADR 0040](0040-account-model.md) for the full decision and its nineteen
 honest limitations.
 
+## Enrollment rate limiting (added Phase 53, 2026-07-28)
+
+Limitation 6 above, and the Phase 52 clarification of it, both end with "**no
+rate limiting on enrollment attempts**". That is no longer accurate as written.
+Per the addendum rule the text above is untouched; this records what changed.
+
+[ADR 0041](0041-abuse-bounds-and-the-removed-webhook-limiter.md) adds an
+**opt-in** stdlib token bucket on `POST /v1/devices/enroll`
+(`SIGILD_ENROLL_RATE_LIMIT` / `SIGILD_ENROLL_RATE_BURST`, unset ⇒ no limiter
+installed), keyed on the **socket peer address** — `X-Forwarded-For` is
+deliberately not consulted — returning `429` + `Retry-After`.
+
+Read it with its two stated properties, both of which a verifier proved live:
+
+- ⚠️ **It is a BACKSTOP, not a defence.** Behind the reverse proxy this repo
+  documents, every request arrives from one address and the limiter degrades to a
+  single global bucket. It therefore charges the bucket **only on the denial
+  path**, so a request carrying a **valid, unspent credential and a valid proof of
+  possession can never be refused by it**; and it **fails open** at its key cap.
+  An earlier revision did neither, and refused a legitimate customer.
+- ⚠️ **It does not reduce load.** The handler always runs, including its database
+  work; the limiter replaces only the response.
+
+Everything else in limitation 6 is unchanged, and the **single-ATTEMPT** semantics
+of limitation 2 are untouched.
+
 ## References
 
 - Code: [`../../sigild/internal/api/deviceauth.go`](../../sigild/internal/api/deviceauth.go),

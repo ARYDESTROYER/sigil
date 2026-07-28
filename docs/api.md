@@ -16,11 +16,15 @@
 > model sits an **account** ([below](#account-model-dev-gated--phase-52)): a
 > server-assigned id on the device row that **entitlement** and **vault
 > ownership** key off instead of the device. It is **auth metadata only** — no
-> email, no password, no session, **no recovery** — and ⭐ **no request anywhere
-> names an account**. A **dev-gated, opt-in
+> email, no password, no session, **no identity system** — and ⭐ **no request
+> anywhere names an account**. The only recovery is a **paper kit printed in
+> advance** ([below](#recovery-kits-dev-gated--phase-54)), which the server sees
+> as an ordinary device and has **no concept of**. A **dev-gated, opt-in
 > billing layer** (hosted checkout + provider webhooks, [below](#billing--subscriptions-dev-gated-opt-in--phase-45))
 > stores subscription state but **no card data**, and has **never been run
-> against a live payment provider**. Nothing
+> against a live payment provider**; since Phase 55 it can, **opt-in**, refuse a
+> lapsed account's **writes** with `402` — ⭐ **never its reads**
+> ([below](#entitlement-enforcement-opt-in--phase-55)). Nothing
 > here is audited or production-ready. See [`deployment.md`](deployment.md) for
 > the (not-yet-applied) deploy story and [`sprint-72h.md`](sprint-72h.md) for
 > scope. This reference describes the surface as wired in
@@ -114,6 +118,7 @@ the source of truth for the exact strings):
 | `sigild_oplog_auth_denied_total{reason="…"}` | counter | request auth/authz denials, **labelled by reason** (the fixed enum below) |
 | `sigild_oplog_authz_denied_total` | counter | requests denied by **per-vault authorization** (HTTP `403`) — a subset of the above, broken out so an operator can alert on `403`s alone |
 | `sigild_oplog_ratelimit_rejected_total` | counter | appends rejected with `429` by the per-vault rate limiter |
+| `sigild_abuse_ratelimit_rejected_total{surface="…"}` | counter | requests rejected with `429` by an **abuse-bound** limiter, over the closed set `enroll` / `invite` ([below](#abuse-rate-limiting-enrollment--invite-minting)). Counts only — **no address, account or key label**, so a scrape cannot learn *who* was limited |
 | `sigild_device_enrollments_total` | counter | device enrollments accepted (`POST /v1/devices/enroll`) |
 | `sigild_device_enroll_denied_total{reason="…"}` | counter | enrollment attempts denied, labelled by reason |
 | `sigild_device_revocations_total` | counter | device revocations performed |
@@ -127,6 +132,9 @@ the source of truth for the exact strings):
 | `sigild_vault_key_envelopes_total` | counter | opaque wrapped-vault-key envelopes deposited (`PUT /v1/vaults/{vaultID}/keys/{deviceID}`) |
 | `sigild_vault_key_envelope_fetches_total` | counter | envelopes collected by their recipient (`GET /v1/vaults/{vaultID}/keys/{deviceID}`) |
 | `sigild_key_envelope_deletes_total` | counter | envelopes deleted during a vault key rotation (`DELETE /v1/vaults/{vaultID}/keys/{deviceID}`). A count only — no vault ID, no device ID, no blob |
+| `sigild_key_envelope_index_total` | counter | per-device envelope-index reads (`GET /v1/devices/{deviceID}/keys`) — which vaults hold a wrapped key for the caller. A count only |
+| `sigild_entitlement_enforcing` | gauge (`0`/`1`) | `1` when payment enforcement is active on the three **write** surfaces (reads are never enforced). Exported so an operator can see at a glance whether a knob believed to be on actually is |
+| `sigild_entitlement_decisions_total{outcome="…"}` | counter | entitlement verdicts on **write** requests, over the closed set `entitled` / `grace` / `refused` / `fail_open`. **No account or subject label** — a scrape must never be able to enumerate which customers are behind on payment |
 | `sigild_billing_checkouts_total{provider="…"}` | counter | hosted checkout sessions created, by provider (`stripe`/`razorpay`/`juspay`) |
 | `sigild_billing_webhooks_total{provider="…",outcome="…"}` | counter | **authenticated** webhooks handled, by provider and outcome (`accepted`, `ignored`, `duplicate`, `stale`, `illegal`, `unresolved`) |
 | `sigild_billing_webhook_rejected_total{reason="…"}` | counter | webhooks rejected **before** application, by reason (`bad_signature`, `malformed`, `unknown_provider`, `payload_too_large`, `store_error`) |
@@ -559,8 +567,12 @@ connection) rather than blocking a goroutine.
 > no hardcoded credential — but it is **dev-gated** behind
 > `SIGILD_ENABLE_DEV_OPS`, **off by default**, has **not been audited**, and is
 > **not** the product's account/session model. There is no user account, no
-> session or token issuance, no key rotation, no recovery, no hardware
-> attestation, and **no rate limiting on enrollment attempts**. Still plain
+> session or token issuance, no key rotation and no hardware attestation. Since
+> Phase 54 there **is** a **recovery kit** — but it is a paper key printed in
+> advance ([below](#recovery-kits-dev-gated--phase-54)), **not** an identity or
+> reset mechanism. Enrollment can now be **rate limited** (opt-in,
+> [below](#abuse-rate-limiting-enrollment--invite-minting)) — read that section's
+> two caveats before treating it as a defence. Still plain
 > HTTP in dev. **Do not expose publicly and do not store real secrets.** See
 > [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md).
 
@@ -579,12 +591,22 @@ on the requested vault.
 | `SIGILD_ENROLL_TOKEN_TTL` | optional | A **positive Go duration** (e.g. `24h`). A token then expires that long after it was **first registered** — registration is idempotent, so restarts do not extend the clock. **Unset ⇒ tokens never expire, but remain SINGLE-USE.** |
 | `SIGILD_ADMIN_TOKEN` | optional | Operator token for the operator-only routes (list all devices, revoke **any** device); **≥ 16 characters**. **Unset ⇒ those paths are permanently `401`** — there is **no implicit open-admin mode**. Compared in constant time; never logged or exported. |
 | `SIGILD_ACCOUNT_MAX_DEVICES` | optional | Member devices per account. Default **10**, range `[1, 1000]`. Counts **ACTIVE devices only** — a revoked device frees its seat. Anti-freeloading, **not** anti-fraud. |
-| `SIGILD_ACCOUNT_MAX_INVITES` | optional | **Open** (unused, unexpired, unrevoked) invites per account. Default **5**, range `[1, 100]`. It bounds stored **state**, not request volume — there is **no rate limit on invite minting**. |
+| `SIGILD_ACCOUNT_MAX_INVITES` | optional | **Open** (unused, unexpired, unrevoked) invites per account. Default **5**, range `[1, 100]`. It bounds stored **state**, not request volume; request volume is the separate, opt-in `SIGILD_INVITE_RATE_LIMIT` below. |
 | `SIGILD_ACCOUNT_INVITE_TTL` | optional | Go duration; how long a freshly minted invite stays redeemable. Default **15m**, must be `> 0` and `<= 24h`. A client may request a **shorter** life, never a longer one. |
+| `SIGILD_ENROLL_RATE_LIMIT` / `SIGILD_ENROLL_RATE_BURST` | optional | **Failed**-enrollment token bucket, keyed on the **socket peer address**. Unset ⇒ **no limiter installed**. See [Abuse rate limiting](#abuse-rate-limiting-enrollment--invite-minting) — and read its caveats, because it is a **backstop, not a defence**. |
+| `SIGILD_INVITE_RATE_LIMIT` / `SIGILD_INVITE_RATE_BURST` | optional | Invite-minting token bucket, keyed **per account** (not per device). Unset ⇒ no limiter installed. |
 
-All seven are parsed and validated **fail-fast, before the listener binds**; a
+All eleven are parsed and validated **fail-fast, before the listener binds**; a
 malformed value is a clear startup error, not a surprise at request time. An
 account value **outside its range is an error, never a silent clamp**.
+
+⚠️ The four rate-limit variables deliberately **do not require**
+`SIGILD_ENABLE_DEV_OPS` or `SIGILD_DEVICE_AUTH`, unlike the `SIGILD_ACCOUNT_*`
+settings. Those change *who owns a vault*, so a silently-ignored value there
+would be an ownership surprise; a rate limit is purely protective, and refusing
+to boot because a protective knob is currently moot is the worse failure. Setting
+one without the dev gate is a **boot WARNING** naming that nothing is being
+limited, not an error.
 
 > **There is deliberately no `SIGILD_ACCOUNTS` switch.** The account model
 > ([below](#account-model-dev-gated--phase-52)) rides `SIGILD_DEVICE_AUTH`,
@@ -603,6 +625,63 @@ on restart, which means a **spent enrollment token becomes reusable after a
 restart** (the server warns loudly at boot). The **file backend
 (`SIGILD_OPLOG_DIR`) was not extended**: device auth alongside it falls back to
 the in-memory registry, also warned at boot.
+
+### Abuse rate limiting (enrollment + invite minting)
+
+Added in **Phase 53** ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)),
+**off by default**. Two stdlib token buckets — no new dependency; `sigild` still
+has exactly one direct Go dependency:
+
+| Route | Key | Charged when | Env |
+|-------|-----|--------------|-----|
+| `POST /v1/devices/enroll` | the **socket peer address** (IPv4 full address; IPv6 **/64 prefix**; an unparseable address shares one bucket) | ⭐ **only when the attempt FAILS** | `SIGILD_ENROLL_RATE_LIMIT` / `_BURST` |
+| `POST /v1/account/invites` | the caller's **account id** (siblings share one bucket) | on every mint | `SIGILD_INVITE_RATE_LIMIT` / `_BURST` |
+
+Over-rate is the **same** `429` contract the per-vault op-log limiter uses:
+
+```json
+{ "error": "rate_limited", "detail": "too many failed enrollment attempts from this source address" }
+{ "error": "rate_limited", "detail": "too many invites minted by this account" }
+```
+
+with a `Retry-After` header in whole seconds (`ceil(1 / rate)`, minimum 1, fixed
+per limiter). ⚠️ The `detail` names the **surface, never the key** — it must not
+tell a caller which address bucket, which account, or which peer it collided
+with. The limiter is installed **only on the live route**; the dev-gated `501`
+stub is never limited, or the limiter itself would become a probe for whether the
+feature is on.
+
+**Two properties that matter as much as the feature, both proven live:**
+
+- ⚠️ **This is a BACKSTOP, not a defence.** The only deployment topology this repo
+  documents is a **reverse proxy**, so every request reaches `sigild` from one
+  address and the enrollment limiter degrades to a **single global bucket**.
+  `X-Forwarded-For` is deliberately **not** consulted (without a trusted-proxy
+  configuration it is attacker-supplied text, and keying on it would let one
+  client mint unlimited buckets). An earlier revision rejected *before* the
+  handler and was reproduced **refusing a legitimate customer holding a valid,
+  unspent operator token** — a global account-creation off switch. Two changes
+  fixed it: the bucket is charged **only on the denial path**, so **a request
+  carrying a valid, unspent credential and a valid proof of possession can never
+  be refused by it**; and the limiter now **fails open at its key cap** instead of
+  closed (the old branch let one IPv6 /48 fill 10,000 buckets and lock out
+  everyone else). **Real per-source limiting belongs at the edge.**
+- ⚠️ **It does not reduce load.** Charging only on the denial path means the
+  handler **always runs**, including its database work; the limiter replaces only
+  the **response**. It bounds how useful flooding is, not what it costs the
+  server.
+
+Observability: `sigild_abuse_ratelimit_rejected_total{surface}` over the closed
+set `{enroll, invite}`, and the audit event `abuse.rate_limited`
+(`request_id`, `surface`, `subject`). ⚠️ **The source address is deliberately not
+logged**, and `subject` is **empty** on the enrollment surface (it is the account
+id on the invite surface): this server holds no personal data anywhere, an IP
+address is personal data in most regimes, and it would not change what an
+operator does — the proxy or firewall that would act already has the address.
+
+⛔ **`POST /v1/billing/webhook/{provider}` is deliberately NOT rate limited**, and
+`SIGILD_WEBHOOK_RATE_LIMIT` / `_BURST` **no longer exist** (setting either now
+logs a boot WARNING). See [Billing → honest limits](#honest-limits-read-before-believing-any-of-the-above-1).
 
 ### Storage (migration `0002_devices.sql`)
 
@@ -699,6 +778,7 @@ permission`, where `permission` is `read` or `write` and **`write` implies
 | `GET /v1/vaults/{vaultID}/keys/{deviceID}` | read **and** being the addressee |
 | `GET /v1/vaults/{vaultID}/keys` | **write** (rotation support; metadata only) |
 | `DELETE /v1/vaults/{vaultID}/keys/{deviceID}` | **write** (rotation support) |
+| `GET /v1/devices/{deviceID}/keys` | **being that device** (self-only), then **read** per listed vault — unauthorized vaults are silently filtered, not an error |
 
 **Ownership is TRUST ON FIRST WRITE — by ACCOUNT (Phase 52).** A vault with no
 owner is claimed by the **first account that successfully authenticates a WRITE**
@@ -731,8 +811,9 @@ existing clients), but **no authorization decision reads it**.
 > first becomes its owning account and locks the real owner out with a `403`.
 > Ownership **never moves between accounts** (no transfer, merge or split), and
 > while revoking one device no longer orphans a vault, **losing or revoking every
-> device in an account does** — permanently, with **no recovery** (see
-> [Account model → honest limits](#account-model--honest-limits)).
+> device in an account does** — permanently, unless a **recovery kit was printed
+> in advance** ([below](#recovery-kits-dev-gated--phase-54)); there is no other
+> recovery (see [Account model → honest limits](#account-model--honest-limits)).
 
 ### `401` vs `403`, and the absence of an auth oracle
 
@@ -889,6 +970,7 @@ is recorded **only after a valid proof**.
   | `401 Unauthorized` | `unauthorized` | missing headers, stale timestamp, unknown/spent/expired token, an unknown/used/expired/revoked **invite**, a revoked inviter, a **pinned-invite key mismatch**, bad proof, or a replayed nonce — **all return the same body**, so a prober cannot distinguish them |
   | `409 Conflict` | `device_exists` | that public key is already enrolled |
   | `409 Conflict` | `account_full` | the invite resolved, but the target account is at `SIGILD_ACCOUNT_MAX_DEVICES` **active** devices. Reachable **only after** a credential and a valid proof have been accepted — exactly like `device_exists` — so the distinct status leaks nothing the caller did not already hold |
+  | `429 Too Many Requests` | `rate_limited` | only when `SIGILD_ENROLL_RATE_LIMIT` is set, and only ever **replacing a failed attempt's response** — a `2xx` is never rate limited (see [Abuse rate limiting](#abuse-rate-limiting-enrollment--invite-minting)). Carries `Retry-After` |
   | `500` | `internal` | the registry could not be read/written |
   | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
 
@@ -896,8 +978,10 @@ is recorded **only after a valid proof**.
 > **before** the device row is created, so an enrollment that then conflicts on a
 > duplicate key still **burns the token**. That is deliberately fail-closed (the
 > server never silently permits a retry), but an operator must issue a **new**
-> token after such a failure. There is also **no rate limiting on enrollment
-> attempts** — the per-vault op-log limiter does not cover this route.
+> token after such a failure. Enrollment **can** now be rate limited
+> ([above](#abuse-rate-limiting-enrollment--invite-minting)), but only failures
+> are charged and behind a reverse proxy it is one global bucket — a **backstop,
+> not a defence**.
 >
 > **Account INVITES are different, on purpose: they are single-SUCCESS.** An
 > operator can re-mint a token from a shell; a customer mid-flow on a phone
@@ -1144,7 +1228,9 @@ surface:
 
 > **DEV-GATED and UNAUDITED, and explicitly NOT an identity system.** An account
 > is **auth metadata only**: a server-assigned id on a device row. There is **no
-> email, no password, no session, no PII — and NO RECOVERY of any kind.** It is
+> email, no password, no session, no PII, and no operator break-glass — the only
+> recovery is a **paper kit printed in advance**
+> ([below](#recovery-kits-dev-gated--phase-54)).** It is
 > active exactly when the v3 device model is (which already requires
 > `SIGILD_ENABLE_DEV_OPS`); there is deliberately **no separate switch**. See
 > [ADR 0040](decisions/0040-account-model.md).
@@ -1302,6 +1388,7 @@ only its SHA-256 digest is stored.
   | `403 Forbidden` | `forbidden` | the signing device carries no account (`missing_account`) |
   | `409 Conflict` | `account_full` | the account is already at `SIGILD_ACCOUNT_MAX_DEVICES` **active** devices — refused early, because minting an invite that could only ever fail is worse than a clear `409` |
   | `409 Conflict` | `invite_limit` | the account already holds `SIGILD_ACCOUNT_MAX_INVITES` **open** invites |
+  | `429 Too Many Requests` | `rate_limited` | only when `SIGILD_INVITE_RATE_LIMIT` is set — the **per-account** bucket is empty ([above](#abuse-rate-limiting-enrollment--invite-minting)). Carries `Retry-After`. ⚠️ This check runs **after** authentication, so it does **not** make an unauthenticated flood of this route cheaper |
   | `500` | `internal` | the registry could not be read/written |
   | `501 Not Implemented` | `not_implemented` | the account model is not enabled |
 
@@ -1395,13 +1482,17 @@ All nineteen are enumerated in
 [ADR 0040](decisions/0040-account-model.md#bad--honest-limitations-all-real-none-papered-over).
 The ones that change what this API *means*:
 
-1. ⚠️ **NO RECOVERY, AT ALL.** No email, no password, no recovery code, no
-   operator break-glass. **Lose or revoke every device in an account and the
-   account is permanently unreachable, its vaults permanently unreadable by the
-   customer AND by us, and its subscription stranded.** The orphan failure
-   **narrowed** (from "revoke one device" to "lose every device"); it was **not
-   eliminated**. The guidance is "keep two devices enrolled" — a mitigation, not
-   a fix.
+1. ⚠️ **STILL NOT AN IDENTITY SYSTEM — and recovery exists only if it was printed
+   in advance.** There is no email, no password, and **no operator break-glass**.
+   Since Phase 54 a customer *can* print a **recovery kit**
+   ([below](#recovery-kits-dev-gated--phase-54)) — 56 characters on paper that
+   derive an ordinary member device — which addresses the **data** half of this
+   limitation. ⚠️ **A kit cannot be created after the loss.** Lose or revoke every
+   device **without having printed one**, and the account is permanently
+   unreachable, its vaults permanently unreadable by the customer AND by us, and
+   its subscription stranded. The orphan failure **narrowed** again; it was **not
+   eliminated**. And the kit brings a risk of its own: **whoever holds the paper
+   holds the account.**
 2. **Membership is FLAT.** Any member may invite, revoke **every** other member,
    run checkout and administer every account-owned vault. **Revoking a
    compromised device does NOT revoke the devices it invited** — the audit log
@@ -1415,15 +1506,22 @@ The ones that change what this API *means*:
    **own** singleton account, so an existing two-device customer ends up with
    **two accounts and two billing subjects**. The remedy is manual and leaves a
    second subscription row for an operator to reconcile.
-6. **Entitlement is REPORTED, never ENFORCED.** No route refuses service to an
-   unentitled account. What changed is only that a cancel or refund now demotes
-   the whole account at once.
+6. **Entitlement CAN now be enforced, but only on writes, and only opt-in.**
+   `SIGILD_ENTITLEMENT_ENFORCE` (**off by default**) makes a lapsed account's
+   **writes** answer `402` past the grace period
+   ([below](#entitlement-enforcement-opt-in--phase-55)). ⭐ **Reads and
+   same-account key recovery are never refused**, and `past_due` stays entitled.
+   With the switch unset, this limitation still reads exactly as written.
 7. **`SIGILD_ACCOUNT_MAX_DEVICES` is anti-freeloading, not anti-fraud**, and a
    compromised provider webhook secret now moves an **account's** status rather
-   than one device's.
-8. **No rate limiting** on `POST /v1/devices/enroll` or
-   `POST /v1/account/invites` — the caps bound stored **state**, not request
-   volume — and **no sweep job for expired invites**.
+   than one device's — which, with enforcement on, means it can move an account's
+   **service**.
+8. **Rate limiting is opt-in and is a BACKSTOP.**
+   `POST /v1/devices/enroll` and `POST /v1/account/invites` can be bounded
+   ([above](#abuse-rate-limiting-enrollment--invite-minting)), but behind a
+   reverse proxy the enrollment bucket is global, only failures are charged, and
+   the handler still runs. The device/invite caps bound stored **state**, not
+   request volume, and there is still **no sweep job for expired invites**.
 9. **The replay nonce cache is still per-process and in-memory.** Invite
    consumption is DB-atomic and therefore multi-instance safe; **signed requests
    are not**.
@@ -1443,7 +1541,7 @@ The ones that change what this API *means*:
 
 ## Device-to-device vault sharing (DEV-GATED, opt-in) — Phase 46
 
-> **DEV-GATED, OPT-IN, and UNAUDITED.** These **six** routes let one enrolled device
+> **DEV-GATED, OPT-IN, and UNAUDITED.** These **seven** routes let one enrolled device
 > hand a vault's encryption key to another **without the server ever being able to
 > read it**. The relay is real and the authorization is real (it is the *same* v3
 > code path as the op-log, not a parallel one), but it is **gated off by default**
@@ -1460,6 +1558,14 @@ The ones that change what this API *means*:
 > ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)).
 > **`sigild` gained no knowledge of any of that** — it does not store, serve or
 > validate a pin or a safety number, and it still performs no cryptography.
+>
+> **Phase 54 added the seventh** (`GET /v1/devices/{deviceID}/keys`, a **self-only,
+> metadata-only** index of which vaults hold a wrapped key for one device) to
+> support the **recovery kit** ([below](#recovery-kits-dev-gated--phase-54)). It
+> needed **no migration** — the index `sigil_vault_key_envelopes_by_recipient`
+> from `0004_key_sharing.sql` was created for exactly this query — so
+> `sigild_schema_version` stays **5**, and `sigild` still has **no concept of
+> "recovery"**.
 
 ### The shape of the flow
 
@@ -1712,9 +1818,57 @@ vault cannot collect the **new** key.
   state ("no envelope for that device") already holds. `delete_key_envelope` /
   `deleteKeyEnvelope` therefore return `false` rather than raising.
 
+### `GET /v1/devices/{deviceID}/keys` — which vaults hold a key for ME (SELF-ONLY, METADATA ONLY)
+
+Added in **Phase 54** ([ADR 0042](decisions/0042-recovery-kit.md)). A device
+restoring itself on a fresh machine — the case a **recovery kit** exists for —
+knows its own device id and **nothing else**: not which vaults it can open, not
+which account it belongs to. This is the one route that answers *"which vaults
+hold a wrapped key addressed to me?"*
+
+- **Auth:** the four v3 headers. ⭐ **Self-only**, and the check runs **before any
+  store read**: if `deviceID` is not the authenticated device's own id the answer
+  is **`403`** (`forbidden_device`). An **unknown** device id is the **same coarse
+  `403`, never a `404`** — there is no existence oracle on the registry here.
+- ⭐ **Metadata only — never a blob.** The Postgres backend selects
+  `octet_length(blob)`, so the ciphertext never leaves the database for this
+  route. Collecting an envelope is still the separate
+  `GET /v1/vaults/{vaultID}/keys/{deviceID}`.
+- **Per-vault filtering:** each candidate row is checked with the ordinary
+  `authorizeVault(… needRead)`, and a vault the caller may not read is **silently
+  omitted** rather than raising — so the list is exactly "what I may fetch".
+  `needRead` **never claims** an unowned vault.
+- **Ordering** is by vault id, stable across backends. An unknown recipient is
+  **not** an error — it lists zero vaults.
+- **Success — `200 OK`:**
+
+  ```json
+  {
+    "device_id": "dev_B",
+    "vaults": [
+      { "vaultID": "demo", "sender_device_id": "dev_A", "size_bytes": 1226, "created_at": "<RFC3339>" }
+    ],
+    "has_more": false
+  }
+  ```
+
+  At most **500** rows (`maxRecipientIndexRows`) are returned; beyond that
+  `has_more` is `true`. ⚠️ There is deliberately **no cursor** — a device with
+  more than 500 covered vaults cannot page past the first 500.
+
+- **Errors:**
+
+  | Status | `error` code | When |
+  |--------|--------------|------|
+  | `400 Bad Request` | `missing_device_id` | no device ID in the path |
+  | `401 Unauthorized` | `unauthorized` | v3 signature check failed — including a **revoked** device |
+  | `403 Forbidden` | `forbidden` | the path device is **not** the authenticated device — **and the same answer for an unknown device id** |
+  | `500 Internal Server Error` | `internal` | the store could not be read |
+  | `501 Not Implemented` | `not_implemented` | dev-ops off, or no registry configured |
+
 ### Audit log
 
-Five events, all **metadata plus (where there is a blob) a fingerprint** — the
+Six events, all **metadata plus (where there is a blob) a fingerprint** — the
 envelope bytes, the vault key, the hybrid public keys, signatures and nonces are
 **never** logged:
 
@@ -1725,6 +1879,7 @@ envelope bytes, the vault key, the hybrid public keys, signatures and nonces are
 | `vault.key_envelope_get` | `request_id`, `vault_id`, `recipient_device_id`, `size_bytes`, `blob_sha256` |
 | `vault.key_envelope_list` | `request_id`, `vault_id`, `device_id` (the caller), `returned_count`. **No `blob_sha256`** — the route never reads a blob, so there is nothing to fingerprint |
 | `vault.key_envelope_delete` | `request_id`, `vault_id`, `recipient_device_id`, `device_id` (the caller). Records **who removed whose** envelope; again no blob is read |
+| `device.key_envelope_index` | `request_id`, `device_id` (the caller, who is also the subject — the route is self-only), `returned_count`. **No `blob_sha256`**, no vault list: the route reads no blob, and the log is not a place to mirror a device's coverage |
 
 The shared `blob_sha256` lets an operator correlate "the sender uploaded X" with
 "the recipient collected X" **without the server retaining the ciphertext**.
@@ -1893,7 +2048,8 @@ worth knowing when reading the rest of this document:
   does not re-wrap already-deposited envelopes.
 - **One mailbox per (vault, recipient).** A deposit is an upsert, so any device with
   `write` access can overwrite an envelope another writer deposited.
-- **No rate limiting** on these routes — the per-vault limiter covers appends only.
+- **No rate limiting** on these routes — the per-vault limiter covers appends only,
+  and the abuse limiters cover enrollment and invite minting only.
 - **Request authentication is classical Ed25519** (contract v3). The wrap is
   PQ-hybrid; the signature over the request is not, and **the system is not
   "post-quantum secure"**.
@@ -1902,6 +2058,81 @@ worth knowing when reading the rest of this document:
   *same* `0600` plaintext files; the browser clients seal both into the device-identity
   container (stronger at rest) but hold them **unzeroized in JS memory** while the vault
   is unlocked. Nothing is zeroized on any client.
+
+---
+
+## Recovery kits (DEV-GATED) — Phase 54
+
+> **DEV-GATED and UNAUDITED.** ⭐ **`sigild` has NO concept of "recovery".** There
+> is no recovery table, no recovery flag, no recovery route, and **no migration**
+> — `sigild_schema_version` stays **5**. This section exists because an operator
+> and an auditor need to know what a recovery kit *looks like on the wire*, which
+> is: **an ordinary device**. See [ADR 0042](decisions/0042-recovery-kit.md), and
+> [`crypto-spec.md`](crypto-spec.md#recovery-kit--a-printable-paper-key) for the
+> format and derivation.
+
+A **recovery kit** is a member device whose Ed25519 identity and hybrid
+(X25519 + ML-KEM-768) identity are **HKDF-SHA256 derivations of 32 bytes of
+client CSPRNG printed on paper** — never transmitted, never stored on a device,
+and **never derivable from anything the server holds**.
+
+**Everything the server sees, it already served before:**
+
+| What the kit does | The request it makes | What the server stores |
+|-------------------|----------------------|------------------------|
+| joins the account | `POST /v1/devices/enroll` with an ordinary invite + proof of possession | one more device row, label `"recovery-kit"` |
+| publishes its key | `PUT /v1/devices/{kitID}/hybrid-key` | one more **public** hybrid key |
+| is covered for a vault | `PUT /v1/vaults/{vaultID}/keys/{kitID}` + `POST /v1/vaults/{vaultID}/grants` | one more **opaque** ~1226-byte `SIGILhyb` envelope, and a grant |
+| finds itself after a restore | `GET /v1/devices/{kitID}/keys` ([above](#get-v1devicesdeviceidkeys--which-vaults-hold-a-key-for-me-self-only-metadata-only)) | nothing — it is a read |
+| collects a key | `GET /v1/vaults/{vaultID}/keys/{kitID}` | nothing — it is a read |
+| is retired | `POST /v1/devices/{kitID}/revoke` | the ordinary revocation |
+
+**The label is deliberately visible.** A kit enrols under the device label
+`"recovery-kit"`, which appears in `GET /v1/account`. Hiding it would buy only
+protection against targeted denial and would cost every client the ability to
+show a user whether recovery is set up.
+
+⭐ **The security-critical part is entirely client-side.** Wrapping a vault key to
+a kit goes through the same pinned-fetch choke point as any other wrap
+([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)),
+with one extra rule: a **first-sight** wrap to a device the client believes is a
+recovery kit is **REFUSED** unless the caller supplies the safety number printed
+on the sheet. `sigild` neither knows nor enforces this — it stores no pin, no
+safety number and no trust state.
+
+⚠️ **The residual limit, stated exactly.** Recognising that a recipient *is* a
+kit resolves the device **label** from `GET /v1/account` — a listing the
+**adversarial server serves**. **A server that renames or hides the label
+degrades `vault share` / `vault rotate` to a kit back to ordinary first-sight
+TOFU (warned and pinned) rather than a refusal.** The caller-**asserted** paths
+(`sigil recovery cover`, `sigil recovery generate`) do not depend on the server
+and are unaffected, and **no path anywhere accepts a changed key or a mismatched
+safety number**. So the honest claim is **"refuses first-sight kit wraps against a
+server that does not lie about labels"**, *not* "refuses first-sight kit wraps".
+
+### Honest limits
+
+- ⚠️ **WHOEVER HOLDS THE PAPER HAS FULL CONTROL OF THE ACCOUNT** — read every
+  covered vault, revoke every device. It is **stronger than a stolen locked
+  phone**: no OS lock, no biometric, no vault password stands in front of it. Its
+  nominal `read` grant is **cosmetic**, because account ownership authorizes it
+  regardless.
+- ⚠️ **It recovers KEYS, not DATA.** A vault that was never synced to this server
+  is gone.
+- ⚠️ **It only opens the vaults it was told to COVER**, as of the print date. A
+  vault created later needs `sigil recovery cover`, and nothing reminds anyone.
+- ⚠️ **A kit cannot be created after the loss.**
+- ⚠️ **A kit consumes a seat** against `SIGILD_ACCOUNT_MAX_DEVICES`, appears in
+  `GET /v1/account`, and can be revoked by **any** member — membership is flat.
+- ⚠️ **Client coverage is PARTIAL.** The **`sigil` CLI has the full flow**
+  (`recovery generate | cover | check | verify | restore | revoke`). There is **no
+  recovery UI in the webapp** (no `RecoveryPanel`, no `recovery.spec.ts`) and
+  **none in the MV3 extension** (although its `build.sh` *does* vendor
+  `recovery.mjs`), and the **desktop has no recovery commands**; those surfaces
+  consume only the *wrap gate* (the safety-number field and the refusal). ⚠️ Since
+  `restore` runs on a **new install**, **a user whose only client was the browser
+  or the extension cannot restore there today.**
+- ⚠️ **Dev-gated, plain HTTP, UNAUDITED.**
 
 ---
 
@@ -1962,8 +2193,8 @@ takes no subject parameter. A client therefore cannot buy — or query — a
 subscription on another subject's behalf, because there is no body, query or path
 field anywhere that names one. "Subject" now means **account**, so paying on one
 device entitles the others ([Account model](#account-model-dev-gated--phase-52));
-it is still **not** an identity — there is no email, no password and no recovery
-(see the limits at the end of this section).
+it is still **not** an identity — no email, no password, and no recovery beyond a
+**paper kit printed in advance** (see the limits at the end of this section).
 
 ### Default posture — the deliberate `501`
 
@@ -2237,7 +2468,8 @@ device that never ran checkout still sees the account's entitlement**.
   "status": "active",
   "entitled": true,
   "current_period_end": "2026-08-26T00:00:00Z",
-  "updated_at": "2026-07-26T18:22:41Z"
+  "updated_at": "2026-07-26T18:22:41Z",
+  "entitlement": { "enforced": true, "writes": "allowed", "reads": "allowed" }
 }
 ```
 
@@ -2246,6 +2478,15 @@ device that never ran checkout still sees the account's entitlement**.
 `current_period_end` and `updated_at` are omitted when unset. `401` on failed
 device auth, **`403` when the signing device carries no account**
 (`missing_account`), `500` on a store fault, `501` when billing is off.
+
+The **`entitlement` block is additive and present only when
+`SIGILD_ENTITLEMENT_ENFORCE` is on** ([below](#entitlement-enforcement-opt-in--phase-55));
+with enforcement off this response is **byte-identical** to before. `writes` is
+`allowed` / `grace` / `refused`, `reads` is the constant `"allowed"` (the
+guarantee is stated in the payload, not only in this document), and
+`grace_ends_at` (RFC3339) appears when applicable. ⭐ **This is the warning channel
+for read-only clients**, which are never refused and would otherwise discover a
+lapse only on their first write.
 
 > **Cross-cutover subjects.** A hosted checkout started **before** migration
 > `0005` put a **device** id into the provider's metadata, and a provider echoes
@@ -2284,6 +2525,16 @@ device auth, **`403` when the signing device carries no account**
 | `SIGILD_JUSPAY_AMOUNT_MINOR` | optional | Default amount in minor units (paise); rendered to the decimal major-unit string Juspay expects, by integer arithmetic only. |
 | `SIGILD_JUSPAY_CURRENCY` | optional | Default currency. |
 | `SIGILD_JUSPAY_API_BASE_URL` | optional | API host override (default `https://api.juspay.in`). |
+| `SIGILD_ENTITLEMENT_ENFORCE` | opt-in | `1`/`true` makes a lapsed account's **writes** answer `402` past the grace period ([below](#entitlement-enforcement-opt-in--phase-55)). **Unset ⇒ OFF and byte-identical behaviour.** Requires `SIGILD_ENABLE_DEV_OPS` **and** `SIGILD_DEVICE_AUTH` **and** `SIGILD_BILLING_PROVIDERS` — each missing one is a **boot error** with a message saying why. |
+| `SIGILD_ENTITLEMENT_GRACE` | optional | Go duration; how long after entitlement lapses writes keep working (**warned, not refused**). Default **14 days** (`336h`), bounded to `(0, 365d]`. Setting it **without** `SIGILD_ENTITLEMENT_ENFORCE` is a **boot error** — an inert grace period means an operator believes writes are being enforced when they are not. |
+
+⛔ **`SIGILD_WEBHOOK_RATE_LIMIT` and `SIGILD_WEBHOOK_RATE_BURST` no longer exist.**
+They were built in Phase 53 and **removed** when a live reproduction showed the
+limiter shedding genuine, correctly-signed provider deliveries
+([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)).
+Setting either now emits a **boot WARNING** naming the removal, rather than being
+silently inert — but it **does not fail boot**, because a protective knob that has
+become moot must not take a payments server down.
 
 All of it is **parsed and validated before the listener binds**. Enabling a
 provider without its credentials is a **boot error**, never a runtime surprise: a
@@ -2349,22 +2600,187 @@ amount:
   subscription keys off the signing device's **account**
   ([above](#account-model-dev-gated--phase-52)), so a user's devices share one
   subject. There is still **no user record, no email, no household, no
-  organization, no seat model, no transfer and NO RECOVERY**; ⚠️ **every device
+  organization, no seat model, no transfer, and no recovery beyond a paper kit
+  printed in advance**; ⚠️ **every device
   enrolled before migration `0005` was adopted into its OWN singleton account**,
   so an existing two-device customer has **two accounts and two billing
   subjects**, reconcilable only by hand. A compromised provider webhook secret
   now moves an **account's** status rather than one device's.
 - **No invoicing, proration, tax, refunds, chargebacks, dunning or reconciliation
   job**, and no admin surface for billing.
-- **No entitlement enforcement.** `entitled` is reported; nothing in the op-log
-  or device routes consults it. Gating the op-log on payment status would lock a
-  customer out of their own 2FA codes over a failed card, and needs grace periods
-  and dunning that do not exist — a deliberate deferral, not an oversight.
+- **Entitlement enforcement exists, is OFF by default, and refuses only writes.**
+  See [below](#entitlement-enforcement-opt-in--phase-55). With
+  `SIGILD_ENTITLEMENT_ENFORCE` unset, `entitled` is reported and consulted by
+  nothing, exactly as before. There is still **no dunning, no notification and no
+  reconciliation** — the only warnings are response headers, the additive
+  `entitlement` block, and the server's own audit log.
+- ⛔ **No rate limiting on `POST /v1/billing/webhook/{provider}`, deliberately, and
+  the limiter that once existed was REMOVED.** An early Phase 53 revision limited
+  it before signature verification, keyed on the provider name — the only key
+  available at that point, and one **forged traffic controls too**. A verifier
+  reproduced the consequence on a live server: one unauthenticated thread at
+  ~137 forged requests/second caused **15 of 15 genuine, correctly-signed Stripe
+  deliveries to be shed with `429`**; a longer flood shed roughly **2,000
+  consecutive genuine retries**; **zero payment events were applied**, and the
+  customer was then refused with `402` by entitlement enforcement. Because a
+  provider's retry budget is **finite**, such an event is lost **permanently**.
+  ⭐ **The rule:** you cannot safely shed traffic on a route where shedding costs
+  money and the legitimate sender has a finite retry budget — limiting *before*
+  verification lets anonymous traffic spend the honest sender's quota, and
+  limiting *after* verification is no better, because an authentic burst is
+  exactly what must never be dropped. What bounds the work instead is the **64 KiB
+  body cap** and the cost of **one HMAC over a size-capped buffer** — no database
+  round trip, no state created. Volume protection for this route belongs at the
+  **edge** ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)).
 - **The in-memory store is non-durable** (see above), and there is **no PCI
   attestation** — hosted checkout keeps scope minimal, it does not certify
   anything.
 - **In any real deployment webhooks must arrive over TLS.** The dev server speaks
   plain HTTP.
+
+---
+
+## Entitlement enforcement (opt-in) — Phase 55
+
+> **OFF BY DEFAULT, DEV-GATED, UNAUDITED.** With `SIGILD_ENTITLEMENT_ENFORCE`
+> unset, **no handler reads the subscription store, no header is set, no audit
+> line is written and no metric moves** — every response is byte-identical to a
+> server built before this existed. See
+> [ADR 0043](decisions/0043-entitlement-enforcement.md).
+
+Until Phase 55, entitlement was **reported and never enforced**
+([ADR 0040](decisions/0040-account-model.md) limitation 8). It can now be
+enforced — very narrowly, and asymmetrically, for one reason:
+
+> **This product holds a customer's second factor. Gating it on payment status
+> means a declined card can lock a person out of their own bank login.**
+
+### ⭐ What is refused, and what is never refused
+
+| Method + path | Past grace |
+|---------------|-----------|
+| `POST /v1/vaults/{vaultID}/ops` | **`402`** — new op-log entries |
+| `PUT /v1/vaults/{vaultID}/keys/{deviceID}` | **`402` ONLY when `{deviceID}` belongs to ANOTHER account** |
+| `POST /v1/vaults/{vaultID}/grants` | **`402` ONLY when the grantee belongs to ANOTHER account** |
+| **everything else** | **never refused** |
+
+"Everything else" is exhaustive and worth reading: every `GET` (the op-log, chain
+verification, key envelopes, the per-device envelope index, hybrid keys, grants,
+devices, the account, invites, the subscription itself), plus device
+**enrollment**, device **revocation**, hybrid-key **publish**, envelope
+**deletion**, invite **minting**, every billing route **including checkout** — and
+⭐ **depositing a wrapped vault key (with the grant that accompanies it) to a
+device of the CALLER'S OWN ACCOUNT.**
+
+Two guarantees follow, and both were driven live by a verifier:
+
+- **A lapsed customer keeps every 2FA code they already have.** (Verified: a
+  lapsed account still produced the RFC 6238 vector `94287082`.) `past_due`
+  remains **entitled** — a declined card starts the provider's retry window, not
+  a cutoff.
+- **A lapsed customer can still get the keys onto their own devices.** ⚠️ The
+  first cut refused this, and a verifier found the lockout: past grace a customer
+  whose phone had died could enroll a replacement and then **could not receive the
+  vault key for it** (`402`), so the new phone held ciphertext it could never
+  decrypt — and **printing a recovery kit was refused too**, leaving them one
+  device failure from permanent loss, while the `402` body claimed
+  `key_recovery_allowed: true`. Establishing key access within your own account is
+  now in the never-refused set.
+
+The asymmetry is **mechanically enforced**: a test parses the package's AST and
+fails if the enforcement call set ever changes, so a future read handler cannot
+quietly acquire a payment check.
+
+### The `402` response
+
+```json
+{
+  "error": "payment_required",
+  "detail": "this account's subscription has lapsed and its grace period has ended, so new writes are refused; reading your existing vault contents, collecting your key envelopes, and giving another device of THIS account the key to a vault (including creating a recovery kit) are NOT affected",
+  "subscription_status": "canceled",
+  "grace_ended_at": "2026-07-14T00:00:00Z",
+  "reads_allowed": true,
+  "key_recovery_allowed": true,
+  "checkout_path": "/v1/billing/checkout"
+}
+```
+
+`reads_allowed` and `key_recovery_allowed` are **always `true`**;
+`grace_ended_at` is omitted when no anchor date could be established.
+`subscription_status` is from the closed billing enum.
+
+⭐ **It is deliberately NOT collapsed into `401`/`403`.** A client must be able to
+tell *"pay to continue"* from *"your key is wrong"* and from *"you may not touch
+this vault"*, and act on it. **No auth oracle is created**, because the gate runs
+strictly **after authentication AND authorization have both succeeded** — an
+unauthenticated or unauthorized caller gets its `401`/`403` exactly as before and
+can never see a `402`, so the only party who learns an account's billing state is
+a **verified member of that account**, which `GET /v1/billing/subscription`
+already tells them. With the dev gate off, every gated route stays `501`, never
+`402`.
+
+### Warning headers
+
+Set on gated **write** responses only — on the successful `2xx` while in grace,
+and on the `402` itself. An entitled account's responses carry none of them.
+
+| Header | Value |
+|--------|-------|
+| `X-Sigil-Entitlement` | `grace` or `lapsed` |
+| `X-Sigil-Entitlement-Status` | the billing status from the closed enum |
+| `X-Sigil-Entitlement-Grace-Ends` | RFC3339 UTC instant (omitted when unknown) |
+
+### Where grace is measured from
+
+- **With a subscription record:** the **later** of `updated_at` and
+  `current_period_end`. Taking the later is customer-favouring on purpose — a
+  subscription canceled mid-period keeps working until the period it was
+  **already paid for** ends, and any later touch of the row can only **extend**
+  service.
+- **With no record at all** (never subscribed): the **account's creation time**.
+  ⚠️ This makes the grace period double as the **buy-in window** — a trial by side
+  effect. There is no separate trial mechanism in this server.
+
+The boundary is exclusive: exactly at `anchor + grace`, writes are refused.
+
+### Every uncertainty FAILS OPEN
+
+Enforcement not configured, a subscription-store fault, an unreadable account
+row, no anchor date, or a device carrying no account (an authorization state
+already refused upstream with `403`, which must never be re-served as a payment
+problem) all **allow** the request. A database blip must never cost a customer
+their vault. `entitlement.fail_open` is logged at **error** level, because it
+means enforcement is silently *not* happening.
+
+### Observability
+
+`sigild_entitlement_enforcing` (gauge) and
+`sigild_entitlement_decisions_total{outcome}` over the closed set
+`entitled` / `grace` / `refused` / `fail_open` — **no account or subject label**.
+Audit events `entitlement.grace` (warn), `entitlement.refused` (warn) and
+`entitlement.fail_open` (error) carry `account_id`, `device_id`, a
+`subscription_status`, a grace instant and a fixed `surface`
+(`ops_append` / `key_envelope_put` / `vault_grant`) — never a token, key,
+signature, nonce, card field or byte of ciphertext. By its **absence** from that
+stream, the audit log is also the evidence that no read was ever refused.
+
+### Honest limits
+
+- ⚠️ **A vault claim happens before the refusal.** A first write to an *unclaimed*
+  vault is claimed by the authorization step and only then refused with `402`.
+  Accepted knowingly: the claim binds the vault to the caller's **own** account.
+- ⚠️ **Enforcement depends on a durable subscription store.** With the in-memory
+  store, a restart loses every subscription and every account then **fails open**
+  — free service, silently, until the store is repopulated.
+- **No dunning, notification, email, invoice or reconciliation**, and **no
+  per-account override**: one grace period for the whole server.
+- **Refusal is not revocation.** Nothing is deleted and nothing expires; a lapsed
+  account's data stays where it is (and keeps costing storage).
+- **`past_due` is entitled**, so a genuinely failed card buys the provider's whole
+  retry window *plus* the grace period. Deliberate, and a real revenue leak.
+- **All billing caveats still hold** — never run against a live provider account,
+  Juspay *UNVERIFIED-AGAINST-LIVE-DASHBOARD*, and a compromised provider webhook
+  secret can now move an account's **service**, not just its reported status.
 
 ---
 
@@ -2379,11 +2795,13 @@ minimum:
   [above](#multi-device-auth-model-contract-v3--dev)) and a real (if minimal)
   **account model** on top of it
   ([above](#account-model-dev-gated--phase-52)), but production still owes an
-  **identity** layer — no email, no password, **no recovery of any kind** today —
-  plus session/token issuance (JWT bearer tokens,
-  [`../sigild/internal/auth/`](../sigild/internal/auth/)), **key rotation** and
-  re-enrollment, **rate limiting on enrollment attempts and invite minting**, a
-  **shared** (not per-process) replay store, roles inside an account (membership
+  **identity** layer — no email, no password, no operator break-glass; the only
+  recovery is a **paper kit printed in advance**
+  ([above](#recovery-kits-dev-gated--phase-54)) — plus session/token issuance
+  (JWT bearer tokens, [`../sigild/internal/auth/`](../sigild/internal/auth/)),
+  **key rotation** and re-enrollment, **rate limiting that actually works
+  per-source** (what exists today is a proxy-blind backstop, [above](#abuse-rate-limiting-enrollment--invite-minting)),
+  a **shared** (not per-process) replay store, roles inside an account (membership
   is flat), account transfer/merge/deletion, and an ownership model stronger than
   trust-on-first-write. The legacy `SIGILD_OPLOG_PUBKEY` mode remains only a
   single static DEV key with no authorization at all, and with neither contract

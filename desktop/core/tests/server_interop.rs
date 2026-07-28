@@ -361,7 +361,7 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
         Err(DesktopError::NotEnrolled(_))
     ));
     assert!(matches!(
-        desktop.share_vault(VAULT_FROM_DESKTOP, "dev_whoever", "read"),
+        desktop.share_vault(VAULT_FROM_DESKTOP, "dev_whoever", "read", None),
         Err(DesktopError::NotEnrolled(_))
     ));
     say("status reads with no state at all; contract-v3 ops say NotEnrolled");
@@ -546,9 +546,12 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
     // 5. (a) DESKTOP SHARES TO THE CLI -> the CLI prints 94287082.
     // -----------------------------------------------------------------
     let share_fp = desktop
-        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read")
+        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None)
         .expect("share to the CLI device");
-    assert_eq!(share_fp, shared_fp, "shared the same key it holds");
+    assert_eq!(
+        share_fp.fingerprint, shared_fp,
+        "shared the same key it holds"
+    );
 
     let accepted = h.cli(
         &cli_home,
@@ -722,7 +725,7 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
         unenrolled.publish_hybrid().unwrap_err(),
         unenrolled.accept_vault(VAULT_FROM_DESKTOP).unwrap_err(),
         unenrolled
-            .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read")
+            .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None)
             .unwrap_err(),
         unenrolled.check_server().unwrap_err(),
     ] {
@@ -823,7 +826,7 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
 
     // The first share is what PINS K1. It must succeed.
     desktop
-        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read")
+        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None)
         .expect("the first share pins the key and succeeds");
     let (k1, state) = desktop.peer_safety_number(&cli_id).expect("safety number");
     assert_eq!(state, "matches the pinned key", "K1 should be pinned now");
@@ -838,7 +841,7 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
     say("that device now presents a DIFFERENT hybrid public key under the same id");
 
     // The share must REFUSE, and refuse as the alarm — not as a generic error.
-    let presented = match desktop.share_vault(VAULT_FROM_DESKTOP, &cli_id, "read") {
+    let presented = match desktop.share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None) {
         Err(DesktopError::KeyPinMismatch {
             device_id,
             pinned_safety_number,
@@ -877,7 +880,9 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
             desktop.rotate_vault(
                 VAULT_FROM_DESKTOP,
                 &vault_path,
-                std::slice::from_ref(&cli_id)
+                std::slice::from_ref(&cli_id),
+                &[],
+                &[],
             ),
             Err(DesktopError::KeyPinMismatch { .. })
         ),
@@ -893,7 +898,7 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
     );
     assert!(
         matches!(
-            desktop.share_vault(VAULT_FROM_DESKTOP, &cli_id, "read"),
+            desktop.share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None),
             Err(DesktopError::KeyPinMismatch { .. })
         ),
         "a refused re-pin must leave the old pin in place"
@@ -907,7 +912,7 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
     assert_eq!(previous.as_deref(), Some(k1.as_str()));
     assert_eq!(current, presented);
     desktop
-        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read")
+        .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None)
         .expect("sharing resumes once the new key is deliberately pinned");
     say("after a deliberate re-pin to the presented number, sharing resumes");
 

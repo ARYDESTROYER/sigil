@@ -270,6 +270,98 @@ func runKeySharingSuite(t *testing.T, newStore func(*testing.T) DeviceStore) {
 		}
 	})
 
+	t.Run("KeyEnvelopeRecipientIndex", func(t *testing.T) {
+		// Phase 54 (the recovery kit): a device that knows NO vault ids asks
+		// which envelopes are addressed to IT. METADATA only, sorted by vault
+		// id, and strictly scoped to the one recipient.
+		s := newStore(t)
+		sender := newTestDevice(t, "A")
+		b := newTestDevice(t, "B")
+		c := newTestDevice(t, "C")
+		for _, d := range []Device{sender, b, c} {
+			if err := createDevice(ctx, s, d); err != nil {
+				t.Fatalf("CreateDevice: %v", err)
+			}
+		}
+
+		// An unknown recipient is an EMPTY slice, never an error — a kit that
+		// was never covered must read as "nothing to recover", not as a fault.
+		if got, err := s.ListKeyEnvelopesForRecipient(ctx, "dev_nobody"); err != nil || len(got) != 0 {
+			t.Fatalf("index for unknown recipient = (%v, %v), want ([], nil)", got, err)
+		}
+
+		tag := uniqueTag()
+		// Deliberately deposited out of order, so a passing sort assertion
+		// cannot be an accident of insertion order.
+		vZ := "vault-z-" + tag
+		vA := "vault-a-" + tag
+		vM := "vault-m-" + tag
+		blobZ := testEnvelopeBlob(t, 1226)
+		blobA := testEnvelopeBlob(t, 900)
+		blobOther := testEnvelopeBlob(t, 700)
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		for _, e := range []KeyEnvelope{
+			{VaultID: vZ, RecipientDeviceID: b.ID, SenderDeviceID: sender.ID, Blob: blobZ, CreatedAt: now},
+			{VaultID: vA, RecipientDeviceID: b.ID, SenderDeviceID: sender.ID, Blob: blobA, CreatedAt: now},
+			// Addressed to SOMEONE ELSE: it must never appear in B's index.
+			{VaultID: vM, RecipientDeviceID: c.ID, SenderDeviceID: sender.ID, Blob: blobOther, CreatedAt: now},
+		} {
+			if err := s.PutKeyEnvelope(ctx, e); err != nil {
+				t.Fatalf("PutKeyEnvelope: %v", err)
+			}
+		}
+
+		got, err := s.ListKeyEnvelopesForRecipient(ctx, b.ID)
+		if err != nil {
+			t.Fatalf("ListKeyEnvelopesForRecipient: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("index listed %d rows, want 2 (%+v)", len(got), got)
+		}
+		// Sorted BYTE-WISE by vault id (COLLATE "C" in Postgres), so both
+		// backends agree regardless of database locale.
+		if got[0].VaultID > got[1].VaultID {
+			t.Fatalf("index is not sorted by vault id: %+v", got)
+		}
+		if got[0].VaultID != vA || got[1].VaultID != vZ {
+			t.Fatalf("index = %+v, want [%s %s]", got, vA, vZ)
+		}
+		for _, m := range got {
+			if m.RecipientDeviceID != b.ID {
+				t.Fatalf("index leaked another recipient's row: %+v", m)
+			}
+			if m.SenderDeviceID != sender.ID {
+				t.Fatalf("index row = %+v, want sender %s", m, sender.ID)
+			}
+		}
+		if got[0].SizeBytes != len(blobA) || got[1].SizeBytes != len(blobZ) {
+			t.Fatalf("index sizes = (%d, %d), want (%d, %d)",
+				got[0].SizeBytes, got[1].SizeBytes, len(blobA), len(blobZ))
+		}
+		// ⭐ METADATA ONLY. KeyEnvelopeMeta has no blob field at all — this
+		// asserts the runtime consequence: none of the deposited ciphertext is
+		// reachable through the index.
+		for _, m := range got {
+			for _, blob := range [][]byte{blobA, blobZ, blobOther} {
+				if bytes.Contains([]byte(m.VaultID+m.RecipientDeviceID+m.SenderDeviceID), blob) {
+					t.Fatalf("index row carries envelope bytes: %+v", m)
+				}
+			}
+		}
+
+		// Deleting an envelope removes it from the index too.
+		if err := s.DeleteKeyEnvelope(ctx, vZ, b.ID); err != nil {
+			t.Fatalf("DeleteKeyEnvelope: %v", err)
+		}
+		after, err := s.ListKeyEnvelopesForRecipient(ctx, b.ID)
+		if err != nil {
+			t.Fatalf("ListKeyEnvelopesForRecipient after delete: %v", err)
+		}
+		if len(after) != 1 || after[0].VaultID != vA {
+			t.Fatalf("index after delete = %+v, want just %s", after, vA)
+		}
+	})
+
 	t.Run("KeyEnvelopeRejectsBadSizeAndUnknownRecipient", func(t *testing.T) {
 		s := newStore(t)
 		d := newTestDevice(t, "B")

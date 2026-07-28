@@ -51,20 +51,39 @@ use std::path::{Path, PathBuf};
 
 use sigil_cli::{
     enroll_device, fetch_hybrid_key, generate_hybrid_identity, generate_key, generate_vault_key,
-    get_key_envelope, grant_vault_access, keyring_get, keyring_put, load_hybrid_public,
-    load_hybrid_secret, load_identity, load_key_file, load_keyring, publish_hybrid_key,
-    pull_ops_auth, push_op_auth, put_key_envelope, save_hybrid_public, save_hybrid_secret,
-    save_key, unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, CliError, DeviceIdentity,
-    RequestAuth, VaultKeyring, VAULT_KEYRING_FILE, VAULT_KEY_LEN,
+    get_key_envelope, keyring_get, keyring_put, load_hybrid_public, load_hybrid_secret,
+    load_identity, load_key_file, load_keyring, publish_hybrid_key, pull_ops_auth, push_op_auth,
+    save_hybrid_public, save_hybrid_secret, save_key, share_vault_to_known_key, unwrap_vault_key,
+    vault_key_fingerprint, CliError, DeviceIdentity, RequestAuth, VaultKeyring, VAULT_KEYRING_FILE,
+    VAULT_KEY_LEN,
 };
 // Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
 // The desktop adds NO implementation of its own: it calls the same sigil-cli
 // library functions the CLI does, so the semantics and the safety-number digest
 // cannot drift between the two (ADR 0037).
 use sigil_cli::{
-    fetch_hybrid_key_pinned, hybrid_safety_number, load_pins, pairwise_safety_number,
-    repin_hybrid_key, rotate_vault_key, HybridKeyPin, PinStatus, HYBRID_PIN_FILE,
+    hybrid_safety_number, load_pins, pairwise_safety_number, repin_hybrid_key, rotate_vault_key,
+    verify_recipient_for_wrap, HybridKeyPin, RecipientTrust, HYBRID_PIN_FILE,
 };
+
+/// What a share actually did — fingerprints and PUBLIC digits only, never a key.
+///
+/// ⭐ `safety_number` and `trust` are returned so a UI can show the trust
+/// decision. The CLI now prints them BEFORE wrapping (the previous ordering
+/// showed the number only after the vault key was already on the server); a
+/// desktop UI should surface `needs_out_of_band_check` just as loudly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareOutcome {
+    /// 16-hex SHA-256 fingerprint of the vault key that was wrapped.
+    pub fingerprint: String,
+    /// The recipient's safety number — the digits to compare out of band.
+    pub safety_number: String,
+    /// How trust in the recipient's key was established.
+    pub trust: String,
+    /// True when this was an unverified FIRST SIGHT: pinned now, but nothing
+    /// out of band has confirmed it.
+    pub needs_out_of_band_check: bool,
+}
 // Phase 52 — the ACCOUNT model. Same rule again: the desktop implements no
 // protocol of its own, it calls the sigil-cli library functions the CLI calls,
 // so a desktop account request and a `sigil account …` request are the same
@@ -273,6 +292,28 @@ fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
             pinned_safety_number,
             presented_safety_number,
         },
+        // ⭐ Also not a generic failure: the WRAP GATE refused because trust in
+        // the recipient's key could not be established. Both causes carry the
+        // number the server is serving, which is what a human compares.
+        e @ (CliError::UnverifiedRecoveryKit { .. } | CliError::SafetyNumberMismatch { .. }) => {
+            let detail = e.to_string();
+            match e {
+                CliError::UnverifiedRecoveryKit {
+                    device_id,
+                    presented_safety_number,
+                }
+                | CliError::SafetyNumberMismatch {
+                    device_id,
+                    presented_safety_number,
+                    ..
+                } => DesktopError::KeyUnverified {
+                    device_id,
+                    presented_safety_number,
+                    detail,
+                },
+                _ => unreachable!("matched above"),
+            }
+        }
         other => DesktopError::Vault(format!("{other} (while {what})")),
     }
 }
@@ -582,7 +623,13 @@ impl DeviceConfig {
     ///   (convert it first — the human password is NEVER shared).
     /// - [`DesktopError::MissingOnServer`] when the recipient has published no
     ///   hybrid key, [`DesktopError::Forbidden`] when this device may not write.
-    pub fn share_vault(&self, vault_id: &str, to_device: &str, permission: &str) -> Result<String> {
+    pub fn share_vault(
+        &self,
+        vault_id: &str,
+        to_device: &str,
+        permission: &str,
+        expected_safety_number: Option<&str>,
+    ) -> Result<ShareOutcome> {
         let identity = self.enrolled_identity()?;
         let auth = identity.auth();
 
@@ -590,34 +637,41 @@ impl DeviceConfig {
             .vault_key(vault_id)?
             .ok_or_else(|| DesktopError::NotShared(vault_id.to_string()))?;
 
-        // 1) the recipient's PUBLIC hybrid key — through the PIN CHOKE POINT.
-        //    A key that differs from the one pinned on first sight raises
-        //    DesktopError::KeyPinMismatch and we stop HERE: nothing is wrapped,
-        //    nothing is uploaded, and the vault key never touches the
-        //    substituted key.
-        let (recipient, _pin) =
-            fetch_hybrid_key_pinned(&self.server, to_device, &auth, &self.pins_path()).map_err(
-                |e| {
-                    net_error(
-                        e,
-                        &self.server,
-                        "fetching the recipient's hybrid public key",
-                    )
-                },
-            )?;
+        // 1) ⭐ THE WRAP GATE (sigil_cli::verify_recipient_for_wrap). It resolves
+        //    the recipient's PUBLIC hybrid key AND settles trust in it in one
+        //    call. A changed key (KeyPinMismatch), a wrong safety number, or an
+        //    unpinned RECOVERY KIT all stop HERE: nothing is wrapped, nothing is
+        //    uploaded, and the pin store is not mutated. Same gate the CLI uses —
+        //    there is no second implementation (ADR 0037).
+        let recipient = verify_recipient_for_wrap(
+            &self.server,
+            to_device,
+            &auth,
+            &self.pins_path(),
+            expected_safety_number,
+            false,
+        )
+        .map_err(|e| {
+            net_error(
+                e,
+                &self.server,
+                "verifying the recipient's hybrid public key",
+            )
+        })?;
+        let safety_number = recipient.safety_number().to_string();
+        let needs_check = recipient.trust().needs_out_of_band_check();
 
-        // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce
-        let envelope = wrap_vault_key(&recipient, &key)?;
+        // 2-4) WRAP -> deposit -> grant, through the library's single path. It
+        //      takes the VerifiedRecipient produced above and has no other way in.
+        share_vault_to_known_key(&self.server, vault_id, &recipient, permission, &key, &auth)
+            .map_err(|e| net_error(e, &self.server, "sharing the vault (wrap, deposit, grant)"))?;
 
-        // 3) deposit the OPAQUE envelope; the server cannot read it
-        put_key_envelope(&self.server, vault_id, to_device, &envelope, &auth)
-            .map_err(|e| net_error(e, &self.server, "depositing the wrapped vault key"))?;
-
-        // 4) authorize through the EXISTING grant API
-        grant_vault_access(&self.server, vault_id, to_device, permission, &auth)
-            .map_err(|e| net_error(e, &self.server, "granting vault access"))?;
-
-        Ok(vault_key_fingerprint(&key))
+        Ok(ShareOutcome {
+            fingerprint: vault_key_fingerprint(&key),
+            safety_number,
+            trust: recipient.trust().label().to_string(),
+            needs_out_of_band_check: needs_check,
+        })
     }
 
     // -- Phase 50: key verification -------------------------------------
@@ -742,23 +796,35 @@ impl DeviceConfig {
     /// deleting every other device's envelope.
     ///
     /// The remediation revocation was missing. Every recipient's key goes through
-    /// the PIN CHECK first, so a substituted key aborts the whole rotation before
-    /// the vault file or the server is touched.
+    /// the WRAP GATE first, so a substituted key — or an unverified RECOVERY KIT
+    /// recipient — aborts the whole rotation before the vault file or the server
+    /// is touched. `safety_numbers` is `(device id, printed digits)` for any
+    /// recipient the user can verify out of band, and is REQUIRED for a
+    /// first-sight recovery kit.
     ///
     /// ⚠️ It protects FUTURE content ONLY. A device that already unwrapped the
     /// previous key keeps that key and whatever it had already copied.
+    ///
+    /// ⭐ **The Phase 54 drop guard applies here too, by the same reuse rule.**
+    /// A device that currently holds an envelope and is named by neither
+    /// `recipients` nor `drop` ABORTS the rotation, having touched nothing —
+    /// because rotating a vault while silently forgetting a RECOVERY KIT ends
+    /// recoverability while everything else keeps working.
     ///
     /// Returns `(old fingerprint, new fingerprint, re-wrapped device ids,
     /// removed device ids)` — fingerprints, never keys.
     ///
     /// # Errors
     /// - [`DesktopError::KeyPinMismatch`] if ANY recipient's key changed.
+    /// - [`DesktopError::Net`] naming each unaccounted-for holder.
     /// - [`DesktopError::NotShared`] when the vault has no key in the keyring.
     pub fn rotate_vault(
         &self,
         vault_id: &str,
         vault_path: &Path,
         recipients: &[String],
+        drop: &[String],
+        safety_numbers: &[(String, String)],
     ) -> Result<(String, String, Vec<String>, Vec<String>)> {
         let identity = self.enrolled_identity()?;
         let auth = identity.auth();
@@ -769,6 +835,8 @@ impl DeviceConfig {
             &self.keyring_path(),
             &self.pins_path(),
             recipients,
+            drop,
+            safety_numbers,
             &auth,
             Argon2Params::RECOMMENDED,
         )
@@ -779,7 +847,7 @@ impl DeviceConfig {
             report
                 .rewrapped
                 .into_iter()
-                .map(|(d, _): (String, PinStatus)| d)
+                .map(|(d, _): (String, RecipientTrust)| d)
                 .collect(),
             report.removed,
         ))
@@ -1220,7 +1288,7 @@ mod tests {
         let c = DeviceConfig::new("http://127.0.0.1:1", scratch("notenrolled"));
         for e in [
             c.publish_hybrid().unwrap_err(),
-            c.share_vault("v", "dev_x", "read").unwrap_err(),
+            c.share_vault("v", "dev_x", "read", None).unwrap_err(),
             c.accept_vault("v").unwrap_err(),
             c.check_server().unwrap_err(),
         ] {

@@ -54,11 +54,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sigil_core::{
-    hybrid_open, hybrid_seal, ml_kem768_keygen, open_record, public_key_from_seed, seal_record,
-    sign, x25519_public_key, Argon2Params, HybridSealError, OtpAlgorithm, RecordError,
+    decode_recovery_kit, derive_recovery_keys, encode_recovery_kit, hybrid_open, hybrid_seal,
+    ml_kem768_keygen, open_record, public_key_from_seed, seal_record, sign, x25519_public_key,
+    Argon2Params, HybridSealError, OtpAlgorithm, RecordError, RecoveryError,
     ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_DECAPS_KEY_LEN, ML_KEM768_ENCAPS_COIN_LEN,
-    ML_KEM768_ENCAPS_KEY_LEN, ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, SIG_PUBLIC_KEY_LEN,
-    SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
+    ML_KEM768_ENCAPS_KEY_LEN, ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, RECOVERY_SEED_LEN,
+    SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
 
 /// The 8-byte magic that prefixes every container.
@@ -166,6 +167,68 @@ pub enum CliError {
         /// The safety number of the key the server just presented.
         presented_safety_number: String,
     },
+    /// ⚠️ A rotation would have SILENTLY DESTROYED a recipient's access
+    /// (Phase 54).
+    ///
+    /// `rotate_vault_key` deletes the envelope of every device not named by
+    /// `--to`. That is the point — it is how a compromised device is excluded —
+    /// but it means a rotation that simply forgot to name the RECOVERY KIT ends
+    /// recoverability while everything else keeps working. Destruction is now an
+    /// explicit act: the rotation aborts, having touched NOTHING, and the caller
+    /// must either add each device to `--to` (keep it) or to `--drop` (remove
+    /// it deliberately).
+    ///
+    /// Carries only device ids plus a flag for those this client's pin store
+    /// marks as a recovery kit. No key material.
+    RecipientsWouldBeDropped {
+        /// The vault whose rotation was refused.
+        vault_id: String,
+        /// `(device id, is this client's recovery kit?)` for each device that
+        /// holds an envelope but was named by neither `--to` nor `--drop`.
+        unknown: Vec<(String, bool)>,
+    },
+    /// A RECOVERY KIT operation failed at the CLI layer: an undecodable printed
+    /// code, a failed pre-print verification round-trip, a kit that covers
+    /// nothing, or a refused first-sight cover. NEVER carries the recovery code,
+    /// the recovery seed, a derived seed, a vault key or any secret bytes.
+    Recovery(String),
+    /// ⛔ A wrap was refused because the recipient is a RECOVERY KIT this client
+    /// has never pinned, and no safety number was supplied to check the server's
+    /// answer against (Phase 53-55 fix round).
+    ///
+    /// ADR 0038's lesson is that the choke point is the FETCH and EVERY wrap path
+    /// must go through it. Phase 54 put this requirement on ONE COMMAND
+    /// (`recovery cover`), so `vault share --to <kitID>` and `vault rotate --to
+    /// <kitID>` reached the identical outcome — the live vault key wrapped to
+    /// whatever key the server served — through ordinary first-sight TOFU. The
+    /// requirement now lives in [`verify_recipient_for_wrap`], which every wrap
+    /// path calls, so no command can reach a kit without it.
+    ///
+    /// It is STRICTER than ordinary first sight on purpose: for a recovery kit
+    /// the out-of-band channel is guaranteed to exist — the safety number is
+    /// printed on the sheet in the user's own hand — so there is no excuse for
+    /// trusting the registry. Nothing was wrapped, nothing was uploaded, and the
+    /// pin store was NOT mutated.
+    UnverifiedRecoveryKit {
+        /// The kit device the wrap was aimed at.
+        device_id: String,
+        /// The safety number the server is presenting for it right now, so a
+        /// human can compare it to the sheet before re-running with
+        /// `--safety-number`.
+        presented_safety_number: String,
+    },
+    /// ⛔ A supplied `--safety-number` did NOT match the key the server is
+    /// serving. A hard stop with nothing wrapped, nothing uploaded, and the pin
+    /// store unchanged: either the sheet was mistyped, or the server substituted
+    /// a key it can decrypt with.
+    SafetyNumberMismatch {
+        /// The device whose key was being verified.
+        device_id: String,
+        /// What the human supplied (from the sheet / the phone call).
+        expected_safety_number: String,
+        /// What the server is actually serving.
+        presented_safety_number: String,
+    },
 }
 
 impl From<RecordError> for CliError {
@@ -236,7 +299,65 @@ impl core::fmt::Display for CliError {
                  call, in person), then re-pin deliberately with \
                  `sigil device repin {device_id}`."
             ),
+            CliError::RecipientsWouldBeDropped { vault_id, unknown } => {
+                write!(
+                    f,
+                    "REFUSING TO ROTATE vault {vault_id}: {} device(s) currently hold a wrapped \
+                     key for it but were named by neither --to nor --drop. Rotating would DELETE \
+                     their envelopes and silently end their access.",
+                    unknown.len()
+                )?;
+                for (device_id, is_kit) in unknown {
+                    if *is_kit {
+                        write!(
+                            f,
+                            "\n  {device_id}  ⚠️  THIS IS YOUR RECOVERY KIT — dropping it means \
+                             the printed sheet can no longer recover this vault"
+                        )?;
+                    } else {
+                        write!(f, "\n  {device_id}")?;
+                    }
+                }
+                write!(
+                    f,
+                    "\n  Nothing was changed. Add each device to --to to KEEP its access, or to \
+                     --drop to remove it deliberately (or use --drop-all-others)."
+                )
+            }
+            CliError::Recovery(e) => write!(f, "recovery kit error: {e}"),
+            CliError::UnverifiedRecoveryKit {
+                device_id,
+                presented_safety_number,
+            } => write!(
+                f,
+                "REFUSING TO WRAP: device {device_id} is a RECOVERY KIT that this client has never \
+                 pinned, so the only thing vouching for its key is the server — and a hostile \
+                 server that substituted its own key would be handed this vault's key.\n  \
+                 from server:  {presented_safety_number}\n  \
+                 The safety number is PRINTED ON THE RECOVERY SHEET. Compare it, then re-run with \
+                 --safety-number \"<the six 5-digit groups from the sheet>\".\n  \
+                 Nothing was wrapped, nothing was uploaded, and no key was pinned."
+            ),
+            CliError::SafetyNumberMismatch {
+                device_id,
+                expected_safety_number,
+                presented_safety_number,
+            } => write!(
+                f,
+                "REFUSING TO WRAP: the safety number you supplied does not match the key this \
+                 server is serving for {device_id}.\n  \
+                 you supplied: {expected_safety_number}\n  \
+                 from server:  {presented_safety_number}\n  \
+                 Either it was mistyped, or the server substituted a key it can decrypt with. \
+                 Nothing was wrapped, nothing was uploaded, and no key was pinned."
+            ),
         }
+    }
+}
+
+impl From<RecoveryError> for CliError {
+    fn from(e: RecoveryError) -> Self {
+        CliError::Recovery(e.to_string())
     }
 }
 
@@ -3185,6 +3306,21 @@ pub struct HybridKeyPin {
     pub safety_number: String,
     /// Unix seconds at which this pin was recorded.
     pub pinned_at: u64,
+    /// WHERE this pin came from, when it was not an ordinary server fetch.
+    ///
+    /// The only value written today is [`PIN_ORIGIN_RECOVERY_KIT`] (Phase 54),
+    /// recording that the key was DERIVED locally from a recovery secret and
+    /// pinned WITHOUT ever asking the server — the one pin in the system that
+    /// cannot have been poisoned by a key substitution, and the marker that lets
+    /// `vault rotate` say "this is your recovery kit" instead of "unknown
+    /// recipient".
+    ///
+    /// ADDITIVE and OPTIONAL: it is omitted when absent, so a store written by
+    /// an older client parses unchanged and this one writes the shape it always
+    /// did unless a kit is involved. The pin-store VERSION is deliberately NOT
+    /// bumped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// How many times a human has deliberately RE-pinned this device. `0` means
     /// "still the key we saw first". A non-zero value is worth showing a user.
     #[serde(default)]
@@ -3305,6 +3441,7 @@ fn make_pin(
     device_id: &str,
     identity: &HybridPublicIdentity,
     repins: u32,
+    origin: Option<String>,
 ) -> Result<HybridKeyPin, CliError> {
     Ok(HybridKeyPin {
         device_id: device_id.to_string(),
@@ -3316,6 +3453,7 @@ fn make_pin(
             .map(|d| d.as_secs())
             .unwrap_or(0),
         repins,
+        origin,
     })
 }
 
@@ -3365,9 +3503,10 @@ pub fn check_and_pin(
     }
 
     store.version = HYBRID_PIN_STORE_VERSION;
-    store
-        .pins
-        .insert(device_id.to_string(), make_pin(device_id, identity, 0)?);
+    store.pins.insert(
+        device_id.to_string(),
+        make_pin(device_id, identity, 0, None)?,
+    );
     save_pins(pins_path, &store)?;
     Ok(PinStatus::FirstSight)
 }
@@ -3391,7 +3530,9 @@ pub fn repin_hybrid_key(
     let mut store = load_pins(pins_path)?;
     let previous = store.pins.get(device_id).cloned();
     let repins = previous.as_ref().map(|p| p.repins + 1).unwrap_or(0);
-    let pin = make_pin(device_id, identity, repins)?;
+    // A deliberate re-pin replaces a DERIVED pin with a fetched one, so the
+    // `origin` marker is dropped: it would no longer be true.
+    let pin = make_pin(device_id, identity, repins, None)?;
     let new_number = pin.safety_number.clone();
     store.version = HYBRID_PIN_STORE_VERSION;
     store.pins.insert(device_id.to_string(), pin);
@@ -3418,6 +3559,256 @@ pub fn fetch_hybrid_key_pinned(
     let identity = fetch_hybrid_key(server, device_id, auth)?;
     let status = check_and_pin(pins_path, device_id, &identity)?;
     Ok((identity, status))
+}
+
+// ===========================================================================
+// ⭐⭐ THE WRAP GATE — the single choke point EVERY vault-key wrap passes
+// ===========================================================================
+//
+// ADR 0038 states the rule this exists to enforce: "the enforcement rides on the
+// fetch itself … EVERY wrap path goes through it. A trust store that some code
+// path forgets to consult is worthless."
+//
+// Phase 54 broke that rule. It added a real requirement — a recovery kit's key
+// must be checked against the safety number printed on the sheet — but it added
+// it to ONE COMMAND (`recovery cover`) instead of to the choke point. A verifier
+// reproduced the consequence live: `sigil vault share --to <kitID>` and
+// `sigil vault rotate --to <kitID>` reach the IDENTICAL outcome (the live vault
+// key wrapped to whatever key the server serves) through ordinary first-sight
+// TOFU, from a sibling device with ZERO prior knowledge of the kit — with the
+// human shown a safety number only AFTER the wrap, deposit and grant had all
+// completed.
+//
+// So the requirement moved INTO the fetch, and the fetch produces a value that
+// only this function can construct:
+//
+//   * [`VerifiedRecipient`] has PRIVATE fields and NO public constructor;
+//   * [`share_vault_to_known_key`] — the one wrap → deposit → grant path — takes
+//     a `&VerifiedRecipient`, so it cannot be called with an unchecked identity;
+//   * `share`, `rotate`, `cover` and `recovery generate` all obtain theirs here.
+//
+// That makes "is every wrap gated?" answerable by grep rather than by reading
+// every call site: `VerifiedRecipient` is constructed in exactly one place.
+
+/// How this client came to trust a recipient's hybrid public key. Ordered
+/// strongest → weakest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientTrust {
+    /// DERIVED locally from a recovery secret this process holds. Nothing was
+    /// fetched, so there was nothing for a server to substitute.
+    Derived,
+    /// Byte-identical to the key this client pinned earlier.
+    Pinned,
+    /// First sight, and a safety number supplied by the human MATCHED the key
+    /// the server served.
+    VerifiedFirstSight,
+    /// ⚠️ First sight with no out-of-band check. This is ADR 0038's accepted
+    /// trust-on-first-use limit, and it is NOT permitted for a recovery kit.
+    UnverifiedFirstSight,
+}
+
+impl RecipientTrust {
+    /// A short phrase for CLI output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RecipientTrust::Derived => "derived locally from your recovery secret (never fetched)",
+            RecipientTrust::Pinned => "matches the key this client pinned earlier",
+            RecipientTrust::VerifiedFirstSight => {
+                "FIRST SIGHT, verified against the safety number you supplied"
+            }
+            RecipientTrust::UnverifiedFirstSight => {
+                "FIRST SIGHT — NOT verified out of band (pinned now)"
+            }
+        }
+    }
+
+    /// Whether a human still needs to compare the safety number out of band.
+    pub fn needs_out_of_band_check(&self) -> bool {
+        matches!(self, RecipientTrust::UnverifiedFirstSight)
+    }
+}
+
+/// A recipient hybrid public key that has passed [`verify_recipient_for_wrap`].
+///
+/// ⭐ The fields are PRIVATE and there is NO public constructor, so the only way
+/// to obtain one is through the gate. That is what makes
+/// [`share_vault_to_known_key`]'s signature a proof rather than a convention.
+#[derive(Debug, Clone)]
+pub struct VerifiedRecipient {
+    device_id: String,
+    identity: HybridPublicIdentity,
+    trust: RecipientTrust,
+    safety_number: String,
+}
+
+impl VerifiedRecipient {
+    /// The device this key belongs to.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    /// The verified hybrid public identity.
+    pub fn identity(&self) -> &HybridPublicIdentity {
+        &self.identity
+    }
+    /// How trust was established.
+    pub fn trust(&self) -> RecipientTrust {
+        self.trust
+    }
+    /// The safety number of the key that is about to be wrapped to. Callers
+    /// MUST show this BEFORE wrapping, not after.
+    pub fn safety_number(&self) -> &str {
+        &self.safety_number
+    }
+}
+
+/// Is `device_id` a RECOVERY KIT, as far as this client can tell?
+///
+/// The signal is the kit's deliberately-visible device label
+/// ([`RECOVERY_DEVICE_LABEL`]) on the CALLER'S OWN account listing — `GET
+/// /v1/account`, which names no account and returns only "mine" (ADR 0040 §2).
+/// A cross-account recipient is not this account's kit, so it is not one for
+/// this purpose.
+///
+/// FAIL-CLOSED: any error other than "this server has no account model at all"
+/// (`501`) propagates, so a wrap is refused rather than proceeding on a signal we
+/// could not read. Under legacy v2 / unsigned auth there is no account model and
+/// therefore no kit, which is answered without a request.
+///
+/// ⚠️ HONEST LIMIT: the label comes from the server, which is the adversary this
+/// whole mechanism is about. A hostile server can HIDE the label and degrade a
+/// kit wrap back to ordinary first-sight TOFU with a warning — no worse than any
+/// other first contact, and exactly what the safety number exists to close. What
+/// it cannot do is make a kit wrap succeed against a DIFFERENT key than the one
+/// pinned, or against a supplied safety number that does not match.
+fn recipient_is_recovery_kit(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<bool, CliError> {
+    if !matches!(auth, RequestAuth::V3 { .. }) {
+        return Ok(false);
+    }
+    match get_account(server, auth) {
+        Ok(info) => Ok(info
+            .devices
+            .iter()
+            .any(|d| d.device_id == device_id && d.label == RECOVERY_DEVICE_LABEL)),
+        // No account model on this server => recovery kits cannot exist here.
+        Err(CliError::Server { status: 501, .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// ⭐⭐ THE GATE. Resolve a recipient's hybrid public key and establish trust in
+/// it, in ONE call, before anything can be wrapped to it.
+///
+/// | situation | outcome | pin store |
+/// |---|---|---|
+/// | key DERIVED locally (pin `origin = "recovery-kit"`) | [`RecipientTrust::Derived`], **no fetch at all** | untouched |
+/// | pinned key, byte-identical | [`RecipientTrust::Pinned`] | untouched |
+/// | pinned key, **different** | ⛔ [`CliError::PinMismatch`] | **untouched** |
+/// | first sight + matching `expected_safety_number` | [`RecipientTrust::VerifiedFirstSight`] | pinned |
+/// | first sight + **wrong** `expected_safety_number` | ⛔ [`CliError::SafetyNumberMismatch`] | **untouched** |
+/// | first sight, **recipient is a RECOVERY KIT**, no safety number | ⛔ [`CliError::UnverifiedRecoveryKit`] | **untouched** |
+///
+/// `known_recovery_kit` is the caller ASSERTING that the recipient is a kit —
+/// `sigil recovery cover --device-id <kitID>` says so by construction. When it
+/// is false the gate works it out itself, from the caller's own account listing
+/// (see [`recipient_is_recovery_kit`]), which is what makes `vault share --to
+/// <kitID>` and `vault rotate --to <kitID>` obey the same rule without the user
+/// having to declare anything.
+/// | first sight, ordinary device, no safety number | [`RecipientTrust::UnverifiedFirstSight`] (ADR 0038 TOFU) | pinned |
+///
+/// Every refusal happens BEFORE the key is pinned, which matters more than it
+/// looks: pinning a key we then refused would mean a simple retry sees "match"
+/// and proceeds — the alarm would silence itself.
+///
+/// There is NO flag, option, environment variable or default anywhere that makes
+/// this accept a changed key, and none that waives the safety number for a
+/// recovery kit.
+///
+/// # Errors
+/// - [`CliError::PinMismatch`] / [`CliError::SafetyNumberMismatch`] /
+///   [`CliError::UnverifiedRecoveryKit`] — hard stops; nothing was wrapped,
+///   uploaded or pinned.
+/// - [`CliError::Server`] / [`CliError::Http`] from the fetch or the
+///   recovery-kit lookup (fail-closed).
+pub fn verify_recipient_for_wrap(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+    pins_path: &std::path::Path,
+    expected_safety_number: Option<&str>,
+    known_recovery_kit: bool,
+) -> Result<VerifiedRecipient, CliError> {
+    check_device_id(device_id)?;
+
+    // 1) A LOCALLY DERIVED key (a recovery kit generated on this device). There
+    //    is no fetch, so there is nothing to substitute and nothing to verify.
+    if let Some(identity) = derived_pin(pins_path, device_id)? {
+        let safety_number = hybrid_safety_number(device_id, &identity)?;
+        return Ok(VerifiedRecipient {
+            device_id: device_id.to_string(),
+            identity,
+            trust: RecipientTrust::Derived,
+            safety_number,
+        });
+    }
+
+    // 2) Ask the server, then decide. Note the ORDER: nothing below writes to the
+    //    pin store until every check has passed.
+    let identity = fetch_hybrid_key(server, device_id, auth)?;
+    let presented = hybrid_safety_number(device_id, &identity)?;
+
+    // A supplied safety number is ALWAYS checked, pinned or not. Checking it on a
+    // pinned key costs nothing and catches a human who is comparing the wrong
+    // device.
+    if let Some(expected) = expected_safety_number {
+        if normalize_safety_number(expected) != normalize_safety_number(&presented) {
+            return Err(CliError::SafetyNumberMismatch {
+                device_id: device_id.to_string(),
+                expected_safety_number: expected.to_string(),
+                presented_safety_number: presented,
+            });
+        }
+    }
+
+    let store = load_pins(pins_path)?;
+    if store.pins.contains_key(device_id) {
+        // check_and_pin returns Match or PinMismatch here and mutates nothing.
+        match check_and_pin(pins_path, device_id, &identity)? {
+            PinStatus::Match | PinStatus::Repinned | PinStatus::FirstSight => {}
+        }
+        return Ok(VerifiedRecipient {
+            device_id: device_id.to_string(),
+            identity,
+            trust: RecipientTrust::Pinned,
+            safety_number: presented,
+        });
+    }
+
+    // 3) FIRST SIGHT. If this is a recovery kit, the printed sheet makes an
+    //    out-of-band check available, so it is REQUIRED — no TOFU for the one
+    //    credential that can reconstruct the whole account.
+    let trust = if expected_safety_number.is_some() {
+        RecipientTrust::VerifiedFirstSight
+    } else {
+        if known_recovery_kit || recipient_is_recovery_kit(server, device_id, auth)? {
+            return Err(CliError::UnverifiedRecoveryKit {
+                device_id: device_id.to_string(),
+                presented_safety_number: presented,
+            });
+        }
+        RecipientTrust::UnverifiedFirstSight
+    };
+
+    check_and_pin(pins_path, device_id, &identity)?;
+    Ok(VerifiedRecipient {
+        device_id: device_id.to_string(),
+        identity,
+        trust,
+        safety_number: presented,
+    })
 }
 
 // --- vault key rotation + re-wrap ------------------------------------------
@@ -3530,9 +3921,15 @@ pub struct RotationReport {
     pub old_key_fingerprint: String,
     /// SHA-256 fingerprint (16 hex) of the NEW key.
     pub new_key_fingerprint: String,
-    /// Devices the new key was re-wrapped to, with their pin status.
-    pub rewrapped: Vec<(String, PinStatus)>,
+    /// Devices the new key was re-wrapped to, with how trust in each was
+    /// established by the wrap gate.
+    pub rewrapped: Vec<(String, RecipientTrust)>,
     /// Devices whose stale envelope was DELETED from the server.
+    ///
+    /// Every entry here was named EXPLICITLY by the caller's `drop` list: a
+    /// device that holds an envelope and is in neither `recipients` nor `drop`
+    /// aborts the rotation ([`CliError::RecipientsWouldBeDropped`]) instead of
+    /// being removed silently.
     pub removed: Vec<String>,
 }
 
@@ -3541,9 +3938,13 @@ pub struct RotationReport {
 /// The owner-side remediation that revocation was missing:
 ///
 ///   1. read the CURRENT vault key from the local keyring (required);
-///   2. fetch + PIN-CHECK **every** recipient's hybrid public key FIRST, so a
-///      [`CliError::PinMismatch`] aborts the whole rotation before a single byte
-///      of local or server state is touched;
+///   2. run **every** recipient through [`verify_recipient_for_wrap`] FIRST — the
+///      same gate `share` and `cover` use — so a [`CliError::PinMismatch`], a
+///      [`CliError::SafetyNumberMismatch`] or an
+///      [`CliError::UnverifiedRecoveryKit`] aborts the whole rotation before a
+///      single byte of local or server state is touched. `safety_numbers` is
+///      `(device id, printed digits)` for any recipient the caller can verify
+///      out of band, and is REQUIRED for a first-sight recovery kit;
 ///   3. draw a FRESH 32-byte vault key;
 ///   4. re-seal the vault FILE under it (mode `0600`, written via a temp file and
 ///      renamed, so a crash cannot leave a half-written vault);
@@ -3562,7 +3963,18 @@ pub struct RotationReport {
 /// that everything sealed AFTER the rotation is unreadable to a device left out
 /// of `recipients`.
 ///
+/// ⭐ **THE FAIL-CLOSED DROP GUARD (Phase 54).** Step 7 destroys access, so it
+/// may not happen by omission. BEFORE anything is mutated, the current envelope
+/// holders are listed and any device in neither `recipients` nor `drop` aborts
+/// the rotation with [`CliError::RecipientsWouldBeDropped`], naming each one and
+/// flagging any that this client's pin store marks as a RECOVERY KIT. `--to`
+/// keeps its exact meaning (the complete new recipient set), so excluding a
+/// compromised device is still one command — what changed is that the
+/// destruction is now stated rather than implied.
+///
 /// # Errors
+/// - [`CliError::RecipientsWouldBeDropped`] if a current holder was not named
+///   (nothing is mutated).
 /// - [`CliError::PinMismatch`] if ANY recipient's key changed (nothing is
 ///   mutated).
 /// - [`CliError::Sharing`] if this vault has no key in the keyring, or on an IO
@@ -3576,12 +3988,48 @@ pub fn rotate_vault_key(
     keyring_path: &std::path::Path,
     pins_path: &std::path::Path,
     recipients: &[String],
+    drop: &[String],
+    safety_numbers: &[(String, String)],
     auth: &RequestAuth<'_>,
     params: Argon2Params,
 ) -> Result<RotationReport, CliError> {
     check_vault(vault_id)?;
-    for r in recipients {
+    for r in recipients.iter().chain(drop.iter()) {
         check_device_id(r)?;
+    }
+
+    // 0) ⭐ THE DROP GUARD. Enumerate who holds an envelope RIGHT NOW and refuse
+    //    if the caller did not account for every one of them. This runs FIRST,
+    //    before the keyring, the vault file, the pin checks or a single request
+    //    that changes state, so a refusal leaves everything exactly as it was.
+    let existing = list_key_envelopes(server, vault_id, auth)?;
+    let keep: std::collections::BTreeSet<&str> = recipients.iter().map(String::as_str).collect();
+    let dropping: std::collections::BTreeSet<&str> = drop.iter().map(String::as_str).collect();
+    let unnamed: Vec<&str> = existing
+        .iter()
+        .map(|e| e.device_id.as_str())
+        .filter(|d| !keep.contains(d) && !dropping.contains(d))
+        .collect();
+    if !unnamed.is_empty() {
+        // Consult the LOCAL pin store so a recovery kit is named as such. A
+        // sibling device that never heard of the kit has no such pin and will
+        // simply see "unknown recipient" — an honest limit, not a bug.
+        let pins = load_pins(pins_path).unwrap_or_default();
+        let unknown = unnamed
+            .into_iter()
+            .map(|d| {
+                let is_kit = pins
+                    .pins
+                    .get(d)
+                    .and_then(|p| p.origin.as_deref())
+                    .is_some_and(|o| o == PIN_ORIGIN_RECOVERY_KIT);
+                (d.to_string(), is_kit)
+            })
+            .collect();
+        return Err(CliError::RecipientsWouldBeDropped {
+            vault_id: vault_id.to_string(),
+            unknown,
+        });
     }
 
     // 1) The key we are retiring. A vault that was never rekeyed has no key here,
@@ -3600,14 +4048,20 @@ pub fn rotate_vault_key(
         ))
     })?;
 
-    // 2) PIN-CHECK EVERY RECIPIENT BEFORE MUTATING ANYTHING. If one device's key
-    //    was substituted, the whole rotation aborts with the vault untouched —
-    //    far better than a half-rotated vault whose key leaked to an attacker.
-    let mut resolved: Vec<(String, HybridPublicIdentity, PinStatus)> =
-        Vec::with_capacity(recipients.len());
+    // 2) ⭐ GATE EVERY RECIPIENT BEFORE MUTATING ANYTHING, through the SAME
+    //    verify_recipient_for_wrap that `share` and `cover` use. If one device's
+    //    key was substituted — or one recipient is an unverified RECOVERY KIT —
+    //    the whole rotation aborts with the vault untouched, which is far better
+    //    than a half-rotated vault whose key leaked to an attacker.
+    let mut resolved: Vec<VerifiedRecipient> = Vec::with_capacity(recipients.len());
     for device in recipients {
-        let (identity, status) = fetch_hybrid_key_pinned(server, device, auth, pins_path)?;
-        resolved.push((device.clone(), identity, status));
+        let expected = safety_numbers
+            .iter()
+            .find(|(d, _)| d == device)
+            .map(|(_, n)| n.as_str());
+        resolved.push(verify_recipient_for_wrap(
+            server, device, auth, pins_path, expected, false,
+        )?);
     }
 
     // 3-4) Fresh key, re-seal the vault, write it atomically at 0600.
@@ -3632,20 +4086,22 @@ pub fn rotate_vault_key(
     // 6) Re-wrap to every chosen recipient (an UPSERT — the old envelope is
     //    replaced, not appended to).
     let mut rewrapped = Vec::with_capacity(resolved.len());
-    for (device, identity, status) in &resolved {
-        let envelope = wrap_vault_key(identity, &new_key)?;
-        put_key_envelope(server, vault_id, device, &envelope, auth)?;
-        rewrapped.push((device.clone(), *status));
+    for recipient in &resolved {
+        let envelope = wrap_vault_key(recipient.identity(), &new_key)?;
+        put_key_envelope(server, vault_id, recipient.device_id(), &envelope, auth)?;
+        rewrapped.push((recipient.device_id().to_string(), recipient.trust()));
     }
 
-    // 7) Remove the stale envelopes of everyone left out.
-    let keep: std::collections::BTreeSet<&str> = recipients.iter().map(String::as_str).collect();
+    // 7) Remove the stale envelopes of everyone left out. Re-listed here rather
+    //    than reusing step 0's snapshot, so a device that deposited an envelope
+    //    mid-rotation is still caught — and every removal is one the caller
+    //    named in `drop`, because step 0 refused otherwise.
     let mut removed = Vec::new();
-    for existing in list_key_envelopes(server, vault_id, auth)? {
-        if !keep.contains(existing.device_id.as_str())
-            && delete_key_envelope(server, vault_id, &existing.device_id, auth)?
+    for holder in list_key_envelopes(server, vault_id, auth)? {
+        if !keep.contains(holder.device_id.as_str())
+            && delete_key_envelope(server, vault_id, &holder.device_id, auth)?
         {
-            removed.push(existing.device_id);
+            removed.push(holder.device_id);
         }
     }
 
@@ -3658,9 +4114,1123 @@ pub fn rotate_vault_key(
     })
 }
 
+// ===========================================================================
+// PHASE 54 — THE RECOVERY KIT
+// ===========================================================================
+//
+// THE MODEL, IN ONE SENTENCE. A recovery kit is an ORDINARY MEMBER DEVICE whose
+// Ed25519 and hybrid private keys are derived from 32 bytes of client CSPRNG
+// that are printed on paper, never transmitted, never stored on any device, and
+// never derivable from anything the server holds. `sigild` gains NO concept of
+// "recovery".
+//
+// WHAT THE SERVER SEES, AND IT IS ONLY WHAT IT ALREADY SAW: one more device row
+// (a label, an Ed25519 PUBLIC key, an account id), one more hybrid PUBLIC key
+// row (32 + 1184 bytes, length-checked only), and one more opaque ~1226-byte
+// `SIGILhyb` envelope per covered vault — byte-for-byte the shapes it already
+// relays for device-to-device sharing (ADR 0035). No table, column, route,
+// metric or audit field added by this phase can hold a kit secret, a vault key,
+// a password or a plaintext.
+//
+// THE CENTRAL COMPROMISE, recorded as a compromise and not a feature: the
+// envelope is NOT on the paper, and retrieving it requires authentication. That
+// is what forces the paper to ALSO be an identity, and that is where the entire
+// blast radius comes from — a stolen kit is full account takeover (flat
+// membership, ADR 0040 limitation 3), strictly more powerful than a stolen
+// locked phone. `hybrid_seal` gives you a recipient who can decrypt; it does not
+// give you a courier.
+//
+// WHAT IS RECOVERED: every vault key wrapped to the kit BEFORE the loss, and
+// therefore the 2FA secrets in those vaults — but ONLY if the vault's sealed
+// container was pushed to the op-log. ⚠️ THE KIT RECOVERS KEYS, NOT DATA.
+//
+// WHAT IS NOT: a vault key never wrapped to the kit; password-sealed PERSONAL
+// vaults (they have no vault key to wrap — coverage requires `vault rekey`, a
+// ONE-WAY DOOR); anything after a rotation that excluded the kit; and a LOST
+// KIT, for which there is no recovery of the recovery and no escrow. The floor
+// of "lose everything => lose everything" is NOT raised.
+//
+// ⚠️ THE PRINTED CODE AND EVERY DERIVED SEED ARE SECRETS. They are returned to
+// the caller once, never written to a file by this crate, never logged, never
+// placed in a request body, header, URL, metric or audit field. The only
+// outbound bytes derived from a kit are PUBLIC keys and signatures.
+//
+// STATUS: dev-gated, plain HTTP, pre-audit, UNAUDITED. The wrap is a CUSTOM
+// KEM-then-AEAD, NOT RFC 9180 HPKE, and the system is not "post-quantum secure".
+
+/// The device label a recovery kit enrolls under.
+///
+/// DELIBERATELY VISIBLE. Hiding it would buy only protection against targeted
+/// denial (a hostile server can deny everything anyway) and targeted
+/// substitution (already covered by pinning), and it would cost every client the
+/// ability to render "Recovery: not set up" — the single most valuable piece of
+/// feedback in the design.
+pub const RECOVERY_DEVICE_LABEL: &str = "recovery-kit";
+
+/// The [`HybridKeyPin::origin`] marker for a key DERIVED from a recovery secret
+/// rather than fetched from a server.
+pub const PIN_ORIGIN_RECOVERY_KIT: &str = "recovery-kit";
+
+/// Draw a fresh 32-byte recovery secret from the OS CSPRNG.
+///
+/// Caller-supplied entropy, exactly like every other seed this crate produces —
+/// `sigil-core` still draws none (ADR 0007).
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails.
+pub fn generate_recovery_seed() -> Result<[u8; RECOVERY_SEED_LEN], CliError> {
+    let mut seed = [0u8; RECOVERY_SEED_LEN];
+    fill_random(&mut seed)?;
+    Ok(seed)
+}
+
+/// A recovery kit's full derived identity: the Ed25519 request-auth key pair and
+/// the hybrid (X25519 + ML-KEM-768) encryption identity.
+///
+/// ⚠️ Holds SECRET key material. It is deliberately NOT `Serialize`, so there is
+/// no accidental path from here to a file or a request body.
+#[derive(Clone)]
+pub struct RecoveryIdentity {
+    /// The 32-byte Ed25519 signing seed. SECRET.
+    pub ed25519_seed: [u8; SIG_SEED_LEN],
+    /// The 32-byte Ed25519 public key. PUBLIC — this is what is enrolled.
+    pub public_key: [u8; SIG_PUBLIC_KEY_LEN],
+    /// The hybrid SECRET identity (X25519 secret + ML-KEM keygen seed). SECRET.
+    pub hybrid_secret: HybridSecretIdentity,
+    /// The hybrid PUBLIC identity. PUBLIC — this is what is published.
+    pub hybrid_public: HybridPublicIdentity,
+}
+
+/// REDACTED on purpose: a kit's derived material must never reach a log line via
+/// a stray `{:?}`.
+impl std::fmt::Debug for RecoveryIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryIdentity { <redacted> }")
+    }
+}
+
+/// Derive a kit's full identity from its 32-byte recovery secret.
+///
+/// Deterministic and RNG-free: it is `sigil-core`'s [`derive_recovery_keys`]
+/// feeding the EXISTING [`public_key_from_seed`], [`x25519_public_key`] and
+/// [`ml_kem768_keygen`] primitives unchanged. No new crypto lives here.
+#[must_use]
+pub fn derive_recovery_identity(seed: &[u8; RECOVERY_SEED_LEN]) -> RecoveryIdentity {
+    let keys = derive_recovery_keys(seed);
+    let public_key = public_key_from_seed(&keys.ed25519_seed);
+    let x25519_pub = x25519_public_key(&keys.x25519_secret);
+    let (mlkem_encaps_key, _dk) = ml_kem768_keygen(&keys.mlkem_keygen_seed);
+    RecoveryIdentity {
+        ed25519_seed: keys.ed25519_seed,
+        public_key,
+        hybrid_secret: HybridSecretIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_secret: BASE64.encode(keys.x25519_secret),
+            mlkem_seed: BASE64.encode(keys.mlkem_keygen_seed),
+        },
+        hybrid_public: HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: BASE64.encode(x25519_pub),
+            mlkem_encaps_key: BASE64.encode(mlkem_encaps_key),
+        },
+    }
+}
+
+/// Everything on a printed sheet EXCEPT the secret line. All of it is public;
+/// none of it can be used to decrypt anything.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryKitPublic {
+    /// The server-assigned device id of the enrolled kit. NOT secret — it is
+    /// needed to address the kit's own envelope index at restore time, which is
+    /// why it is printed on the sheet.
+    pub device_id: String,
+    /// The account the kit joined. NOT secret.
+    pub account_id: String,
+    /// The server the kit was enrolled against. NOT secret.
+    pub server: String,
+    /// std-base64 of the kit's 32-byte X25519 PUBLIC key.
+    pub x25519_public_key: String,
+    /// std-base64 of the kit's 1184-byte ML-KEM-768 encapsulation key.
+    pub mlkem_encaps_key: String,
+    /// The kit's rendered SAFETY NUMBER — the out-of-band verification string
+    /// another device compares before wrapping a vault key to this kit.
+    pub safety_number: String,
+    /// Unix seconds at which the kit was printed.
+    pub created_at: u64,
+    /// The vaults covered AS OF THE PRINT DATE. Coverage drifts: a vault created
+    /// later is not covered until `sigil recovery cover` runs.
+    pub covered: Vec<String>,
+}
+
+/// PIN a hybrid public key this client DERIVED itself, without ever asking the
+/// server.
+///
+/// ⭐ This is the one pin in the system established with no fetch, so there is
+/// nothing to poison: from here on, covering a vault from THIS device calls
+/// [`share_vault_to_known_key`] with the derived identity and never
+/// [`fetch_hybrid_key`]. It does not weaken ADR 0038, whose invariant is "every
+/// key OBTAINED FROM THE SERVER is pin-checked before a wrap" — here none is
+/// obtained.
+///
+/// Re-pinning the SAME key is a no-op. A DIFFERENT existing pin is refused with
+/// [`CliError::PinMismatch`]: this function never silently replaces a pin.
+///
+/// # Errors
+/// - [`CliError::PinMismatch`] if a different key is already pinned for that id.
+/// - [`CliError::Identity`] / [`CliError::Sharing`] on a decode or IO failure.
+pub fn pin_derived_key(
+    pins_path: &std::path::Path,
+    device_id: &str,
+    identity: &HybridPublicIdentity,
+) -> Result<(), CliError> {
+    let presented = identity.decode()?;
+    let mut store = load_pins(pins_path)?;
+    if let Some(existing) = store.pins.get(device_id) {
+        let pinned = HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: existing.x25519_public_key.clone(),
+            mlkem_encaps_key: existing.mlkem_encaps_key.clone(),
+        }
+        .decode()?;
+        if pinned.x25519_public_key == presented.x25519_public_key
+            && pinned.mlkem_encaps_key == presented.mlkem_encaps_key
+        {
+            return Ok(());
+        }
+        return Err(CliError::PinMismatch {
+            device_id: device_id.to_string(),
+            pinned_safety_number: existing.safety_number.clone(),
+            presented_safety_number: hybrid_safety_number(device_id, identity)?,
+        });
+    }
+    store.version = HYBRID_PIN_STORE_VERSION;
+    store.pins.insert(
+        device_id.to_string(),
+        make_pin(
+            device_id,
+            identity,
+            0,
+            Some(PIN_ORIGIN_RECOVERY_KIT.to_string()),
+        )?,
+    );
+    save_pins(pins_path, &store)
+}
+
+/// Look up the LOCALLY DERIVED hybrid identity this client pinned for
+/// `device_id`, if any — i.e. a pin whose `origin` is
+/// [`PIN_ORIGIN_RECOVERY_KIT`].
+///
+/// Returning `Some` is what lets a cover/share proceed with NO server fetch.
+///
+/// # Errors
+/// - [`CliError::Sharing`] on a pin-store IO/parse failure.
+pub fn derived_pin(
+    pins_path: &std::path::Path,
+    device_id: &str,
+) -> Result<Option<HybridPublicIdentity>, CliError> {
+    let store = load_pins(pins_path)?;
+    Ok(store
+        .pins
+        .get(device_id)
+        .filter(|p| p.origin.as_deref() == Some(PIN_ORIGIN_RECOVERY_KIT))
+        .map(|p| HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: p.x25519_public_key.clone(),
+            mlkem_encaps_key: p.mlkem_encaps_key.clone(),
+        }))
+}
+
+/// ⭐ THE ONE wrap → deposit → grant path.
+///
+/// Wrap `vault_key` to a recipient, deposit the opaque envelope, and authorize
+/// the recipient through the EXISTING grant route.
+///
+/// ⭐ IT TAKES A [`VerifiedRecipient`], WHICH ONLY [`verify_recipient_for_wrap`]
+/// CAN CONSTRUCT. That is the enforcement, not a comment: `sigil vault share`,
+/// `sigil vault rotate`, `sigil recovery cover` and `sigil recovery generate`
+/// all funnel through here, and none of them can supply an identity that has not
+/// been through the gate. Note what this function deliberately does NOT do: it
+/// never fetches a key and never touches the pin store, so the trust decision
+/// stays where the caller can display it BEFORE anything is wrapped.
+///
+/// Returns the envelope bytes so a caller can write them out for inspection.
+///
+/// # Errors
+/// - [`CliError::Identity`] / [`CliError::Rng`] / [`CliError::HybridSeal`] from
+///   the wrap.
+/// - [`CliError::Server`] / [`CliError::Http`] from the deposit or the grant.
+pub fn share_vault_to_known_key(
+    server: &str,
+    vault_id: &str,
+    recipient: &VerifiedRecipient,
+    permission: &str,
+    vault_key: &[u8; VAULT_KEY_LEN],
+    auth: &RequestAuth<'_>,
+) -> Result<Vec<u8>, CliError> {
+    check_vault(vault_id)?;
+    let recipient_device_id = recipient.device_id();
+    // WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
+    let envelope = wrap_vault_key(recipient.identity(), vault_key)?;
+    // DEPOSIT the opaque envelope; the server cannot read it.
+    put_key_envelope(server, vault_id, recipient_device_id, &envelope, auth)?;
+    // AUTHORIZE through the EXISTING grant route, so access and keys agree.
+    grant_vault_access(server, vault_id, recipient_device_id, permission, auth)?;
+    Ok(envelope)
+}
+
+/// One vault a device holds a wrapped key for, as reported by
+/// `GET /v1/devices/{deviceID}/keys`. METADATA ONLY — never a blob.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecoverableVault {
+    /// The vault the envelope belongs to.
+    #[serde(rename = "vaultID")]
+    pub vault_id: String,
+    /// The device that deposited it.
+    #[serde(default)]
+    pub sender_device_id: String,
+    /// Size of the opaque envelope in bytes.
+    #[serde(default)]
+    pub size_bytes: usize,
+    /// RFC 3339 timestamp of the deposit.
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// ASK THE SERVER which vaults hold a wrapped key for `device_id`.
+///
+/// SELF-ONLY server-side: asking for another device's index is a `403`. A
+/// restored recovery kit has no local state at all and therefore knows no vault
+/// ids — this is the only way it can find out what it is able to decrypt. It
+/// grants nothing new: the server already holds every one of these ids, and the
+/// caller could already fetch each envelope by naming its vault.
+///
+/// # Errors
+/// - [`CliError::Server`] on a non-2xx: `401` (unknown/revoked kit — or the
+///   wrong server), `403` (asking about another device), `501` (device model
+///   off).
+/// - [`CliError::BadResponse`] if the `200` body is not the expected JSON.
+pub fn list_recoverable_vaults(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<Vec<RecoverableVault>, CliError> {
+    check_device_id(device_id)?;
+    #[derive(Deserialize)]
+    struct Wire {
+        #[serde(default)]
+        vaults: Vec<RecoverableVault>,
+    }
+    let path = format!("/v1/devices/{device_id}/keys");
+    let req = ureq::get(&join_url(server, &path));
+    let req = apply_auth(req, auth, "GET", &path, "", b"")?;
+    let text = finish(req.call())?;
+    let wire: Wire =
+        serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))?;
+    Ok(wire.vaults)
+}
+
+/// What the mandatory pre-print verification round-trip proved.
+#[derive(Debug, Clone)]
+pub struct RecoveryVerification {
+    /// The account the kit resolved to when it authenticated AS ITSELF. It is
+    /// compared against the generating device's own account: a mismatch means
+    /// the server enrolled the kit somewhere else, and the kit is revoked
+    /// instead of printed.
+    pub account_id: String,
+    /// How many vaults the kit's own envelope index reported.
+    pub indexed_vaults: usize,
+    /// The vault whose envelope was actually unwrapped end to end.
+    pub unwrapped_vault: String,
+    /// The 16-hex SHA-256 fingerprint of the unwrapped key — matched against the
+    /// generating device's copy. Never the key.
+    pub key_fingerprint: String,
+}
+
+/// A freshly generated recovery kit.
+///
+/// ⚠️ [`RecoveryKitOutcome::code`] is THE SECRET. It is returned exactly once,
+/// is never written to a file or logged by this crate, and should be rendered
+/// and then dropped.
+#[derive(Clone)]
+pub struct RecoveryKitOutcome {
+    /// ⚠️ THE SECRET: the ungrouped 56-character recovery code. Render it with
+    /// [`format_recovery_kit`].
+    pub code: String,
+    /// Everything else on the sheet. All public.
+    pub public: RecoveryKitPublic,
+    /// `(vault id, key fingerprint)` for each vault the kit now covers.
+    pub covered: Vec<(String, String)>,
+    /// What the pre-print verification round-trip proved.
+    pub verification: RecoveryVerification,
+    /// Active devices in the account after the kit joined, and the server's cap.
+    /// The kit consumes one seat.
+    pub seats_used: usize,
+    /// The server's configured per-account device cap.
+    pub seat_limit: usize,
+}
+
+/// REDACTED on purpose: the printed code must not reach a log line.
+impl std::fmt::Debug for RecoveryKitOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryKitOutcome")
+            .field("code", &"<redacted>")
+            .field("public", &self.public)
+            .field("covered", &self.covered)
+            .field("verification", &self.verification)
+            .finish()
+    }
+}
+
+/// GENERATE a recovery kit and cover a set of vaults with it.
+///
+/// The whole flow, in order:
+///
+/// 1. draw 32 CSPRNG bytes and derive the kit's Ed25519 + hybrid identity;
+/// 2. mint a PINNED, single-use invite for the kit's Ed25519 public key through
+///    the EXISTING account-invite route (so an intercepted invite is useless to
+///    anyone else);
+/// 3. redeem it AS THE KIT through the EXISTING enrollment challenge, under the
+///    visible label [`RECOVERY_DEVICE_LABEL`];
+/// 4. publish the kit's hybrid PUBLIC key, signed as the kit (that route is
+///    self-only, so it must happen here);
+/// 5. ⭐ PIN the DERIVED key locally, `origin = "recovery-kit"` — from now on,
+///    covering a vault from this device never fetches a key, so there is no
+///    fetch to poison;
+/// 6. wrap this device's copy of each vault key to the kit and grant it `read`;
+/// 7. ⭐ VERIFY BEFORE PRINTING — re-parse the code about to be printed,
+///    re-derive from the PARSED value, authenticate v3 as the kit, assert the
+///    account it resolves to is the generating device's own, collect one
+///    envelope, unwrap it, and compare fingerprints. Any failure REVOKES the
+///    partial kit and returns an error: a kit that was generated but never
+///    worked is structurally impossible.
+///
+/// The generating device persists ONLY public material (the pin). The seed and
+/// every derived secret are dropped when this returns.
+///
+/// # Errors
+/// - [`CliError::Recovery`] if the verification round-trip fails (the kit is
+///   revoked first), or if a named vault has no key in the local keyring.
+/// - [`CliError::Server`] / [`CliError::Http`] from any step.
+#[allow(clippy::too_many_arguments)]
+pub fn recovery_generate(
+    server: &str,
+    auth: &RequestAuth<'_>,
+    vault_ids: &[String],
+    keyring_path: &std::path::Path,
+    pins_path: &std::path::Path,
+    invite_ttl_seconds: Option<u64>,
+) -> Result<RecoveryKitOutcome, CliError> {
+    // The generating device's own account, so step 7 has something to compare
+    // against. Fetched FIRST: if this device cannot even read its own account,
+    // nothing below is going to work.
+    let mine = get_account(server, auth)?;
+
+    // 1) Entropy and derivation.
+    let seed = generate_recovery_seed()?;
+    let identity = derive_recovery_identity(&seed);
+    let code_bytes = encode_recovery_kit(&seed);
+    let code = std::str::from_utf8(&code_bytes)
+        .map_err(|e| CliError::Recovery(format!("encoded code is not ASCII: {e}")))?
+        .to_string();
+
+    // Every vault we intend to cover must have a key HERE, before anything is
+    // enrolled: failing later would leave a half-covered kit behind.
+    let mut keys: Vec<(String, [u8; VAULT_KEY_LEN])> = Vec::with_capacity(vault_ids.len());
+    for vault_id in vault_ids {
+        let key = keyring_get(keyring_path, vault_id)?.ok_or_else(|| {
+            CliError::Recovery(format!(
+                "no vault key for {vault_id:?} in {}; a PASSWORD-sealed vault cannot be covered by \
+                 a recovery kit — run `sigil vault rekey --vault {vault_id}` first (that is a \
+                 ONE-WAY door)",
+                keyring_path.display()
+            ))
+        })?;
+        keys.push((vault_id.clone(), key));
+    }
+
+    // 2) A PINNED, single-use invite for exactly this public key.
+    let invite =
+        create_account_invite(server, auth, invite_ttl_seconds, Some(&identity.public_key))?;
+
+    // 3) Redeem it AS THE KIT, over the unchanged enrollment challenge.
+    let enrolled = enroll_device(
+        server,
+        &invite.invite,
+        RECOVERY_DEVICE_LABEL,
+        &identity.public_key,
+        &identity.ed25519_seed,
+    )?;
+    let kit_id = enrolled.device_id.clone();
+    let kit_auth = RequestAuth::V3 {
+        device_id: &kit_id,
+        seed: &identity.ed25519_seed,
+    };
+
+    // From here on a failure leaves a live kit on the server, so every early
+    // return goes through this: revoke it and report the ORIGINAL error.
+    let abort = |e: CliError| -> CliError {
+        let _ = revoke_device(server, &kit_id, auth, None);
+        e
+    };
+
+    // 4) Publish the kit's hybrid PUBLIC key (self-only route).
+    publish_hybrid_key(server, &kit_id, &identity.hybrid_public, &kit_auth).map_err(abort)?;
+
+    // 5) ⭐ PIN THE DERIVED KEY. Nothing was fetched, so nothing could be
+    //    substituted. This is what makes step 6 fetch-free.
+    pin_derived_key(pins_path, &kit_id, &identity.hybrid_public).map_err(abort)?;
+
+    // 6) Cover each vault: wrap OUR copy of the key to the DERIVED identity.
+    //    ⭐ It goes through the SAME gate as every other wrap. Because step 5
+    //    just pinned the derived key with origin = "recovery-kit", the gate
+    //    short-circuits on RecipientTrust::Derived and makes NO request — so
+    //    there is still no fetch to poison, and there is still exactly ONE
+    //    construction site for a VerifiedRecipient.
+    let verified =
+        verify_recipient_for_wrap(server, &kit_id, auth, pins_path, None, true).map_err(abort)?;
+    debug_assert_eq!(verified.trust(), RecipientTrust::Derived);
+    let mut covered = Vec::with_capacity(keys.len());
+    for (vault_id, key) in &keys {
+        share_vault_to_known_key(server, vault_id, &verified, "read", key, auth).map_err(abort)?;
+        covered.push((vault_id.clone(), vault_key_fingerprint(key)));
+    }
+
+    // 7) ⭐ THE MANDATORY VERIFICATION ROUND-TRIP. Deliberately re-parses the
+    //    printed form and re-derives from THAT, so a codec bug cannot ship a
+    //    sheet that decodes to a different identity.
+    let verification =
+        verify_kit_round_trip(server, &code, &kit_id, &mine.account_id, &keys).map_err(abort)?;
+
+    let safety_number = hybrid_safety_number(&kit_id, &identity.hybrid_public)?;
+    let after = get_account(server, auth)?;
+
+    Ok(RecoveryKitOutcome {
+        code,
+        public: RecoveryKitPublic {
+            device_id: kit_id,
+            account_id: enrolled
+                .account_id
+                .unwrap_or_else(|| mine.account_id.clone()),
+            server: server.to_string(),
+            x25519_public_key: identity.hybrid_public.x25519_public_key.clone(),
+            mlkem_encaps_key: identity.hybrid_public.mlkem_encaps_key.clone(),
+            safety_number,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            covered: vault_ids.to_vec(),
+        },
+        covered,
+        verification,
+        seats_used: after.device_count,
+        seat_limit: after.device_limit,
+    })
+}
+
+/// The pre-print proof: parse the code, re-derive, authenticate as the kit, and
+/// unwrap one envelope end to end.
+fn verify_kit_round_trip(
+    server: &str,
+    code: &str,
+    kit_id: &str,
+    expected_account: &str,
+    keys: &[(String, [u8; VAULT_KEY_LEN])],
+) -> Result<RecoveryVerification, CliError> {
+    // Re-parse the EXACT text that will be printed.
+    let parsed = decode_recovery_kit(code)?;
+    let reborn = derive_recovery_identity(&parsed);
+    let auth = RequestAuth::V3 {
+        device_id: kit_id,
+        seed: &reborn.ed25519_seed,
+    };
+
+    // ⭐ The account assertion. This is the only thing that catches a hostile
+    // server that enrolled the kit into a DIFFERENT account — where it would
+    // authenticate perfectly and recover nothing of ours.
+    let account = get_account(server, &auth)?;
+    if account.account_id != expected_account {
+        return Err(CliError::Recovery(format!(
+            "the kit enrolled into account {} but this device is in {expected_account}; the \
+             server did not put the kit in your account, so it is being revoked and NOT printed",
+            account.account_id
+        )));
+    }
+
+    let indexed = list_recoverable_vaults(server, kit_id, &auth)?;
+    if keys.is_empty() {
+        // A kit covering nothing still proved it can authenticate and read its
+        // own (empty) index, which is everything there is to prove.
+        return Ok(RecoveryVerification {
+            account_id: account.account_id,
+            indexed_vaults: indexed.len(),
+            unwrapped_vault: String::new(),
+            key_fingerprint: String::new(),
+        });
+    }
+
+    let (vault_id, expected_key) = &keys[0];
+    if !indexed.iter().any(|v| &v.vault_id == vault_id) {
+        return Err(CliError::Recovery(format!(
+            "the kit's own envelope index does not list vault {vault_id:?}; it is being revoked \
+             and NOT printed"
+        )));
+    }
+    let envelope = get_key_envelope(server, vault_id, kit_id, &auth)?;
+    let recovered = unwrap_vault_key(&reborn.hybrid_secret, &envelope)?;
+    let fingerprint = vault_key_fingerprint(&recovered);
+    if fingerprint != vault_key_fingerprint(expected_key) {
+        return Err(CliError::Recovery(format!(
+            "the kit unwrapped a DIFFERENT key for vault {vault_id:?}; it is being revoked and \
+             NOT printed"
+        )));
+    }
+    Ok(RecoveryVerification {
+        account_id: account.account_id,
+        indexed_vaults: indexed.len(),
+        unwrapped_vault: vault_id.clone(),
+        key_fingerprint: fingerprint,
+    })
+}
+
+/// VERIFY a printed recovery code OFFLINE — decode + checksum only.
+///
+/// Makes NO network request whatsoever, which is exactly the property that lets
+/// a client tell "you mistyped it" apart from "this server does not know that
+/// kit" without leaking a code to a wrong server first.
+///
+/// # Errors
+/// - [`CliError::Recovery`] wrapping the [`RecoveryError`].
+pub fn recovery_verify(code: &str) -> Result<[u8; RECOVERY_SEED_LEN], CliError> {
+    Ok(decode_recovery_kit(code)?)
+}
+
+/// One vault's recovery coverage, as observed FROM THIS DEVICE.
+#[derive(Debug, Clone)]
+pub struct RecoveryCoverage {
+    /// The vault.
+    pub vault_id: String,
+    /// Whether the kit currently holds an envelope for it.
+    pub covered: bool,
+    /// RFC 3339 timestamp of the kit's envelope, when covered.
+    pub covered_at: String,
+    /// Whether the vault's sealed container has EVER been pushed to the op-log.
+    /// ⚠️ A kit recovers KEYS, not DATA: an unsynced vault is unrecoverable even
+    /// when it is "covered".
+    pub synced: bool,
+}
+
+/// CHECK, from this device, which of its vaults the kit still covers.
+///
+/// ⚠️ Report this as "checked from this device", never as "you are covered". A
+/// vault created on a sibling device that never heard of the kit is invisible
+/// here — that is honest coverage drift, not a bug.
+///
+/// # Errors
+/// - [`CliError::Server`] / [`CliError::Http`] from the transport (listing a
+///   vault's envelopes needs WRITE on it).
+pub fn recovery_check(
+    server: &str,
+    auth: &RequestAuth<'_>,
+    kit_device_id: &str,
+    keyring_path: &std::path::Path,
+) -> Result<Vec<RecoveryCoverage>, CliError> {
+    check_device_id(kit_device_id)?;
+    let keyring = load_keyring(keyring_path)?;
+    let mut out = Vec::with_capacity(keyring.keys.len());
+    for vault_id in keyring.keys.keys() {
+        let holders = list_key_envelopes(server, vault_id, auth)?;
+        let kit = holders.iter().find(|h| h.device_id == kit_device_id);
+        // "Has this vault ever been synced?" — one op is enough to answer it,
+        // and the blob is opaque to us as much as to the server.
+        let synced = !pull_ops_auth(server, vault_id, 0, auth)?.is_empty();
+        out.push(RecoveryCoverage {
+            vault_id: vault_id.clone(),
+            covered: kit.is_some(),
+            covered_at: kit.map(|k| k.created_at.clone()).unwrap_or_default(),
+            synced,
+        });
+    }
+    Ok(out)
+}
+
+/// COVER one vault with an existing kit: wrap this vault's key to the kit and
+/// grant it `read`.
+///
+/// TWO PATHS, and the difference is the whole point:
+///
+/// * **On the GENERATING device** the kit's key is in the pin store with
+///   `origin = "recovery-kit"`, so the DERIVED identity is used directly and
+///   nothing is fetched. There is no substitution window at all.
+/// * **On any OTHER device** there is no derived pin, so the key comes from the
+///   server through [`fetch_hybrid_key_pinned`] — which on a first sight would
+///   be plain trust-on-first-use. This is STRICTER than ADR 0038 here, because
+///   the out-of-band channel is guaranteed present: the safety number is printed
+///   on the sheet in the user's own hand. `expected_safety_number` is therefore
+///   REQUIRED on that path, and a mismatch is refused. A warning would not be
+///   good enough when the verification channel is in the user's pocket.
+///
+/// # Errors
+/// - [`CliError::Recovery`] if a sibling device gave no (or a wrong) safety
+///   number.
+/// - [`CliError::PinMismatch`] if the kit's published key changed.
+/// - [`CliError::Server`] / [`CliError::Http`] from the transport.
+#[allow(clippy::too_many_arguments)]
+pub fn recovery_cover(
+    server: &str,
+    auth: &RequestAuth<'_>,
+    kit_device_id: &str,
+    vault_id: &str,
+    keyring_path: &std::path::Path,
+    pins_path: &std::path::Path,
+    expected_safety_number: Option<&str>,
+) -> Result<(String, bool), CliError> {
+    check_device_id(kit_device_id)?;
+    check_vault(vault_id)?;
+
+    // ⭐ THE TRUST DECISION COMES FIRST, before the keyring is even read: a
+    // device that cannot establish which key belongs to the kit must be refused
+    // for THAT reason, not for whatever it happens to be missing locally.
+    //
+    // This used to be bespoke logic living here, which is exactly the defect the
+    // fix round closed — `vault share --to <kitID>` reached the same outcome
+    // without it. It is now the SHARED gate, so the requirement holds from every
+    // command rather than from this one.
+    let verified = verify_recipient_for_wrap(
+        server,
+        kit_device_id,
+        auth,
+        pins_path,
+        expected_safety_number,
+        // The caller SAID this is a recovery kit, so the gate does not have to
+        // discover it — and cannot be fooled by a server that hides the label.
+        true,
+    )?;
+    let derived = verified.trust() == RecipientTrust::Derived;
+
+    let key = keyring_get(keyring_path, vault_id)?.ok_or_else(|| {
+        CliError::Recovery(format!(
+            "no vault key for {vault_id:?} in {}; only a SHARED vault can be covered — run \
+             `sigil vault rekey --vault {vault_id}` first",
+            keyring_path.display()
+        ))
+    })?;
+
+    share_vault_to_known_key(server, vault_id, &verified, "read", &key, auth)?;
+    Ok((vault_key_fingerprint(&key), derived))
+}
+
+/// Compare safety numbers ignoring presentation (spacing/case), so a user who
+/// typed the digits without spaces is not told their sheet is wrong.
+fn normalize_safety_number(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+/// What a restore actually recovered.
+#[derive(Debug, Clone)]
+pub struct RestoreReport {
+    /// The kit's device id.
+    pub device_id: String,
+    /// The account it belongs to.
+    pub account_id: String,
+    /// `(vault id, vault file path, key fingerprint, entries recovered)`.
+    pub vaults: Vec<(String, std::path::PathBuf, String, usize)>,
+    /// Vaults the index listed but that could not be recovered, with a reason.
+    /// A covered-but-never-synced vault lands here: the KEY was recovered, the
+    /// DATA was never on the server.
+    pub skipped: Vec<(String, String)>,
+    /// Whether the kit's own secrets were persisted (`--adopt`).
+    pub adopted: bool,
+}
+
+/// RESTORE from a printed recovery kit.
+///
+/// The code is decoded and checksummed **OFFLINE, before any network I/O**, so a
+/// mistyped code never reaches a server. Then: derive → authenticate v3 as the
+/// kit → read the kit's own envelope index → per vault, collect the envelope,
+/// unwrap the vault key, pull the op-log, OPEN the container (proving it is
+/// readable) and only then write the vault file `0600` in a `0700` directory via
+/// a temp file and a rename, so an unreadable container can never clobber a good
+/// vault.
+///
+/// ⭐ **DEFAULT IS EPHEMERAL.** With `adopt = false` the kit's own secrets are
+/// NOT written to disk: this machine recovers the vaults and remains an ordinary
+/// machine. With `adopt = true` the Ed25519 seed and hybrid identity are
+/// persisted `0600` — and the caller MUST tell the user that this machine is now
+/// a second copy of the paper.
+///
+/// # Errors
+/// - [`CliError::Recovery`] for an undecodable code (offline) or a kit whose
+///   index is empty.
+/// - [`CliError::Server`]: `401` = valid code, but this server has no such
+///   device (wrong server, wrong account, or revoked — the server deliberately
+///   will not say which).
+pub fn recovery_restore(
+    code: &str,
+    server: &str,
+    device_id: &str,
+    out_dir: &std::path::Path,
+    adopt: bool,
+) -> Result<RestoreReport, CliError> {
+    // ⭐ OFFLINE FIRST. Zero network I/O happens before this succeeds.
+    let seed = recovery_verify(code)?;
+    check_device_id(device_id)?;
+    let identity = derive_recovery_identity(&seed);
+    let auth = RequestAuth::V3 {
+        device_id,
+        seed: &identity.ed25519_seed,
+    };
+
+    let account = get_account(server, &auth)?;
+    let indexed = list_recoverable_vaults(server, device_id, &auth)?;
+    if indexed.is_empty() {
+        return Err(CliError::Recovery(
+            "valid code and device, but there is nothing to recover: this kit holds no vault key \
+             on this server. It was enrolled but never covered a vault (`sigil recovery cover`), \
+             or a `sigil vault rotate` dropped it."
+                .to_string(),
+        ));
+    }
+
+    ensure_state_dir(out_dir)?;
+    let keyring_path = out_dir.join(VAULT_KEYRING_FILE);
+    let mut report = RestoreReport {
+        device_id: device_id.to_string(),
+        account_id: account.account_id,
+        vaults: Vec::new(),
+        skipped: Vec::new(),
+        adopted: adopt,
+    };
+
+    for entry in &indexed {
+        let envelope = match get_key_envelope(server, &entry.vault_id, device_id, &auth) {
+            Ok(e) => e,
+            Err(e) => {
+                report.skipped.push((entry.vault_id.clone(), e.to_string()));
+                continue;
+            }
+        };
+        // Rejects any recovered plaintext that is not exactly 32 bytes.
+        let key = unwrap_vault_key(&identity.hybrid_secret, &envelope)?;
+
+        let ops = pull_ops_auth(server, &entry.vault_id, 0, &auth)?;
+        let Some(last) = ops.last() else {
+            report.skipped.push((
+                entry.vault_id.clone(),
+                "the key was recovered but this vault has NEVER been pushed to the op-log — a kit \
+                 recovers KEYS, not DATA, so there is nothing here to open"
+                    .to_string(),
+            ));
+            // The key is still worth keeping: the data may be pushed later.
+            keyring_put(&keyring_path, &entry.vault_id, &key)?;
+            continue;
+        };
+
+        // ⭐ OPEN BEFORE WRITING. A container that does not open never touches
+        // the filesystem, so it cannot clobber anything.
+        let vault = match open_vault(&key, &last.blob) {
+            Ok(v) => v,
+            Err(e) => {
+                report.skipped.push((
+                    entry.vault_id.clone(),
+                    format!(
+                        "the newest op for this vault did not open with the recovered key: {e}"
+                    ),
+                ));
+                keyring_put(&keyring_path, &entry.vault_id, &key)?;
+                continue;
+            }
+        };
+
+        let path = out_dir.join(format!("{}.sigil", sanitize_file_stem(&entry.vault_id)));
+        let tmp = path.with_extension("restore.tmp");
+        write_secret_file(&tmp, &last.blob)
+            .map_err(|e| CliError::Recovery(format!("could not write restored vault: {e}")))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            CliError::Recovery(format!(
+                "could not place restored vault {}: {e}",
+                path.display()
+            ))
+        })?;
+        keyring_put(&keyring_path, &entry.vault_id, &key)?;
+        report.vaults.push((
+            entry.vault_id.clone(),
+            path,
+            vault_key_fingerprint(&key),
+            vault.entries.len(),
+        ));
+    }
+
+    if adopt {
+        // ⚠️ THIS MACHINE IS NOW A SECOND COPY OF THE PAPER.
+        let key_path = out_dir.join("device.key");
+        save_key(
+            &key_path,
+            &KeyFile {
+                version: KEY_FILE_VERSION,
+                seed: BASE64.encode(identity.ed25519_seed),
+                public_key: BASE64.encode(identity.public_key),
+                device_id: Some(device_id.to_string()),
+            },
+        )?;
+        let hybrid_path = out_dir.join("device.hybrid");
+        save_hybrid_secret(&hybrid_path, &identity.hybrid_secret)?;
+        let mut pub_path = hybrid_path.clone().into_os_string();
+        pub_path.push(".pub");
+        save_hybrid_public(std::path::Path::new(&pub_path), &identity.hybrid_public)?;
+        // This machine DERIVED the kit's hybrid key from the paper, so it knows
+        // that key without ever asking a server — pin it as such. Without this,
+        // an adopted machine would have to be handed the safety number to cover
+        // a new vault with a key it holds the secret half of.
+        pin_derived_key(
+            &out_dir.join(HYBRID_PIN_FILE),
+            device_id,
+            &identity.hybrid_public,
+        )?;
+    }
+
+    Ok(report)
+}
+
+/// Create `dir` mode `0700` if it does not exist, so everything written into it
+/// starts out owner-only.
+fn ensure_state_dir(dir: &std::path::Path) -> Result<(), CliError> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.as_os_str().is_empty() || dir.exists() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| CliError::Recovery(format!("could not create {}: {e}", dir.display())))
+}
+
+/// Make a vault id safe to use as a FILE NAME. Vault ids are already free of
+/// `/` and whitespace ([`check_vault`]), so this only guards the remaining
+/// awkward cases (`.`/`..` and other path-ish characters).
+fn sanitize_file_stem(vault_id: &str) -> String {
+    let cleaned: String = vault_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '_') {
+        "vault".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// What a revocation did, and what the user still has to do by hand.
+#[derive(Debug, Clone)]
+pub struct RecoveryRevokeReport {
+    /// The kit that was revoked.
+    pub device_id: String,
+    /// Vaults whose envelope for the kit was deleted.
+    pub envelopes_removed: Vec<String>,
+    /// Vaults where there was no envelope to remove.
+    pub already_clear: Vec<String>,
+}
+
+/// REVOKE a recovery kit: refuse it at the door and take back its envelopes.
+///
+/// It does NOT auto-rotate. Rotation re-seals user data and must stay an
+/// explicit act — and revocation cannot un-learn a key the kit already
+/// unwrapped, so the caller is told to run `sigil vault rotate` per vault.
+///
+/// Sibling revocation (ADR 0040 §5) means any member device can do this; the kit
+/// can also revoke itself.
+///
+/// # Errors
+/// - [`CliError::Server`] / [`CliError::Http`] from the transport.
+pub fn recovery_revoke(
+    server: &str,
+    auth: &RequestAuth<'_>,
+    kit_device_id: &str,
+    vault_ids: &[String],
+) -> Result<RecoveryRevokeReport, CliError> {
+    check_device_id(kit_device_id)?;
+    // Envelopes FIRST, while the caller's own access is certainly intact — and
+    // because a revoked device that still has an envelope sitting in its mailbox
+    // is a worse state than the reverse.
+    let mut removed = Vec::new();
+    let mut clear = Vec::new();
+    for vault_id in vault_ids {
+        if delete_key_envelope(server, vault_id, kit_device_id, auth)? {
+            removed.push(vault_id.clone());
+        } else {
+            clear.push(vault_id.clone());
+        }
+    }
+    revoke_device(server, kit_device_id, auth, None)?;
+    Ok(RecoveryRevokeReport {
+        device_id: kit_device_id.to_string(),
+        envelopes_removed: removed,
+        already_clear: clear,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sigil_core::format_recovery_kit;
+
+    // --- Phase 54: the recovery kit -----------------------------------------
+
+    /// ⭐ THE ANTI-DRIFT ANCHOR, reproduced from `sigil-core`'s own KAT. The
+    /// same fixed seed must yield the same Ed25519 public key, the same X25519
+    /// public key and the same ML-KEM encapsulation key here, in the wasm
+    /// bindings and in JS — otherwise a kit printed by one client cannot be
+    /// redeemed by another, and that failure is SILENT.
+    #[test]
+    fn recovery_derivation_known_answer_vector() {
+        use sha2::Digest as _;
+        let seed = [0x42u8; RECOVERY_SEED_LEN];
+        let id = derive_recovery_identity(&seed);
+
+        let hex = |b: &[u8]| -> String {
+            let mut s = String::new();
+            for x in b {
+                s.push_str(&format!("{x:02x}"));
+            }
+            s
+        };
+        assert_eq!(
+            hex(&id.public_key),
+            "913af25b7f0ea458577b80124f137f7a8f0e5850a73a5cdeaf92e9169edeb717"
+        );
+        let keys = id.hybrid_public.decode().expect("decode hybrid public");
+        assert_eq!(
+            hex(&keys.x25519_public_key),
+            "a55ac63d4d1f84face17abb82cc3449cd43c3f25f7a08008075bd594acc98754"
+        );
+        let digest: [u8; 32] = sha2::Sha256::digest(keys.mlkem_encaps_key).into();
+        assert_eq!(
+            hex(&digest),
+            "14260b3e72b496ac3fde4a2434fd0f175f55324cca38ef8cd75a53675b643806"
+        );
+        // The PRINTED form of the same seed.
+        let encoded = encode_recovery_kit(&seed);
+        assert_eq!(
+            format_recovery_kit(std::str::from_utf8(&encoded).unwrap()),
+            "05144GJ2-89144GJ2-89144GJ2-89144GJ2-89144GJ2-89144GJ2-89145G6W"
+        );
+    }
+
+    /// The derived hybrid identity must actually be usable as a KEM recipient:
+    /// wrap a vault key to the PUBLIC half, unwrap it with the SECRET half.
+    #[test]
+    fn recovery_identity_wraps_and_unwraps_a_vault_key() {
+        let seed = [0x9du8; RECOVERY_SEED_LEN];
+        let id = derive_recovery_identity(&seed);
+        let key = [0x5au8; VAULT_KEY_LEN];
+        let envelope = wrap_vault_key(&id.hybrid_public, &key).expect("wrap");
+        // A recovery envelope is an ORDINARY SIGILhyb container — no new format.
+        assert_eq!(&envelope[..8], HYBRID_MAGIC.as_slice());
+        let recovered = unwrap_vault_key(&id.hybrid_secret, &envelope).expect("unwrap");
+        assert_eq!(recovered, key);
+
+        // A DIFFERENT recovery secret recovers nothing.
+        let other = derive_recovery_identity(&[0x9eu8; RECOVERY_SEED_LEN]);
+        assert!(unwrap_vault_key(&other.hybrid_secret, &envelope).is_err());
+    }
+
+    /// A code that round-trips through the printed form re-derives the SAME
+    /// identity — the property the pre-print verification relies on.
+    #[test]
+    fn printed_code_round_trips_to_the_same_identity() {
+        let seed = generate_recovery_seed().expect("rng");
+        let code = encode_recovery_kit(&seed);
+        let text = std::str::from_utf8(&code).unwrap();
+        let grouped = format_recovery_kit(text);
+        let parsed = recovery_verify(&grouped).expect("decode the grouped form");
+        assert_eq!(parsed, seed);
+        let a = derive_recovery_identity(&seed);
+        let b = derive_recovery_identity(&parsed);
+        assert_eq!(a.public_key, b.public_key);
+        assert_eq!(
+            a.hybrid_public.mlkem_encaps_key,
+            b.hybrid_public.mlkem_encaps_key
+        );
+    }
+
+    /// A mistyped code is rejected OFFLINE, and the error never echoes the code.
+    #[test]
+    fn a_mistyped_code_is_rejected_offline_without_echoing_it() {
+        let seed = [0x31u8; RECOVERY_SEED_LEN];
+        let code = encode_recovery_kit(&seed);
+        let mut text = std::str::from_utf8(&code).unwrap().to_string();
+        // Flip one character to a different alphabet member.
+        let first = text.remove(0);
+        text.insert(0, if first == 'Z' { 'Y' } else { 'Z' });
+        let err = recovery_verify(&text).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("not a valid recovery code"), "{msg}");
+        assert!(!msg.contains(&text), "the error echoed the code: {msg}");
+    }
+
+    /// `pin_derived_key` writes a pin marked `origin: "recovery-kit"`, is
+    /// idempotent for the same key, and REFUSES to replace a different one.
+    #[test]
+    fn pin_derived_key_marks_origin_and_refuses_replacement() {
+        let dir = std::env::temp_dir().join(format!("sigil-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pins = dir.join("hybrid-pins.json");
+        let _ = std::fs::remove_file(&pins);
+
+        let id = derive_recovery_identity(&[0x07u8; RECOVERY_SEED_LEN]);
+        pin_derived_key(&pins, "dev_kit", &id.hybrid_public).expect("first pin");
+        let store = load_pins(&pins).expect("load");
+        let pin = store.pins.get("dev_kit").expect("pinned");
+        assert_eq!(pin.origin.as_deref(), Some(PIN_ORIGIN_RECOVERY_KIT));
+        assert_eq!(pin.repins, 0);
+
+        // Idempotent for the same key.
+        pin_derived_key(&pins, "dev_kit", &id.hybrid_public).expect("re-pin same key");
+
+        // A DIFFERENT key is refused — this function never silently replaces.
+        let other = derive_recovery_identity(&[0x08u8; RECOVERY_SEED_LEN]);
+        let err = pin_derived_key(&pins, "dev_kit", &other.hybrid_public).expect_err("must refuse");
+        assert!(matches!(err, CliError::PinMismatch { .. }));
+        // And the store is untouched.
+        let after = load_pins(&pins).expect("load");
+        assert_eq!(
+            after.pins.get("dev_kit").unwrap().x25519_public_key,
+            id.hybrid_public.x25519_public_key
+        );
+
+        // `derived_pin` finds it; an ordinary (fetched) pin is not "derived".
+        assert!(derived_pin(&pins, "dev_kit").expect("derived").is_some());
+        check_and_pin(&pins, "dev_other", &other.hybrid_public).expect("ordinary pin");
+        assert!(derived_pin(&pins, "dev_other").expect("derived").is_none());
+        let _ = std::fs::remove_file(&pins);
+    }
+
+    /// An OLD pin store (no `origin` field) still parses, and a store written
+    /// without a kit still has no `origin` key at all — the pin-store VERSION
+    /// was deliberately not bumped.
+    #[test]
+    fn pin_store_origin_is_additive_and_omitted_when_absent() {
+        let legacy = r#"{"version":1,"pins":{"dev_a":{"device_id":"dev_a",
+            "x25519_public_key":"AA==","mlkem_encaps_key":"AA==",
+            "safety_number":"00000 00000 00000 00000 00000 00000","pinned_at":1,"repins":0}}}"#;
+        let store: HybridPinStore = serde_json::from_str(legacy).expect("legacy store parses");
+        assert_eq!(store.version, HYBRID_PIN_STORE_VERSION);
+        assert!(store.pins.get("dev_a").unwrap().origin.is_none());
+
+        let rendered = serde_json::to_string(&store).expect("serialize");
+        assert!(
+            !rendered.contains("origin"),
+            "an absent origin must not be written: {rendered}"
+        );
+    }
 
     /// Fast Argon2id params so tests are near-instant while still hitting the
     /// real KDF path. (Argon2 requires `m_cost >= 8 * p_cost`.)

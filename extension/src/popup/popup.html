@@ -241,6 +241,22 @@
           </span>
         </div>
 
+        <!-- ⭐ The out-of-band check, entered BEFORE the wrap. Optional for an
+             ordinary device; MANDATORY for a RECOVERY KIT this browser has never
+             pinned — those digits are printed on the sheet, and a kit
+             reconstructs the whole account. -->
+        <label for="sharing-share-safety">
+          Their safety number (optional — required for a recovery kit)
+        </label>
+        <input
+          id="sharing-share-safety"
+          spellcheck="false"
+          autocomplete="off"
+          inputmode="numeric"
+          placeholder="83791 28129 67801 50284 55242 77845"
+          data-testid="sharing-share-safety"
+        />
+
         <button type="button" id="sharing-accept" data-testid="sharing-accept">
           Accept a vault shared to this device
         </button>
@@ -272,6 +288,33 @@
           autocomplete="off"
           placeholder="dev_…, dev_… (include THIS device)"
           data-testid="sharing-rotate-to"
+        />
+        <!-- ⭐ Rotation DELETES the envelope of everyone left out, so it refuses
+             to do that by omission (Phase 54's drop guard). Name them here, or
+             tick the box — without one of the two, any rotation that actually
+             excludes somebody hard-fails. -->
+        <label for="sharing-rotate-drop">…and device ids whose access is being REMOVED</label>
+        <input
+          id="sharing-rotate-drop"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_… (their envelope is deleted)"
+          data-testid="sharing-rotate-drop"
+        />
+        <label>
+          <input type="checkbox" id="sharing-rotate-drop-all" data-testid="sharing-rotate-drop-all" />
+          Remove every other device that currently holds a key for this vault
+          (including a RECOVERY KIT, which then no longer recovers it)
+        </label>
+        <label for="sharing-rotate-safety">
+          Safety numbers for first-sight recipients (dev_x=digits, comma separated)
+        </label>
+        <input
+          id="sharing-rotate-safety"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_abc=83791 28129 67801 50284 55242 77845"
+          data-testid="sharing-rotate-safety"
         />
         <button type="button" id="sharing-rotate" data-testid="sharing-rotate">
           Rotate this vault&rsquo;s key and re-wrap

@@ -34,14 +34,18 @@
 //! exactly why the testable logic is kept out of it.
 
 use sigil_core::{
-    format_code as core_format_code, hotp as core_hotp, hybrid_open as core_hybrid_open,
-    hybrid_seal as core_hybrid_seal, ml_kem768_keygen as core_ml_kem768_keygen,
-    open_record as core_open_record, public_key_from_seed as core_public_key_from_seed,
-    seal_record as core_seal_record, sign as core_sign, totp as core_totp, verify as core_verify,
+    decode_recovery_kit as core_decode_recovery_kit,
+    derive_recovery_keys as core_derive_recovery_keys,
+    encode_recovery_kit as core_encode_recovery_kit, format_code as core_format_code,
+    format_recovery_kit as core_format_recovery_kit, hotp as core_hotp,
+    hybrid_open as core_hybrid_open, hybrid_seal as core_hybrid_seal,
+    ml_kem768_keygen as core_ml_kem768_keygen, open_record as core_open_record,
+    public_key_from_seed as core_public_key_from_seed, seal_record as core_seal_record,
+    sign as core_sign, totp as core_totp, verify as core_verify,
     x25519_public_key as core_x25519_public_key, Argon2Params, OtpAlgorithm,
     ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
-    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
-    X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
+    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, RECOVERY_SEED_LEN, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN,
+    SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
 use wasm_bindgen::prelude::*;
 
@@ -439,6 +443,70 @@ pub fn ed25519_verify(
     ed25519_verify_inner(public_key, message, signature).map_err(|e| JsError::new(&e))
 }
 
+// --- RECOVERY KIT (Phase 54) -----------------------------------------------
+//
+// Thin shells over `sigil-core`'s recovery module. NO cryptography and NO codec
+// lives here: the Crockford codec, the checksum and the HKDF derivation are all
+// in the core, so the browser, the CLI and the native desktop client cannot
+// drift — a kit printed by one MUST be redeemable by the others, and that
+// failure would be silent.
+//
+// ⚠️ The 32-byte recovery secret and every derived seed are SECRET. JS must not
+// log them, persist them in the clear, or place them in a request. The only
+// outbound bytes derived from a kit are PUBLIC keys and signatures.
+//
+// The entropy is still the CALLER's (`crypto.getRandomValues` in JS), so this
+// crate stays `getrandom`-free.
+
+/// Encode a caller-supplied 32-byte recovery secret as the printed
+/// 56-character (ungrouped) recovery code.
+///
+/// Throws a JS `Error` unless `seed` is exactly 32 bytes.
+#[wasm_bindgen]
+pub fn recovery_encode(seed: &[u8]) -> Result<String, JsError> {
+    recovery_encode_inner(seed).map_err(|e| JsError::new(&e))
+}
+
+/// Decode a printed recovery code back to its 32-byte secret.
+///
+/// Forgiving about presentation (hyphens, spaces, case, and the Crockford
+/// `O`/`I`/`L` folding) and strict about content. Throws a JS `Error` naming the
+/// failure — a wrong length, a character outside the alphabet, a failed
+/// checksum, or an unsupported version. It makes NO network request, which is
+/// what lets a client tell "you mistyped it" apart from "that server does not
+/// know this kit".
+#[wasm_bindgen]
+pub fn recovery_decode(code: &str) -> Result<Vec<u8>, JsError> {
+    recovery_decode_inner(code).map_err(|e| JsError::new(&e))
+}
+
+/// Derive the kit's 32-byte Ed25519 device seed from its recovery secret.
+#[wasm_bindgen]
+pub fn recovery_derive_ed25519_seed(seed: &[u8]) -> Result<Vec<u8>, JsError> {
+    recovery_derive_ed25519_seed_inner(seed).map_err(|e| JsError::new(&e))
+}
+
+/// Derive the kit's 32-byte X25519 secret scalar from its recovery secret.
+#[wasm_bindgen]
+pub fn recovery_derive_x25519_secret(seed: &[u8]) -> Result<Vec<u8>, JsError> {
+    recovery_derive_x25519_secret_inner(seed).map_err(|e| JsError::new(&e))
+}
+
+/// Derive the kit's 64-byte ML-KEM-768 keygen seed (`d ‖ z`) from its recovery
+/// secret.
+#[wasm_bindgen]
+pub fn recovery_derive_mlkem_seed(seed: &[u8]) -> Result<Vec<u8>, JsError> {
+    recovery_derive_mlkem_seed_inner(seed).map_err(|e| JsError::new(&e))
+}
+
+/// Render a recovery code for the printed sheet: 7 groups of 8 characters
+/// joined by `-`. ONE renderer everywhere, so the grouping cannot drift between
+/// surfaces.
+#[wasm_bindgen]
+pub fn recovery_format(code: &str) -> String {
+    core_format_recovery_kit(code)
+}
+
 // --- Testable core-marshalling logic (no `JsError`, so it runs natively) ----
 
 #[allow(clippy::too_many_arguments)]
@@ -742,9 +810,139 @@ fn ed25519_verify_inner(
     Ok(core_verify(&public_key, message, &signature).is_ok())
 }
 
+// --- Recovery-kit inner helpers (native-testable, no `JsError`) -------------
+
+fn recovery_seed_arg(seed: &[u8]) -> Result<[u8; RECOVERY_SEED_LEN], String> {
+    fixed("recovery secret", seed)
+}
+
+fn recovery_encode_inner(seed: &[u8]) -> Result<String, String> {
+    let seed = recovery_seed_arg(seed)?;
+    let code = core_encode_recovery_kit(&seed);
+    String::from_utf8(code.to_vec()).map_err(|e| format!("encoded recovery code is not ASCII: {e}"))
+}
+
+fn recovery_decode_inner(code: &str) -> Result<Vec<u8>, String> {
+    core_decode_recovery_kit(code)
+        .map(|s| s.to_vec())
+        .map_err(|e| e.to_string())
+}
+
+fn recovery_derive_ed25519_seed_inner(seed: &[u8]) -> Result<Vec<u8>, String> {
+    let seed = recovery_seed_arg(seed)?;
+    Ok(core_derive_recovery_keys(&seed).ed25519_seed.to_vec())
+}
+
+fn recovery_derive_x25519_secret_inner(seed: &[u8]) -> Result<Vec<u8>, String> {
+    let seed = recovery_seed_arg(seed)?;
+    Ok(core_derive_recovery_keys(&seed).x25519_secret.to_vec())
+}
+
+fn recovery_derive_mlkem_seed_inner(seed: &[u8]) -> Result<Vec<u8>, String> {
+    let seed = recovery_seed_arg(seed)?;
+    Ok(core_derive_recovery_keys(&seed).mlkem_keygen_seed.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Phase 54: the recovery kit ----------------------------------------
+
+    /// Lowercase hex, so the KATs below read the same as the core's.
+    fn hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(char::from_digit(u32::from(b >> 4), 16).expect("nibble"));
+            out.push(char::from_digit(u32::from(b & 0x0f), 16).expect("nibble"));
+        }
+        out
+    }
+
+    /// ⭐ THE ANTI-DRIFT ANCHOR, identical to `sigil-core`'s and the CLI's. A
+    /// kit printed by one client must be redeemable by every other, and a
+    /// divergence here would fail SILENTLY.
+    #[test]
+    fn recovery_derivation_known_answer_vector() {
+        let seed = [0x42u8; RECOVERY_SEED_LEN];
+
+        let ed_seed = recovery_derive_ed25519_seed_inner(&seed).expect("ed25519 seed");
+        let ed_pub = ed25519_public_key_inner(&ed_seed).expect("ed25519 public key");
+        assert_eq!(
+            hex(&ed_pub),
+            "913af25b7f0ea458577b80124f137f7a8f0e5850a73a5cdeaf92e9169edeb717"
+        );
+
+        let x_secret = recovery_derive_x25519_secret_inner(&seed).expect("x25519 secret");
+        let x_pub = hybrid_x25519_public_inner(&x_secret).expect("x25519 public");
+        assert_eq!(
+            hex(&x_pub),
+            "a55ac63d4d1f84face17abb82cc3449cd43c3f25f7a08008075bd594acc98754"
+        );
+
+        // The ML-KEM encapsulation key is 1184 bytes, so its FIRST and LAST 16
+        // bytes are pinned rather than a SHA-256 of the whole thing (this crate
+        // has no hash dependency and must not gain one). `sigil-core`'s own KAT
+        // pins the full digest; these two windows pin the same key here.
+        let mlkem_seed = recovery_derive_mlkem_seed_inner(&seed).expect("mlkem seed");
+        let encaps = hybrid_mlkem_encaps_key_inner(&mlkem_seed).expect("mlkem encaps");
+        assert_eq!(encaps.len(), ML_KEM768_ENCAPS_KEY_LEN);
+        assert_eq!(hex(&encaps[..16]), "ea867c0b6760c45a626095121b213812");
+        assert_eq!(
+            hex(&encaps[encaps.len() - 16..]),
+            "9d833ea2523b6b6d6f5add44e4529afc"
+        );
+
+        // And the PRINTED form.
+        let code = recovery_encode_inner(&seed).expect("encode");
+        assert_eq!(code.len(), 56);
+        assert_eq!(
+            recovery_format(&code),
+            "05144GJ2-89144GJ2-89144GJ2-89144GJ2-89144GJ2-89144GJ2-89145G6W"
+        );
+        assert_eq!(recovery_decode_inner(&code).expect("decode"), seed.to_vec());
+    }
+
+    /// Presentation folds; `U` and a bad checksum do not.
+    #[test]
+    fn recovery_decode_is_forgiving_about_presentation_and_strict_about_content() {
+        let seed = [0x1du8; RECOVERY_SEED_LEN];
+        let code = recovery_encode_inner(&seed).expect("encode");
+        let grouped = recovery_format(&code);
+        assert_eq!(
+            recovery_decode_inner(&grouped).expect("grouped"),
+            seed.to_vec()
+        );
+        assert_eq!(
+            recovery_decode_inner(&grouped.to_lowercase()).expect("lowercase"),
+            seed.to_vec()
+        );
+
+        let mut with_u: Vec<char> = code.chars().collect();
+        with_u[3] = 'U';
+        let with_u: String = with_u.into_iter().collect();
+        assert!(
+            recovery_decode_inner(&with_u).is_err(),
+            "U must be rejected"
+        );
+
+        let mut typo: Vec<char> = code.chars().collect();
+        typo[0] = if typo[0] == 'Z' { 'Y' } else { 'Z' };
+        let typo: String = typo.into_iter().collect();
+        let err = recovery_decode_inner(&typo).expect_err("a typo must be rejected");
+        assert!(err.contains("not a valid recovery code"), "{err}");
+    }
+
+    /// A wrong-length secret is a caller bug and is reported as such.
+    #[test]
+    fn recovery_derive_rejects_a_wrong_length_secret() {
+        for bad in [vec![0u8; 31], vec![0u8; 33], vec![]] {
+            assert!(recovery_encode_inner(&bad).is_err());
+            assert!(recovery_derive_ed25519_seed_inner(&bad).is_err());
+            assert!(recovery_derive_x25519_secret_inner(&bad).is_err());
+            assert!(recovery_derive_mlkem_seed_inner(&bad).is_err());
+        }
+    }
 
     // Fast Argon2 params so the native tests are near-instant while still
     // exercising the real Argon2id path. (Argon2 requires m_cost >= 8 * p_cost.)

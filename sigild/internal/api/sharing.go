@@ -225,10 +225,27 @@ func (h *handlers) keyEnvelopePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Signature covers the body, so authenticate/authorize AFTER reading it.
-	out := h.authorizeOpsRequest(r, blob, vaultID, needWrite)
+	dev, out := h.authorizeOpsRequestDevice(r, blob, vaultID, needWrite)
 	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
 		return
+	}
+	// ENTITLEMENT (Phase 55): depositing a NEW wrapped key is a write, so a
+	// fully-lapsed account is refused with 402 after grace. ⭐ THE COLLECTING
+	// SIDE — keyEnvelopeGet, and the per-device index — IS NEVER GATED, so a
+	// customer who stopped paying can still fetch every key they were given and
+	// therefore still open every vault they already hold. Off by default.
+	//
+	// ⭐ AND A DEPOSIT TO A DEVICE OF THE CALLER'S OWN ACCOUNT IS EXEMPT. That is
+	// how a replacement device — or a recovery kit, which is an ordinary member
+	// device — is given the key to data the customer ALREADY has. Refusing it
+	// left a lapsed customer downloading ciphertext they could never decrypt,
+	// which is not "reads are never refused" in any meaningful sense. Sharing to
+	// ANOTHER account is still gated: that extends the product to somebody else.
+	if !h.sameAccountRecipient(r.Context(), dev, recipientID) {
+		if !h.requireEntitlement(w, r, dev, entitlementSurfaceKeyEnvelopePut) {
+			return
+		}
 	}
 	if len(blob) == 0 {
 		writeError(w, http.StatusBadRequest, "empty_envelope", "envelope body must not be empty")
@@ -407,6 +424,109 @@ func (h *handlers) keyEnvelopeList(w http.ResponseWriter, r *http.Request) {
 		VaultID    string                     `json:"vaultID"`
 		Recipients []keyEnvelopeRecipientJSON `json:"recipients"`
 	}{VaultID: vaultID, Recipients: recipients})
+}
+
+// ---------------------------------------------------------------------------
+// Recovery support (Phase 54): the per-DEVICE envelope index.
+//
+//	GET /v1/devices/{deviceID}/keys
+//
+// WHY THE SERVER NEEDS THIS AT ALL. A client restored from a RECOVERY KIT — a
+// printed 32-byte secret from which its Ed25519 and hybrid keys are re-derived —
+// starts with NO local state whatsoever, so it knows no vault ids. Printing them
+// on the sheet would go stale the instant a vault is created. The same hole
+// exists (less dramatically) for any device that joined an account by invite.
+//
+// WHY IT GRANTS NOTHING NEW. The server already holds every one of these vault
+// ids — they are in the path of every request the caller makes — and the caller
+// could already collect each envelope one at a time by naming its vault. This
+// route only removes the need to guess. Its net new capability is ~zero, which
+// is exactly why it is acceptable.
+//
+// THE THREE RULES, all reusing existing choke points verbatim:
+//
+//	SELF-ONLY   deviceID != the AUTHENTICATED device => 403 forbidden_device,
+//	            checked BEFORE any store read. Byte-identical to the addressee
+//	            check in keyEnvelopeGet.
+//	READ AUTHZ  every row is filtered through authorizeVault(needRead), so an
+//	            envelope for a vault the caller no longer holds read on is not
+//	            listed. needRead NEVER CLAIMS an unowned vault (the Phase 51
+//	            rule), so listing can never take ownership of anything.
+//	METADATA    the handler never calls GetKeyEnvelope. Postgres selects
+//	            octet_length(blob), so no ciphertext leaves the database.
+//
+// NO MIGRATION was needed: the index sigil_vault_key_envelopes_by_recipient from
+// 0004_key_sharing.sql was created for precisely this query, so
+// sigild_schema_version stays 5.
+// ---------------------------------------------------------------------------
+
+// maxRecipientIndexRows caps one page of the per-device envelope index. A device
+// with more covered vaults than this gets has_more=true; there is no cursor,
+// because the realistic count is single digits and a cursor would be dead code.
+const maxRecipientIndexRows = 500
+
+// recipientVaultJSON is one row of the per-device envelope index. Metadata only.
+type recipientVaultJSON struct {
+	VaultID        string `json:"vaultID"`
+	SenderDeviceID string `json:"sender_device_id"`
+	SizeBytes      int    `json:"size_bytes"`
+	CreatedAt      string `json:"created_at"`
+}
+
+// deviceKeyEnvelopeIndex reports which vaults have a wrapped key waiting for the
+// CALLING device. Self-only, read-authorized, metadata-only.
+func (h *handlers) deviceKeyEnvelopeIndex(w http.ResponseWriter, r *http.Request) {
+	targetID := r.PathValue("deviceID")
+	if targetID == "" {
+		writeError(w, http.StatusBadRequest, "missing_device_id", "device ID is required")
+		return
+	}
+
+	dev, out := h.authenticateDevice(r, nil)
+	if !out.allowed() {
+		h.denyOps(w, r, "", out)
+		return
+	}
+	// SELF-ONLY, and decided before the store is touched: a device may ask what
+	// is addressed to IT, never what is addressed to anyone else.
+	if dev.ID != targetID {
+		h.denyOps(w, r, "", authOutcome{Reason: reasonForbiddenDevice, DeviceID: dev.ID})
+		return
+	}
+
+	metas, err := h.devices.ListKeyEnvelopesForRecipient(r.Context(), dev.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "")
+		return
+	}
+
+	vaults := make([]recipientVaultJSON, 0, len(metas))
+	hasMore := false
+	for _, m := range metas {
+		// Per-vault READ authorization, one row at a time. needRead never
+		// claims, so enumerating cannot take ownership of an unowned vault.
+		if vout := h.authorizeVault(r, dev, m.VaultID, needRead); !vout.allowed() {
+			continue
+		}
+		if len(vaults) >= maxRecipientIndexRows {
+			hasMore = true
+			break
+		}
+		vaults = append(vaults, recipientVaultJSON{
+			VaultID:        m.VaultID,
+			SenderDeviceID: m.SenderDeviceID,
+			SizeBytes:      m.SizeBytes,
+			CreatedAt:      m.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	h.auditKeyEnvelopeIndex(r, dev.ID, len(vaults))
+	h.metrics.incKeyEnvelopeIndex()
+	writeJSON(w, http.StatusOK, struct {
+		DeviceID string               `json:"device_id"`
+		Vaults   []recipientVaultJSON `json:"vaults"`
+		HasMore  bool                 `json:"has_more"`
+	}{DeviceID: dev.ID, Vaults: vaults, HasMore: hasMore})
 }
 
 // keyEnvelopeDelete removes the envelope addressed to one device, so a device

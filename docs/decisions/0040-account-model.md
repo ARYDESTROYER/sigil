@@ -570,3 +570,60 @@ ordinary `sigil device enroll --token <invite>`, which is the point of §3.
   [ADR 0034](0034-billing-provider-seam.md) (the billing subject this moves),
   [ADR 0035](0035-device-to-device-vault-sharing.md) (the key relay that does the
   decryption half membership does not).
+
+## Three limitations revised by Phases 53–55 (added Phase 55, 2026-07-28)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed and which ADR changed it.
+
+- **Limitation 1 ("THIS IS NOT AN IDENTITY SYSTEM, AND THERE IS NO RECOVERY …
+  *this must be written down before anyone charges real money*") — the DATA half
+  is addressed; the IDENTITY half is NOT.**
+  [ADR 0042](0042-recovery-kit.md) adds a **recovery kit**: an **ordinary member
+  device** whose Ed25519 and hybrid private keys are HKDF-SHA256 derivations of
+  32 bytes of client CSPRNG **printed on paper** — never transmitted, never
+  stored on a device, never derivable from anything the server holds. `sigild`
+  gained **no concept of recovery**: no table, no migration
+  (`sigild_schema_version` stays **5**), one metadata-only self-only route
+  (`GET /v1/devices/{deviceID}/keys`).
+  ⚠️ **What is still true as written:** there is still **no email, no password,
+  no operator break-glass and no identity system**, and a customer who never
+  printed a kit is in exactly the position limitation 1 describes — **a kit
+  cannot be created after the loss**. It recovers **keys, not data** (a vault
+  never synced is gone) and only the vaults it was told to **cover**.
+  ⚠️ **And a new risk exists that did not before:** whoever holds the paper has
+  **full control of the account** — read every covered vault, revoke every device
+  — with no OS lock and no vault password in front of it. The kit's nominal
+  `read` grant is cosmetic, because §5 above authorizes it through **account
+  ownership**.
+- **Limitation 8 ("Entitlement is REPORTED, never ENFORCED") — retired, behind an
+  opt-in switch, and deliberately asymmetric.**
+  [ADR 0043](0043-entitlement-enforcement.md) adds `SIGILD_ENTITLEMENT_ENFORCE`
+  (**off by default**, byte-identical behaviour when unset) with
+  `SIGILD_ENTITLEMENT_GRACE` (default **14 days**): past grace, an account whose
+  subscription lapsed has **writes** refused with **`402 Payment Required`** and
+  a machine-readable body — never collapsed into the coarse `401`/`403` envelopes,
+  and reachable only *after* authentication and authorization have both
+  succeeded, so it is no oracle. ⭐ **READS AND SAME-ACCOUNT KEY RECOVERY ARE
+  NEVER REFUSED** — a lapsed customer can still read every code they already
+  have, collect their envelopes, give the vault key to a **replacement device of
+  their own account**, print a **recovery kit**, revoke a stolen device, and pay.
+  `past_due` remains **entitled**. The concern this limitation recorded — *"gating
+  the op-log on payment status would lock a customer out of their own 2FA codes
+  over a failed card"* — is therefore honoured, not overturned.
+- **Limitation 12's first clause ("No rate limiting on `POST
+  /v1/devices/enroll` or `POST /v1/account/invites`") — addressed, with two
+  properties that must be read alongside it.**
+  [ADR 0041](0041-abuse-bounds-and-the-removed-webhook-limiter.md) adds opt-in
+  stdlib token buckets (`SIGILD_ENROLL_RATE_LIMIT`/`_BURST` keyed on the socket
+  peer address, `SIGILD_INVITE_RATE_LIMIT`/`_BURST` keyed per account; `429` +
+  `Retry-After`; still exactly one direct Go dependency).
+  ⚠️ **It is a BACKSTOP, not a defence:** behind the only topology this repo
+  documents — a reverse proxy — every request arrives from one address and the
+  enrollment limiter degrades to a single global bucket. It charges the bucket
+  **only on the denial path**, so a request carrying a valid, unspent credential
+  and a valid proof can **never** be refused by it, and it **fails open** at its
+  key cap. ⚠️ **It also does not reduce load:** the handler always runs,
+  including its database work; the limiter replaces only the response.
+  **The second clause of limitation 12 is unchanged — there is still no sweep job
+  for expired invites.**

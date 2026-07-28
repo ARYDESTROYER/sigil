@@ -11,8 +11,182 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 52; Phase 52 is complete and gated but UNCOMMITTED in the
-working tree — `main` @ origin is at Phase 51 + the journal backfill commit `3c9a0b6`).**
+**Where we are (through Phase 55; Phases 52–55 are complete and gated but UNCOMMITTED in
+the working tree — `main` @ origin is at `bde8115`).**
+
+**Phases 53, 54 and 55 took the three ADR 0040 limitations that stop a paid product from
+being a paid product** — limit 12 (no rate limiting), the **data half** of limit 1 (NO
+RECOVERY), and limit 8 (entitlement reported, never enforced). ⚠️ **NONE of them added a
+migration — `sigild_schema_version` is still 5**, and `sigild/go.mod` still has exactly ONE
+direct require (`pgx`).
+
+**PHASE 53 — ABUSE BOUNDS.** A hand-written stdlib token bucket (the SAME
+`internal/api/ratelimit.go` type as the op-log limiter, **no new dependency**) bounds
+**`POST /v1/devices/enroll`** (keyed on the **SOCKET PEER ADDRESS**; ⚠️ **`X-Forwarded-For`
+is deliberately IGNORED** — attacker text without a trusted-proxy config, and keying on it
+would mint unlimited buckets; pinned **at the call site**) and **`POST /v1/account/invites`**
+(keyed **per ACCOUNT**). Env `SIGILD_ENROLL_RATE_LIMIT`/`_BURST` +
+`SIGILD_INVITE_RATE_LIMIT`/`_BURST`, off by default, validated fail-fast, `429 rate_limited`
++ `Retry-After`; metric `sigild_abuse_ratelimit_rejected_total{surface}` (closed set
+`enroll`/`invite`); audit `abuse.rate_limited` — ⚠️ **the source address is NEVER logged**
+(no personal data anywhere in this server; the proxy that would block already has it).
+⚠️⚠️ **TWO PROPERTIES TO STATE AS LOUDLY AS THE FEATURE, both proven live: (1) IT IS A
+BACKSTOP, NOT A DEFENCE** — the only topology this repo documents is a reverse proxy, so
+every request arrives from ONE address and the limiter degrades to a **single global
+bucket**. An earlier revision rejected BEFORE the handler and was reproduced **refusing a
+LEGITIMATE customer holding a valid, unspent operator token** — a global account-creation OFF
+SWITCH, on the very path someone uses after losing a device. **Fixed two ways: the bucket is
+charged ONLY on the DENIAL path** (a 2xx is flushed untouched and costs nothing, so a valid
+credential + valid proof can NEVER be refused by it) **and `Allow` now FAILS OPEN at its key
+cap** (fail-closed let one IPv6 /48 fill 10,000 buckets and lock out everyone).
+**(2) IT DOES NOT REDUCE LOAD** — the handler ALWAYS runs, including its DB work; the limiter
+replaces only the RESPONSE. Real per-source limiting belongs at the **EDGE**, and is
+configured **NOWHERE in `deploy/`**. ⛔ **THE WEBHOOK RATE LIMITER WAS BUILT, PROVEN HARMFUL,
+AND REMOVED.** An early revision limited `POST /v1/billing/webhook/{provider}` **before
+signature verification**, keyed on the provider name; a verifier reproduced it live —
+**~137 forged req/s from ONE unauthenticated thread shed 15 of 15 genuine, correctly-signed
+Stripe deliveries with 429**, a longer flood shed ~2,000 consecutive genuine retries,
+**ZERO payment events applied**, and the customer was then refused **402** by Phase 55. A
+provider's retry budget is FINITE ⇒ the event is lost **PERMANENTLY**. ⭐ **THE RULE: you
+cannot safely shed traffic on a route where shedding costs money and the legitimate sender
+has a finite retry budget** — BEFORE verification, forged traffic spends the honest sender's
+quota (the only key, the provider name, is attacker-controlled too); AFTER verification is no
+better, because an authentic burst is exactly what must never be dropped. What bounds it
+instead: the **64 KiB body cap** and **one HMAC over a size-capped buffer**.
+`SIGILD_WEBHOOK_RATE_LIMIT`/`_BURST` **NO LONGER EXIST**; setting them logs a loud boot
+WARNING naming the removal (added after a verifier pointed out they were **silently inert**)
+— it WARNS rather than failing boot, because a moot protective knob must not take a payments
+server down. **ADR 0041.**
+
+**PHASE 54 — THE RECOVERY KIT.** ⭐ **A kit is an ORDINARY MEMBER DEVICE whose Ed25519 +
+hybrid private keys are HKDF-SHA256 derivations of 32 bytes of client CSPRNG PRINTED ON
+PAPER** — never transmitted, never stored on a device, never derivable from anything the
+server holds. ⭐ **`sigild` gained NO concept of "recovery"**: no table, **no migration**, no
+flag, no config — it sees one more device row (label `"recovery-kit"`), one more hybrid
+PUBLIC key, one more opaque ~1226-byte `SIGILhyb` envelope per covered vault. **ONE new
+route: `GET /v1/devices/{deviceID}/keys`** — the index a kit needs on a FRESH machine:
+**SELF-ONLY** (mismatched path id ⇒ **403 BEFORE any store read**; an **unknown device id is
+the SAME coarse 403, never 404**), **METADATA ONLY** (`octet_length(blob)`), each row
+filtered by `authorizeVault(needRead)`, capped at 500 with `has_more` and no cursor; it
+needed no migration because `sigil_vault_key_envelopes_by_recipient` from `0004` was created
+for exactly this query. **FORMAT:** 32-byte seed; `check = SHA-256("sigil-recovery-kit-v1\n"
+‖ [0x01] ‖ seed)[0..2]`; `body = [0x01] ‖ seed(32) ‖ check(2)` = **35 bytes = 280 bits**;
+**Crockford base32 ⇒ exactly 56 chars, NO padding**, printed as **7 groups of 8**. Crockford
+folds `O`→`0` and `I`/`L`→`1`; ⚠️ **`U` is REJECTED, never folded**. ⭐ **DECODE ORDER IS
+CONTRACTUAL: length → alphabet → CHECKSUM → version** (the checksum COVERS the version byte,
+so a flipped version bit reports *"not a valid code"*, which is what a human holding paper
+needs to hear). A **NEW codec** in `recovery.rs`; it deliberately does **NOT** touch the RFC
+4648 `base32_decode` used by TOTP. **DERIVATION:** HKDF-SHA256 only — `PRK =
+HKDF-Extract(salt="sigil-recovery-kit-v1", ikm=seed)` (⚠️ salt has NO trailing newline, the
+checksum domain DOES), Expand to `…/ed25519-device-seed` (32) · `…/x25519-secret` (32) ·
+`…/mlkem-keygen-seed` (64), into the EXISTING deterministic primitives. ⭐ **ADR 0007 is what
+makes this possible** — the core reads no RNG, so a paper secret is just another entropy
+source and NOTHING in the core changed. **No new dependency** (`hkdf` + `sha2` already
+direct). **HKDF and NOT Argon2id**: the input is already-uniform 256-bit CSPRNG; only domain
+separation is needed. **COMMANDS** `sigil recovery generate|cover|check|verify|restore|
+revoke`; the secret is enterable via **prompt (echo off) / `--code-stdin`**, with `--code`
+kept for scripts but now warning that it lands in argv + shell history — and **deliberately
+NO env var**. ⭐⭐ **THE SECURITY-CRITICAL PART, AND WHY IT NEEDED TWO ROUNDS: the FIRST
+implementation put the safety-number requirement on the `recovery cover` COMMAND, and a
+verifier proved live that `vault share --to <kitID>` and `vault rotate --to <kitID>` reached
+the IDENTICAL wrap through ordinary first-sight TOFU, showing the human the number only AFTER
+the wrap and upload completed. THAT IS ADR 0038's OWN LESSON ("the choke point is the FETCH,
+and EVERY wrap path goes through it") VIOLATED ONE PHASE AFTER IT WAS WRITTEN DOWN.** The fix
+moved it into **`verify_recipient_for_wrap`**, **ENFORCED BY TYPE**: it returns a
+**`VerifiedRecipient`** with **private fields and no other constructor**, and the one
+wrap→deposit→grant path takes `&VerifiedRecipient` — so the gate cannot be bypassed without
+failing to compile. Outcomes: **derived ⇒ no fetch** · **pinned+identical ⇒ proceed** ·
+**pinned+different ⇒ `PinMismatch`** · first sight + matching `--safety-number` ⇒ proceed ·
+first sight + wrong number ⇒ **`SafetyNumberMismatch`** · first sight + **recipient is a kit**
++ no number ⇒ **REFUSE (`UnverifiedRecoveryKit`)** · first sight + ordinary device ⇒ TOFU as
+0038 allows. ⭐ **Every refusal happens BEFORE the key is pinned** (pinning a refused key
+would let a retry see `Match` and silence its own alarm). `vault rotate` gained a fail-closed
+`--drop`/`--drop-all-others` guard flagging *"⚠️ THIS IS YOUR RECOVERY KIT"*. **Three
+independent mutations turn share, rotate and cover red SEPARATELY**, and I disabled the gate
+personally → `cli/tests/e2e-recovery.sh` went red with *"expected 'recovery cover …' to FAIL,
+but it succeeded"*, then restored it. ⚠️⚠️ **THE RESIDUAL LIMIT, IN THESE WORDS:** the
+kit-DISCOVERY arm resolves a kit by device **LABEL** from **`GET /v1/account`** — a listing
+**the adversarial server serves**. **A server that renames or hides the label degrades
+`vault share`/`vault rotate` to a kit back to ordinary first-sight TOFU (warned and pinned)
+rather than a refusal.** The caller-ASSERTED paths (`recovery cover`, `recovery generate`) do
+NOT depend on the server, and **NO path anywhere accepts a CHANGED key or a mismatched safety
+number** ⇒ the honest claim is **"refuses first-sight kit wraps against a server that does not
+lie about labels"**, **NOT** "refuses first-sight kit wraps" (a verifier judged this
+consistent with ADR 0038's accepted TOFU limit and asked for exactly those words).
+⚠️ **OTHER LIMITS:** whoever holds the paper has **FULL CONTROL of the account** — read every
+covered vault, revoke every device — **stronger than a stolen locked phone** (no OS lock, no
+vault password), and its nominal `read` grant is **COSMETIC** because it is an account MEMBER
+of the OWNING account; it recovers **KEYS, not DATA**; only the vaults it was told to
+**COVER**; **a kit cannot be created after the loss**; it consumes a seat. **ADR 0042.**
+
+**PHASE 55 — ENTITLEMENT ENFORCEMENT.** Behind **`SIGILD_ENTITLEMENT_ENFORCE`** (OFF by
+default, **byte-identical when unset** — no store read, no header, no log line, no metric)
+with **`SIGILD_ENTITLEMENT_GRACE`** (default **14 days**, `(0,365d]`), an account whose
+subscription lapsed longer ago than grace has **WRITES** refused with **402 Payment
+Required** and a machine-readable body — **never collapsed into the coarse 401/403
+envelopes**, and reachable **only AFTER authn AND authz both succeed**, so it is **no
+oracle**. ⭐ **READS AND KEY RECOVERY ARE NEVER REFUSED:** `requireEntitlement` is called from
+**exactly THREE write handlers** (`opsAppend`, `keyEnvelopePut`, `vaultGrantCreate`) and
+**no read handler** — pinned by a test that **PARSES THE PACKAGE AST**, so the asymmetry is
+mechanically enforced, not remembered. A verifier drove it live: a lapsed account still
+produced **94287082**, and **`past_due` remains ENTITLED**. ⚠️ **A verifier found a real
+LOCKOUT and the fix closed it:** past grace a customer could not deposit a key envelope to
+their OWN new device (402) and could not print a recovery kit — one device failure from
+permanent loss, while the 402 body claimed `key_recovery_allowed: true`. **`sameAccountRecipient()`
+now exempts a key deposit AND its grant when the recipient is a device of the CALLER'S OWN
+ACCOUNT.** Everything **FAILS OPEN** (store fault / unreadable account / no anchor / no
+account id), and `entitlement.fail_open` is **ERROR**-level because it means enforcement is
+silently not happening. Grace runs from the **LATER** of `updated_at` and
+`current_period_end`; ⚠️ a **never-subscribed** account is graced from its **creation time**,
+so **the grace window doubles as the buy-in window — a trial by side effect, with no separate
+trial mechanism**. Metrics `sigild_entitlement_enforcing` (gauge) +
+`sigild_entitlement_decisions_total{outcome}` (closed set, **no account label**); audit
+`entitlement.grace`/`.refused`/`.fail_open`; headers `X-Sigil-Entitlement`(`-Status`,
+`-Grace-Ends`) on gated writes only; an additive `entitlement` block on
+`GET /v1/billing/subscription`. Unlike the abuse limiters it **REQUIRES**
+`SIGILD_ENABLE_DEV_OPS` + `SIGILD_DEVICE_AUTH` + `SIGILD_BILLING_PROVIDERS` (a silently-moot
+payment gate is a business hazard). **The verifier mutation-tested this phase hard: 15
+separate control mutations all went red.** **ADR 0043.**
+
+⚠️ **THE PROCESS, HONESTLY: three verifiers returned `pass = false`.** Two findings were
+**SEVERE** — the **money-losing webhook limiter** (deleted, not tuned) and the
+**substitutable recovery kit** (a control on a command instead of on the path, one phase
+after that lesson was written down; now type-enforced). Two more were the same shape smaller:
+the enrollment limiter refusing a legitimate customer, and the entitlement lockout. Then a
+**fix round** and an **independent re-verification that PASSED**. ⭐ **The pattern worth
+keeping: a control is not a control until it sits on the path it protects, and a protective
+mechanism that can refuse the honest party is worse than none.**
+
+✅ **VERIFIED FIRST-HAND:** Go gofmt/vet clean, **`go test -race -count=1 ./...` = 549 PASS /
+30 SKIP / 0 FAIL** without a DSN and **625 PASS / 0 SKIP / 0 FAIL** against a real
+`postgres:16` (⭐ the **0 SKIP** proves the gated suites RAN); **exactly ONE direct Go
+dependency**; Rust `libsigil` **115+19**, `cli` **89+3**, `sigil-wasm` **29**, `desktop`
+**15+1+2**, all fmt/clippy `-D warnings` clean; **ALL ELEVEN** Node interop suites pass
+(`recovery-interop` is the eleventh); **ALL THREE** e2e scripts pass (`e2e-recovery.sh`,
+`e2e-accounts.sh`, `e2e-sharing.sh`); webapp Playwright **8/8**, extension **3/3**, marketing
+builds; both `Cargo.lock`s still `getrandom`==0; all ten workflows parse. I also
+mutation-tested the recovery choke point personally and confirmed the retired-knob boot
+warning fires **twice** on a live server.
+
+⚠️ **THE BIGGEST GAP THESE PHASES LEAVE:** ⭐ **RECOVERY IS CLI-ONLY.** No `recovery.spec.ts`
+and no `RecoveryPanel` in the webapp; **no recovery UI in the extension** (although
+`extension/build.sh` **DOES** vendor `recovery.mjs`); **no recovery commands on the desktop**.
+Since `restore` runs on a **NEW install**, **a user whose only client was the browser or the
+extension cannot restore there today.** Also: **no operator/edge rate limiting is configured
+anywhere in `deploy/`**, and the **Postgres store suite has no per-run schema isolation** (two
+concurrent `go test ./...` runs against ONE database corrupt each other). Three stale code
+comments and one stale test header still describe the pre-fix limiter (`main.go` ~923 and
+`router.go`'s `EnrollRateLimit` both say it *"rejects before the body is read"* — it
+**buffers and always runs the handler**; `metrics.go`/`audit.go`/`ratelimit.go` still say
+*"three-value"* surface set, which is **two**; `abuse_test.go`'s cap test header still says
+*"fails closed"* against its own assertions), and `interface SigilWasm` in
+`web/packages/sigil-wasm/index.d.ts` lacks the `recovery_*` methods — all code follow-ups,
+deliberately not made in a documentation-only phase; `docs/api.md` and `docs/deployment.md`
+are the authority. ⚠️ **THE CI GAP IS NOW WIDER: `interop.yml` still runs NONE of
+`accounts-interop.mjs`, `recovery-interop.mjs`, `e2e-accounts.sh` or `e2e-recovery.sh`** —
+one line each, and `recovery-interop.mjs` is the ONLY automated guard on the Rust↔JS recovery
+codec. **NEW ADRs 0041, 0042, 0043** (+ dated addenda on **0031**, **0038** and
+**0040**); docs synced in the same change. Details in the Phase 53/54/55 entry below.
 
 **Phase 52 made an ACCOUNT the subject of ENTITLEMENT and the OWNER of vaults.** Sigil is a
 **paid** product, but a **DEVICE** was the only subject that existed, and two verified
@@ -7273,3 +7447,445 @@ is a one-line step each; it is on the open list below.
 - **Billing has still never been run against a live provider account**, Juspay remains
   UNVERIFIED-AGAINST-LIVE-DASHBOARD, and the whole repo remains **pre-audit and UNAUDITED**.
   Do not store real secrets.
+
+---
+
+## 2026-07-28 — Phases 53, 54 & 55 (abuse bounds and a rate limiter DELETED for losing money; the RECOVERY KIT; entitlement enforcement that refuses writes and never reads)
+
+### Why these three, together
+
+They are three different answers to the same sentence, which ADR 0040 wrote down at
+the end of Phase 52 and which has been the loudest open item in the repo since:
+
+> *This must be written down before anyone charges real money.*
+
+ADR 0040 closed with nineteen honest limitations. Three of them were the ones that
+stop a paid product from being a paid product:
+
+1. **limit 1** — *there is NO RECOVERY*: lose every device and the account, its
+   vaults and its subscription are gone, for the customer **and** for us;
+2. **limit 8** — *entitlement is REPORTED, never ENFORCED*: the server would tell
+   you your subscription was canceled and then serve you anyway;
+3. **limit 12** — *no rate limiting* on the two routes that mint state.
+
+Phase 53 took limit 12, Phase 54 took the **data half** of limit 1, and Phase 55
+took limit 8. **`sigild` gained no migration in any of the three —
+`sigild_schema_version` is still 5.**
+
+---
+
+### ⭐ Phase 53 — abuse bounds, and the part that matters more than the feature
+
+A hand-written stdlib token bucket (the **same** `internal/api/ratelimit.go` type
+the op-log limiter already used — **no new dependency**; `sigild` still has exactly
+one direct Go require, `pgx`) now bounds **`POST /v1/devices/enroll`**, keyed on the
+**socket peer address**, and **`POST /v1/account/invites`**, keyed **per account**.
+`SIGILD_ENROLL_RATE_LIMIT`/`_BURST` + `SIGILD_INVITE_RATE_LIMIT`/`_BURST`, off by
+default, validated fail-fast, `429 rate_limited` + `Retry-After`, one new metric
+`sigild_abuse_ratelimit_rejected_total{surface}` over the closed set
+`{enroll, invite}`, one new audit event `abuse.rate_limited` — and the **source
+address is deliberately never logged** (this server holds no personal data anywhere;
+the proxy that would actually block already has the address).
+
+⚠️ **TWO PROPERTIES DOCUMENTED AS PROMINENTLY AS THE FEATURE, because a verifier
+proved both live.**
+
+**(a) It is a BACKSTOP, not a defence.** The only deployment topology this repo
+documents (`deploy/caddy/Caddyfile`, `deploy/local/Caddyfile.local`) is a reverse
+proxy, so every request reaches `sigild` from **one** address and the limiter
+degrades to a **single global bucket**. An earlier revision of this phase rejected
+*before* the handler, and a verifier drove the consequence: an attacker sending junk
+from one address drew `{401 ×5, 429 ×25}`, and the next request — **a legitimate new
+customer presenting a VALID, unspent operator token — was refused `429`.** Behind a
+proxy, "one address" is every address, so that limiter was **a global switch for
+turning off account creation and invite redemption**: exactly the path somebody uses
+*after losing a device*. **Two changes fixed it**: the bucket is charged **only on
+the DENIAL path** (a 2xx is flushed through untouched and costs nothing, so a request
+carrying a valid, unspent credential and a valid proof **can never be refused by
+it**), and `Allow` now **FAILS OPEN at its key cap** instead of closed (the old
+fail-closed branch meant one IPv6 /48 could fill 10,000 buckets and lock out
+everyone else). Real per-source limiting belongs at the **edge**.
+
+**(b) It does not reduce load.** Charging only on denial means the handler **always
+runs**, including its database work; the limiter replaces only the **response**. It
+bounds how useful flooding is, not what it costs us. That trade is what makes it
+impossible for the limiter to refuse a valid enrolment, and it is stated so nobody
+reads "rate limit" as "load shed".
+
+`X-Forwarded-For` is **not consulted**, on purpose — without a trusted-proxy config
+it is attacker text, and keying on it would let one client mint unlimited buckets
+*and* fill the bounded map. `TestEnrollRateLimitIgnoresForwardedFor` pins that **at
+the call site**, not just on the pure function, because a wrapper that read the
+header would satisfy every unit test of `clientRateKey` while defeating it entirely.
+
+### ⛔ THE WEBHOOK RATE LIMITER WAS BUILT, PROVEN HARMFUL, AND REMOVED
+
+An early Phase 53 revision also limited `POST /v1/billing/webhook/{provider}` —
+**before signature verification**, keyed on the **provider name**, because that is
+the only key available before the body is authenticated.
+
+**A verifier reproduced the consequence on a live server.** One unauthenticated
+thread at roughly **137 forged requests/second caused 15 of 15 genuine,
+correctly-signed Stripe deliveries to be shed with `429`**. A longer flood shed
+roughly **2,000 consecutive genuine retries**. **Zero payment events were applied**,
+and the customer was then refused with **`402`** by the Phase 55 enforcement in this
+same change. Because a provider's retry budget is **finite**, the event is lost
+**permanently** — there is no later delivery to recover it.
+
+⭐ **THE RULE, and the reason this is a recorded decision rather than a bug fix:**
+
+> **You cannot safely shed traffic on a route where shedding costs money and the
+> legitimate sender has a finite retry budget.**
+
+Both placements fail, independently. **Before verification**, anonymous forged
+traffic spends the honest sender's quota — and the only key available, the provider
+name in the path, is **attacker-controlled too**, so there is no key that separates
+them. **After verification is no better**: an authentic burst (a provider catching up
+after an outage, a batch of renewals) is **exactly the traffic that must never be
+dropped**, so a limiter there only ever destroys revenue.
+
+So the route is **not rate limited at all**. What bounds the work is what already did:
+the **64 KiB body cap** and the cost of **one HMAC over a size-capped buffer** — no
+database round trip, no state created, before the signature verifies. Volume
+protection belongs at the edge. `SIGILD_WEBHOOK_RATE_LIMIT`/`_BURST` **no longer
+exist**; setting either now logs a loud boot **WARNING** naming the removal and its
+reason — added after a verifier pointed out they were otherwise **silently inert**,
+which is the most dangerous possible misunderstanding of a removal. It **warns rather
+than failing boot**, because a protective knob that has become moot must not take a
+payments server down; everything that *changes behaviour* still fails fast.
+
+---
+
+### ⭐ Phase 54 — the RECOVERY KIT
+
+**A recovery kit is an ORDINARY MEMBER DEVICE whose private keys come off paper.**
+Its Ed25519 and hybrid (X25519 + ML-KEM-768) identities are HKDF-SHA256 derivations
+of **32 bytes of client CSPRNG printed on a sheet** — never transmitted, never stored
+on a device, never derivable from anything the server holds.
+
+⭐ **`sigild` gained NO concept of "recovery".** No table, **no migration**
+(`sigild_schema_version` stays **5**), no flag, no config. It sees only shapes it
+already relayed: one more device row (label `"recovery-kit"`), one more hybrid
+**public** key, and one more opaque ~1226-byte `SIGILhyb` envelope per covered vault.
+The one addition is **`GET /v1/devices/{deviceID}/keys`** — the index a kit needs on
+a **fresh machine**, where it knows its own device id and nothing else. **Self-only**
+(a mismatched path id is `403` **before any store read**, and an **unknown** device id
+is the **same coarse `403`, never `404`**), **metadata only** (Postgres selects
+`octet_length(blob)`), each row filtered by the ordinary `authorizeVault(needRead)`.
+It needed no migration: `sigil_vault_key_envelopes_by_recipient` from `0004` was
+created for exactly this query.
+
+**FORMAT.** 32-byte seed; `check = SHA-256("sigil-recovery-kit-v1\n" ‖ [0x01] ‖
+seed)[0..2]`; `body = [0x01] ‖ seed(32) ‖ check(2)` = **35 bytes = 280 bits**;
+**Crockford base32** ⇒ **exactly 56 characters** (280/5 divides, so no padding),
+printed as **7 groups of 8**. Crockford omits `I`/`L`/`O`/`U` and folds `O`→`0`,
+`I`/`L`→`1`; ⚠️ **`U` is REJECTED, never folded** (folding it would let two distinct
+strings decode to the same value). ⭐ **Decode order is contractual: length →
+alphabet → CHECKSUM → version.** The checksum **covers the version byte** and is
+checked first, so a flipped version bit reports *"that is not a valid recovery code
+— check for a mistyped character"* rather than *"unsupported version 17"*; a person
+holding paper needs to be told to look at their typing. It is a **new codec** in
+`recovery.rs` and deliberately does **not** touch the RFC 4648 `base32_decode` used
+by TOTP, which must stay `otpauth://`-interoperable.
+
+**DERIVATION.** HKDF-SHA256 only — `PRK = HKDF-Extract(salt="sigil-recovery-kit-v1",
+ikm=seed)`, then Expand to an ed25519 seed (32), an x25519 secret (32) and a 64-byte
+ML-KEM keygen seed, fed to the **existing** deterministic caller-entropy primitives.
+⭐ **ADR 0007 is what makes this possible**: because `sigil-core` reads no RNG, a
+paper secret is just another entropy source and **nothing in the core changed to
+accommodate recovery**. `hkdf` and `sha2` were already direct dependencies, so **no
+new dependency** and the core stays wasm-pure and RNG-free. **HKDF and not Argon2id,
+deliberately**: the input is 256 bits of CSPRNG, already uniform — there is no
+low-entropy password to stretch, only domain separation to provide.
+
+**COMMANDS.** `sigil recovery generate | cover | check | verify | restore | revoke`.
+The secret is enterable by a **non-argv path** — `--code` (kept for scripts, now
+warning on stderr that it lands in argv and shell history) → `--code-stdin` / non-TTY
+stdin → otherwise an interactive **prompt with echo disabled**. There is deliberately
+**no environment variable**.
+
+### ⭐ The part that needed two rounds, and the ADR-0038 lesson it violated
+
+**The FIRST implementation put the safety-number requirement on the `recovery cover`
+COMMAND.** A verifier proved live that `sigil vault share --to <kitID>` and
+`sigil vault rotate --to <kitID>` reached the **identical wrap** through ordinary
+first-sight TOFU — with the human shown the safety number only **after** the wrap and
+upload had completed. A hostile server could substitute the kit's hybrid public key
+and receive the vault key.
+
+⚠️ **That is exactly the ADR 0038 lesson — *"the choke point is the FETCH, and EVERY
+wrap path goes through it"* — violated ONE PHASE after it was written down.** A rule
+that lives in a command rather than on the path it protects is not a rule; it is a
+habit, and habits are what new call sites forget.
+
+**The fix moved the requirement into a single choke point and then made forgetting it
+impossible to compile.** `verify_recipient_for_wrap` returns a **`VerifiedRecipient`**
+whose fields are **private** and which has **no other constructor** (built in exactly
+three literals, all inside that function); the one wrap→deposit→grant path takes
+`&VerifiedRecipient`. A caller cannot reach the wrap without producing the value the
+wrap requires.
+
+Trust outcomes: **derived** pin (`origin = "recovery-kit"`) ⇒ no fetch at all ·
+**pinned + identical** ⇒ proceed · **pinned + different** ⇒ `PinMismatch` · first
+sight + matching `--safety-number` ⇒ proceed · first sight + wrong number ⇒
+`SafetyNumberMismatch` · first sight + **recipient is a recovery kit** + no number ⇒
+**refuse** (`UnverifiedRecoveryKit`) · first sight + ordinary device ⇒ TOFU, as ADR
+0038 allows. ⭐ **Every refusal happens BEFORE the key is pinned** — pinning a refused
+key would let a retry see `Match` and **silence its own alarm**. `vault rotate` also
+gained a fail-closed drop guard that **refuses** to silently strand a current envelope
+holder, flagging *"⚠️ THIS IS YOUR RECOVERY KIT"*.
+
+**Three independent mutations each turn share, rotate and cover red separately**, and
+**I disabled the whole gate personally** and confirmed `cli/tests/e2e-recovery.sh`
+goes red with *"expected 'recovery cover …' to FAIL, but it succeeded"*, then restored
+it exactly.
+
+### ⚠️⚠️ THE RESIDUAL LIMIT — recorded in these words, not softened
+
+The **kit-DISCOVERY** arm resolves a kit by device **LABEL** from `GET /v1/account`
+— a listing **the adversarial server serves**.
+
+> **A server that renames or hides the label degrades `vault share` / `vault rotate`
+> to a kit back to ordinary first-sight TOFU (warned and pinned) rather than a
+> refusal.**
+
+The caller-**ASSERTED** paths (`recovery cover`, `recovery generate`) do not depend
+on the server and are unaffected, and **no path anywhere accepts a CHANGED key or a
+mismatched safety number**. So the honest claim is **"refuses first-sight kit wraps
+against a server that does not lie about labels"**, **not** "refuses first-sight kit
+wraps". A verifier judged this consistent with ADR 0038's already-accepted
+TOFU-on-first-contact limit **and asked specifically that the ADR say it in those
+words**; it does.
+
+### Other honest limits of the kit
+
+⚠️ **Whoever holds the paper has FULL CONTROL of the account** — read every covered
+vault, revoke every device. It is **stronger than a stolen locked phone**: no OS lock,
+no biometric, no vault password. Its nominal `read` grant is **cosmetic**, because it
+is an account **member** of the account that **owns** the vault, so ownership
+authorizes it anyway. It recovers **KEYS, not DATA** (a vault never synced is gone);
+it opens **only the vaults it was told to COVER**; **a kit cannot be created after the
+loss**; it consumes a seat; and revoking it cannot un-learn what it already unwrapped.
+
+---
+
+### ⭐ Phase 55 — entitlement enforcement, with the asymmetry as the shape of the code
+
+Behind **`SIGILD_ENTITLEMENT_ENFORCE`** (off by default, byte-identical when unset)
+with **`SIGILD_ENTITLEMENT_GRACE`** (default **14 days**, bounded `(0, 365d]`), an
+account whose subscription lapsed longer ago than grace has **WRITES** refused with
+**`402 Payment Required`** and a machine-readable body — **never collapsed into the
+coarse `401`/`403` envelopes, and never confused with them**. The gate runs strictly
+**after** authentication *and* authorization, so a `402` is **no oracle**: an
+unauthenticated or unauthorized caller gets its `401`/`403` exactly as before.
+
+The reason for the whole design, in one sentence: **this product holds a customer's
+second factor, so gating it on payment status means a declined card can lock a person
+out of their own bank login.** That is not a billing inconvenience; it is a security
+failure we would have caused.
+
+⭐ **READS AND KEY RECOVERY ARE NEVER REFUSED.** `requireEntitlement` is called from
+**exactly three write handlers** (`opsAppend`, `keyEnvelopePut`, `vaultGrantCreate`)
+and from **no read handler** — and `entitlement_test.go` **parses the package's AST**
+and fails if that call set ever changes, so the asymmetry is **mechanically enforced,
+not remembered**. A verifier drove it live and confirmed a lapsed account still
+produced the RFC 6238 vector **`94287082`**, and that **`past_due` remains entitled**.
+
+⚠️ **A verifier found a real LOCKOUT, and the fix closed it.** Past grace, a customer
+whose phone had died could enroll a replacement and then **could not deposit a key
+envelope to their OWN new device** (`402`), so the new phone held ciphertext it could
+never decrypt — and **could not print a recovery kit** either, since a kit is a member
+device and covering it is a key deposit. They were left **one device failure from
+permanent loss**, while the `402` body claimed `key_recovery_allowed: true`. **A
+read-only guarantee over data you cannot decrypt is not a guarantee.**
+`sameAccountRecipient()` now exempts a key deposit **and the grant that accompanies
+it** when the recipient belongs to the **caller's own account**. Still refused: new
+op-log writes, and shares to a device of a **different** account.
+
+Everything else about it: every uncertainty **fails open** (store fault, unreadable
+account, no anchor, no account id), and `entitlement.fail_open` is logged at **error**
+because it means enforcement is silently *not* happening. Grace runs from the **later**
+of `updated_at` and `current_period_end`; ⚠️ a **never-subscribed** account is graced
+from its **creation time**, so the grace window doubles as the **buy-in window** — a
+trial by side effect, named as such, with no separate trial mechanism in this server.
+New metrics `sigild_entitlement_decisions_total{outcome}` (closed set) and
+`sigild_entitlement_enforcing` (a gauge, so an operator can see whether a knob
+believed to be on actually is). Unlike the abuse limiters, this **requires** its
+prerequisites — a silently-moot payment gate is a business hazard.
+
+**The verifier mutation-tested this phase hard: 15 separate control mutations all
+went red.**
+
+---
+
+### ⚠️ THE PROCESS, HONESTLY
+
+**Three verifiers returned `pass = false`.** Two of the findings were **severe**, and
+both were things that read fine in a diff:
+
+- ⭐ **The money-losing webhook limiter.** Not a subtle bug — a reproduction in which
+  an anonymous attacker destroyed a paying customer's subscription events and the
+  customer was then refused service by the very next feature in the same change. The
+  outcome was **deletion, not tuning**, and a rule written down so it is not
+  reinvented.
+- ⭐ **The substitutable recovery kit.** A control placed on a command instead of on
+  the path, one phase after this repo wrote down that exact lesson. The outcome was a
+  **type-enforced choke point**, so the mistake cannot recur silently.
+
+Two more findings were the same shape at smaller scale: the enrollment limiter
+refusing a legitimate customer, and the entitlement lockout that left a customer
+unable to key their own replacement device.
+
+Then a **fix round**, and an **independent re-verification that passed**. I also ran
+two checks personally: disabling the recovery choke point turns `e2e-recovery.sh` red
+with the exact expected message (restored afterwards), and a live server confirmed the
+**retired-knob boot warning fires twice** — once for `SIGILD_WEBHOOK_RATE_LIMIT` and
+once for `SIGILD_WEBHOOK_RATE_BURST`.
+
+The pattern across all five findings is worth keeping: **a control is not a control
+until it sits on the path it protects, and a protective mechanism that can refuse the
+honest party is worse than none.**
+
+---
+
+### ✅ The gate (all run before this entry)
+
+- **Go:** `gofmt` clean, `go vet` clean, **`go test -race -count=1 ./...` = 549 PASS /
+  30 SKIP / 0 FAIL** without a Postgres DSN, and **625 PASS / 0 SKIP / 0 FAIL** with
+  one against a real `postgres:16`. ⭐ The **0 SKIP** is the proof the gated Postgres
+  suites actually ran. **Exactly ONE direct Go dependency (`pgx`) — unchanged.**
+- **Rust:** `libsigil` **115 + 19**, `cli` **89 + 3**, `sigil-wasm` **29**, `desktop`
+  **15 unit + 1 + 2 integration**; every workspace `fmt` clean and `clippy
+  --all-targets -D warnings` clean. **Both `Cargo.lock`s still `getrandom`-free.**
+- **Node interop: ALL ELEVEN pass** — `recovery-interop.mjs` is the eleventh.
+- **All THREE end-to-end scripts pass:** `e2e-recovery.sh` (new), `e2e-accounts.sh`,
+  `e2e-sharing.sh`.
+- **Clients:** webapp Playwright **8/8**, extension **3/3**, marketing builds.
+- **All ten workflows parse.**
+- **No migration was added by any of the three phases — `sigild_schema_version` is
+  still 5.**
+
+---
+
+### 📄 Docs updated in the same change (the docs-stay-in-sync rule)
+
+- **`docs/decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md` — NEW.** The
+  two limiters, the backstop-not-a-defence and does-not-reduce-load properties, the
+  charge-on-denial and fail-open fixes with the reproductions that forced them, and
+  the **webhook limiter's removal** with the money-losing reproduction and the rule it
+  teaches. Revises ADR 0040 limitation 12.
+- **`docs/decisions/0042-recovery-kit.md` — NEW, the big one.** The format, the HKDF
+  derivation, the choke point **enforced by type**, the **ADR 0038 lesson it initially
+  violated** (recorded as a rejected alternative rather than quietly fixed), the
+  label-discovery residual **in the words a verifier asked for**, and thirteen honest
+  limits including the partial client coverage. Addresses the **data half** of ADR
+  0040 limitation 1.
+- **`docs/decisions/0043-entitlement-enforcement.md` — NEW.** The never-refuse-reads
+  asymmetry as a **decision with its reason**, the AST test that enforces it, the
+  same-account key-recovery exemption and the lockout that forced it, the fail-open
+  table, the grace anchors, and why `402` is not `401`/`403`. Retires ADR 0040
+  limitation 8.
+- **`docs/decisions/0040-account-model.md`** — a dated **addendum** on limitations 1,
+  8 and 12 (the repo's addendum rule: report what changed, never edit the body).
+- **`docs/decisions/0031-multi-device-auth-model.md`** — a dated addendum retiring
+  *"no rate limiting on enrollment attempts"* **with both caveats attached**.
+- **`docs/decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md`** — a dated
+  addendum recording that its own choke-point rule was violated one phase later, and
+  that the fetch gate is now **type-enforced** with two new refusals and a fourth
+  trust outcome.
+- **`docs/decisions/README.md`** — three index rows, the banner paragraph, and
+  revision notes on the 0031, 0038 and 0040 rows.
+- **`docs/api.md`** — the new **`GET /v1/devices/{deviceID}/keys`** route (it had
+  **zero** occurrences before); a new **Abuse rate limiting** section; new **Recovery
+  kits** and **Entitlement enforcement** sections; the `402` body, headers and the
+  refused/never-refused table; the additive `entitlement` block on
+  `GET /v1/billing/subscription`; the six new env vars; four new metrics
+  (`sigild_abuse_ratelimit_rejected_total`, `sigild_key_envelope_index_total`,
+  `sigild_entitlement_enforcing`, `sigild_entitlement_decisions_total`); the new audit
+  events; `429` rows on the enroll and invite routes; and the correction of *"**No
+  entitlement enforcement.** `entitled` is reported; nothing … consults it"*, which
+  was false after Phase 55.
+- **`docs/threat-model.md`** — ⭐ **row 12 rewritten.** It claimed a *"recovery kit
+  (12-word seed), recovery delegates (delay, default 7d), platform-passkey-bound
+  recovery"*. **None of those three mechanisms exists**, and an auditor reading it
+  would have believed a 7-day delegate window gives a detection-and-veto period. What
+  ships is 56 Crockford characters conferring **immediate, un-delayed, un-notified**
+  full account takeover. Also: a new **Recovery kit adversaries** section (**AE** the
+  paper holder, **AF** a server that lies about device labels, **AG** key substitution
+  aimed at the kit, **AH** a kit prober), a new **I2** enrollment-flood row, the
+  webhook-DoS bullet rewritten around the removal, and every stale *"no recovery of
+  any kind"* / *"No key rotation, re-enrollment, or recovery"* / *"No rate limiting on
+  enrollment attempts"* line corrected.
+- **`docs/deployment.md`** — new **§15** (abuse bounds, with §15.3 on why the webhook
+  route is not limited and the verbatim retired-knob boot warning), **§16**
+  (entitlement enforcement: what turning it on means operationally, the grace period,
+  the buy-in-window side effect, and what to watch), and **§17** (recovery kits: the
+  customer walkthrough and the *treat the sheet as the account* cautions); plus a
+  **§11 caveat that the Postgres store suite has no per-run schema isolation**, so two
+  concurrent `go test ./...` runs against one database corrupt each other.
+- **`docs/crypto-spec.md`** — a new **Recovery kit** section: the Crockford encoding
+  with the contractual decode order, the `sigil-recovery-kit-v1` domains (checksum
+  **with** a trailing newline, HKDF salt **without**), the three `info` strings, and
+  why HKDF rather than Argon2id. Neither `Crockford` nor `sigil-recovery-kit-v1`
+  appeared anywhere under `docs/` before.
+- **`docs/architecture.md`, `docs/README.md`, `CLAUDE.md`, `README.md`** — the new
+  route, the three features, the corrected limits, and the updated test counts
+  (**eleven** Node interop suites, **three** e2e scripts, `sigil-wasm` **29**).
+
+### ⚠️ Found inaccurate beyond the brief
+
+- **`docs/threat-model.md`'s closing status note** described the implemented tables as
+  *"the **second** and **third** tables … A–I and R–W"*. There are now six, and the
+  account boundary (Y–AD) and billing (J–Q) tables were already missing from that
+  sentence **before** this phase. Corrected to enumerate all of them.
+- **Two code comments still contradict the shipped limiter** and were left alone
+  because this phase was documentation-only: `sigild/cmd/server/main.go` (~line 923)
+  and the `EnrollRateLimit` field comment in `router.go` both say the enroll limiter
+  *"rejects before the body is read or the database is touched"*. `rateLimitEnroll`
+  **buffers the handler's response and always runs it**. `docs/api.md` and
+  `docs/deployment.md` document the real behaviour and are the authority; the comments
+  are a one-line follow-up.
+- **Three stale "three-value surface set" comments** (`metrics.go`, `audit.go`,
+  `ratelimit.go` *"the three abuse limiters"*) survive from the revision that still
+  had a webhook limiter. The closed set is **two**. Same follow-up.
+- **`abuse_test.go`'s `TestAbuseLimiterBoundedAndEvicts` header comment still says a
+  new key at the cap is "REJECTED — an abuse control fails closed"** — contradicted by
+  its own assertions, which check it is **admitted**. The test is correct; the comment
+  is from the pre-fix revision.
+- **`interface SigilWasm` in `web/packages/sigil-wasm/index.d.ts` was not extended**
+  with `recovery_encode` / `recovery_decode` / `recovery_derive_*` / `recovery_format`,
+  so those wasm calls are **untyped at that boundary** even though `recovery.mjs`
+  calls them. Recorded in ADR 0042 and `CLAUDE.md`.
+
+### ➡️ Still open (honest)
+
+- ⭐ **Recovery is CLI-ONLY.** There is **no `recovery.spec.ts` and no `RecoveryPanel`
+  in the webapp**, **no recovery UI in the extension** (although `extension/build.sh`
+  **does** vendor `recovery.mjs`), and **no recovery commands on the desktop**. Since
+  `restore` runs on a **NEW install**, **a user whose only client was the browser or
+  the extension cannot restore there today.** This is the largest gap the three phases
+  leave behind.
+- ⭐ **No operator/edge rate limiting is configured anywhere in `deploy/`** — no Caddy
+  `rate_limit`, no firewall rule, no fail2ban. The in-process limiters are a backstop
+  and say so; the real control does not exist yet.
+- **The Postgres store suite has no per-run schema isolation** — two concurrent
+  `go test ./...` runs against one database corrupt each other. Now a runbook line;
+  a per-run schema or database is the actual fix.
+- **Cross-sign the hybrid public key with the device's enrolled Ed25519 identity** —
+  still the highest-value follow-up, and now doubly so: it is also what would close
+  ADR 0042's label-discovery residual, since a signed key needs no label to be trusted.
+- **No dunning, notification or reconciliation** around entitlement; the only warnings
+  are response headers, the additive subscription block and the audit log.
+- ⚠️ **THE CI GAP GOT WIDER.** `interop.yml` was not updated in Phase 52 and was not
+  updated now, so **four** locally-green gates are run by **nothing in CI**:
+  `accounts-interop.mjs`, **`recovery-interop.mjs`** (the only automated guard on the
+  Rust↔JS recovery codec and derivation), `e2e-accounts.sh` and **`e2e-recovery.sh`**
+  (the proof that the wrap gate fires on share, rotate *and* cover). One line each.
+- **The clean-up list above** (three stale comments, one stale test header, the
+  `SigilWasm` type gap) — code changes, deliberately not made in a docs-only phase.
+- **Roles inside an account**, account transfer/merge/deletion, a shared (not
+  per-process) replay store, UI-driven test coverage for the account, key-trust and
+  recovery flows.
+- **Billing has still never been run against a live provider account**, Juspay remains
+  UNVERIFIED-AGAINST-LIVE-DASHBOARD, and the whole repo remains **pre-audit and
+  UNAUDITED**. Do not store real secrets.

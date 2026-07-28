@@ -17,8 +17,10 @@ independent audit completes and trademark clears (brief, GTM Phase 1).
 - [`api.md`](api.md) — `sigild` HTTP reference: the `/healthz`, `/readyz`,
   `/version` probes, the **dev-only, opt-in** opaque-blob vault op-log (default
   `501`, unauthenticated unless one of two opt-in contracts is configured), the
-  multi-device auth model, the **account model**, the vault-key relay, and the
-  billing routes — all dev-gated and all `501` by default.
+  multi-device auth model, its opt-in **abuse rate limits**, the **account
+  model**, the vault-key relay, what a **recovery kit** looks like on the wire,
+  the billing routes and their opt-in **entitlement enforcement** (`402` on
+  writes only) — all dev-gated and all `501` by default.
 - [`deployment.md`](deployment.md) — the (not-yet-applied) `sigild` deployment
   runbook: topology, secrets posture, PQ-TLS nuance, and an honest
   what-is-not-deployable / validation-status accounting.
@@ -27,10 +29,12 @@ independent audit completes and trademark clears (brief, GTM Phase 1).
 
 Every line here is **subject to change**. Substantial parts of the scaffold now
 exist and are tested (the crypto core, the CLI, the dev op-log server, four
-client surfaces — webapp, MV3 extension, native desktop and the CLI — and, since
-Phase 52, device **enrollment**, real per-vault **authorization** and an
-**account model**). But the system as a whole is **pre-audit and not
-production-ready**: nothing here is **audited**, every one of those server-side
-pieces is **dev-gated and `501` by default**, and the product-level layer is
-still missing — an **identity** system (no email, no password, **no recovery**),
-session/token issuance, key rotation, and mobile.
+client surfaces — webapp, MV3 extension, native desktop and the CLI — device
+**enrollment**, real per-vault **authorization**, an **account model**, and,
+since Phases 53–55, opt-in **abuse bounds**, a printable **recovery kit** and
+opt-in **entitlement enforcement**). But the system as a whole is **pre-audit and
+not production-ready**: nothing here is **audited**, every one of those
+server-side pieces is **dev-gated and `501` by default**, and the product-level
+layer is still missing — an **identity** system (no email, no password, no
+operator break-glass; the only recovery is a **paper kit printed in advance**,
+and it is **CLI-only**), session/token issuance, device-key rotation, and mobile.

@@ -80,6 +80,7 @@ mod kx;
 mod mldsa;
 mod mlkem;
 mod record;
+mod recovery;
 mod sig;
 mod totp;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
@@ -105,6 +106,11 @@ pub use mlkem::{
     ML_KEM768_ENCAPS_KEY_LEN, ML_KEM768_KEYGEN_SEED_LEN, ML_KEM768_SHARED_SECRET_LEN,
 };
 pub use record::{open_record, seal_record, RecordError};
+pub use recovery::{
+    decode_recovery_kit, derive_recovery_keys, encode_recovery_kit, format_recovery_kit,
+    RecoveryError, RecoveryKeys, RECOVERY_CHECK_LEN, RECOVERY_GROUP_LEN, RECOVERY_KIT_BODY_LEN,
+    RECOVERY_KIT_CHARS, RECOVERY_KIT_VERSION, RECOVERY_SEED_LEN,
+};
 pub use sig::{
     public_key_from_seed, sign, verify, SigError, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
 };

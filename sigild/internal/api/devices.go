@@ -506,11 +506,11 @@ func (h *handlers) vaultGrantCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Signature covers the body, so authenticate/authorize AFTER reading it.
-	if out := h.authorizeOpsRequest(r, body, vaultID, needOwner); !out.allowed() {
+	dev, out := h.authorizeOpsRequestDevice(r, body, vaultID, needOwner)
+	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
 		return
 	}
-
 	var req grantRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "body must be a JSON object")
@@ -524,6 +524,25 @@ func (h *handlers) vaultGrantCreate(w http.ResponseWriter, r *http.Request) {
 	if !store.ValidPermission(perm) {
 		writeError(w, http.StatusBadRequest, "invalid_request", `permission must be "read" or "write"`)
 		return
+	}
+	// ENTITLEMENT (Phase 55): handing another device access is a write. The
+	// matching READ route (vaultGrantList) is not gated, and neither is device
+	// REVOCATION — taking access AWAY is a security remediation and must work
+	// whether or not the bill is paid. Off by default.
+	//
+	// ⭐ EXEMPT when the grantee is a device of the CALLER'S OWN ACCOUNT. Every
+	// key handover inside an account is wrap → deposit → grant as ONE operation
+	// (cli/src/lib.rs::share_vault_to_known_key), so gating the grant while
+	// exempting the deposit would half-complete a recovery kit or a replacement
+	// device and leave the customer worse off than a clean refusal. Granting to
+	// ANOTHER account is still gated.
+	//
+	// It runs AFTER the body is parsed because the grantee is only known then —
+	// still strictly after authentication and authorization, so it is no oracle.
+	if !h.sameAccountRecipient(r.Context(), dev, req.DeviceID) {
+		if !h.requireEntitlement(w, r, dev, entitlementSurfaceVaultGrant) {
+			return
+		}
 	}
 	// The grantee must exist and be active — a grant to an unknown or revoked
 	// device is refused rather than silently recorded.

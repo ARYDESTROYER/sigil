@@ -160,6 +160,7 @@ fn ipc(e: DesktopError) -> IpcError {
         // ⭐ Its own tag: a changed hybrid key is neither an auth failure nor a
         // server error. The UI must present it as the key-substitution alarm.
         DesktopError::KeyPinMismatch { .. } => "key changed",
+        DesktopError::KeyUnverified { .. } => "key unverified",
         DesktopError::Server { .. } => "server error",
         _ => "error",
     };
@@ -594,23 +595,54 @@ fn pull(vault_id: String, state: State<'_, AppState>) -> CmdResult<PullOutcome> 
 
 /// Share a vault with another enrolled device: wrap this vault's key to that
 /// device's hybrid public key, deposit the opaque envelope, and grant access.
-/// Returns the key's fingerprint so both sides can compare.
+///
+/// `safety_number` is the recipient's digits, read out of band (or printed on a
+/// RECOVERY SHEET). It is OPTIONAL for an ordinary device — where a first sight
+/// is still ADR 0038's accepted trust-on-first-use — and MANDATORY for a
+/// recovery kit this device has never pinned, which the wrap gate enforces.
+///
+/// Returns the trust decision alongside the key fingerprint, so the UI can show
+/// what was trusted rather than only that something happened.
 #[tauri::command]
 fn share(
     vault_id: String,
     device_id: String,
     permission: String,
+    safety_number: Option<String>,
     state: State<'_, AppState>,
-) -> CmdResult<String> {
+) -> CmdResult<ShareView> {
     let permission = permission.trim();
     let permission = if permission.is_empty() {
         "read"
     } else {
         permission
     };
-    sync_config(&state)?
-        .share_vault(vault_id.trim(), device_id.trim(), permission)
-        .map_err(ipc)
+    let expected = safety_number
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let out = sync_config(&state)?
+        .share_vault(
+            vault_id.trim(),
+            device_id.trim(),
+            permission,
+            expected.as_deref(),
+        )
+        .map_err(ipc)?;
+    Ok(ShareView {
+        fingerprint: out.fingerprint,
+        safety_number: out.safety_number,
+        trust: out.trust,
+        needs_out_of_band_check: out.needs_out_of_band_check,
+    })
+}
+
+/// What a share did, for the UI. PUBLIC material only — never a key.
+#[derive(serde::Serialize)]
+struct ShareView {
+    fingerprint: String,
+    safety_number: String,
+    trust: String,
+    needs_out_of_band_check: bool,
 }
 
 /// Accept a vault shared TO this device: collect the envelope, unwrap it with
@@ -818,12 +850,18 @@ fn repin(
         .map_err(ipc)
 }
 
-/// ROTATE this vault's key and re-wrap it to exactly `device_ids`, deleting every
-/// other envelope. Protects FUTURE content only.
+/// ROTATE this vault's key and re-wrap it to exactly `device_ids`, deleting the
+/// envelope of every device named in `drop_device_ids`. A current holder named in
+/// NEITHER list aborts the rotation (Phase 54). Protects FUTURE content only.
 #[tauri::command]
 fn rotate(
     vault_id: String,
     device_ids: Vec<String>,
+    drop_device_ids: Option<Vec<String>>,
+    // (device id, printed safety-number digits) for any recipient verified out
+    // of band. REQUIRED for a first-sight recovery kit; the wrap gate refuses
+    // otherwise, before a single byte of local or server state is touched.
+    safety_numbers: Option<Vec<(String, String)>>,
     state: State<'_, AppState>,
 ) -> CmdResult<RotationView> {
     let recipients: Vec<String> = device_ids
@@ -836,6 +874,14 @@ fn rotate(
             "list every device that KEEPS access (usually including this one)",
         ));
     }
+    // Phase 54: a holder named by neither list aborts the rotation, so removing
+    // a device's access — including a RECOVERY KIT's — has to be stated.
+    let drop: Vec<String> = drop_device_ids
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
     let config = sync_config(&state)?;
     let path = {
         let guard = state
@@ -848,8 +894,14 @@ fn rotate(
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(default_vault_path)
     };
+    let safety: Vec<(String, String)> = safety_numbers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(d, n)| (d.trim().to_string(), n.trim().to_string()))
+        .filter(|(d, n)| !d.is_empty() && !n.is_empty())
+        .collect();
     let (old, new, rewrapped, removed) = config
-        .rotate_vault(vault_id.trim(), &path, &recipients)
+        .rotate_vault(vault_id.trim(), &path, &recipients, &drop, &safety)
         .map_err(ipc)?;
     // The in-memory session still holds the OLD key, so drop it: the file on disk
     // is now sealed under the new one and must be unlocked afresh.

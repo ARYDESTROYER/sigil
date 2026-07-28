@@ -67,7 +67,13 @@
 // human-comparable SAFETY NUMBER closes the first-contact window pinning cannot.
 // See the Phase 50 section at the bottom of this file.
 
-import { signedFetch, grantVaultAccess, DeviceAuthError, explainAuthStatus } from "./device-auth.mjs";
+import {
+  signedFetch,
+  grantVaultAccess,
+  getAccount,
+  DeviceAuthError,
+  explainAuthStatus,
+} from "./device-auth.mjs";
 import { bytesToBase64, base64ToBytes } from "./totp-vault.mjs";
 
 // ── sizes (mirrored from cli/src/lib.rs + sigil-core) ────────────────────────
@@ -474,7 +480,14 @@ export async function getKeyEnvelope(wasm, auth, vaultId, deviceId = null) {
 export async function shareVault(
   wasm,
   auth,
-  { vaultId, recipientDeviceId, vaultKey, permission = "read", pins = null },
+  {
+    vaultId,
+    recipientDeviceId,
+    vaultKey,
+    permission = "read",
+    pins = null,
+    expectedSafetyNumber = null,
+  },
 ) {
   checkAuth(auth);
   checkId("vault id", vaultId);
@@ -484,19 +497,24 @@ export async function shareVault(
     throw new Error(`sharing: permission must be "read" or "write", got ${permission}`);
   }
 
-  // 1) the recipient's PUBLIC hybrid key — through the PIN CHOKE POINT (Phase
-  //    50). If the key the server hands back differs from the one this client
-  //    pinned, this THROWS KeyPinMismatchError and we stop HERE: nothing is
-  //    wrapped, nothing is uploaded, and the vault key never touches the
-  //    substituted key. `pins` defaults to auth.pins (the store that came out of
-  //    the sealed device-identity container), so an unlocked client enforces
-  //    with no extra wiring.
+  // 1) ⭐ THE WRAP GATE. Resolve the recipient's PUBLIC hybrid key AND settle
+  //    trust in it in ONE call, before anything can be wrapped. A changed key
+  //    (KeyPinMismatchError), a wrong expectedSafetyNumber
+  //    (SafetyNumberMismatchError), or an unpinned RECOVERY KIT
+  //    (UnverifiedRecoveryKitError) all stop HERE: nothing is wrapped, nothing
+  //    is uploaded, and the pin store is not mutated. `pins` defaults to
+  //    auth.pins (the store that came out of the sealed device-identity
+  //    container), so an unlocked client enforces with no extra wiring.
   const pinStore = requirePinStore(pins ?? auth.pins);
   const {
     identity: recipient,
-    pinStatus,
+    trust,
     safetyNumber: recipientSafetyNumber,
-  } = await fetchHybridKeyPinned(wasm, auth, recipientDeviceId, pinStore);
+  } = await verifyRecipientForWrap(wasm, auth, recipientDeviceId, {
+    pins: pinStore,
+    expectedSafetyNumber,
+  });
+  const pinStatus = trust === TRUST_PINNED || trust === TRUST_DERIVED ? "match" : "first-sight";
   // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
   const envelope = wrapVaultKey(wasm, recipient, vaultKey);
   // 3) DEPOSIT the OPAQUE envelope; the server cannot read it.
@@ -517,9 +535,11 @@ export async function shareVault(
     envelopeBytes: envelope.length,
     permission,
     fingerprint: await vaultKeyFingerprint(vaultKey),
-    // ⭐ Phase 50: what the pin check concluded, and the number the user should
-    // confirm out of band. `pinStatus === "first-sight"` means this key has NOT
-    // been verified by a human yet — a UI should say so.
+    // ⭐ What the wrap gate concluded, and the number the user should confirm
+    // out of band. `trust === "unverified-first-sight"` means this key has NOT
+    // been verified by a human yet — a UI should say so. `pinStatus` is kept for
+    // callers written against the Phase 50 shape.
+    trust,
     pinStatus,
     safetyNumber: recipientSafetyNumber,
     pins: pinStore,
@@ -717,6 +737,41 @@ export async function pairwiseSafetyNumber(a, b) {
 export const HYBRID_PIN_STORE_VERSION = 1;
 
 /**
+ * The `origin` marker a pin carries when its key was DERIVED locally (from a
+ * recovery secret) rather than fetched from a server — the one pin in the system
+ * established without asking anybody, so there was nothing to substitute.
+ *
+ * MIRRORS `cli/src/lib.rs::PIN_ORIGIN_RECOVERY_KIT`. The pin-store VERSION is
+ * deliberately NOT bumped: `origin` is additive and omitted when absent, so an
+ * older client reads a newer store unchanged.
+ */
+export const PIN_ORIGIN_RECOVERY_KIT = "recovery-kit";
+
+/**
+ * ⚠️ Thrown by {@link rotateVaultKey} when a device currently holding an
+ * envelope was named by NEITHER the new recipient set NOR `drop`.
+ *
+ * Rotating would delete its envelope and silently end its access — including,
+ * most damagingly, a RECOVERY KIT's. `unknown` is `[{ deviceId, isRecoveryKit }]`
+ * and carries no key material. Nothing was changed when this throws.
+ */
+export class RecipientsWouldBeDroppedError extends Error {
+  constructor(vaultId, unknown) {
+    const names = unknown
+      .map((u) => (u.isRecoveryKit ? `${u.deviceId} (YOUR RECOVERY KIT)` : u.deviceId))
+      .join(", ");
+    super(
+      `refusing to rotate ${vaultId}: ${unknown.length} device(s) hold a wrapped key but were ` +
+        `named by neither the recipient list nor drop — rotating would silently end their ` +
+        `access: ${names}. Nothing was changed.`,
+    );
+    this.name = "RecipientsWouldBeDroppedError";
+    this.vaultId = vaultId;
+    this.unknown = unknown;
+  }
+}
+
+/**
  * ⚠️ THE KEY-SUBSTITUTION ALARM. Thrown when a device's published hybrid public
  * key differs from the one this client pinned.
  *
@@ -896,6 +951,186 @@ export async function fetchHybridKeyPinned(wasm, auth, deviceId, pins = null) {
   return { identity, pinStatus: outcome.status, safetyNumber: outcome.safetyNumber, pins: store };
 }
 
+// ===========================================================================
+// ⭐⭐ THE WRAP GATE — MIRRORS cli/src/lib.rs::verify_recipient_for_wrap
+// ===========================================================================
+//
+// ADR 0038: "the enforcement rides on the fetch itself … EVERY wrap path goes
+// through it. A trust store that some code path forgets to consult is
+// worthless."
+//
+// Phase 54 broke that rule on the Rust side by putting the recovery-kit
+// verification on ONE COMMAND (`recovery cover`) instead of on the choke point,
+// so `vault share --to <kitID>` and `vault rotate --to <kitID>` reached the same
+// outcome through ordinary first-sight TOFU. The same shape existed here:
+// coverVault checked, shareVault and rotateVaultKey did not. Both sides now
+// funnel every wrap through ONE function.
+
+// The device label a recovery kit enrols under. Deliberately NOT exported: the
+// same name is exported by recovery.mjs, and the `@sigil/wasm` barrel re-exports
+// both with `export *` — two star-exports of one name make it ambiguous and it
+// silently disappears from the barrel. Mirrors `cli/src/lib.rs::RECOVERY_DEVICE_LABEL`.
+const RECOVERY_KIT_DEVICE_LABEL = "recovery-kit";
+
+/** How trust in a recipient's key was established. Mirrors `RecipientTrust`. */
+export const TRUST_DERIVED = "derived";
+export const TRUST_PINNED = "pinned";
+export const TRUST_VERIFIED_FIRST_SIGHT = "verified-first-sight";
+export const TRUST_UNVERIFIED_FIRST_SIGHT = "unverified-first-sight";
+
+/**
+ * ⛔ Thrown when a wrap targets a RECOVERY KIT this client has never pinned and
+ * no safety number was supplied to check the server's answer against.
+ *
+ * Stricter than an ordinary first sight ON PURPOSE: a kit's safety number is
+ * printed on the sheet, so the out-of-band channel is guaranteed to exist — and
+ * a kit is the one credential that reconstructs a whole account. Nothing was
+ * wrapped, nothing uploaded, and no key pinned.
+ */
+export class UnverifiedRecoveryKitError extends Error {
+  constructor(deviceId, presentedSafetyNumber) {
+    super(
+      `REFUSING TO WRAP: device ${deviceId} is a RECOVERY KIT this client has never pinned, so ` +
+        `the only thing vouching for its key is the server — and a hostile server that ` +
+        `substituted its own key would be handed this vault's key.\n  from server: ` +
+        `${presentedSafetyNumber}\n  The safety number is PRINTED ON THE RECOVERY SHEET. Compare ` +
+        `it, then retry supplying expectedSafetyNumber. Nothing was wrapped, nothing was ` +
+        `uploaded, and no key was pinned.`,
+    );
+    this.name = "UnverifiedRecoveryKitError";
+    this.deviceId = deviceId;
+    this.presentedSafetyNumber = presentedSafetyNumber;
+  }
+}
+
+/** ⛔ Thrown when a supplied safety number does not match the served key. */
+export class SafetyNumberMismatchError extends Error {
+  constructor(deviceId, expected, presented) {
+    super(
+      `REFUSING TO WRAP: the safety number supplied does not match the key this server is ` +
+        `serving for ${deviceId}.\n  you supplied: ${expected}\n  from server:  ${presented}\n  ` +
+        `Either it was mistyped, or the server substituted a key it can decrypt with. Nothing was ` +
+        `wrapped, nothing was uploaded, and no key was pinned.`,
+    );
+    this.name = "SafetyNumberMismatchError";
+    this.deviceId = deviceId;
+    this.expectedSafetyNumber = expected;
+    this.presentedSafetyNumber = presented;
+  }
+}
+
+/** Compare safety numbers ignoring spacing/presentation. */
+function sameSafetyNumber(a, b) {
+  return String(a).replace(/\D/g, "") === String(b).replace(/\D/g, "");
+}
+
+/** The DERIVED pin for a device, if this client holds one (mirrors `derived_pin`). */
+function derivedPinIdentity(store, deviceId) {
+  const pin = store?.pins?.[deviceId];
+  if (!pin || pin.origin !== PIN_ORIGIN_RECOVERY_KIT) return null;
+  return {
+    x25519PublicKey: base64ToBytes(pin.x25519_public_key ?? ""),
+    mlkemEncapsKey: base64ToBytes(pin.mlkem_encaps_key ?? ""),
+  };
+}
+
+/**
+ * Is `deviceId` a RECOVERY KIT, as far as this client can tell?
+ *
+ * The signal is the kit's deliberately-visible device label on the CALLER'S OWN
+ * account listing (`GET /v1/account`, which names no account and returns only
+ * "mine"). FAIL-CLOSED: an error other than 501 (no account model on this
+ * server at all) propagates, so a wrap is refused rather than proceeding on a
+ * signal we could not read.
+ *
+ * ⚠️ HONEST LIMIT, identical to the Rust side: the label comes from the server,
+ * which is the adversary. A hostile server can HIDE it and degrade a kit wrap to
+ * ordinary first-sight TOFU with a warning — no worse than any other first
+ * contact. What it cannot do is make the wrap accept a CHANGED key or a
+ * mismatched safety number.
+ */
+async function recipientIsRecoveryKit(wasm, auth, deviceId) {
+  try {
+    const account = await getAccount(wasm, { deviceId: auth.deviceId, seed: auth.seed }, auth.baseUrl);
+    return (account.devices ?? []).some(
+      (d) => d.device_id === deviceId && d.label === RECOVERY_KIT_DEVICE_LABEL,
+    );
+  } catch (err) {
+    if (err && err.status === 501) return false;
+    throw err;
+  }
+}
+
+/**
+ * ⭐⭐ THE GATE. Resolve a recipient's hybrid public key AND establish trust in
+ * it, in ONE call, before anything can be wrapped to it.
+ *
+ *   await verifyRecipientForWrap(wasm, auth, deviceId, {
+ *     pins, expectedSafetyNumber, knownRecoveryKit
+ *   }) -> { deviceId, identity, trust, safetyNumber, pins }
+ *
+ * | situation | outcome | pin store |
+ * |---|---|---|
+ * | key DERIVED locally (`origin: "recovery-kit"`) | `derived`, NO fetch | untouched |
+ * | pinned key, byte-identical | `pinned` | untouched |
+ * | pinned key, **different** | ⛔ {@link KeyPinMismatchError} | **untouched** |
+ * | first sight + matching safety number | `verified-first-sight` | pinned |
+ * | first sight + **wrong** safety number | ⛔ {@link SafetyNumberMismatchError} | **untouched** |
+ * | first sight, **RECOVERY KIT**, no safety number | ⛔ {@link UnverifiedRecoveryKitError} | **untouched** |
+ * | first sight, ordinary device, no safety number | `unverified-first-sight` (ADR 0038 TOFU) | pinned |
+ *
+ * Every refusal happens BEFORE the key is pinned. Pinning a key we then refused
+ * would mean a retry sees "match" and proceeds — the alarm silencing itself.
+ */
+export async function verifyRecipientForWrap(
+  wasm,
+  auth,
+  deviceId,
+  { pins = null, expectedSafetyNumber = null, knownRecoveryKit = false } = {},
+) {
+  checkAuth(auth);
+  checkId("device id", deviceId);
+  const store = requirePinStore(pins ?? auth.pins);
+
+  // 1) A LOCALLY DERIVED key. Nothing was fetched, so nothing could be swapped.
+  const derived = derivedPinIdentity(store, deviceId);
+  if (derived) {
+    return {
+      deviceId,
+      identity: derived,
+      trust: TRUST_DERIVED,
+      safetyNumber: await safetyNumber(deviceId, derived),
+      pins: store,
+    };
+  }
+
+  // 2) Ask the server, then decide. Nothing below writes to the pin store until
+  //    every check has passed.
+  const identity = await fetchHybridKey(wasm, auth, deviceId);
+  const presented = await safetyNumber(deviceId, identity);
+
+  if (expectedSafetyNumber && !sameSafetyNumber(expectedSafetyNumber, presented)) {
+    throw new SafetyNumberMismatchError(deviceId, expectedSafetyNumber, presented);
+  }
+
+  if (store.pins[deviceId]) {
+    // Throws KeyPinMismatchError on a changed key; mutates nothing either way.
+    await checkAndPin(store, deviceId, identity);
+    return { deviceId, identity, trust: TRUST_PINNED, safetyNumber: presented, pins: store };
+  }
+
+  // 3) FIRST SIGHT.
+  let trust = TRUST_VERIFIED_FIRST_SIGHT;
+  if (!expectedSafetyNumber) {
+    if (knownRecoveryKit || (await recipientIsRecoveryKit(wasm, auth, deviceId))) {
+      throw new UnverifiedRecoveryKitError(deviceId, presented);
+    }
+    trust = TRUST_UNVERIFIED_FIRST_SIGHT;
+  }
+  await checkAndPin(store, deviceId, identity);
+  return { deviceId, identity, trust, safetyNumber: presented, pins: store };
+}
+
 // ── rotation transport: list + delete envelopes ──────────────────────────────
 
 /** The URL PATH of a vault's envelope COLLECTION (mirrors `key_envelopes_path`). */
@@ -971,6 +1206,17 @@ export async function deleteKeyEnvelope(wasm, auth, vaultId, deviceId) {
  * The CALLER persists the returned `sealedVault` (and pushes it) and the returned
  * `vaultKey` — this module stores nothing.
  *
+ * ⭐ **THE FAIL-CLOSED DROP GUARD (Phase 54).** Step 5 DESTROYS access, so it
+ * may not happen by omission. Before anything is mutated, the current envelope
+ * holders are listed and any device in neither `recipientDeviceIds` nor `drop`
+ * throws {@link RecipientsWouldBeDroppedError}, naming each one and flagging any
+ * that this client's pin store marks as a RECOVERY KIT (`origin:
+ * "recovery-kit"`). `recipientDeviceIds` keeps its exact meaning — the complete
+ * new recipient set — so excluding a compromised device is still one call; what
+ * changed is that destroying access is now stated rather than implied.
+ *
+ * MIRRORS `cli/src/lib.rs::rotate_vault_key`'s guard exactly.
+ *
  * ⚠️ WHAT THIS DOES NOT DO. It protects FUTURE content ONLY. A device that
  * already unwrapped the PREVIOUS key still holds that key and whatever it had
  * already copied; cryptography cannot un-send a secret. What it DOES guarantee is
@@ -980,7 +1226,18 @@ export async function deleteKeyEnvelope(wasm, auth, vaultId, deviceId) {
 export async function rotateVaultKey(
   wasm,
   auth,
-  { vaultId, recipientDeviceIds, sealedVault, oldVaultKey, params, salt = null, nonce = null, pins = null },
+  {
+    vaultId,
+    recipientDeviceIds,
+    sealedVault,
+    oldVaultKey,
+    params,
+    salt = null,
+    nonce = null,
+    pins = null,
+    drop = [],
+    safetyNumbers = {},
+  },
 ) {
   checkAuth(auth);
   checkId("vault id", vaultId);
@@ -995,13 +1252,43 @@ export async function rotateVaultKey(
   const container = sealedVault instanceof Uint8Array ? sealedVault : new Uint8Array(sealedVault);
   const store = requirePinStore(pins ?? auth.pins);
 
-  // 1) PIN-CHECK EVERYONE BEFORE MUTATING ANYTHING. A substituted key aborts the
-  //    rotation with the vault untouched — far better than a half-rotated vault
-  //    whose key leaked.
+  // 0) ⭐ THE DROP GUARD (Phase 54). Enumerate who holds an envelope RIGHT NOW
+  //    and refuse if the caller did not account for every one of them. This runs
+  //    FIRST — before the pin checks, before the re-seal, before any request
+  //    that changes state — so a refusal leaves everything exactly as it was.
+  const existingHolders = await listKeyEnvelopes(wasm, auth, vaultId);
+  const keepSet = new Set(recipientDeviceIds);
+  const dropSet = new Set(Array.isArray(drop) ? drop : []);
+  const unnamed = existingHolders
+    .map((h) => h.deviceId)
+    .filter((d) => !keepSet.has(d) && !dropSet.has(d));
+  if (unnamed.length > 0) {
+    // Consult the LOCAL pin store so a recovery kit is NAMED as such. A device
+    // that never heard of the kit has no such pin and will only see "unknown
+    // recipient" — an honest limit, not a bug.
+    throw new RecipientsWouldBeDroppedError(
+      vaultId,
+      unnamed.map((deviceId) => ({
+        deviceId,
+        isRecoveryKit: store?.pins?.[deviceId]?.origin === PIN_ORIGIN_RECOVERY_KIT,
+      })),
+    );
+  }
+
+  // 1) ⭐ GATE EVERYONE BEFORE MUTATING ANYTHING, through the SAME
+  //    verifyRecipientForWrap that shareVault uses. A substituted key — or an
+  //    unverified RECOVERY KIT recipient — aborts the rotation with the vault
+  //    untouched, far better than a half-rotated vault whose key leaked.
+  //    `safetyNumbers` is `{ [deviceId]: "the printed digits" }` for any
+  //    recipient the user verified out of band; it is REQUIRED for a
+  //    first-sight recovery kit.
   const resolved = [];
   for (const deviceId of recipientDeviceIds) {
-    const { identity, pinStatus } = await fetchHybridKeyPinned(wasm, auth, deviceId, store);
-    resolved.push({ deviceId, identity, pinStatus });
+    const { identity, trust } = await verifyRecipientForWrap(wasm, auth, deviceId, {
+      pins: store,
+      expectedSafetyNumber: safetyNumbers?.[deviceId] ?? null,
+    });
+    resolved.push({ deviceId, identity, trust });
   }
 
   // 2-3) Fresh key, re-seal the container under it.
@@ -1024,17 +1311,19 @@ export async function rotateVaultKey(
   // 4) Re-wrap to every chosen recipient (an UPSERT — the old envelope is
   //    replaced, not appended to).
   const rewrapped = [];
-  for (const { deviceId, identity, pinStatus } of resolved) {
+  for (const { deviceId, identity, trust } of resolved) {
     const envelope = wrapVaultKey(wasm, identity, vaultKey);
     await putKeyEnvelope(wasm, auth, vaultId, deviceId, envelope);
-    rewrapped.push({ deviceId, pinStatus });
+    rewrapped.push({ deviceId, trust, pinStatus: trust });
   }
 
-  // 5) Remove the stale envelopes of everyone left out.
-  const keep = new Set(recipientDeviceIds);
+  // 5) Remove the stale envelopes of everyone left out. Re-listed rather than
+  //    reusing step 0's snapshot, so a device that deposited an envelope
+  //    mid-rotation is still caught — and every removal is one the caller named
+  //    in `drop`, because step 0 refused otherwise.
   const removed = [];
   for (const existing of await listKeyEnvelopes(wasm, auth, vaultId)) {
-    if (keep.has(existing.deviceId)) continue;
+    if (keepSet.has(existing.deviceId)) continue;
     if (await deleteKeyEnvelope(wasm, auth, vaultId, existing.deviceId)) {
       removed.push(existing.deviceId);
     }

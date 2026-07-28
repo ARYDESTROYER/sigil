@@ -30,10 +30,16 @@ package api
 // query — a subscription on another subject's behalf, because there is no body,
 // query or path field anywhere that names a subject.
 //
-// ENTITLEMENT IS REPORTED, NEVER ENFORCED. No route here (or anywhere in sigild)
-// refuses service to an unentitled account; gating the op-log on payment status
-// would lock a customer out of their own 2FA codes over a failed card, and needs
-// grace periods and dunning it does not have. That is a deliberate deferral.
+// ENTITLEMENT IS REPORTED HERE, AND — SINCE PHASE 55, WHEN AN OPERATOR OPTS IN —
+// ENFORCED ELSEWHERE. Nothing in THIS file ever refuses service: checkout must
+// work (it is how a lapsed customer pays) and the subscription route must work
+// (it is how their client learns to send them there). Enforcement lives in
+// entitlement.go and touches exactly three WRITE handlers, none of them here.
+//
+// ⭐ AND IT CAN NEVER REFUSE A READ. A failed card must not cost a person the 2FA
+// codes they already have; see entitlement.go for how that asymmetry is made
+// structural rather than remembered. With SIGILD_ENTITLEMENT_ENFORCE unset (the
+// default) nothing is enforced at all, exactly as before.
 //
 // NO CARD DATA CROSSES THIS FILE. Checkout returns a provider-hosted URL; the
 // customer's card details go to the provider, never here. No handler, struct or
@@ -298,6 +304,41 @@ type webhookResponse struct {
 // a tampered body and a stale timestamp all produce the identical response, so a
 // prober cannot learn which check tripped. The precise reason goes only to the
 // audit log and the per-reason metric.
+//
+// ---- ⛔ THERE IS DELIBERATELY NO RATE LIMITER ON THIS ROUTE ----
+//
+// Phase 53 put a per-provider token bucket here, ahead of VerifyWebhook. It was
+// REMOVED in the Phase 53-55 fix round, and nothing like it may come back,
+// because it lost money in a live reproduction:
+//
+//	one unauthenticated thread at ~137 forged requests/second shed 15 of 15
+//	genuine, correctly-signed Stripe deliveries with 429; a longer flood shed
+//	~2000 consecutive genuine retries. Not one payment event was applied, and
+//	the customer was subsequently refused with 402 by entitlement enforcement.
+//
+// THE RULE THAT FAILURE TEACHES: you cannot safely shed traffic on a route where
+// shedding costs money and the legitimate sender has a FINITE retry budget.
+//
+//   - Limiting BEFORE verification (what we shipped) lets anonymous forged
+//     traffic spend the SAME tokens as the authentic sender, because the key can
+//     only be something an attacker also controls — the provider name in the
+//     path. That is not a bound on abuse; it is a remote off switch for revenue.
+//   - Limiting AFTER verification is no better. The only traffic it could shed
+//     is an authentic burst, which is exactly the traffic that must never be
+//     dropped. A 429 is "retryable", not "safe": Stripe retries a finite number
+//     of times, so a sustained limit turns a deferral into a PERMANENT loss.
+//
+// WHAT ACTUALLY BOUNDS THE WORK IS ALREADY HERE AND STAYS: the body is read
+// under maxWebhookBodyBytes, an oversize body is 413'd without being buffered,
+// and verification is a single HMAC over that size-capped buffer. The cost of a
+// forged request is therefore O(64 KiB) with no database round trip and no state
+// created — the same order as any other unauthenticated request this server
+// answers.
+//
+// VOLUME PROTECTION FOR THIS ROUTE BELONGS AT THE EDGE, where it can be applied
+// per SOURCE with a provider IP allowlist — i.e. where forged traffic and
+// authentic traffic are distinguishable. Inside this process they are not, which
+// is the whole reason the limiter could not be made safe.
 func (h *handlers) billingWebhook(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("provider")
 	provider, ok := h.cfg.Billing.Providers[name]
@@ -309,7 +350,6 @@ func (h *handlers) billingWebhook(w http.ResponseWriter, r *http.Request) {
 			"no webhook endpoint is configured for that provider")
 		return
 	}
-
 	// Read the body ONCE, and keep the EXACT bytes. Everything downstream —
 	// signature verification first, JSON parsing second — works from this slice.
 	// Re-encoding before verification would change key order and whitespace and
@@ -404,6 +444,15 @@ type subscriptionResponse struct {
 	Entitled         bool   `json:"entitled"`
 	CurrentPeriodEnd string `json:"current_period_end,omitempty"`
 	UpdatedAt        string `json:"updated_at,omitempty"`
+	// Entitlement is the ADDITIVE enforcement block (Phase 55), present only when
+	// this server actually enforces payment. It is nil — and therefore absent from
+	// the JSON — on every server that has not opted in, so this response stays
+	// byte-identical by default.
+	//
+	// It is the warning channel for a READ-ONLY client: such a client is never
+	// refused and never sees a warning header, so without this it would learn
+	// about a lapse only when it first tried to write.
+	Entitlement *entitlementJSON `json:"entitlement,omitempty"`
 }
 
 // billingSubscription returns the AUTHENTICATED DEVICE'S ACCOUNT's subscription
@@ -424,12 +473,22 @@ func (h *handlers) billingSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ⭐ THIS ROUTE IS NEVER GATED BY ENTITLEMENT. Refusing to tell a customer why
+	// they are being refused, because they are being refused, would be absurd —
+	// and this is the route their client uses to find out it must send them to
+	// checkout. It reports enforcement state; it never applies it.
+	var entitlement *entitlementJSON
+	if h.entitlementActive() {
+		entitlement = entitlementBlock(true, h.evaluateEntitlement(r.Context(), subject, time.Now().UTC()))
+	}
+
 	sub, err := h.cfg.Billing.Subscriptions.GetSubscription(r.Context(), subject)
 	if err != nil {
 		if errors.Is(err, store.ErrSubscriptionNotFound) {
 			// "Never subscribed" is a valid answer, not a fault.
 			writeJSON(w, http.StatusOK, subscriptionResponse{
 				Subject: subject, Status: string(billing.StatusNone), Entitled: false,
+				Entitlement: entitlement,
 			})
 			return
 		}
@@ -442,10 +501,11 @@ func (h *handlers) billingSubscription(w http.ResponseWriter, r *http.Request) {
 		status = billing.StatusNone
 	}
 	resp := subscriptionResponse{
-		Subject:  sub.Subject,
-		Provider: sub.Provider,
-		Status:   string(status),
-		Entitled: status.Entitled(),
+		Subject:     sub.Subject,
+		Provider:    sub.Provider,
+		Status:      string(status),
+		Entitled:    status.Entitled(),
+		Entitlement: entitlement,
 	}
 	if !sub.CurrentPeriodEnd.IsZero() {
 		resp.CurrentPeriodEnd = sub.CurrentPeriodEnd.UTC().Format(time.RFC3339)

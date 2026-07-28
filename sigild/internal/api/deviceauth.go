@@ -470,15 +470,30 @@ func (h *handlers) authorizeByGrant(r *http.Request, dev store.Device, vaultID s
 // The legacy path is preserved byte-for-byte so existing clients (the sigil CLI,
 // the wasm sync tests) keep working exactly as before.
 func (h *handlers) authorizeOpsRequest(r *http.Request, body []byte, vaultID string, need accessNeed) authOutcome {
+	_, out := h.authorizeOpsRequestDevice(r, body, vaultID, need)
+	return out
+}
+
+// authorizeOpsRequestDevice is authorizeOpsRequest, additionally returning the
+// AUTHENTICATED DEVICE ROW so a caller can act on the device's account without a
+// second registry read. The authorization logic is byte-identical — the one-value
+// form above is a thin wrapper over this — so no existing behaviour moved.
+//
+// It exists for the WRITE handlers, which need dev.AccountID to evaluate
+// entitlement (Phase 55). In the legacy v2 / no-auth modes there is no device
+// row, so the returned Device is the zero value and its empty AccountID makes
+// requireEntitlement allow — legacy mode is never enforced, which is correct: it
+// has no account model to bill.
+func (h *handlers) authorizeOpsRequestDevice(r *http.Request, body []byte, vaultID string, need accessNeed) (store.Device, authOutcome) {
 	if h.deviceAuthEnabled() {
 		dev, out := h.authenticateDevice(r, body)
 		if !out.allowed() {
-			return out
+			return store.Device{}, out
 		}
-		return h.authorizeVault(r, dev, vaultID, need)
+		return dev, h.authorizeVault(r, dev, vaultID, need)
 	}
 	// Legacy v2 (or disabled) path, unchanged.
-	return authOutcome{Reason: h.authorizeOps(r, body)}
+	return store.Device{}, authOutcome{Reason: h.authorizeOps(r, body)}
 }
 
 // writeAuthError maps a denial reason to its response. The error CODE and DETAIL

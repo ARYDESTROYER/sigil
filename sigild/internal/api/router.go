@@ -61,6 +61,36 @@ type Config struct {
 	// It is only consulted when OpLogRateLimit > 0; a value < 1 is clamped up to
 	// 1 by the limiter so single requests always pass.
 	OpLogRateBurst int
+	// ---- Abuse bounds (Phase 53). ALL OPT-IN; every one defaults OFF. ----
+	//
+	// Each pair configures one hand-written token bucket (the same mechanism
+	// OpLogRateLimit uses; no dependency was added). A rate of 0 — the default —
+	// installs NO limiter at all, so an un-opted-in server behaves exactly as it
+	// did before. A burst < 1 is clamped up to 1 by the limiter so single
+	// requests always pass.
+
+	// EnrollRateLimit caps POST /v1/devices/enroll per SOURCE ADDRESS
+	// (requests/second). Enrollment is the one UNAUTHENTICATED write path in
+	// this server, so the limiter wraps the handler and rejects before the body
+	// is read and before the database is touched. See clientRateKey for why the
+	// key is the socket peer and never a forwarded-for header.
+	EnrollRateLimit float64
+	// EnrollRateBurst is that bucket's capacity.
+	EnrollRateBurst int
+
+	// InviteRateLimit caps POST /v1/account/invites per ACCOUNT
+	// (requests/second) — not per device. Membership is flat and the open-invite
+	// cap it complements is per-account, so keying on the device would let an
+	// account with N devices mint at N times the intended rate.
+	InviteRateLimit float64
+	// InviteRateBurst is that bucket's capacity.
+	InviteRateBurst int
+
+	// ⛔ There is NO webhook rate limit, deliberately. One existed in Phase 53 and
+	// was removed after it demonstrably destroyed payment events: forged traffic
+	// spends the same tokens as authentic provider deliveries, and the provider's
+	// retry budget is finite. See billingWebhook.
+
 	// SchemaVersion is the applied op-log DB migration version, surfaced by the
 	// sigild_schema_version metric. main.go sets it from the Postgres backend's
 	// applied migration version; it stays 0 for the mem/file backends (which
@@ -121,6 +151,30 @@ type Config struct {
 	// longer one.
 	AccountInviteTTL time.Duration
 
+	// ---- Entitlement enforcement (Phase 55). OPT-IN; defaults OFF. ----
+	//
+	// With EntitlementEnforce false (the default) NOTHING changes: no handler
+	// reads the subscription store, no header is set, no audit line is written
+	// and no metric moves. That is the ADR 0040 limitation-8 behaviour —
+	// entitlement REPORTED, never enforced — preserved byte for byte.
+
+	// EntitlementEnforce turns on payment enforcement for the three WRITE
+	// surfaces (op-log append, key-envelope deposit, vault grant). It is
+	// meaningful only alongside the device model AND billing: without an account
+	// there is no subject to bill, and without a subscription store there is
+	// nothing to read. NewRouter gates on all three, and cmd/server refuses to
+	// boot if this is set without them.
+	//
+	// ⭐ IT CAN NEVER REFUSE A READ. requireEntitlement is called from write
+	// handlers only; the read path holds no entitlement code at all. See
+	// entitlement.go.
+	EntitlementEnforce bool
+	// EntitlementGrace is how long after entitlement lapses writes keep working
+	// (warned, not refused). 0 => DefaultEntitlementGrace. It stacks ON TOP of
+	// billing's past_due-is-entitled rule, so a declined card costs a customer
+	// nothing until the provider's retries AND this window have both run out.
+	EntitlementGrace time.Duration
+
 	// AdminToken is the OPTIONAL operator token (SIGILD_ADMIN_TOKEN) that
 	// authorizes the operator-only device routes (list all devices, revoke any
 	// device). Empty (the default) means those operator paths are permanently
@@ -150,6 +204,34 @@ func NewRouter(cfg Config) http.Handler {
 	// auth paths return before touching it).
 	if cfg.OpLogPubKey != nil || deviceAuth {
 		h.nonces = newNonceCache()
+	}
+	// Abuse bounds (Phase 53). Each limiter exists ONLY when a positive rate is
+	// configured; nil means "not configured" and allowAbuse short-circuits, so
+	// the default path does no work. The enroll limiter is a route wrapper (it
+	// charges the bucket from the handler's OUTCOME, so a successful enrolment is
+	// never refused); the invite limiter lives at its handler's choke point
+	// because its key is not known until the caller is authenticated.
+	var enrollLimiter *rateLimiter
+	if cfg.EnrollRateLimit > 0 {
+		enrollLimiter = newRateLimiterWithMax(cfg.EnrollRateLimit, cfg.EnrollRateBurst, abuseLimiterMaxKeys)
+	}
+	if cfg.InviteRateLimit > 0 {
+		h.inviteLimiter = newRateLimiterWithMax(cfg.InviteRateLimit, cfg.InviteRateBurst, abuseLimiterMaxKeys)
+	}
+
+	// Entitlement enforcement (Phase 55). Active ONLY when it was explicitly
+	// switched on AND the device model is live (there is an account to bill) AND
+	// billing is configured (there is a subscription store to read). Any one of
+	// the three missing leaves the zero policy, and requireEntitlement returns on
+	// its first line — so an un-opted-in or half-configured server does no
+	// entitlement work whatsoever.
+	if cfg.EntitlementEnforce && deviceAuth && h.billingEnabled() {
+		grace := cfg.EntitlementGrace
+		if grace <= 0 {
+			grace = DefaultEntitlementGrace
+		}
+		h.entitlement = entitlementPolicy{Active: true, Grace: grace}
+		h.metrics.entitlementEnforcing = 1
 	}
 
 	mux := http.NewServeMux()
@@ -204,7 +286,16 @@ func NewRouter(cfg Config) http.Handler {
 	// device registry: with either off, every one of them returns the deliberate
 	// 501 rather than 404 or any partial auth behaviour.
 	if deviceAuth {
-		mux.Handle("POST /v1/devices/enroll", http.HandlerFunc(h.devicesEnroll))
+		// Enrollment is the one UNAUTHENTICATED write path here, so the abuse
+		// limiter wraps it OUTSIDE the handler — but it charges the bucket from
+		// the handler's OUTCOME, so a SUCCESSFUL enrolment can never be refused
+		// (see rateLimitEnroll for the denial this shape exists to prevent).
+		// Unconfigured (the default) => no wrapper at all.
+		var enrollHandler http.Handler = http.HandlerFunc(h.devicesEnroll)
+		if enrollLimiter != nil {
+			enrollHandler = rateLimitEnroll(enrollLimiter, h, enrollHandler)
+		}
+		mux.Handle("POST /v1/devices/enroll", enrollHandler)
 		mux.Handle("GET /v1/devices", http.HandlerFunc(h.devicesList))
 		mux.Handle("POST /v1/devices/{deviceID}/revoke", http.HandlerFunc(h.devicesRevoke))
 		mux.Handle("POST /v1/vaults/{vaultID}/grants", http.HandlerFunc(h.vaultGrantCreate))
@@ -225,6 +316,13 @@ func NewRouter(cfg Config) http.Handler {
 		// auth path. The list route returns METADATA only, never a blob.
 		mux.Handle("GET /v1/vaults/{vaultID}/keys", http.HandlerFunc(h.keyEnvelopeList))
 		mux.Handle("DELETE /v1/vaults/{vaultID}/keys/{deviceID}", http.HandlerFunc(h.keyEnvelopeDelete))
+		// Recovery support (Phase 54): the per-DEVICE envelope index, so a
+		// client restored from a printed recovery kit — which knows no vault
+		// ids at all — can discover what it is able to decrypt. SELF-ONLY and
+		// METADATA-ONLY, over the SAME authenticateDevice / authorizeVault
+		// choke points; no new auth path, and no migration (it reads the
+		// by-recipient index 0004 already created).
+		mux.Handle("GET /v1/devices/{deviceID}/keys", http.HandlerFunc(h.deviceKeyEnvelopeIndex))
 		// Account model (Phase 52): membership and single-use invites. Same dev
 		// gate and the same authenticateDevice choke point — no new auth path.
 		// NOTHING here names an account: every one of them derives it from the
@@ -249,6 +347,7 @@ func NewRouter(cfg Config) http.Handler {
 		mux.Handle("GET /v1/vaults/{vaultID}/keys/{deviceID}", stub)
 		mux.Handle("GET /v1/vaults/{vaultID}/keys", stub)
 		mux.Handle("DELETE /v1/vaults/{vaultID}/keys/{deviceID}", stub)
+		mux.Handle("GET /v1/devices/{deviceID}/keys", stub)
 		// The account routes get their OWN 501 stub (not the device one), so its
 		// detail string names this surface and the device stub's text — which
 		// existing tests assert — is untouched.

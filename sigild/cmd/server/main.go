@@ -108,6 +108,44 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Abuse bounds (Phase 53), validated BEFORE binding too. All six values are
+	// OPT-IN and default OFF: unset installs no limiter, so an un-opted-in server
+	// behaves exactly as it did before. A malformed value is a startup failure,
+	// never a silent fallback to "unlimited" — a rate limiter that quietly
+	// disabled itself on a typo would be worse than none, because an operator
+	// would believe the route was protected.
+	abuseCfg, err := validateAbuseConfig(abuseEnv{
+		EnrollRate:  os.Getenv("SIGILD_ENROLL_RATE_LIMIT"),
+		EnrollBurst: os.Getenv("SIGILD_ENROLL_RATE_BURST"),
+		InviteRate:  os.Getenv("SIGILD_INVITE_RATE_LIMIT"),
+		InviteBurst: os.Getenv("SIGILD_INVITE_RATE_BURST"),
+	})
+	if err != nil {
+		logger.Error("invalid abuse rate-limit configuration", "err", err)
+		os.Exit(1)
+	}
+
+	// Entitlement enforcement (Phase 55), validated BEFORE binding too. OPT-IN
+	// and OFF BY DEFAULT: with SIGILD_ENTITLEMENT_ENFORCE unset, nothing is
+	// enforced and the server behaves exactly as it did before.
+	//
+	// Enabling it WITHOUT dev-ops, device auth and billing is a BOOT ERROR rather
+	// than a silently inert knob — this one decides whether a paying customer's
+	// writes are served, and an operator who believes enforcement is on when it
+	// is not is exactly the person who will discover the truth from a revenue
+	// report. It performs no network I/O and reads no store.
+	entitlementCfg, err := validateEntitlementConfig(entitlementEnv{
+		Enforce:    os.Getenv("SIGILD_ENTITLEMENT_ENFORCE"),
+		Grace:      os.Getenv("SIGILD_ENTITLEMENT_GRACE"),
+		DevOps:     os.Getenv("SIGILD_ENABLE_DEV_OPS"),
+		DeviceAuth: os.Getenv("SIGILD_DEVICE_AUTH"),
+		Billing:    os.Getenv("SIGILD_BILLING_PROVIDERS"),
+	})
+	if err != nil {
+		logger.Error("invalid entitlement configuration", "err", err)
+		os.Exit(1)
+	}
+
 	// Billing config, validated BEFORE binding too. Entirely OPT-IN: with
 	// SIGILD_BILLING_PROVIDERS unset billing is OFF and the /v1/billing routes
 	// stay at their 501 stub. Enabling a provider without its credentials is a
@@ -160,11 +198,17 @@ func main() {
 		DevOpsEnabled:  devOps,
 		OpLogRateLimit: rate,
 		OpLogRateBurst: burst,
+
+		EnrollRateLimit: abuseCfg.EnrollRate,
+		EnrollRateBurst: abuseCfg.EnrollBurst,
+		InviteRateLimit: abuseCfg.InviteRate,
+		InviteRateBurst: abuseCfg.InviteBurst,
 	}
 	if devOps && rate > 0 {
 		logger.Warn("DEV op-log per-vault RATE LIMIT enabled — dev-only",
 			"rate_per_sec", rate, "burst", burst)
 	}
+	logAbuseBounds(logger, abuseCfg, devOps)
 	if devOps {
 		// Backend selection for the DEV op-log, in PRECEDENCE order:
 		//   1. SIGILD_OPLOG_POSTGRES (a DSN) => durable, CONCURRENT Postgres backend
@@ -288,7 +332,7 @@ func main() {
 
 			// Accounts are ON whenever device auth is. Named at boot because it
 			// changes who owns a vault and who is entitled.
-			logger.Warn("ACCOUNT MODEL ACTIVE: entitlement and vault ownership key off the ACCOUNT of the signing device, not the device. Membership is FLAT (any member may invite, revoke any sibling, run checkout and administer every account-owned vault) and there is NO RECOVERY — lose or revoke every device in an account and it is permanently unreachable. Dev-only, UNAUDITED",
+			logger.Warn("ACCOUNT MODEL ACTIVE: entitlement and vault ownership key off the ACCOUNT of the signing device, not the device. Membership is FLAT (any member may invite, revoke any sibling, run checkout and administer every account-owned vault) and there is NO RECOVERY UNLESS A RECOVERY KIT WAS GENERATED IN ADVANCE — lose or revoke every device in an account that never printed a kit and it is permanently unreachable. A kit cannot be created after the fact. Dev-only, UNAUDITED",
 				"max_devices_per_account", cfg.AccountMaxDevices,
 				"max_open_invites_per_account", cfg.AccountMaxInvites,
 				"invite_ttl", cfg.AccountInviteTTL.String())
@@ -311,6 +355,13 @@ func main() {
 			cfg.Billing.DefaultProvider = billingCfg.DefaultProvider
 			cfg.Billing.SuccessURL = billingCfg.SuccessURL
 			cfg.Billing.CancelURL = billingCfg.CancelURL
+
+			// Entitlement enforcement rides billing + device auth (both are on
+			// here, and validateEntitlementConfig already required them). The
+			// router gates on all three defensively as well.
+			cfg.EntitlementEnforce = entitlementCfg.Enforce
+			cfg.EntitlementGrace = entitlementCfg.Grace
+			logEntitlementEnforcement(logger, entitlementCfg)
 
 			// Logs WHICH providers are enabled and which Juspay webhook scheme is
 			// active. NEVER a key, secret, username or password.
@@ -860,6 +911,247 @@ func parseBoundedDuration(s string, def, maxValue time.Duration) (time.Duration,
 		return 0, fmt.Errorf("must be at most %s, got %s", maxValue, d)
 	}
 	return d, nil
+}
+
+// ---- Abuse bounds configuration (Phase 53) ----
+//
+// Environment, ALL optional; unset => that limiter is NOT INSTALLED and the
+// route behaves exactly as it did before:
+//
+//	SIGILD_ENROLL_RATE_LIMIT   POST /v1/devices/enroll, per SOURCE ADDRESS
+//	SIGILD_ENROLL_RATE_BURST   (requests/second, bucket depth). Enrollment is the
+//	                           one unauthenticated write path. ⚠️ It charges the
+//	                           bucket only on the DENIAL path, so the handler and
+//	                           its database work ALWAYS run and only the RESPONSE
+//	                           is replaced: it bounds how useful flooding is, NOT
+//	                           what it costs us. That is the deliberate trade that
+//	                           makes it unable to refuse a valid enrolment.
+//	                           ⚠️ Behind a reverse proxy every request appears to
+//	                           come from the proxy and shares ONE bucket — see
+//	                           clientRateKey. Rate-limit at the proxy instead.
+//	SIGILD_INVITE_RATE_LIMIT   POST /v1/account/invites, per ACCOUNT (not per
+//	SIGILD_INVITE_RATE_BURST   device: membership is flat and the open-invite cap
+//	                           is per-account).
+// ⛔ THERE IS NO SIGILD_WEBHOOK_RATE_LIMIT. One existed in Phase 53 and was
+// REMOVED: on POST /v1/billing/webhook/{provider} the limiter's only possible
+// key is the provider name, which forged traffic controls too, so an anonymous
+// flood spent the same tokens as authentic Stripe deliveries and destroyed
+// payment events in a live reproduction. Volume protection for that route
+// belongs at the edge, where sources are distinguishable. Setting the old
+// variables now does nothing; they are not read anywhere.
+//
+// These deliberately do NOT require SIGILD_ENABLE_DEV_OPS / SIGILD_DEVICE_AUTH,
+// unlike the SIGILD_ACCOUNT_* settings. Those change WHO OWNS a vault, so a
+// silently-ignored value there would be an ownership surprise; a rate limit is
+// purely protective, and refusing to boot because a protective knob is currently
+// moot would be a worse failure than the boot warning logAbuseBounds emits.
+
+// abuseEnv is the raw environment for the abuse limiters, injected so validation
+// is unit-testable without touching the process environment.
+type abuseEnv struct {
+	EnrollRate  string
+	EnrollBurst string
+	InviteRate  string
+	InviteBurst string
+}
+
+// abuseConfig is the validated result. A zero rate means "not configured", which
+// api.NewRouter turns into "no limiter installed".
+type abuseConfig struct {
+	EnrollRate  float64
+	EnrollBurst int
+	InviteRate  float64
+	InviteBurst int
+}
+
+// Enabled reports whether any abuse limiter is configured.
+func (c abuseConfig) Enabled() bool {
+	return c.EnrollRate > 0 || c.InviteRate > 0
+}
+
+// validateAbuseConfig parses + validates the abuse-bound environment and fails
+// fast on any malformed value, BEFORE the listener binds. It performs no network
+// I/O and never calls os.Exit, so it is unit-testable.
+//
+// It reuses parseRateLimit / parseRateBurst / effectiveBurst verbatim, so all
+// four rate limiters in this server share one parsing contract: a non-negative
+// finite rate, a non-negative integer burst, and a burst defaulting to
+// ceil(rate) when a positive rate is set without one.
+func validateAbuseConfig(env abuseEnv) (abuseConfig, error) {
+	var cfg abuseConfig
+	var err error
+
+	if cfg.EnrollRate, cfg.EnrollBurst, err = parseLimiterPair(env.EnrollRate, env.EnrollBurst); err != nil {
+		return abuseConfig{}, fmt.Errorf("SIGILD_ENROLL_RATE_LIMIT/SIGILD_ENROLL_RATE_BURST: %w", err)
+	}
+	if cfg.InviteRate, cfg.InviteBurst, err = parseLimiterPair(env.InviteRate, env.InviteBurst); err != nil {
+		return abuseConfig{}, fmt.Errorf("SIGILD_INVITE_RATE_LIMIT/SIGILD_INVITE_RATE_BURST: %w", err)
+	}
+	return cfg, nil
+}
+
+// parseLimiterPair parses one (rate, burst) pair. An empty rate yields (0, 0) —
+// the limiter is not installed. A positive rate resolves its burst through
+// effectiveBurst, exactly as the op-log limiter does.
+func parseLimiterPair(rawRate, rawBurst string) (float64, int, error) {
+	r, err := parseRateLimit(rawRate)
+	if err != nil {
+		return 0, 0, err
+	}
+	b, err := parseRateBurst(rawBurst)
+	if err != nil {
+		return 0, 0, err
+	}
+	if r > 0 {
+		b = effectiveBurst(r, b)
+	}
+	return r, b, nil
+}
+
+// logAbuseBounds names every configured abuse limiter at boot, and warns when
+// one is configured but the route it protects is gated off.
+//
+// The second half matters: the enroll, invite and webhook routes are all
+// dev-gated, so a limiter configured on a server without SIGILD_ENABLE_DEV_OPS
+// protects a route that only ever answers 501. That is harmless, but an operator
+// who set it believes something is protected — so it is said out loud rather
+// than being a silently inert knob.
+func logAbuseBounds(logger *slog.Logger, cfg abuseConfig, devOps bool) {
+	// A RETIRED knob must never be silently ignored. SIGILD_WEBHOOK_RATE_LIMIT
+	// existed in Phase 53 and was removed when a live reproduction showed it let
+	// anonymous forged traffic spend an authentic provider's quota and destroy
+	// payment events. An operator upgrading with it still in an EnvironmentFile
+	// would otherwise boot clean and believe the webhook route was protected —
+	// which is the most dangerous possible misunderstanding of a removal.
+	//
+	// This WARNS rather than refusing to boot, for the reason given above: a
+	// protective knob that has become moot should not take a payments server
+	// down. Everything that CHANGES BEHAVIOUR still fails fast.
+	for _, retired := range []string{"SIGILD_WEBHOOK_RATE_LIMIT", "SIGILD_WEBHOOK_RATE_BURST"} {
+		if os.Getenv(retired) != "" {
+			logger.Warn("RETIRED SETTING IGNORED: this variable is set but is no longer read. The webhook rate limiter was REMOVED because its only possible key is the provider name, which forged traffic also controls, so an anonymous flood spent authentic deliveries' quota and destroyed payment events. THE WEBHOOK ROUTE IS NOT RATE LIMITED — bound it at the edge, where sources are distinguishable",
+				"setting", retired)
+		}
+	}
+	if !cfg.Enabled() {
+		return
+	}
+	logger.Warn("ABUSE RATE LIMITS ENABLED (per-process, in-memory token buckets) — these bound REQUEST VOLUME; the SIGILD_ACCOUNT_* caps bound stored STATE. A multi-instance deploy divides each budget across instances (there is no shared limiter store)",
+		"enroll_per_sec", cfg.EnrollRate, "enroll_burst", cfg.EnrollBurst,
+		"invite_per_sec", cfg.InviteRate, "invite_burst", cfg.InviteBurst)
+	if cfg.EnrollRate > 0 {
+		logger.Warn("ABUSE: the enrollment limiter keys on the SOCKET PEER ADDRESS and IGNORES X-Forwarded-For (untrusted input would let one client mint unlimited buckets). BEHIND A REVERSE PROXY — THE ONLY TOPOLOGY THIS REPO SHIPS — ALL ENROLMENTS SHARE ONE BUCKET, so this is a BACKSTOP, not a defence: rate-limit at the proxy, which knows the real peer. It charges the bucket ONLY for FAILED attempts, so a valid enrolment is never refused by it")
+	}
+	if !devOps {
+		logger.Warn("ABUSE: rate limits are configured but SIGILD_ENABLE_DEV_OPS is off, so the enroll and invite routes answer 501 and NOTHING IS BEING LIMITED. This is not an error — the setting is simply inert until the dev gate is on")
+	}
+}
+
+// ---- Entitlement enforcement configuration (Phase 55) ----
+//
+//	SIGILD_ENTITLEMENT_ENFORCE  truthy => refuse WRITES from an account whose
+//	                            subscription lapsed more than the grace period
+//	                            ago. UNSET (the default) => nothing is enforced
+//	                            and the server behaves exactly as before.
+//	SIGILD_ENTITLEMENT_GRACE    how long after a lapse writes keep working
+//	                            (warned, not refused). Default 14 DAYS, bounded
+//	                            to (0, 365d].
+//
+// ⭐ WHAT ENFORCEMENT CAN AND CANNOT DO, because an operator must know before
+// switching it on:
+//
+//	REFUSED after grace   POST /v1/vaults/{id}/ops          (new op-log entries)
+//	                      PUT  /v1/vaults/{id}/keys/{dev}   ONLY when {dev}
+//	                      POST /v1/vaults/{id}/grants       belongs to ANOTHER
+//	                                                        account
+//	NEVER REFUSED         every GET — the op-log, the chain verification, key
+//	                      envelopes, the per-device envelope index, hybrid keys,
+//	                      grants, devices, the account, invites — plus device
+//	                      enrollment and REVOCATION, envelope DELETION, invite
+//	                      minting, every billing route including checkout, AND
+//	                      ⭐ depositing a wrapped vault key (with its grant) to a
+//	                      device of the CALLER'S OWN ACCOUNT, which is what makes
+//	                      replacing a dead device and printing a RECOVERY KIT
+//	                      work while lapsed.
+//
+// The line is drawn so a lapsed customer keeps every 2FA code they already have,
+// can always establish the key access needed to read them on their own devices,
+// can always revoke a stolen device, and can always pay. Refusing any of those
+// over a declined card would be a security failure we caused. (The narrower
+// earlier line — reads only — was reproduced leaving a lapsed customer with a
+// new phone full of ciphertext it could never decrypt, and unable to print a
+// recovery kit.)
+//
+// UNLIKE the abuse limiters (which are purely protective and merely inert
+// without the dev gate), this REQUIRES SIGILD_ENABLE_DEV_OPS, SIGILD_DEVICE_AUTH
+// and SIGILD_BILLING_PROVIDERS: it decides whether customers are served, and a
+// setting that silently does nothing there is a business and support hazard.
+
+// entitlementDefaultGrace / entitlementMaxGrace bound the configured window. The
+// default is deliberately generous (see api.DefaultEntitlementGrace) and is
+// taken from the api package so the two cannot drift.
+const (
+	entitlementDefaultGrace = api.DefaultEntitlementGrace
+	entitlementMaxGrace     = 365 * 24 * time.Hour
+)
+
+// entitlementEnv is the raw environment, injected so validation is unit-testable
+// without touching the process environment.
+type entitlementEnv struct {
+	Enforce    string
+	Grace      string
+	DevOps     string
+	DeviceAuth string
+	Billing    string
+}
+
+// entitlementConfig is the validated result. Enforce false => the api layer
+// installs no policy at all.
+type entitlementConfig struct {
+	Enforce bool
+	Grace   time.Duration
+}
+
+// validateEntitlementConfig parses + validates the enforcement environment and
+// fails fast BEFORE the listener binds. It performs no network I/O, reads no
+// store, and never calls os.Exit.
+func validateEntitlementConfig(env entitlementEnv) (entitlementConfig, error) {
+	enforce := truthy(env.Enforce)
+	graceSet := strings.TrimSpace(env.Grace) != ""
+
+	if graceSet && !enforce {
+		return entitlementConfig{}, errors.New("SIGILD_ENTITLEMENT_GRACE requires SIGILD_ENTITLEMENT_ENFORCE: a grace period with nothing to be graceful about is an inert setting, and an operator who set it believes writes are being enforced")
+	}
+	if !enforce {
+		return entitlementConfig{}, nil
+	}
+	if !truthy(env.DevOps) {
+		return entitlementConfig{}, errors.New("SIGILD_ENTITLEMENT_ENFORCE requires SIGILD_ENABLE_DEV_OPS: the routes it gates all answer 501 without the dev gate")
+	}
+	if !truthy(env.DeviceAuth) {
+		return entitlementConfig{}, errors.New("SIGILD_ENTITLEMENT_ENFORCE requires SIGILD_DEVICE_AUTH: entitlement is a property of an ACCOUNT, and accounts exist only under the multi-device auth model")
+	}
+	if strings.TrimSpace(env.Billing) == "" {
+		return entitlementConfig{}, errors.New("SIGILD_ENTITLEMENT_ENFORCE requires SIGILD_BILLING_PROVIDERS: with no subscription store there is nothing to read, and enforcement would refuse every account or (as it in fact does) fail open for every one")
+	}
+
+	grace, err := parseBoundedDuration(env.Grace, entitlementDefaultGrace, entitlementMaxGrace)
+	if err != nil {
+		return entitlementConfig{}, fmt.Errorf("SIGILD_ENTITLEMENT_GRACE: %w", err)
+	}
+	return entitlementConfig{Enforce: true, Grace: grace}, nil
+}
+
+// logEntitlementEnforcement names, at every boot, exactly what enforcement will
+// and will not refuse. It is a Warn even on the happy path: this is the one
+// setting in this server that can stop serving a paying customer, so it is never
+// allowed to be a quiet line in a config dump.
+func logEntitlementEnforcement(logger *slog.Logger, cfg entitlementConfig) {
+	if !cfg.Enforce {
+		return
+	}
+	logger.Warn("ENTITLEMENT ENFORCEMENT ENABLED: after an account's subscription lapses AND its grace period expires, WRITES are refused with HTTP 402 (new op-log entries; new key envelopes and new vault grants ONLY when addressed to a device of ANOTHER account). READS ARE NEVER REFUSED — the op-log, chain verification, key envelopes, the per-device envelope index, hybrid keys, grants, devices, the account and every billing route (including checkout) all keep working, as do device enrollment, device REVOCATION and envelope DELETION. ESTABLISHING KEY ACCESS WITHIN YOUR OWN ACCOUNT IS ALSO NEVER REFUSED: depositing a wrapped vault key to a SAME-ACCOUNT device, and the grant that accompanies it, are exempt, so replacing a dead device and printing a RECOVERY KIT both still work. A lapsed customer therefore keeps every code they have, can always get the keys to read them onto their own devices, can always revoke a stolen device, and can always pay. past_due is still ENTITLED (a declined card starts a provider retry window, not a cutoff), and the grace period runs from the LATER of the subscription's last update and its paid-through date. An account that NEVER subscribed is graced from its creation time, so the same window doubles as the buy-in window. Any uncertainty FAILS OPEN (a subscription-store fault serves the request and logs entitlement.fail_open at error level). Dev-gated, UNAUDITED",
+		"grace", cfg.Grace.String())
 }
 
 // parseOpLogPubKey parses SIGILD_OPLOG_PUBKEY: the standard-base64 encoding of a

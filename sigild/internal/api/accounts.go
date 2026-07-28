@@ -245,6 +245,24 @@ type inviteJSON struct {
 }
 
 // accountInviteCreate mints a single-use invite for the CALLER's account.
+//
+// RATE LIMITING (Phase 53) IS KEYED ON THE ACCOUNT, NOT THE DEVICE. The route is
+// authenticated, so both keys are available — the account is the tighter and the
+// more honest one:
+//
+//   - The state cap it complements (SIGILD_ACCOUNT_MAX_INVITES) is per-account,
+//     so a per-device rate would let an account with N devices mint at N times
+//     the rate its own quota was written around. Two bounds on the same resource
+//     keyed to different subjects is how a limit becomes theatre.
+//   - Membership is FLAT (ADR 0040 limitation 3): any member may invite. There
+//     is no sense in which one device's invite budget is separable from its
+//     siblings' — they are all spending the account's single open-invite quota.
+//
+// ⚠️ IT IS THE CHECK AFTER AUTHENTICATION, DELIBERATELY, AND THAT IS ITS LIMIT.
+// The key does not exist until the signature has been verified and the device
+// row read, so this bounds what a VALID MEMBER may mint; it does NOT make an
+// unauthenticated flood of this route cheaper. That flood is bounded by the
+// signature check itself, which is the same cost every other signed route pays.
 func (h *handlers) accountInviteCreate(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxAccountBodyBytes+1))
 	if err != nil || len(body) > maxAccountBodyBytes {
@@ -254,6 +272,13 @@ func (h *handlers) accountInviteCreate(w http.ResponseWriter, r *http.Request) {
 	// The v3 signature covers the body, so authenticate AFTER reading it.
 	dev, ok := h.authenticateAccountRequest(w, r, body)
 	if !ok {
+		return
+	}
+	// Bound minting volume before any store work. The subject recorded in the
+	// audit line is the account — which this stream already carries everywhere,
+	// so it is no new privacy surface.
+	if !h.allowAbuse(r, h.inviteLimiter, abuseSurfaceInvite, dev.AccountID, dev.AccountID) {
+		writeRateLimited(w, h.inviteLimiter, "too many invites minted by this account")
 		return
 	}
 

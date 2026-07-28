@@ -65,6 +65,7 @@ import {
   safetyNumber,
   repinHybridKey,
   rotateVaultKey,
+  listKeyEnvelopes,
   newPinStore,
   KeyPinMismatchError,
 } from "../../vendor/sharing.mjs";
@@ -251,9 +252,11 @@ function renderAccount() {
     : "";
   state.textContent =
     `Account ${account.account_id} — ${account.device_count} of ${account.device_limit} ` +
-    `devices in use${revoked}. No recovery: an account is reachable only through a ` +
-    `member device's private key, and membership is flat (any member may invite, and ` +
-    `may revoke any other member).`;
+    `devices in use${revoked}. An account is reachable only through a member ` +
+    `device's private key, so losing every device is unrecoverable UNLESS a ` +
+    `recovery kit was printed in advance (\`sigil recovery generate\` — one cannot ` +
+    `be created after the fact, and this extension cannot print one). Membership ` +
+    `is flat (any member may invite, and may revoke any other member).`;
 
   const id = $("sync-vault").value.trim();
   const holdsKey = Boolean(device.vaultKeys?.[id]);
@@ -853,6 +856,9 @@ $("sharing-share").addEventListener("click", async () => {
       recipientDeviceId: to,
       vaultKey: key,
       permission: $("sharing-permission").value === "write" ? "write" : "read",
+      // Checked BEFORE anything is wrapped. Blank = not supplied; the wrap gate
+      // still REFUSES a first-sight recovery kit without it.
+      expectedSafetyNumber: $("sharing-share-safety").value.trim() || null,
     });
     // Persist the (possibly newly-pinned) store INSIDE the sealed container.
     await persistDevice({ ...device, pins: res.pins });
@@ -976,6 +982,29 @@ $("sharing-rotate").addEventListener("click", async () => {
     if (recipients.length === 0) {
       throw new Error("list every device id that KEEPS access (comma or space separated)");
     }
+    // ⭐ THE DROP LIST. rotateVaultKey REFUSES to delete an envelope its caller
+    // did not name, and this popup used to pass none — so any rotation that
+    // actually excluded somebody, which is the whole point of rotating, threw
+    // with no way through. "Remove every other device" resolves the list from
+    // the server so the destruction is still stated, just not retyped.
+    const drop = $("sharing-rotate-drop")
+      .value.split(/[\s,]+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+    if ($("sharing-rotate-drop-all").checked) {
+      for (const holder of await listKeyEnvelopes(wasm, auth, id)) {
+        if (!recipients.includes(holder.deviceId) && !drop.includes(holder.deviceId)) {
+          drop.push(holder.deviceId);
+        }
+      }
+    }
+    // "dev_x=12345 …" pairs, so a recovery kit among the recipients can be
+    // verified against its printed sheet before anything is wrapped.
+    const safetyNumbers = {};
+    for (const entry of $("sharing-rotate-safety").value.split(",")) {
+      const at = entry.indexOf("=");
+      if (at > 0) safetyNumbers[entry.slice(0, at).trim()] = entry.slice(at + 1).trim();
+    }
     const stored = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
     if (!stored) throw new Error("no sealed vault in this browser to rotate");
     say("Rotating the vault key and re-wrapping…");
@@ -985,6 +1014,8 @@ $("sharing-rotate").addEventListener("click", async () => {
       sealedVault: base64ToBytes(stored),
       oldVaultKey: key,
       params: ARGON2,
+      drop,
+      safetyNumbers,
     });
     await persistDevice({
       ...device,

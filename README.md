@@ -194,7 +194,11 @@ audited; see the status note below.)
   the opaque blob, its hash chain, and the zero-knowledge boundary are unchanged, and it
   adds no new dependency. **Dev-gated and off by default** (every device route returns
   `501` unless `SIGILD_ENABLE_DEV_OPS` is set), **UNAUDITED**, no session/JWT issuance, no
-  key rotation, no rate limiting on enrollment attempts, and a per-process replay cache.
+  device-key rotation, and a per-process replay cache. Enrollment and invite minting **can**
+  be rate limited (opt-in, `SIGILD_ENROLL_RATE_LIMIT` / `SIGILD_INVITE_RATE_LIMIT`) — but
+  behind a reverse proxy that is **one global bucket** that charges only failed attempts, so
+  it is a **backstop, not a defence**; real per-source limiting belongs at the edge
+  ([ADR 0041](docs/decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)).
   Do not expose it publicly or use it for real
   secrets. See [`docs/api.md`](docs/api.md) and
   [ADR 0031](docs/decisions/0031-multi-device-auth-model.md). Ships a distroless
@@ -212,8 +216,9 @@ audited; see the status note below.)
   rejected. New: `GET /v1/account` + three invite routes, `sigil account status | invite |
   invites | revoke-invite`, migration `0005_accounts.sql` (`sigild_schema_version` → `5`).
   Be clear about what it is **not**: an account is **auth metadata only — not an identity
-  system**. There is **no email, no password, and NO RECOVERY**: lose or revoke *every*
-  device in an account and the account, its vaults and its subscription are permanently
+  system**. There is **no email, no password and no operator break-glass**, and the only
+  recovery is a **paper kit you printed in advance** (below): lose or revoke *every* device
+  having printed nothing, and the account, its vaults and its subscription are permanently
   unreachable, by you and by us. Membership is **flat** (any member may invite, revoke
   every other member and run checkout) and **immutable** (no transfer, merge or deletion);
   membership grants **authorization, never decryption** (a joined device reads nothing
@@ -237,11 +242,16 @@ audited; see the status note below.)
   local fake server with fake credentials, and the **Juspay** scheme in
   particular is explicitly unverified against a real dashboard. A subscription
   now keys off the buying device's **account** (above) rather than the device —
-  but an account is **not an identity** (no email, no password, no recovery), and
-  every device enrolled before the account migration was adopted into its **own**
-  account, so an existing two-device setup has two billing subjects. There is no
-  entitlement enforcement, no fraud/chargeback/refund/tax handling, and no PCI
-  attestation.
+  but an account is **not an identity** (no email, no password, no operator
+  break-glass), and every device enrolled before the account migration was adopted
+  into its **own** account, so an existing two-device setup has two billing
+  subjects. Entitlement **enforcement** now exists but is **off by default** and
+  refuses **writes only** — ⭐ **reads and same-account key recovery are never
+  refused**, so a lapsed subscription can never lock you out of the 2FA codes you
+  already have ([ADR 0043](docs/decisions/0043-entitlement-enforcement.md)). There
+  is no fraud/chargeback/refund/tax handling and no PCI attestation, and there is
+  deliberately **no rate limiting on the webhook route** — the one built for it was
+  removed after it was shown to shed genuine, correctly-signed payment deliveries.
   **Nobody has been charged anything.** See
   [`docs/api.md`](docs/api.md#billing--subscriptions-dev-gated-opt-in--phase-45),
   [`docs/deployment.md`](docs/deployment.md) §13 and
@@ -321,7 +331,8 @@ audited; see the status note below.)
   ordinary `sigil device enroll --token <invite>`, so there is no join command and no
   `--account` flag anywhere.
   **Dev / localhost / plain HTTP, no TLS, UNAUDITED** — trust-on-first-write ownership
-  (by account), no identity layer, **no recovery**, no session issuance, no key rotation.
+  (by account), no identity layer, no session issuance, no device-key rotation, and
+  recovery only as a **paper kit printed in advance** (`sigil recovery generate`, below).
   The CLI is also the **reference client for sharing a vault between devices** (the
   webapp and the extension do the same thing from the browser) —
   `sigil device hybrid-publish` publishes this device's hybrid public key, `sigil
@@ -337,6 +348,20 @@ audited; see the status note below.)
   UNAUDITED**, and revoking a device cannot make it forget a key it already
   accepted — rotation only protects what is written afterwards (see the sharing note
   above).
+  **The CLI is also the only client that can print and use a RECOVERY KIT.**
+  `sigil recovery generate | cover | check | verify | restore | revoke` produces a
+  56-character code on paper whose device and hybrid keys are derived from 32 bytes of
+  local randomness — **never sent to the server, and not derivable from anything the
+  server holds** — so a customer who loses every device can still get their vaults back,
+  and we still cannot. The server gained **no concept of recovery**: a kit is an ordinary
+  member device. ⚠️ Be equally clear about the cost: **whoever holds that paper controls
+  the account** — read every covered vault, revoke every device, immediately and without
+  notification, with no OS lock or vault password in the way. It recovers **keys, not
+  data**, only for the vaults it was told to **cover**, and **it cannot be created after
+  the loss**. ⚠️ It is **CLI-only today** — the webapp, the extension and the desktop app
+  have **no recovery UI**, and since `restore` runs on a new install, a user whose only
+  client was a browser cannot restore there. See
+  [ADR 0042](docs/decisions/0042-recovery-kit.md).
   Standalone
   crate; **UNAUDITED** — the OTP math is RFC-vector-checked but the build is not
   audited; **do not store real 2FA secrets yet**. Public copy obeys

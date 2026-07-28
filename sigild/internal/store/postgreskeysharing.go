@@ -161,6 +161,42 @@ func (s *PostgresDeviceStore) ListKeyEnvelopeRecipients(ctx context.Context, vau
 	return out, nil
 }
 
+// ListKeyEnvelopesForRecipient returns METADATA for every envelope addressed to
+// one device, across all vaults, ordered by vault ID BYTE-WISE (COLLATE "C") so
+// the order matches Go's own string comparison on every database.
+//
+// It reads the index sigil_vault_key_envelopes_by_recipient created in migration
+// 0004 — which existed for exactly this query — so Phase 54 needed NO migration.
+// Like the per-vault listing it selects octet_length() rather than the blob, so
+// the ciphertext never leaves the database.
+func (s *PostgresDeviceStore) ListKeyEnvelopesForRecipient(ctx context.Context, recipientDeviceID string) ([]KeyEnvelopeMeta, error) {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	rows, err := s.pool.Query(ctx,
+		`SELECT vault_id, recipient_device_id, sender_device_id, octet_length(blob), created_at
+		   FROM sigil_vault_key_envelopes
+		  WHERE recipient_device_id = $1
+		  ORDER BY vault_id COLLATE "C"`, recipientDeviceID)
+	if err != nil {
+		return nil, fmt.Errorf("list key envelopes for recipient: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]KeyEnvelopeMeta, 0, 8)
+	for rows.Next() {
+		var m KeyEnvelopeMeta
+		if err := rows.Scan(&m.VaultID, &m.RecipientDeviceID, &m.SenderDeviceID, &m.SizeBytes, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("list key envelopes for recipient: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list key envelopes for recipient: %w", err)
+	}
+	return out, nil
+}
+
 // DeleteKeyEnvelope removes the (vault, recipient) mailbox, reporting
 // ErrKeyEnvelopeNotFound when no row matched so both backends agree.
 func (s *PostgresDeviceStore) DeleteKeyEnvelope(ctx context.Context, vaultID, recipientDeviceID string) error {

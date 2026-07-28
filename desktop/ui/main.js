@@ -451,12 +451,24 @@ $("share-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const id = vaultId();
   if (!id) return;
-  const fp = await call("share", {
+  const safety = $("share-safety").value.trim();
+  const r = await call("share", {
     vaultId: id,
     deviceId: $("share-device").value,
     permission: $("share-permission").value,
+    // Optional for an ordinary device; the wrap gate REQUIRES it for a recovery
+    // kit this device has never pinned, and refuses before anything is wrapped.
+    safetyNumber: safety === "" ? null : safety,
   });
-  toast(`shared ${id} (key sha256 ${fp}) — wrapped to that device, opaque to the server`);
+  showSafety(`${$("share-device").value.trim()}: ${r.safety_number}`);
+  toast(
+    r.needs_out_of_band_check
+      ? `shared ${id} (key sha256 ${r.fingerprint}) — but this was a FIRST SIGHT of that ` +
+          `device's key and nothing out of band confirmed it. Read the digits above back to ` +
+          `its owner over a channel the server does not control.`
+      : `shared ${id} (key sha256 ${r.fingerprint}) — ${r.trust}`,
+    r.needs_out_of_band_check
+  );
 });
 
 // ── Phase 50: safety numbers, the pin alarm, and rotation ──────────────────

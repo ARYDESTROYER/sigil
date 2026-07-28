@@ -581,6 +581,122 @@ key is ever printed, logged, or returned across a UI boundary.
   one and no client's container parser changes. Replacing it with a direct KDF is a
   future, format-breaking change.
 
+## Recovery kit — a printable paper key
+
+**Status (pre-audit, UNAUDITED, dev-gated).** A **recovery kit** is the answer to
+the failure the account model recorded and could not fix: lose every device and
+the account is unreachable, by us as well as by the customer. Every ordinary
+answer is unavailable here — there is no email to reset, no password to recover
+(losing it is one of the ways you get here), and a server that could restore a
+vault is a server that could read one. What is left is the oldest answer: **give
+the human the secret, on paper, before they need it**
+([ADR 0042](decisions/0042-recovery-kit.md)).
+
+⭐ **Cryptographically, a kit is not a new mechanism.** It is a **deterministic
+entropy source** feeding the *existing* key-generation primitives. Its device
+identity and its hybrid identity are ordinary ones; the server cannot tell it
+apart from a phone.
+
+### The printed encoding
+
+```
+seed  = 32 bytes from the client CSPRNG              ← printed; never transmitted
+check = SHA-256( "sigil-recovery-kit-v1\n" ‖ [version] ‖ seed )[0..2]
+body  = [version=0x01] ‖ seed(32) ‖ check(2)         = 35 bytes = 280 bits
+code  = crockford32(body)                            = 56 characters, NO PADDING
+sheet = code rendered as 7 groups of 8, hyphen-joined
+```
+
+- **280 bits divides by 5 exactly**, so there is no padding character and no
+  ambiguity about a partial final group.
+- **Crockford base32, not RFC 4648**, because a human reads this off paper: the
+  alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ` omits `I`, `L`, `O` and `U`, and
+  decoding folds `O`→`0` and `I`/`L`→`1`, case-insensitively.
+  ⚠️ **`U` is REJECTED, never folded** — Crockford excludes it, and folding it
+  would let two distinct strings decode to the same value.
+- Any non-alphanumeric character (hyphen, space, tab, newline) is stripped before
+  decoding, so the printed grouping is presentation only.
+- ⭐ **The decode order is part of the contract: length → alphabet → CHECKSUM →
+  version.** The checksum **covers the version byte** and is checked *before* the
+  version is interpreted, so a flipped version bit reports *"that is not a valid
+  recovery code — check for a mistyped character"* rather than *"unsupported
+  version"*. A person holding a paper sheet needs to be told to look at their
+  typing. Only a code whose checksum is **correct** for an unknown version yields
+  an unsupported-version error.
+- The two check bytes are an **integrity** check against transcription error, not
+  a security control: a 16-bit checksum catches the overwhelming majority of typos
+  offline, before any network call. **It is not a MAC.**
+
+⚠️ **This is a NEW codec** ([`../libsigil/core/src/recovery.rs`](../libsigil/core/src/recovery.rs)).
+It deliberately does **not** touch the RFC 4648 `base32_decode` used for TOTP
+secrets: that one must stay interoperable with every `otpauth://` producer in the
+world, and teaching it Crockford folding would be a compatibility change to an
+interoperability surface for the benefit of an unrelated feature.
+
+### The derivation
+
+```
+PRK = HKDF-Extract( salt = "sigil-recovery-kit-v1",  ikm = seed(32) )
+
+ed25519_seed      = HKDF-Expand( PRK, "sigil-recovery-kit-v1/ed25519-device-seed", 32 )
+x25519_secret     = HKDF-Expand( PRK, "sigil-recovery-kit-v1/x25519-secret",       32 )
+mlkem_keygen_seed = HKDF-Expand( PRK, "sigil-recovery-kit-v1/mlkem-keygen-seed",   64 )   // d ‖ z
+```
+
+(The HKDF **salt** has no trailing newline; the **checksum domain** above does.
+They are different strings on purpose.)
+
+Those three outputs feed the **existing, unchanged** deterministic primitives —
+`public_key_from_seed` (Ed25519), `x25519_public_key`, and `ml_kem768_keygen`
+(FIPS 203, over the 64-byte `d ‖ z` seed). So the kit ends up holding exactly the
+same two identities every other device holds: an Ed25519 device key for contract-v3
+request signing, and a hybrid (X25519 + ML-KEM-768) identity for receiving wrapped
+vault keys.
+
+- ⭐ **This is [ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md) paying
+  off.** Because `sigil-core` reads **no RNG and no clock** and every keygen takes
+  caller-supplied entropy, a paper secret is *just another entropy source*.
+  **Nothing in the core changed to accommodate recovery.**
+- **HKDF, deliberately NOT Argon2id.** Argon2id exists to make a *low-entropy
+  human secret* expensive to guess. There is no password here — the input is 256
+  bits of CSPRNG, already uniform. The only requirement is **domain separation**,
+  which HKDF provides. A memory-hard KDF would add cost and a parameter-drift
+  hazard while buying nothing.
+- **No new dependency**: `hkdf` and `sha2` were already direct dependencies of
+  `sigil-core`, so the core stays wasm-pure and RNG-free and both `Cargo.lock`s
+  stay `getrandom`-free.
+- The derived-key struct's `Debug` prints exactly `RecoveryKeys { <redacted> }`, so
+  a stray `{:?}` cannot leak it.
+
+The construction is **MIRRORED — NOT SHARED** across the two client
+implementations this repo already maintains: `cli/src/lib.rs` (used by the CLI
+*and* the native desktop app) and
+[`../sigil-wasm/recovery.mjs`](../sigil-wasm/recovery.mjs) (used by the browser
+surfaces), with the **same known-answer vector on both sides** and a Node
+cross-tool test. The wasm bindings add **no cryptography and no codec** — the
+`recovery_*` exports are thin shells over `sigil-core`.
+
+### What this does and does not give you
+
+- **The server never sees the secret**, cannot derive it, and holds no record that
+  a kit is anything other than a device. Adversary classes 4 and 5 in
+  [`threat-model.md`](threat-model.md) are unchanged.
+- **Wrapping a vault key TO a kit goes through the same pinned-fetch choke point
+  as every other wrap** ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)),
+  with one extra rule: a **first-sight** wrap to a device the client believes is a
+  kit is **refused** unless the caller supplies the safety number — which is
+  **printed on the sheet**, so for once the out-of-band channel is in the same
+  hand as the code. A key **derived locally** from the recovery secret is never
+  fetched at all, so there is nothing for a server to substitute.
+- ⚠️ **Whoever holds the paper holds the account.** There is no OS lock, no
+  biometric and **no vault password** in front of those 56 characters. It is
+  **stronger than a stolen locked phone**.
+- ⚠️ **It recovers KEYS, not DATA**, only for the vaults it was told to **cover**,
+  and **it cannot be created after the loss**.
+- ⚠️ **UNAUDITED**, like everything around it. The codec and the derivation are new
+  code. Full adversary treatment in
+  [`threat-model.md`](threat-model.md#recovery-kit-adversaries-dev-gated--see-adr-0042).
+
 ## HOTP / TOTP one-time-password primitive (`hotp` / `totp`)
 
 **Status (pre-audit, UNAUDITED).** `sigil-core` now implements the **authenticator

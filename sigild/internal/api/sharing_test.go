@@ -641,3 +641,251 @@ func TestKeyEnvelopeListDoesNotClaimUnownedVault(t *testing.T) {
 	// A is still not authorized on B's vault.
 	assertForbidden(t, v3Get(t, env.deviceEnv, env.devA, listPath))
 }
+
+// ---------------------------------------------------------------------------
+// Recovery support (Phase 54): GET /v1/devices/{deviceID}/keys — the per-DEVICE
+// envelope index a restored recovery kit uses to discover what it can decrypt.
+// ---------------------------------------------------------------------------
+
+// recipientIndex is the JSON shape of the per-device index route.
+type recipientIndex struct {
+	DeviceID string `json:"device_id"`
+	Vaults   []struct {
+		VaultID        string `json:"vaultID"`
+		SenderDeviceID string `json:"sender_device_id"`
+		SizeBytes      int    `json:"size_bytes"`
+		CreatedAt      string `json:"created_at"`
+	} `json:"vaults"`
+	HasMore bool `json:"has_more"`
+}
+
+// failingKeySharing wraps a DeviceStore and FAILS THE TEST if the envelope index
+// is read. It is how the "checked before any store read" claim is proven rather
+// than asserted: a handler that reached the store would trip it.
+type failingKeySharing struct {
+	store.DeviceStore
+	t *testing.T
+}
+
+func (f failingKeySharing) ListKeyEnvelopesForRecipient(ctx context.Context, recipientDeviceID string) ([]store.KeyEnvelopeMeta, error) {
+	f.t.Fatalf("the index handler read the store for %q; the self-only check must come FIRST", recipientDeviceID)
+	return nil, nil
+}
+
+// TestDeviceKeyEnvelopeIndexIsSelfOnly: a device sees what is addressed to IT,
+// and asking for another device's index is 403 — decided BEFORE the store is
+// touched, proven by a store double that fails the test if it is called.
+func TestDeviceKeyEnvelopeIndexIsSelfOnly(t *testing.T) {
+	devices := store.NewMemDeviceStore()
+	hashes := []string{EnrollTokenHash(testEnrollToken), EnrollTokenHash(testEnrollToken + "-b")}
+	for _, h := range hashes {
+		if err := devices.RegisterEnrollmentToken(context.Background(), h, time.Now().UTC(), time.Time{}); err != nil {
+			t.Fatalf("RegisterEnrollmentToken: %v", err)
+		}
+	}
+	router := NewRouter(Config{
+		Version:           "test",
+		Logger:            discardLogger(),
+		DevOpsEnabled:     true,
+		Devices:           failingKeySharing{DeviceStore: devices, t: t},
+		EnrollTokenHashes: hashes,
+		AdminToken:        testAdminToken,
+	})
+	env := &deviceEnv{router: router, devices: devices}
+	devA := enrollDevice(t, env, testEnrollToken, "A")
+	devB := enrollDevice(t, env, testEnrollToken+"-b", "B")
+
+	// A asking for B's index: 403 forbidden, with the coarse body and no store
+	// read (failingKeySharing would have failed the test).
+	assertForbidden(t, v3Get(t, env, devA, "/v1/devices/"+devB.ID+"/keys"))
+	// Even a device id that does not exist: still 403, never 404 — no oracle.
+	assertForbidden(t, v3Get(t, env, devA, "/v1/devices/dev_doesnotexist/keys"))
+
+	// Unsigned: 401 with the coarse body, not 403.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/devices/"+devA.ID+"/keys", nil))
+	assertUnauthorized(t, rec)
+}
+
+// TestDeviceKeyEnvelopeIndexListsOwnEnvelopes: the happy path — B learns which
+// vaults hold a wrapped key for it WITHOUT knowing any vault id in advance, and
+// the response carries no ciphertext.
+func TestDeviceKeyEnvelopeIndexListsOwnEnvelopes(t *testing.T) {
+	env := newShareEnv(t)
+	blob := randBytes(t, 1226)
+
+	// A claims the vault by depositing B's envelope, then grants B read.
+	if rec := v3Put(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID), blob); rec.Code != http.StatusCreated {
+		t.Fatalf("put status = %d, want 201", rec.Code)
+	}
+	grantBody, _ := json.Marshal(grantRequest{DeviceID: env.devB.ID, Permission: "read"})
+	if rec := v3Post(t, env.deviceEnv, env.devA, "/v1/vaults/"+env.vault+"/grants", grantBody); rec.Code != http.StatusCreated {
+		t.Fatalf("grant status = %d, want 201", rec.Code)
+	}
+
+	rec := v3Get(t, env.deviceEnv, env.devB, "/v1/devices/"+env.devB.ID+"/keys")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got recipientIndex
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.DeviceID != env.devB.ID {
+		t.Fatalf("device_id = %q, want %q", got.DeviceID, env.devB.ID)
+	}
+	if len(got.Vaults) != 1 || got.Vaults[0].VaultID != env.vault {
+		t.Fatalf("vaults = %+v, want just %q", got.Vaults, env.vault)
+	}
+	if got.Vaults[0].SizeBytes != len(blob) || got.Vaults[0].SenderDeviceID != env.devA.ID {
+		t.Fatalf("row = %+v, want size %d from %s", got.Vaults[0], len(blob), env.devA.ID)
+	}
+	if got.HasMore {
+		t.Fatal("has_more = true for a single row")
+	}
+
+	// ⭐ NO BLOB, two ways: neither the raw bytes nor their base64 appear.
+	if bytes.Contains(rec.Body.Bytes(), blob[:32]) {
+		t.Fatal("the index leaked raw envelope bytes")
+	}
+	if strings.Contains(rec.Body.String(), base64.StdEncoding.EncodeToString(blob)) {
+		t.Fatal("the index leaked base64 envelope bytes")
+	}
+
+	// A device that was never an addressee sees an EMPTY list — "nothing to
+	// recover", not an error.
+	devC := enrollDevice(t, env.deviceEnv, testEnrollToken+"-c", "C")
+	rec = v3Get(t, env.deviceEnv, devC, "/v1/devices/"+devC.ID+"/keys")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty index status = %d, want 200", rec.Code)
+	}
+	var empty recipientIndex
+	if err := json.Unmarshal(rec.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(empty.Vaults) != 0 {
+		t.Fatalf("index for a never-covered device = %+v, want empty", empty.Vaults)
+	}
+}
+
+// TestDeviceKeyEnvelopeIndexFiltersUnauthorizedVaults: an envelope for a vault
+// the caller does NOT hold read on is filtered out — and listing never CLAIMS an
+// unowned vault (the Phase 51 rule, preserved).
+func TestDeviceKeyEnvelopeIndexFiltersUnauthorizedVaults(t *testing.T) {
+	env := newShareEnv(t)
+
+	// A claims and covers "vaultShared" for B, but grants B NOTHING.
+	if rec := v3Put(t, env.deviceEnv, env.devA, env.keyPath(env.devB.ID), randBytes(t, 300)); rec.Code != http.StatusCreated {
+		t.Fatalf("put status = %d, want 201", rec.Code)
+	}
+	// Plus an envelope in a SECOND, never-claimed vault — deposited straight
+	// into the store so no claim happens through the API.
+	unowned := "vaultNobodyOwns"
+	if err := env.devices.PutKeyEnvelope(context.Background(), store.KeyEnvelope{
+		VaultID:           unowned,
+		RecipientDeviceID: env.devB.ID,
+		SenderDeviceID:    env.devA.ID,
+		Blob:              randBytes(t, 200),
+		CreatedAt:         time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed envelope: %v", err)
+	}
+
+	rec := v3Get(t, env.deviceEnv, env.devB, "/v1/devices/"+env.devB.ID+"/keys")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got recipientIndex
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Vaults) != 0 {
+		t.Fatalf("index = %+v, want empty: B holds read on neither vault", got.Vaults)
+	}
+
+	// ⭐ needRead NEVER CLAIMS: the unowned vault is still unowned, proven by A
+	// being able to claim it now with a genuine write.
+	if rec := v3Put(t, env.deviceEnv, env.devA, "/v1/vaults/"+unowned+"/keys/"+env.devB.ID, randBytes(t, 128)); rec.Code != http.StatusCreated {
+		t.Fatalf("claim after index = %d, want 201; the index must not have claimed the vault", rec.Code)
+	}
+
+	// Once A grants B read, the row appears.
+	grantBody, _ := json.Marshal(grantRequest{DeviceID: env.devB.ID, Permission: "read"})
+	if rec := v3Post(t, env.deviceEnv, env.devA, "/v1/vaults/"+unowned+"/grants", grantBody); rec.Code != http.StatusCreated {
+		t.Fatalf("grant status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+	rec = v3Get(t, env.deviceEnv, env.devB, "/v1/devices/"+env.devB.ID+"/keys")
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Vaults) != 1 || got.Vaults[0].VaultID != unowned {
+		t.Fatalf("index after grant = %+v, want just %q", got.Vaults, unowned)
+	}
+}
+
+// TestDeviceKeyEnvelopeIndexAuditHasNoBlobFingerprint: the audit line names the
+// device and a count, and — because the route never reads a blob — carries no
+// blob_sha256 and no key/nonce/signature material.
+func TestDeviceKeyEnvelopeIndexAuditHasNoBlobFingerprint(t *testing.T) {
+	var logs bytes.Buffer
+	devices := store.NewMemDeviceStore()
+	hashes := []string{EnrollTokenHash(testEnrollToken), EnrollTokenHash(testEnrollToken + "-b")}
+	for _, h := range hashes {
+		if err := devices.RegisterEnrollmentToken(context.Background(), h, time.Now().UTC(), time.Time{}); err != nil {
+			t.Fatalf("RegisterEnrollmentToken: %v", err)
+		}
+	}
+	router := NewRouter(Config{
+		Version:           "test",
+		Logger:            slog.New(slog.NewJSONHandler(&logs, nil)),
+		DevOpsEnabled:     true,
+		Devices:           devices,
+		EnrollTokenHashes: hashes,
+		AdminToken:        testAdminToken,
+	})
+	env := &deviceEnv{router: router, devices: devices}
+	devA := enrollDevice(t, env, testEnrollToken, "A")
+	devB := enrollDevice(t, env, testEnrollToken+"-b", "B")
+
+	blob := []byte("SUPERSECRETWRAPPEDVAULTKEY-INDEX")
+	if rec := v3Put(t, env, devA, "/v1/vaults/vaultIdx/keys/"+devB.ID, blob); rec.Code != http.StatusCreated {
+		t.Fatalf("put status = %d, want 201", rec.Code)
+	}
+	// Isolate the index event's own log output.
+	logs.Reset()
+	if rec := v3Get(t, env, devA, "/v1/devices/"+devA.ID+"/keys"); rec.Code != http.StatusOK {
+		t.Fatalf("index status = %d, want 200", rec.Code)
+	}
+
+	text := logs.String()
+	if !strings.Contains(text, "device.key_envelope_index") {
+		t.Fatalf("audit log is missing device.key_envelope_index: %s", text)
+	}
+	if !strings.Contains(text, "returned_count") {
+		t.Fatalf("audit log is missing returned_count: %s", text)
+	}
+	if strings.Contains(text, "blob_sha256") {
+		t.Fatal("the index audit line carries a blob fingerprint; the route reads no blob")
+	}
+	for _, forbidden := range []string{"signature", "nonce", "x25519", "mlkem", "SUPERSECRET"} {
+		if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
+			t.Fatalf("the index audit line contains %q: %s", forbidden, text)
+		}
+	}
+}
+
+// TestDeviceKeyEnvelopeIndexIsDevGated: with the device model off the route
+// returns the deliberate 501 — never a 404.
+func TestDeviceKeyEnvelopeIndexIsDevGated(t *testing.T) {
+	for _, cfg := range []Config{
+		{Version: "test", Logger: discardLogger()},
+		{Version: "test", Logger: discardLogger(), DevOpsEnabled: true},
+	} {
+		router := NewRouter(cfg)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/devices/dev_x/keys", nil))
+		if rec.Code != http.StatusNotImplemented {
+			t.Fatalf("GET /v1/devices/dev_x/keys = %d, want 501 (body: %s)", rec.Code, rec.Body.String())
+		}
+	}
+}

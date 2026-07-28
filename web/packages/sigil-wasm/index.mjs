@@ -63,3 +63,11 @@ export * from "../../../sigil-wasm/device-auth.mjs";
 // sigil-wasm/test/sharing-interop.mjs, which proves it BOTH ways against the real
 // `sigil` CLI through a live server.
 export * from "../../../sigil-wasm/sharing.mjs";
+// THE RECOVERY KIT (Phase 54): a paper credential that is an ordinary member
+// device. Same source as sigil-wasm/test/recovery-interop.mjs, which proves it
+// BOTH ways against the real `sigil` CLI through a live server.
+//
+// ⚠️ A recovery code and every seed derived from it are SECRETS. A UI must
+// render a code ONCE and never write it to localStorage, a URL, an analytics
+// event or a log line.
+export * from "../../../sigil-wasm/recovery.mjs";

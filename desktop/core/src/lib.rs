@@ -148,6 +148,24 @@ pub enum DesktopError {
         /// The safety number of the key the server just presented.
         presented_safety_number: String,
     },
+    /// ⛔ The recipient's hybrid public key could NOT be verified, so nothing was
+    /// wrapped (Phase 53-55 fix round).
+    ///
+    /// Two causes, both hard stops: the recipient is a RECOVERY KIT this device
+    /// has never pinned and no safety number was supplied to check the server's
+    /// answer against, or a supplied safety number did not match. A recovery kit
+    /// is the one credential that reconstructs a whole account, and its safety
+    /// number is printed on the sheet — so trusting the registry instead is not
+    /// an option the UI offers.
+    KeyUnverified {
+        /// The device the wrap was aimed at.
+        device_id: String,
+        /// The safety number the server is presenting right now, to compare
+        /// against the sheet.
+        presented_safety_number: String,
+        /// A human explanation. Never key material.
+        detail: String,
+    },
     /// Any other non-2xx status from the server.
     Server {
         /// The HTTP status code.
@@ -203,6 +221,7 @@ impl std::fmt::Display for DesktopError {
                  uploaded. Confirm the presented safety number with that device's owner over a \
                  TRUSTED out-of-band channel, then re-pin deliberately."
             ),
+            DesktopError::KeyUnverified { detail, .. } => write!(f, "{detail}"),
             DesktopError::Server { message, .. } => write!(f, "{message}"),
         }
     }

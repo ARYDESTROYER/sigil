@@ -21,7 +21,7 @@ defense, and the layer the defense lives at.
 | 9 | Compromised OS reading memory | Reads memory between apps | Master key in mlock'd pages; secure enclave where available; minimal in-memory residence; wipe on lock | OS / hardware |
 | 10 | Browser malware | Reads extension state | Extension storage encrypted under master-password-derived key; user-initiated actions only; clipboard cleared after 3s; HTTPS enforced | Extension hardening |
 | 11 | Push-notification operator | Reads push payloads | Payloads carry only opaque vault ID + wake hint; approval blobs decryptable only by the user's other devices | Architecture |
-| 12 | Lost master password | User locked out | Recovery kit (12-word seed), recovery delegates (delay, default 7d), platform-passkey-bound recovery — none let Sigil decrypt unilaterally | Workflow |
+| 12 | Lost master password / lost every device | User locked out | ⚠️ **What ships is a printed 56-character recovery kit and NOTHING ELSE** ([ADR 0042](decisions/0042-recovery-kit.md), [Recovery kit](#recovery-kit-adversaries-dev-gated--see-adr-0042) below). It confers **IMMEDIATE, un-delayed, un-notified, full account takeover** to whoever holds the paper. There is **no recovery delegate**, **no delay window**, **no notification**, **no veto**, and **no passkey-bound recovery** — do not read this row as if there were. It does keep the property that **Sigil cannot decrypt unilaterally**, because the secret never reaches the server; and it must be **printed in advance** or it does not exist | Workflow + client |
 
 **Server-stores-opaque-blobs property.** Even where `sigild` does hold data, it
 holds **only opaque client-encrypted blobs** — never plaintext and never keys.
@@ -57,6 +57,7 @@ production security claim.
 | F | **Malicious enrolled device** | Successfully enrolled; now wants other users' vaults | **Per-vault authorization**: every ops route requires a grant (`write` for append, `read` for list/verify, **ownership** to grant others). A device with no grant gets **`403`**, distinct from `401`. Device IDs are **server-assigned** (128 bits of `crypto/rand`), so an ID cannot be squatted or guessed | `sigild` authorization |
 | G | **Revoked device** | Holds a still-valid private key after being revoked | Revocation is checked **before** signature verification, so a revoked device is refused on its **very next request** regardless of how well it signs. The record is retained (not deleted) so the audit trail stays explainable; revocation is idempotent | `sigild` request auth |
 | H | **Auth prober / oracle-hunter** | Probes to learn *which* check failed, to enumerate devices or tokens | The response body is deliberately **coarse** — `{"error":"unauthorized"}` or `{"error":"forbidden"}` — for **every** credential failure; the typed reason enum goes **only** to the server-side audit log and the per-reason metric. `/metrics` is count-only and carries **no device or vault ID label** (an ID label would let a scrape enumerate the registry). A registry fault is `500`, so infrastructure trouble is never read as a credential verdict | `sigild` API surface |
+| I2 | **Enrollment flood / token-guessing volume** (Phase 53) | Sends unauthenticated enrollment attempts as fast as it can, hoping to guess a token or to exhaust the server | ⚠️ **Bounded only weakly, and only if configured.** With `SIGILD_ENROLL_RATE_LIMIT` set, a **failed** attempt consumes a token from a bucket keyed on the **socket peer address** (IPv4 full address, IPv6 **/64 prefix**) and an empty bucket answers `429` + `Retry-After`. ⚠️ **It is a BACKSTOP, not a defence:** behind the reverse proxy this repo documents it is **one global bucket**, `X-Forwarded-For` is deliberately ignored (it is attacker-supplied text, and keying on it would let one client mint unlimited buckets), and it **fails open** at its 10,000-key cap rather than refusing everyone. It charges **only on the denial path**, so **a valid, unspent credential with a valid proof can never be refused by it** — an earlier revision rejected before the handler and was reproduced **denying a legitimate customer**, i.e. a global account-creation off switch. ⚠️ **It also does not reduce load**: the handler always runs. The real guessing bound remains the ≥ 16-character token minimum, the constant-time digest comparison, and the mandatory proof of possession. **Per-source limiting belongs at the edge and is not configured in `deploy/`** ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)) | `sigild` (backstop) + edge |
 | I | **Compromised admin token** | Holds `SIGILD_ADMIN_TOKEN` | **Not defended beyond the token itself.** The holder can list devices and revoke **any** device (denial of service against every device). It is compared in constant time, never logged or exported, and must be ≥ 16 chars; with it **unset**, the operator routes are permanently `401` — there is **no implicit open-admin mode**. But there is **no rotation, no second factor, and no scoping**. It cannot read or decrypt a vault: it grants no read access to op-log contents and the blobs stay opaque either way |  Operational |
 
 **What this surface does NOT defend (be explicit):**
@@ -73,23 +74,40 @@ production security claim.
 - **~~No ownership transfer — revoking a vault's owner ORPHANS the vault.~~**
   ⚠️ **Retired at the device level by Phase 52.** Ownership belongs to an
   **account**, so every sibling device inherits it: revoking the device that
-  claimed a vault no longer strands it. **The failure was narrowed, not
+  claimed a vault no longer strands it. **The failure was narrowed twice, not
   eliminated** — lose or revoke *every* device in an account and the account, its
-  vaults and its subscription are permanently unreachable, with **no recovery of
-  any kind**. Ownership still never transfers *between accounts*.
-- **No rate limiting on enrollment attempts.** The per-vault op-log rate limiter
-  does not cover `POST /v1/devices/enroll`, so token guessing is bounded only by
-  the ≥ 16-character minimum and the constant-time digest comparison.
+  vaults and its subscription are permanently unreachable **unless a recovery kit
+  was printed in advance** ([below](#recovery-kit-adversaries-dev-gated--see-adr-0042));
+  a kit **cannot be created after the loss**. Ownership still never transfers
+  *between accounts*.
+- **~~No rate limiting on enrollment attempts.~~** ⚠️ **Partly addressed by Phase
+  53 ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)),
+  and the caveats matter more than the feature.** `POST /v1/devices/enroll` can be
+  bounded by an **opt-in** token bucket keyed on the **socket peer address**
+  (`SIGILD_ENROLL_RATE_LIMIT`), returning `429` + `Retry-After`. But it is a
+  **BACKSTOP, not a defence**: behind the reverse proxy this repo documents, every
+  request arrives from one address and it degrades to a **single global bucket**
+  — which is why it charges the bucket **only on the denial path** (so a valid,
+  unspent credential with a valid proof can never be refused by it) and **fails
+  open** at its key cap. It also **does not reduce load** — the handler always
+  runs. Token guessing is still bounded chiefly by the ≥ 16-character minimum and
+  the constant-time digest comparison. **Real per-source limiting belongs at the
+  edge, and is not configured anywhere in `deploy/`.**
 - **The replay cache is per-process and in-memory.** A multi-instance deployment
   needs a shared store (e.g. Redis), or a captured request replayed against a
   *different* instance would pass.
 - **A token is single-ATTEMPT, not single-SUCCESS.** It is spent before the
   device row is created, so a failed enrollment burns it (fail-closed by design;
   the operator must issue a new one).
-- **No key rotation, re-enrollment, or recovery**, no hardware attestation, and
-  no session/JWT layer. Since Phase 52 there **is** an account layer — but it is
-  auth metadata only, with **no identity and no recovery** (see
-  [Account boundary](#account-boundary-dev-gated--see-adr-0040)). The in-memory
+- **No key rotation, no re-enrollment flow**, no hardware attestation, and no
+  session/JWT layer. Since Phase 52 there **is** an account layer — auth metadata
+  only, with **no identity system** (see
+  [Account boundary](#account-boundary-dev-gated--see-adr-0040)) — and since
+  Phase 54 there **is** a **recovery kit**, but only as a **paper key printed in
+  advance**, not as a reset or a break-glass
+  ([below](#recovery-kit-adversaries-dev-gated--see-adr-0042)). Vault **key**
+  rotation has existed since Phase 50 (`sigil vault rotate`); what is still
+  missing is rotation of a **device identity**. The in-memory
   registry is **non-durable** — a spent token becomes reusable after a restart
   (warned loudly at boot), and the file backend was not extended.
 - **Plain HTTP in dev.** Nothing here substitutes for transport security.
@@ -332,8 +350,10 @@ non-adversarial operator's storage faults.
 Phase 52 made an **account** — not a device — the subject of **entitlement** and
 the **owner of vaults**. An account is a **server-assigned id on the device row**;
 a **single-use invite** minted by a member device is the only way a second device
-joins. It is **auth metadata only**: no email, no password, no session, no PII,
-no key material, and **no recovery**.
+joins. It is **auth metadata only**: no email, no password, no session, no PII
+and no key material. It is **not an identity system**, and the only recovery is a
+**paper kit printed in advance**
+([below](#recovery-kit-adversaries-dev-gated--see-adr-0042)).
 
 **The invariant that shapes this boundary:** ⭐ **no request anywhere names an
 account.** Every handler derives it from `dev.AccountID` on the device row of the
@@ -359,15 +379,18 @@ grants ciphertext access, never plaintext**.
 
 **What this boundary does NOT defend (be explicit):**
 
-- ⚠️ **THERE IS NO RECOVERY, AND THIS IS NOT AN IDENTITY SYSTEM.** No email, no
-  password, no recovery code, no operator break-glass. An account is reachable
-  only through a member device's private key. **Lose or revoke every device and
-  the account is permanently unreachable, its vaults permanently unreadable by
-  the customer AND by us, and its subscription stranded.** Compared with the
-  device model this **narrowed** the orphan failure (from "revoke one device" to
-  "lose every device"); it did **not eliminate** it. The guidance — *keep two
-  devices enrolled* — is a **mitigation, not a fix**, and it must be written down
-  before anyone charges real money.
+- ⚠️ **THIS IS STILL NOT AN IDENTITY SYSTEM, AND RECOVERY EXISTS ONLY IF IT WAS
+  PRINTED IN ADVANCE.** No email, no password, no operator break-glass. An account
+  is reachable only through a member device's private key — or through a **printed
+  recovery kit**, which is itself just such a key on paper
+  ([below](#recovery-kit-adversaries-dev-gated--see-adr-0042)). **Lose or revoke
+  every device WITHOUT having printed a kit and the account is permanently
+  unreachable, its vaults permanently unreadable by the customer AND by us, and
+  its subscription stranded** — and **a kit cannot be created after the loss**.
+  Compared with the device model this **narrowed** the orphan failure twice (from
+  "revoke one device" to "lose every device" to "lose every device having printed
+  nothing"); it did **not eliminate** it. *Keep two devices enrolled, and print a
+  kit* is guidance, not a guarantee.
 - **Trust-on-first-write did not go away; it moved up one level.** The first
   *account* to write an unclaimed, high-entropy vault id owns it, and an attacker
   who gets there first still locks the legitimate owner out with a `403`.
@@ -378,14 +401,24 @@ grants ciphertext access, never plaintext**.
   `0005` was adopted into its **own singleton account**, so an existing two-device
   customer has **two accounts and two billing subjects**; the remedy is manual and
   leaves a second subscription row for an operator to reconcile.
-- **Entitlement is reported, never enforced** — no route refuses service to an
-  unentitled account — and **the billing trust assumption's blast radius grew with
-  the subject**: a compromised provider webhook secret now moves an *account's*
-  status rather than one device's.
-- **No rate limiting** on `POST /v1/devices/enroll` or
-  `POST /v1/account/invites`. The device and invite caps bound stored **state**,
-  not request volume, and there is no sweep job for expired invites.
-  `SIGILD_ACCOUNT_MAX_DEVICES` is **anti-freeloading, not anti-fraud**.
+- **Entitlement CAN now be enforced, opt-in and on WRITES ONLY**
+  ([ADR 0043](decisions/0043-entitlement-enforcement.md)): past a grace period a
+  lapsed account's new op-log writes and its cross-account key deposits answer
+  `402`. ⭐ **Reads and same-account key recovery are never refused**, so a lapsed
+  customer keeps every 2FA code they hold and can still key a replacement device
+  or print a recovery kit. With `SIGILD_ENTITLEMENT_ENFORCE` unset (the default)
+  nothing is enforced at all. ⚠️ **The billing trust assumption's blast radius grew
+  again**: a compromised provider webhook secret now moves an *account's* status,
+  and with enforcement on, its **service**.
+- **Rate limiting is opt-in and is a BACKSTOP.** `POST /v1/devices/enroll` (per
+  source address) and `POST /v1/account/invites` (per account) can be bounded
+  ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)),
+  but behind a reverse proxy the enrollment bucket is **global**, only **failed**
+  attempts are charged, the handler still runs, and the invite limiter sits
+  **after** authentication so it does not make an unauthenticated flood cheaper.
+  The device and invite caps bound stored **state**, not request volume, and there
+  is still **no sweep job for expired invites**. `SIGILD_ACCOUNT_MAX_DEVICES` is
+  **anti-freeloading, not anti-fraud** — and a **recovery kit consumes a seat**.
 - **`/metrics` remains always-on and unauthenticated**, and its per-reason
   counters are a weak correlatable oracle (pre-existing). This surface
   deliberately does **not** widen it.
@@ -525,6 +558,57 @@ the browsers; `0600` plaintext key files on the desktop.
 - **Plain HTTP in dev.** Signing proves who sent a request; it is not transport
   security.
 
+## Recovery kit adversaries (dev-gated — see [ADR 0042](decisions/0042-recovery-kit.md))
+
+Phase 54 addressed the **data** half of the account model's worst limitation: a
+**recovery kit** is an **ordinary member device** whose Ed25519 and hybrid private
+keys are HKDF-SHA256 derivations of 32 bytes of client CSPRNG **printed on paper**
+— never transmitted, never stored on a device, never derivable from anything the
+server holds.
+
+⭐ **`sigild` gained no concept of "recovery"**: no table, no migration
+(`sigild_schema_version` stays **5**), no new auth path. It sees one more device
+row, one more hybrid **public** key, and one more opaque ~1226-byte envelope per
+covered vault — shapes it already relayed. So **adversary classes 4 and 5 are
+unchanged**: the server still cannot decrypt anything, and it holds nothing that
+would help someone forge or recover a kit.
+
+**The new capabilities are entirely off-server**, and one of them is severe.
+
+| # | Adversary | Capability | Defense as implemented | Layer |
+| --- | --- | --- | --- | --- |
+| AE | ⚠️ **Whoever holds the printed sheet** | Has 56 characters on paper — from a drawer, a photo, a filing cabinet, a bin, an estate | ⚠️ **Essentially none, by construction.** The sheet **IS** the credential: it confers **immediate, un-delayed, un-notified, full account control** — read every **covered** vault and **revoke every device**. It is **stronger than a stolen locked phone**: there is no OS lock, no biometric and **no vault password** in front of it, and its nominal `read` grant is **cosmetic** because account ownership authorizes it anyway. What exists is a **checksum** (a mistyped code is refused offline, not silently wrong), **`sigil recovery revoke`** (which bites on the kit's very next request), the fact that it opens **only the vaults it was told to cover**, and **audit visibility** (its use looks like an ordinary device's). The real control is **physical**: treat the sheet as the account | Physical / operational |
+| AF | **A server that lies about device labels** | Owns the registry; renames or hides the `"recovery-kit"` label in `GET /v1/account` so a wrap to a kit is not recognised as one | ⚠️ **Partially defended, and this is the phase's stated residual.** Recognising a recipient *as a kit* resolves the **label** from a listing the adversary serves, so a lying server **degrades `vault share` / `vault rotate` to a kit back to ordinary first-sight TOFU (warned and pinned) rather than a refusal**. What it **cannot** do: the caller-**asserted** paths (`sigil recovery cover`, `sigil recovery generate`) do not consult the server at all, and **no path anywhere accepts a CHANGED key or a mismatched safety number** — the pin check and the supplied-safety-number check are independent of the label. The honest claim is therefore **"refuses first-sight kit wraps against a server that does not lie about labels"**, *not* "refuses first-sight kit wraps". A verifier judged this consistent with [ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)'s already-accepted TOFU-on-first-contact limit | Client-side trust store |
+| AG | **Key-substituting server, aiming at the kit** | Answers the kit's `GET /v1/devices/{kitID}/hybrid-key` with **its own** key, so the vault key is wrapped to the server instead of to the paper | **Blocked on the paths that matter, by the same choke point as every other wrap** — and hardened in this phase: the pinned fetch is now reached only through `verify_recipient_for_wrap`, which returns a **`VerifiedRecipient`** whose fields are private and which has **no other constructor**, so a wrap **cannot compile** without passing the gate. A **first-sight** wrap to a device known to be a kit is **REFUSED** (`UnverifiedRecoveryKit`) unless the caller supplies the safety number — and ⭐ **the kit's safety number is printed on its own sheet**, so the out-of-band channel is in the same hand as the code. A key **derived** locally from the recovery secret is never fetched at all (`Derived`). ⚠️ Reaching this rule depends on adversary **AF** above | Client-side trust store + printed sheet |
+| AH | **Kit prober / enumerator** | Steals or guesses a kit's device id and asks what it can reach | `GET /v1/devices/{deviceID}/keys` is **self-only**, checked **before any store read**: a mismatched id is **`403`**, and an **unknown** device id is the **same coarse `403`, never `404`** — no existence oracle. It returns **metadata only, never a blob** (Postgres selects `octet_length(blob)`), and each row is additionally filtered by the ordinary `read` authorization. Collecting an envelope still requires the kit's **private** key, which exists only on paper | `sigild` authorization |
+
+**What the recovery kit does NOT defend (be explicit):**
+
+- ⚠️ **It recovers KEYS, not DATA.** A vault that was never synced to the server is
+  gone; a kit can unwrap a key for ciphertext that exists, not conjure ciphertext
+  that does not.
+- ⚠️ **It only opens the vaults it was told to COVER**, as of the print date. A
+  vault created later needs `sigil recovery cover`, and nothing reminds anyone.
+- ⚠️ **A kit cannot be created after the loss.** It is print-it-before-you-need-it,
+  with the same failure mode as every backup.
+- ⚠️ **A kit consumes a seat** against `SIGILD_ACCOUNT_MAX_DEVICES`, is listed in
+  `GET /v1/account`, and **any member may revoke it** — membership is flat.
+- ⚠️ **Revoking a kit cannot un-learn** what it already unwrapped; the remediation
+  is `vault rotate`, which protects **future content only** and will **refuse** to
+  silently drop a kit from a vault's recipient set.
+- ⚠️ **No zeroization** of the decoded secret or the derived keys, on any client.
+- ⚠️ **`--code` still puts the secret in `argv`** (and shell history). It is warned
+  about on stderr, not removed, because scripts need it; the prompt and
+  `--code-stdin` paths avoid it.
+- ⚠️ **CLIENT COVERAGE IS PARTIAL.** Only the **`sigil` CLI** has the kit lifecycle.
+  The webapp has **no recovery UI**, the extension has **none** (though its
+  `build.sh` vendors `recovery.mjs`), and the desktop has **no recovery commands**;
+  those surfaces consume only the *wrap gate*. Since `restore` runs on a **new
+  install**, **a user whose only client was the browser or the extension cannot
+  restore there today.**
+- ⚠️ **Dev-gated, plain HTTP in dev, UNAUDITED**, and the codec, derivation and
+  gate are all new code.
+
 ## Billing / payment surface (opt-in, dev-gated — see [ADR 0034](decisions/0034-billing-provider-seam.md))
 
 The billing layer adds an endpoint that is, by necessity, **authenticated by
@@ -571,9 +655,34 @@ security claim, and none of it is a PCI attestation.
   endpoint path and event vocabulary are a best-supported reading. A wrong guess
   fails **closed** (`401`, or an `ignored` event) rather than open, but "fails
   closed" is not "correct".
-- **Denial of service against the webhook endpoint.** There is no rate limiting
-  on `/v1/billing/webhook/{provider}` (the per-vault op-log limiter does not
-  cover it); the only bounds are the 64 KiB body cap and the cost of one HMAC.
+- ⛔ **Denial of service against the webhook endpoint — and the rate limiter that
+  was built for it was REMOVED as HARMFUL.** There is deliberately **no rate
+  limiting** on `/v1/billing/webhook/{provider}`; the only bounds are the 64 KiB
+  body cap and the cost of one HMAC over a size-capped buffer (no database round
+  trip, no state created, before the signature verifies). An early Phase 53
+  revision limited the route **before** signature verification, keyed on the
+  **provider name** — the only key available at that point, and one **forged
+  traffic controls too**. A verifier reproduced the result on a live server: one
+  unauthenticated thread at ~137 forged requests/second caused **15 of 15 genuine,
+  correctly-signed Stripe deliveries to be shed with `429`**, and a longer flood
+  shed roughly **2,000 consecutive genuine retries**; **zero payment events were
+  applied**, and the customer was then refused with `402` by entitlement
+  enforcement. A provider's retry budget is **finite**, so those events are lost
+  **permanently**. ⭐ **The rule this teaches:** you cannot safely shed traffic on
+  a route where shedding costs money and the legitimate sender has a finite retry
+  budget — limiting *before* verification lets anonymous forged traffic spend the
+  honest sender's quota, and limiting *after* verification is no better, because
+  an authentic burst is exactly what must never be dropped. **Volume protection
+  for this route belongs at the edge**
+  ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)).
+- **Entitlement enforcement changes what a webhook compromise can do.** With
+  `SIGILD_ENTITLEMENT_ENFORCE` on, an attacker who can mint authentic-looking
+  `subscription_canceled` events can drive an account past its grace period and
+  **stop its writes**. ⭐ It still **cannot stop its reads**: a lapsed account can
+  always read every op, collect every key envelope, key a **replacement device of
+  its own account**, print a recovery kit, revoke a stolen device and pay
+  ([ADR 0043](decisions/0043-entitlement-enforcement.md)). Refusal is also never
+  destructive — nothing is deleted and nothing expires.
 - **The in-memory subscription store is non-durable.** Subscriptions *and* the
   processed-event ledger are lost on restart, so a webhook redelivered across a
   restart **can be applied twice**. Only the Postgres backend gives the
@@ -592,20 +701,34 @@ security claim, and none of it is a PCI attestation.
   the reason it is safe to leave on `basic`.
 
 **Status note for this repo:** almost none of the defenses in the **first** table
-(adversary classes 1–12, the *intended product* design) is implemented yet — the
-closest is class 8 (*insider with vault export*), where the **mechanism** is now
-complete and driveable end to end: `vault rotate` re-keys a vault and re-wraps it
-to exactly the remaining members' hybrid public keys, deleting the departing
-device's envelope. The **workflow** around it is still missing — nothing re-keys
-**automatically** on revoke, a rotation is a manual owner-driven command, and
-revocation still cannot recall a key already unwrapped, so the row's promise holds
-only for content written *after* the rotation. The current `sigild` skeleton performs no crypto on vault contents and
+(adversary classes 1–12, the *intended product* design) is implemented yet — two
+rows are partial and both are worth stating precisely.
+
+Class 8 (*insider with vault export*) has its **mechanism** complete and driveable
+end to end: `vault rotate` re-keys a vault and re-wraps it to exactly the remaining
+members' hybrid public keys, deleting the departing device's envelope. The
+**workflow** around it is still missing — nothing re-keys **automatically** on
+revoke, a rotation is a manual owner-driven command, and revocation still cannot
+recall a key already unwrapped, so the row's promise holds only for content
+written *after* the rotation.
+
+⚠️ **Class 12 (*lost master password / lost every device*) is the row most likely
+to be misread, so read its cell again.** What exists is a **printed 56-character
+recovery kit** and nothing else: **no recovery delegates, no delay window, no
+notification, no veto, and no passkey-bound recovery.** The kit gives its holder
+**immediate, un-delayed, un-notified, full account control**, and it must be
+printed **before** the loss. What the row's original promise *does* still hold: the
+secret never reaches the server, so **Sigil cannot decrypt unilaterally**. See
+[Recovery kit adversaries](#recovery-kit-adversaries-dev-gated--see-adr-0042).
+
+The current `sigild` skeleton performs no crypto on vault contents and
 stores only the opaque blobs and opaque envelopes described above. `libsigil`'s
 crypto is still **UNAUDITED**, and it is **no longer all unused**: the hybrid KEM
 and the `hybrid_seal` / `hybrid_open` composition are now **load-bearing** (they
 wrap vault keys), while the hybrid **signature** and the suite-frame `kem_ct` path
-remain wired into nothing. The **second** and **third** tables (the dev op-log
-request-auth surface, A–I, and the vault-sharing surface, R–W) *are* implemented —
+remain wired into nothing. The later tables (the dev op-log request-auth surface
+A–I2, the account boundary Y–AD, the vault-sharing surface R–X, the recovery-kit
+surface AE–AH, and the billing surface J–Q) *are* implemented —
 that code really runs — but they are **dev-gated, off by default, opt-in, and
 UNAUDITED**, and they are a request-auth and key-distribution model for a dev
 op-log, **not** the product's account, session, or key-management model. Do not represent any of this as live or as a security

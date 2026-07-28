@@ -99,6 +99,37 @@ export function ed25519_verify(
   signature: Uint8Array,
 ): boolean;
 
+/**
+ * Encode a 32-byte recovery seed as the printed kit code: Crockford base32 over
+ * `[version] || seed || checksum`, exactly 56 characters, ungrouped.
+ *
+ * The RECOVERY KIT IS A CREDENTIAL — whoever holds it has full control of the
+ * account. Never log it, never persist it, never put it in a URL.
+ */
+export function recovery_encode(seed: Uint8Array): string;
+
+/**
+ * Decode a printed kit code back to its 32-byte seed. Hyphens and whitespace are
+ * ignored; O folds to 0 and I/L to 1; **U is rejected, never folded**. Throws on
+ * a bad length, a bad character, a bad checksum, or an unsupported version — in
+ * that order, so a flipped version byte reports a bad code rather than an
+ * unsupported one.
+ */
+export function recovery_decode(code: string): Uint8Array;
+
+/** Derive the kit's 32-byte Ed25519 device seed from the recovery seed (HKDF-SHA256). */
+export function recovery_derive_ed25519_seed(seed: Uint8Array): Uint8Array;
+
+/** Derive the kit's 32-byte X25519 secret from the recovery seed (HKDF-SHA256). */
+export function recovery_derive_x25519_secret(seed: Uint8Array): Uint8Array;
+
+/** Derive the kit's 64-byte ML-KEM-768 keygen seed from the recovery seed (HKDF-SHA256). */
+export function recovery_derive_mlkem_seed(seed: Uint8Array): Uint8Array;
+
+/** Render a 56-character kit code as 7 groups of 8, hyphen-joined, for printing. */
+export function recovery_format(code: string): string;
+
+
 /** The XChaCha20-Poly1305 nonce length in bytes (24). */
 export function nonce_len(): number;
 
@@ -124,6 +155,12 @@ export interface SigilWasm {
   ed25519_public_key: typeof ed25519_public_key;
   ed25519_sign: typeof ed25519_sign;
   ed25519_verify: typeof ed25519_verify;
+  recovery_encode: typeof recovery_encode;
+  recovery_decode: typeof recovery_decode;
+  recovery_derive_ed25519_seed: typeof recovery_derive_ed25519_seed;
+  recovery_derive_x25519_secret: typeof recovery_derive_x25519_secret;
+  recovery_derive_mlkem_seed: typeof recovery_derive_mlkem_seed;
+  recovery_format: typeof recovery_format;
   nonce_len: typeof nonce_len;
   recommended_salt_len: typeof recommended_salt_len;
   version: typeof version;
@@ -585,6 +622,12 @@ export function shareVault(
     vaultKey: Uint8Array;
     permission?: "read" | "write";
     pins?: HybridPinStore | null;
+    /**
+     * The recipient's safety number, read out of band. Optional for an ordinary
+     * device; REQUIRED for a RECOVERY KIT this client has never pinned (the
+     * wrap gate throws `UnverifiedRecoveryKitError` otherwise).
+     */
+    expectedSafetyNumber?: string | null;
   },
 ): Promise<{
   recipientDeviceId: string;
@@ -592,6 +635,8 @@ export function shareVault(
   envelopeBytes: number;
   permission: string;
   fingerprint: string;
+  /** How trust in the recipient's key was established. */
+  trust: RecipientTrust;
   /** "first-sight" means this key has NOT been verified by a human yet. */
   pinStatus: "first-sight" | "match";
   safetyNumber: string;
@@ -673,6 +718,53 @@ export function repinHybridKey(
   identity: HybridPublicIdentity,
 ): Promise<{ previousSafetyNumber: string | null; safetyNumber: string; repins: number }>;
 
+/** ⛔ A wrap targeted a RECOVERY KIT this client has never pinned, with no safety number. */
+export class UnverifiedRecoveryKitError extends Error {
+  deviceId: string;
+  presentedSafetyNumber: string;
+}
+
+/** ⛔ A supplied safety number did not match the key the server is serving. */
+export class SafetyNumberMismatchError extends Error {
+  deviceId: string;
+  expectedSafetyNumber: string;
+  presentedSafetyNumber: string;
+}
+
+/** How trust in a recipient's hybrid key was established. */
+export type RecipientTrust =
+  | "derived"
+  | "pinned"
+  | "verified-first-sight"
+  | "unverified-first-sight";
+
+export const TRUST_DERIVED: "derived";
+export const TRUST_PINNED: "pinned";
+export const TRUST_VERIFIED_FIRST_SIGHT: "verified-first-sight";
+export const TRUST_UNVERIFIED_FIRST_SIGHT: "unverified-first-sight";
+
+/**
+ * ⭐⭐ THE WRAP GATE. Resolve a recipient's hybrid key AND establish trust in it
+ * in ONE call. `shareVault`, `rotateVaultKey` and `coverVault` all go through
+ * this; nothing wraps a vault key without it.
+ */
+export function verifyRecipientForWrap(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  deviceId: string,
+  opts?: {
+    pins?: HybridPinStore | null;
+    expectedSafetyNumber?: string | null;
+    knownRecoveryKit?: boolean;
+  },
+): Promise<{
+  deviceId: string;
+  identity: HybridPublicIdentity;
+  trust: RecipientTrust;
+  safetyNumber: string;
+  pins: HybridPinStore;
+}>;
+
 /** FETCH a hybrid key AND enforce the pin. Throws KeyPinMismatchError. */
 export function fetchHybridKeyPinned(
   wasm: SigilWasm,
@@ -719,13 +811,25 @@ export function rotateVaultKey(
     salt?: Uint8Array | null;
     nonce?: Uint8Array | null;
     pins?: HybridPinStore | null;
+    /**
+     * Devices whose envelope may be DELETED. A current holder named by NEITHER
+     * `recipientDeviceIds` nor `drop` throws `RecipientsWouldBeDroppedError`
+     * (Phase 54): destroying access must be stated, not implied.
+     */
+    drop?: string[];
+    /**
+     * `{ [deviceId]: "the printed digits" }` for any recipient verified out of
+     * band. REQUIRED for a first-sight RECOVERY KIT — the wrap gate throws
+     * `UnverifiedRecoveryKitError` otherwise, before anything is mutated.
+     */
+    safetyNumbers?: Record<string, string>;
   },
 ): Promise<{
   vaultKey: Uint8Array;
   sealedVault: Uint8Array;
   oldFingerprint: string;
   newFingerprint: string;
-  rewrapped: { deviceId: string; pinStatus: string }[];
+  rewrapped: { deviceId: string; trust: RecipientTrust; pinStatus: string }[];
   removed: string[];
   pins: HybridPinStore;
 }>;
@@ -737,3 +841,160 @@ export function parseOtpauthUri(uri: string): TotpEntry;
 export function buildOtpauthUri(entry: TotpEntry): string;
 export function decodeMigrationUri(uri: string): TotpEntry[];
 export function encodeMigrationUri(entries: TotpEntry[]): string;
+
+// ── recovery kit (Phase 54) ─────────────────────────────────────────────────
+//
+// A recovery kit is an ORDINARY MEMBER DEVICE whose private keys are derived
+// from 32 bytes printed on paper. The server gains no concept of "recovery".
+//
+// ⚠️ `code` and everything in `RecoveryIdentity` are SECRETS. Render a code
+// ONCE; never persist it, never log it, never put it in a URL.
+
+/** The pin `origin` marker for a key DERIVED locally rather than fetched. */
+export const PIN_ORIGIN_RECOVERY_KIT: "recovery-kit";
+
+/** The visible device label a recovery kit enrolls under. */
+export const RECOVERY_DEVICE_LABEL: "recovery-kit";
+
+/** Bytes in a raw recovery secret. */
+export const RECOVERY_SEED_LEN: 32;
+
+/** Characters in a printed (ungrouped) recovery code. */
+export const RECOVERY_KIT_CHARS: 56;
+
+/** A recovery-kit failure that is not an HTTP failure. Carries no secret. */
+export class RecoveryError extends Error {}
+
+/**
+ * Thrown by `rotateVaultKey` when a current envelope holder was named by
+ * neither the new recipient set nor `drop`. Nothing was changed.
+ */
+export class RecipientsWouldBeDroppedError extends Error {
+  vaultId: string;
+  unknown: { deviceId: string; isRecoveryKit: boolean }[];
+}
+
+/** ⚠️ SECRET. The three seeds a recovery kit re-derives. */
+export interface RecoveryIdentity {
+  ed25519Seed: Uint8Array;
+  hybrid: { x25519Secret: Uint8Array; mlkemSeed: Uint8Array };
+}
+
+/** Plain-language explanation of a recovery-endpoint status (401/403/404/501). */
+export function explainRecoveryStatus(status: number): string;
+
+/** Render a code as 7 groups of 8, hyphen-joined. */
+export function formatRecoveryCode(wasm: SigilWasm, code: string): string;
+
+/**
+ * Decode + checksum a printed code OFFLINE. Makes NO network request, which is
+ * what lets a client distinguish a typo from an unknown device.
+ */
+export function verifyRecoveryKit(wasm: SigilWasm, code: string): Uint8Array;
+
+/** ⚠️ Derive the kit's SECRET identity from its recovery secret. */
+export function deriveRecoveryIdentity(wasm: SigilWasm, seed: Uint8Array): RecoveryIdentity;
+
+/** Which vaults hold a wrapped key for a device. SELF-ONLY; metadata only. */
+export function listRecoverableVaults(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  deviceId?: string | null,
+): Promise<
+  { vaultId: string; senderDeviceId: string; sizeBytes: number; createdAt: string }[]
+>;
+
+/** Pin a key this client DERIVED itself (origin "recovery-kit"). Never replaces. */
+export function pinDerivedKey(
+  pins: HybridPinStore,
+  deviceId: string,
+  publicIdentity: { x25519PublicKey: Uint8Array; mlkemEncapsKey: Uint8Array },
+): Promise<HybridPinStore>;
+
+/** The DERIVED pin for a device, if this client holds one. */
+export function derivedPin(
+  pins: HybridPinStore,
+  deviceId: string,
+): { x25519PublicKey: Uint8Array; mlkemEncapsKey: Uint8Array } | null;
+
+/**
+ * Generate a kit and cover a set of vaults with it. It VERIFIES ITSELF end to
+ * end before returning, and revokes the partial kit on any failure.
+ *
+ * ⚠️ `code` is THE SECRET.
+ */
+export function generateRecoveryKit(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  args: {
+    vaultKeys?: { vaultId: string; vaultKey: Uint8Array }[];
+    pins?: HybridPinStore | null;
+    inviteTtlSeconds?: number | null;
+  },
+): Promise<{
+  code: string;
+  formatted: string;
+  deviceId: string;
+  accountId: string;
+  baseUrl: string;
+  safetyNumber: string;
+  covered: { vaultId: string; fingerprint: string }[];
+  verification: {
+    accountId: string;
+    indexedVaults: number;
+    unwrappedVault: string;
+    fingerprint: string;
+  };
+  pins: HybridPinStore;
+}>;
+
+/**
+ * Cover one more vault. From a client that did NOT generate the kit,
+ * `expectedSafetyNumber` (printed on the sheet) is REQUIRED and must match.
+ */
+export function coverVault(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  args: {
+    kitDeviceId: string;
+    vaultId: string;
+    vaultKey: Uint8Array;
+    pins?: HybridPinStore | null;
+    expectedSafetyNumber?: string | null;
+  },
+): Promise<{
+  vaultId: string;
+  kitDeviceId: string;
+  derived: boolean;
+  fingerprint: string;
+  envelopeBytes: number;
+  pins: HybridPinStore;
+}>;
+
+/**
+ * Restore from a printed kit on a client with NO local state. `deviceId` is
+ * printed on the sheet and is NOT a secret. Nothing is persisted here — the
+ * caller decides, and the browser clients keep everything sealed.
+ */
+export function restoreFromKit(
+  wasm: SigilWasm,
+  args: { baseUrl: string; code: string; deviceId: string },
+): Promise<{
+  deviceId: string;
+  accountId: string;
+  vaults: { vaultId: string; vaultKey: Uint8Array; fingerprint: string }[];
+  skipped: { vaultId: string; reason: string }[];
+  identity: RecoveryIdentity;
+}>;
+
+/** Revoke a kit and take back its envelopes. Does NOT auto-rotate. */
+export function revokeRecoveryKit(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  args: { kitDeviceId: string; vaultIds?: string[] },
+): Promise<{
+  kitDeviceId: string;
+  removed: string[];
+  alreadyClear: string[];
+  rotateReminder: string;
+}>;

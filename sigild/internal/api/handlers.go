@@ -34,6 +34,20 @@ type handlers struct {
 	// metrics holds this router's observability counters. NewRouter always
 	// constructs it (non-nil), so every handler can increment without a guard.
 	metrics *Metrics
+	// inviteLimiter bounds invite MINTING per ACCOUNT (Phase 53). It is nil
+	// unless a positive rate was configured — nil means "not configured" and
+	// allowAbuse short-circuits, so an un-opted-in server does no extra work.
+	// The enrollment limiter is not here: it is a route wrapper, because it
+	// charges the bucket from the handler's OUTCOME (see rateLimitEnroll).
+	//
+	// ⛔ There is deliberately no webhook limiter: shedding traffic on the
+	// billing webhook loses payment events (see billingWebhook).
+	inviteLimiter *rateLimiter
+	// entitlement is the payment-enforcement policy (Phase 55). Its ZERO VALUE
+	// IS OFF, and NewRouter leaves it zero unless enforcement was explicitly
+	// enabled AND both the device model and billing are live. See
+	// entitlement.go — in particular, no READ handler ever consults it.
+	entitlement entitlementPolicy
 }
 
 // denyOps records an auth/authz denial (audit line + metrics) and writes the
@@ -181,8 +195,23 @@ func (h *handlers) opsAppend(w http.ResponseWriter, r *http.Request) {
 	// single-key signature check; with no auth configured it always allows. Must
 	// run AFTER the body is read (it is part of the signed message) and BEFORE we
 	// append.
-	if out := h.authorizeOpsRequest(r, blob, vaultID, needWrite); !out.allowed() {
+	dev, out := h.authorizeOpsRequestDevice(r, blob, vaultID, needWrite)
+	if !out.allowed() {
 		h.denyOps(w, r, vaultID, out)
+		return
+	}
+	// ENTITLEMENT (Phase 55), strictly AFTER authentication and authorization so
+	// the 402 can never become an oracle for a caller who was going to be refused
+	// anyway. Off by default; inside grace this only sets warning headers. The
+	// MATCHING READ ROUTE (opsList) HAS NO SUCH CHECK, on purpose: a customer who
+	// stopped paying can still read every code they already have.
+	//
+	// Note the ordering consequence, accepted knowingly: a first write to an
+	// unclaimed vault has already CLAIMED it above before we refuse here. That is
+	// harmless — the claim binds the vault to the caller's own account, which is
+	// the same party that would pay — and keeping the claim inside the single
+	// authorization choke point is worth more than avoiding it.
+	if !h.requireEntitlement(w, r, dev, entitlementSurfaceOpsAppend) {
 		return
 	}
 	if len(blob) == 0 {

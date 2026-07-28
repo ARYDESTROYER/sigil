@@ -54,6 +54,7 @@ const (
 	auditEventKeyEnvelopeGet     = "vault.key_envelope_get"
 	auditEventKeyEnvelopeList    = "vault.key_envelope_list"
 	auditEventKeyEnvelopeDelete  = "vault.key_envelope_delete"
+	auditEventKeyEnvelopeIndex   = "device.key_envelope_index"
 	// Billing events (Phase 45). METADATA ONLY: a provider name, a normalized
 	// event type, an opaque provider event/session reference, our own subject
 	// reference, and a fixed reason enum.
@@ -67,6 +68,20 @@ const (
 	auditEventBillingWebhook       = "billing.webhook"
 	auditEventBillingWebhookDenied = "billing.webhook_rejected"
 	auditEventBillingTransition    = "billing.subscription_transition"
+	// Abuse-bound event (Phase 53). METADATA ONLY — see auditRateLimited for the
+	// deliberate decision NOT to record a source address.
+	auditEventRateLimited = "abuse.rate_limited"
+	// Entitlement-enforcement events (Phase 55). METADATA ONLY: an account ID, a
+	// device ID, a status from the closed billing enum, a grace instant, a fixed
+	// surface name and a fixed fail-open reason. They carry NO card field (none
+	// exists anywhere in this server), no provider secret, no key, token,
+	// signature, nonce or blob.
+	//
+	// All three fire on WRITE requests only — there is no read-side event,
+	// because there is no read-side check.
+	auditEventEntitlementGrace    = "entitlement.grace"
+	auditEventEntitlementRefused  = "entitlement.refused"
+	auditEventEntitlementFailOpen = "entitlement.fail_open"
 )
 
 // authMode reports the op-log's configured auth mode for the append audit line:
@@ -370,6 +385,94 @@ func (h *handlers) auditKeyEnvelopeGet(r *http.Request, vaultID, recipientID str
 	)
 }
 
+// auditRateLimited logs a request rejected by an abuse-bound rate limiter
+// (Phase 53). surface is the closed two-value enum (enroll, invite — the
+// webhook limiter was removed, see ADR 0041); subject is what may be
+// recorded about WHO was limited.
+//
+// ⚠️ THE SOURCE ADDRESS IS DELIBERATELY NOT LOGGED, and subject is EMPTY on the
+// enrollment surface. The reasoning, written down so it is not quietly reversed:
+//
+//   - This server holds NO personal data anywhere — no email, no name, no
+//     address column, no PII field of any kind (see ADR 0040: an account is a
+//     random id and nothing else). An IP address is personal data in most
+//     regimes. Writing one into the audit stream would create a retention,
+//     minimisation and erasure obligation that NOTHING ELSE in this system has,
+//     for a log that is otherwise safe to keep forever.
+//   - It would not change what an operator does. The response to enrollment
+//     flooding is to tune the limit or to block upstream — and the reverse proxy
+//     or firewall doing the blocking already has the peer address, at a layer
+//     that is designed to hold it.
+//
+// So enrollment rejections are counted, not attributed. For the INVITE surface
+// the subject is the ACCOUNT ID and for the WEBHOOK surface the PROVIDER NAME —
+// both already appear routinely in this audit stream, so neither is a new
+// privacy surface.
+func (h *handlers) auditRateLimited(r *http.Request, surface, subject string) {
+	h.cfg.Logger.Warn(auditEventRateLimited,
+		"event", auditEventRateLimited,
+		"request_id", RequestIDFromContext(r.Context()),
+		"surface", surface,
+		"subject", subject,
+	)
+}
+
+// auditEntitlementGrace logs a WRITE that was SERVED even though the account's
+// entitlement has lapsed, because the grace period is still running. It is a
+// Warn, not an Info: it is the operator's advance notice that this account will
+// start being refused, and the customer's own warning went out in the response
+// headers on the same request.
+func (h *handlers) auditEntitlementGrace(r *http.Request, accountID, deviceID, surface string, dec entitlementDecision) {
+	h.cfg.Logger.Warn(auditEventEntitlementGrace,
+		"event", auditEventEntitlementGrace,
+		"request_id", RequestIDFromContext(r.Context()),
+		"account_id", accountID,
+		"device_id", deviceID,
+		"surface", surface,
+		"subscription_status", string(dec.Status),
+		"grace_ends_at", auditTime(dec.GraceEndsAt),
+	)
+}
+
+// auditEntitlementRefused logs a WRITE refused with 402 after grace expired.
+// This is the record that a customer was told to pay, so it names WHICH write
+// surface was refused — and, by its absence anywhere else in this stream, that
+// no read was ever refused.
+func (h *handlers) auditEntitlementRefused(r *http.Request, accountID, deviceID, surface string, dec entitlementDecision) {
+	h.cfg.Logger.Warn(auditEventEntitlementRefused,
+		"event", auditEventEntitlementRefused,
+		"request_id", RequestIDFromContext(r.Context()),
+		"account_id", accountID,
+		"device_id", deviceID,
+		"surface", surface,
+		"subscription_status", string(dec.Status),
+		"grace_ended_at", auditTime(dec.GraceEndsAt),
+	)
+}
+
+// auditEntitlementFailOpen logs a check that could not be completed and was
+// therefore SERVED. It is an Error because it means enforcement is silently not
+// happening — an operator must be able to see that a store fault is handing out
+// free service, rather than discovering it in a revenue report.
+func (h *handlers) auditEntitlementFailOpen(r *http.Request, accountID, surface, reason string) {
+	h.cfg.Logger.Error(auditEventEntitlementFailOpen,
+		"event", auditEventEntitlementFailOpen,
+		"request_id", RequestIDFromContext(r.Context()),
+		"account_id", accountID,
+		"surface", surface,
+		"reason", reason,
+	)
+}
+
+// auditTime renders an instant for an audit field, or "" when it is zero, so a
+// log consumer never sees a year-1 timestamp masquerading as data.
+func auditTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // auditGrant logs an access grant on a vault: which device was granted what.
 func (h *handlers) auditGrant(r *http.Request, vaultID, deviceID, permission string) {
 	h.cfg.Logger.Info(auditEventVaultGranted,
@@ -390,6 +493,22 @@ func (h *handlers) auditKeyEnvelopeList(r *http.Request, vaultID, callerID strin
 		"request_id", RequestIDFromContext(r.Context()),
 		"vault_id", vaultID,
 		"device_id", callerID,
+		"returned_count", count,
+	)
+}
+
+// auditKeyEnvelopeIndex logs a device asking which vaults have a wrapped key
+// waiting for IT (Phase 54, the recovery-kit restore path). The device id is its
+// OWN — the route is self-only — and the count is post-authorization.
+//
+// There is deliberately NO blob_sha256 here, because the route never reads a
+// blob: it selects sizes and timestamps only. Nothing about a recovery kit's
+// secret, its derived seeds or its printed code can reach this line.
+func (h *handlers) auditKeyEnvelopeIndex(r *http.Request, deviceID string, count int) {
+	h.cfg.Logger.Info(auditEventKeyEnvelopeIndex,
+		"event", auditEventKeyEnvelopeIndex,
+		"request_id", RequestIDFromContext(r.Context()),
+		"device_id", deviceID,
 		"returned_count", count,
 	)
 }

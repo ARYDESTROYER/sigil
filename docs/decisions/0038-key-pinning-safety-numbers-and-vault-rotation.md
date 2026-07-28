@@ -307,3 +307,43 @@ in the vault, so enumerating and deleting them grants it no new power. `sigild` 
   i.e. the security control would degrade into a no-op with no error anywhere. It now
   throws. That change immediately surfaced one genuine stale caller (a pre-Phase-50 test
   relying on the fallback), which is the argument for fail-closed in miniature.
+
+## The choke point is now enforced by TYPE (added Phase 54, 2026-07-28)
+
+§1 above states the rule that matters: *"the enforcement rides on the fetch
+itself … every wrap path goes through it."* Per the addendum rule the text above
+is untouched; this records what changed and why it had to.
+
+**Phase 54 violated that rule one phase after it was written down, and a verifier
+caught it.** [ADR 0042](0042-recovery-kit.md)'s first implementation put its
+extra safety-number requirement on the **`recovery cover` command** rather than
+on the fetch — and `sigil vault share --to <kitID>` and
+`sigil vault rotate --to <kitID>` reached the **identical wrap** through ordinary
+first-sight TOFU, showing the human the safety number only **after** the wrap and
+upload had completed.
+
+The fix hardened this ADR's own mechanism for every caller:
+
+- The pinned fetch is now reached through **one gate**,
+  `verify_recipient_for_wrap` / `verifyRecipientForWrap`, which returns a
+  **`VerifiedRecipient`** whose fields are **private** and which has **no other
+  constructor**. The single wrap→deposit→grant path takes `&VerifiedRecipient`, so
+  a caller cannot reach the wrap without passing the gate — the check is no longer
+  something a new call site can forget.
+- Two refusals join the hard-refusal set of §1's table, both leaving **nothing
+  wrapped, nothing uploaded and the pin store unmutated**:
+  `SafetyNumberMismatch` (a supplied `--safety-number` that does not match what
+  the server is serving — checked **before** the pin lookup, so it applies to
+  pinned keys too) and `UnverifiedRecoveryKit` (a first-sight wrap to a **recovery
+  kit**, whose safety number is printed on its sheet).
+- **Every refusal now happens BEFORE the key is pinned.** Pinning a refused key
+  would let a retry see `Match` and proceed — the alarm would silence itself.
+- A fourth trust outcome, **`Derived`**, exists for a key a client derived locally
+  from a recovery secret: it is **never fetched**, so there is nothing for a server
+  to substitute.
+
+⚠️ **The first-contact limit of the "Bad / accepted costs" section is unchanged**,
+and the kit rule inherits a dependency of its own: recognising that a recipient
+*is* a kit uses a device **label** served by `GET /v1/account`, so a server that
+renames or hides it degrades a kit wrap back to ordinary first-sight TOFU. See
+[ADR 0042](0042-recovery-kit.md) §5 for the exact claim that can honestly be made.

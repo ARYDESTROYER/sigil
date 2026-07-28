@@ -114,6 +114,29 @@ public, make no security claims, until the audit completes and trademark clears.
   `otpauth://` default, so interop requires it; `sha2` already present) — both
   `default-features = false` so the `getrandom`==0 core-lockfile guard holds. Real
   but UNAUDITED. ADR 0023.**
+  **The core also carries the **RECOVERY-KIT codec + derivation** (`recovery.rs`, Phase 54,
+  ADR 0042): `encode_recovery_kit`/`decode_recovery_kit`/`format_recovery_kit`/
+  `derive_recovery_keys` + `RecoveryKeys`/`RecoveryError`. FORMAT: 32-byte seed;
+  `check = SHA-256("sigil-recovery-kit-v1\n" ‖ [0x01] ‖ seed)[0..2]`;
+  `body = [0x01] ‖ seed(32) ‖ check(2)` = **35 bytes = 280 bits**; **Crockford base32** ⇒
+  **exactly 56 characters, NO padding** (280/5 divides), printed as **7 groups of 8**.
+  Crockford (no `I`/`L`/`O`/`U`) folds `O`→`0` and `I`/`L`→`1`, and ⚠️ **`U` is REJECTED,
+  never folded** (folding it would let two distinct strings decode to the same value).
+  ⭐ **DECODE ORDER IS CONTRACTUAL: length → alphabet → CHECKSUM → version** — the checksum
+  COVERS the version byte and is checked first, so a flipped version bit reports *"not a
+  valid code"* rather than *"unsupported version"* (a human holding paper must be told to
+  check their typing). It is a **NEW codec** and deliberately does **NOT** touch the RFC 4648
+  `base32_decode` used by TOTP (that one must stay `otpauth://`-interoperable).
+  DERIVATION: **HKDF-SHA256 only** — `PRK = HKDF-Extract(salt="sigil-recovery-kit-v1",
+  ikm=seed)` (⚠️ salt has NO trailing newline; the checksum domain DOES), then Expand to
+  `"…/ed25519-device-seed"` (32) · `"…/x25519-secret"` (32) · `"…/mlkem-keygen-seed"` (64,
+  `d‖z`), fed to the EXISTING deterministic `public_key_from_seed` / `x25519_public_key` /
+  `ml_kem768_keygen`. ⭐ **ADR 0007 is what makes this possible** — the core reads no RNG, so
+  a paper secret is just another entropy source and NOTHING in the core changed to
+  accommodate recovery. **NO new dependency** (`hkdf` + `sha2` were already direct).
+  **HKDF and NOT Argon2id, deliberately:** the input is 256 bits of CSPRNG, already uniform
+  — there is no low-entropy password to stretch, only domain separation to provide.
+  `RecoveryKeys`'s `Debug` prints `RecoveryKeys { <redacted> }`.**
   `ffi` = C-ABI `seal`/`open`/`buffer_free` + suite smoke export, **plus the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`**
   (`SIGIL_ERR_VERIFY` = -4), **plus the hybrid encryption path
@@ -301,8 +324,10 @@ public, make no security claims, until the audit completes and trademark clears.
   in-memory registry, warned at boot); and it is still **dev-gated, pre-audit, UNAUDITED** —
   ⚠️ **TOFU is no longer "not an account model"** (Phase 52 added one; it is auth metadata,
   **not an identity system**, and TOFW simply moved up one level), but there is still no
-  session/token issuance, **no rate limiting on enrollment attempts**, no key rotation and
-  **no recovery of any kind**. Contract in [`docs/api.md`](docs/api.md); ADR 0031, and
+  session/token issuance and no device-key rotation. **Enrollment CAN now be rate limited**
+  (Phase 53, opt-in — but a **BACKSTOP, not a defence**; see the abuse-bounds bullet below)
+  and **recovery now exists only as a PAPER KIT PRINTED IN ADVANCE** (Phase 54, ADR 0042).
+  Contract in [`docs/api.md`](docs/api.md); ADR 0031 (+ a Phase 53 addendum), and
   **ADR 0040** (which revises limitations 1 and 4).
   **A BILLING / SUBSCRIPTION LAYER (Phase 45, ADR 0034) — opt-in + dev-gated, UNAUDITED,
   NEVER RUN AGAINST A LIVE PROVIDER ACCOUNT:** Sigil is a PAID product, so `sigild` now has
@@ -388,10 +413,13 @@ public, make no security claims, until the audit completes and trademark clears.
   was adopted into its OWN singleton account, so an existing two-device customer has TWO
   billing subjects; recurring
   subscription CREATION is unimplemented for the India adapters (one-time hosted page; their
-  webhook sides do map subscription/mandate events); no entitlement enforcement, no
+  webhook sides do map subscription/mandate events); entitlement enforcement now EXISTS but
+  is **opt-in, write-only and never refuses reads** (Phase 55, ADR 0043); no
   fraud/chargeback/refund/proration/tax/dunning; **no PCI attestation**; the in-memory store
-  is non-durable (a redelivery across a restart could double-apply); no rate limit on the
-  webhook route; and **billing living inside `sigild` is PROVISIONAL** — a scaffold placement,
+  is non-durable (a redelivery across a restart could double-apply); ⛔ **NO rate limit on
+  the webhook route, DELIBERATELY — the one built in Phase 53 was REMOVED after it was
+  reproduced shedding genuine signed deliveries** (ADR 0041); and **billing living inside
+  `sigild` is PROVISIONAL** — a scaffold placement,
   not a final topology. Contract in [`docs/api.md`](docs/api.md), operator guide in
   [`docs/deployment.md`](docs/deployment.md) §13; ADR 0034, **ADR 0039** (the dedup-key
   invariant + the Juspay default).
@@ -548,12 +576,16 @@ public, make no security claims, until the audit completes and trademark clears.
   moved up one level.** **NO ACCOUNT MERGE:** every pre-0005 device is adopted into its OWN
   singleton account, so an existing two-device customer ends up with **TWO accounts and TWO
   billing subjects** (manual remedy, leaves a second subscription row to reconcile).
-  **Entitlement is REPORTED, never ENFORCED.** `SIGILD_ACCOUNT_MAX_DEVICES` is
+  **Entitlement is REPORTED unless `SIGILD_ENTITLEMENT_ENFORCE` is set** (Phase 55, ADR
+  0043: then a lapsed account's WRITES answer 402 past grace, while ⭐ **reads and
+  same-account key recovery are NEVER refused**). `SIGILD_ACCOUNT_MAX_DEVICES` is
   anti-freeloading, not anti-fraud. A compromised provider webhook secret now moves an
-  **ACCOUNT's** status. `/metrics` is still always-on/unauthenticated and its per-reason
-  counters a weak correlatable oracle (**pre-existing; deliberately not widened**). **NO
-  rate limiting** on `POST /v1/devices/enroll` or `POST /v1/account/invites` (the caps bound
-  stored STATE, not request volume) and **no sweep job** for expired invites. The replay
+  **ACCOUNT's** status — and, with enforcement on, its SERVICE. `/metrics` is still
+  always-on/unauthenticated and its per-reason
+  counters a weak correlatable oracle (**pre-existing; deliberately not widened**). **Rate
+  limiting** on `POST /v1/devices/enroll` and `POST /v1/account/invites` is **opt-in and a
+  BACKSTOP** (Phase 53, ADR 0041; the caps still bound stored STATE, not request volume)
+  and there is still **no sweep job** for expired invites. The replay
   nonce cache is **still per-process/in-memory** (invite consumption is DB-atomic and
   therefore multi-instance safe; **signed requests are not**). The in-memory registry is
   **still non-durable** and the **file backend was still not extended**. ⚠️ **ROLLBACK:** a
@@ -580,6 +612,94 @@ public, make no security claims, until the audit completes and trademark clears.
   `cli/tests/e2e-accounts.sh` (real sigild + real CLI, four devices, four HOMEs) and
   `sigil-wasm/test/accounts-interop.mjs` (a JS client and the real Rust binary landing in
   ONE account).
+  **ABUSE BOUNDS (Phase 53, ADR 0041) — opt-in, stdlib-only, NO new dependency:** a
+  hand-written token bucket (the SAME `internal/api/ratelimit.go` type as the op-log
+  limiter) now bounds **`POST /v1/devices/enroll`** (keyed on the **SOCKET PEER ADDRESS** —
+  IPv4 full address, IPv6 **/64 prefix**; **`X-Forwarded-For` is deliberately IGNORED**,
+  since without a trusted-proxy config it is attacker text and keying on it would let one
+  client mint unlimited buckets) and **`POST /v1/account/invites`** (keyed **per ACCOUNT**).
+  Env `SIGILD_ENROLL_RATE_LIMIT`/`_BURST` + `SIGILD_INVITE_RATE_LIMIT`/`_BURST`, **off by
+  default**, validated fail-fast; over-rate is `429 rate_limited` + `Retry-After`. New
+  metric `sigild_abuse_ratelimit_rejected_total{surface}` (closed set `enroll`/`invite`) and
+  audit event `abuse.rate_limited` — ⚠️ **the source address is NEVER logged** (this server
+  holds no personal data anywhere, and the proxy that would block already has it).
+  ⚠️⚠️ **TWO PROPERTIES THAT MUST BE STATED AS LOUDLY AS THE FEATURE, both proven live:**
+  (1) **IT IS A BACKSTOP, NOT A DEFENCE** — the only topology this repo documents
+  (`deploy/caddy/Caddyfile`) is a reverse proxy, so every request arrives from ONE address
+  and the enrollment limiter degrades to a **single global bucket**. An earlier revision
+  rejected BEFORE the handler and was reproduced **refusing a LEGITIMATE customer holding a
+  valid, unspent operator token** — a global account-creation OFF SWITCH. **Fixed two ways:
+  the bucket is charged ONLY on the DENIAL path** (a request with a valid, unspent
+  credential + a valid proof can NEVER be refused by it) **and `Allow` now FAILS OPEN at its
+  key cap** (the old fail-closed branch let one IPv6 /48 fill 10,000 buckets and lock out
+  everyone). (2) **IT DOES NOT REDUCE LOAD** — charging only on denial means the handler
+  ALWAYS runs, including its DB work; the limiter replaces only the RESPONSE. Real
+  per-source limiting belongs at the **EDGE**, and is configured **nowhere in `deploy/`**.
+  ⛔ **THE WEBHOOK RATE LIMITER WAS BUILT, PROVEN HARMFUL, AND REMOVED.** An early Phase 53
+  revision limited `POST /v1/billing/webhook/{provider}` **before signature verification**,
+  keyed on the provider name. A verifier reproduced it live: one unauthenticated thread at
+  **~137 forged req/s shed 15 of 15 genuine, correctly-signed Stripe deliveries with 429**;
+  a longer flood shed ~2,000 consecutive genuine retries; **zero payment events applied**,
+  and the customer was then refused 402 by Phase 55. A provider's retry budget is FINITE, so
+  the event is lost **permanently**. ⭐ **THE RULE: you cannot safely shed traffic on a route
+  where shedding costs money and the legitimate sender has a finite retry budget** — before
+  verification, forged traffic spends the honest sender's quota (the only key, the provider
+  name, is attacker-controlled too); after verification is no better, because an authentic
+  burst is exactly what must never be dropped. What bounds it instead: the 64 KiB body cap
+  and one HMAC over a size-capped buffer. **`SIGILD_WEBHOOK_RATE_LIMIT`/`_BURST` no longer
+  exist**; setting them logs a loud boot WARNING naming the removal (added after a verifier
+  pointed out they were otherwise **silently inert**). ADR 0041; `docs/deployment.md` §15.
+  **ENTITLEMENT ENFORCEMENT (Phase 55, ADR 0043) — opt-in, OFF by default, byte-identical
+  when unset:** behind **`SIGILD_ENTITLEMENT_ENFORCE`** (+ **`SIGILD_ENTITLEMENT_GRACE`**,
+  default **14 days**, bounded `(0,365d]`) an account whose subscription lapsed longer ago
+  than grace has **WRITES** refused with **402 Payment Required** and a machine-readable
+  body (`payment_required`, `subscription_status`, `grace_ended_at`, `reads_allowed`,
+  `key_recovery_allowed`, `checkout_path`) — **never collapsed into the coarse 401/403
+  envelopes**, and reachable **only AFTER authn AND authz both succeed**, so it is no
+  oracle. It requires `SIGILD_ENABLE_DEV_OPS` + `SIGILD_DEVICE_AUTH` +
+  `SIGILD_BILLING_PROVIDERS` (each missing one is a **BOOT ERROR** — unlike the abuse
+  limiters, a silently-moot payment gate is a business hazard). ⭐ **READS AND KEY RECOVERY
+  ARE NEVER REFUSED:** `requireEntitlement` is called from **exactly THREE write handlers**
+  (`opsAppend`, `keyEnvelopePut`, `vaultGrantCreate`) and **no read handler**, pinned by a
+  test that **parses the package AST**. A lapsed customer can still list ops (a verifier
+  drove it live and got the RFC 6238 vector **94287082**), collect envelopes, read the
+  account, mint invites, enroll/revoke devices and pay; **`past_due` remains ENTITLED**.
+  ⚠️ **A verifier found a real LOCKOUT and the fix closed it:** past grace a customer could
+  not deposit a key envelope to their OWN new device (402) and could not print a recovery
+  kit — one device failure from permanent loss, while the 402 body claimed
+  `key_recovery_allowed: true`. **`sameAccountRecipient()` now exempts a key deposit AND its
+  grant when the recipient is a device of the CALLER'S OWN ACCOUNT.** Every uncertainty
+  **FAILS OPEN** (store fault / unreadable account / no anchor / no account id), and
+  `entitlement.fail_open` is logged at **ERROR** because it means enforcement is silently
+  not happening. Grace runs from the **LATER** of `updated_at` and `current_period_end`; a
+  never-subscribed account is graced from its **creation time**, so ⚠️ **the grace window
+  doubles as the buy-in window — there is no separate trial mechanism**. New metrics
+  `sigild_entitlement_enforcing` (gauge) + `sigild_entitlement_decisions_total{outcome}`
+  (closed set `entitled`/`grace`/`refused`/`fail_open`, **no account label**); audit
+  `entitlement.grace`/`.refused`/`.fail_open`; response headers `X-Sigil-Entitlement`,
+  `-Status`, `-Grace-Ends` on gated writes only; an additive `entitlement` block on
+  `GET /v1/billing/subscription`. The verifier mutation-tested this phase hard: **15
+  separate control mutations all went red.** ADR 0043; `docs/deployment.md` §16.
+  **⚠️ NO MIGRATION was added by Phases 53–55 — `sigild_schema_version` is still 5.**
+- `sigild/` **THE RECOVERY-KIT SERVER SIDE (Phase 54, ADR 0042) is ONE ROUTE and NOTHING
+  ELSE.** ⭐ **`sigild` gained NO concept of "recovery"**: no table, no migration, no flag,
+  no config. A recovery kit is an **ORDINARY MEMBER DEVICE** (label `"recovery-kit"`,
+  visible in `GET /v1/account`), so the server sees only shapes it already relayed — one
+  device row, one hybrid PUBLIC key, one opaque ~1226-byte `SIGILhyb` envelope per covered
+  vault. The one addition is **`GET /v1/devices/{deviceID}/keys`** (`deviceKeyEnvelopeIndex`
+  in `internal/api/sharing.go`), the index a kit needs on a **fresh machine** where it knows
+  its own device id and nothing else: **SELF-ONLY** (a mismatched path id ⇒ **403 BEFORE any
+  store read**; an **unknown device id is the SAME coarse 403, never 404** — no existence
+  oracle), **METADATA ONLY** (Postgres selects `octet_length(blob)`, so ciphertext never
+  leaves the DB), each row additionally filtered by the ordinary `authorizeVault(needRead)`
+  (unauthorized vaults are **silently omitted**, not an error; `needRead` never claims),
+  ordered by vault id, capped at **500** rows with `has_more` and ⚠️ **no cursor**. Response
+  `{device_id, vaults:[{vaultID, sender_device_id, size_bytes, created_at}], has_more}`.
+  **It needed NO migration** — the index `sigil_vault_key_envelopes_by_recipient` from
+  `0004_key_sharing.sql` was created for exactly this query. New store method
+  `ListKeyEnvelopesForRecipient` (Mem + Postgres, one conformance suite), metric
+  `sigild_key_envelope_index_total`, audit `device.key_envelope_index`
+  (`device_id`, `returned_count`; **no `blob_sha256`** — the route reads no blob).
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
@@ -881,6 +1001,63 @@ public, make no security claims, until the audit completes and trademark clears.
   but only if a human actually compares it); a user who blindly re-pins defeats it;
   rotation protects **FUTURE content ONLY** (a device that already unwrapped a key keeps
   what it copied); UNAUDITED.
+  ⭐ Also **`sigil recovery generate|cover|check|verify|restore|revoke`** — the
+  **RECOVERY KIT** (Phase 54, ADR 0042), the answer to ADR 0040's limit 1. ⚠️ **A KIT IS AN
+  ORDINARY MEMBER DEVICE** whose Ed25519 + hybrid private keys are HKDF-SHA256 derivations
+  of 32 CSPRNG bytes **printed on paper** — never transmitted, never stored on a device,
+  never derivable from anything the server holds. `generate` prints a sheet (the code, the
+  device id, the account, the server, **the safety number**, the vaults covered *as of the
+  print date*, four warnings) and covers every vault in the keyring; `cover` extends it to
+  one more vault; `verify` checks a typed code **OFFLINE**; `check` reports what a kit can
+  reach; `restore` runs on a **NEW install**; `revoke` retires the sheet. **THE SECRET IS
+  ENTERABLE WITHOUT argv**: `--code` (kept for scripts, now warns on stderr that it lands in
+  argv + shell history) → `--code-stdin` / non-TTY stdin → otherwise an **interactive prompt
+  with echo disabled** (best-effort via `stty -echo` on `/dev/tty`, warning if it fails).
+  **There is deliberately NO env var** (inherited by children, visible in `/proc/*/environ`).
+  ⭐⭐ **THE SECURITY-CRITICAL PART, and why this phase needed two rounds: the wrap gate is a
+  CHOKE POINT ENFORCED BY TYPE.** The FIRST implementation put the safety-number requirement
+  on the `recovery cover` COMMAND — and a verifier proved live that `vault share --to
+  <kitID>` and `vault rotate --to <kitID>` reached the **IDENTICAL wrap** through ordinary
+  first-sight TOFU, showing the human the safety number only AFTER the wrap and upload had
+  completed. **That is ADR 0038's own lesson ("the choke point is the FETCH, and EVERY wrap
+  path goes through it") violated ONE PHASE after it was written down.** The fix:
+  **`verify_recipient_for_wrap(server, device_id, auth, pins_path, expected_safety_number,
+  known_recovery_kit)`** returns a **`VerifiedRecipient`** whose fields are **PRIVATE** and
+  which has **NO other constructor** (built in exactly three literals, all inside that
+  function), and the one wrap→deposit→grant path (`share_vault_to_known_key`) takes
+  **`&VerifiedRecipient`** — so a caller **cannot reach the wrap without passing the gate**.
+  Trust outcomes (`RecipientTrust`): **`Derived`** (pin `origin = "recovery-kit"` ⇒ **no
+  fetch at all**) · **`Pinned`** (identical ⇒ proceed) · **different ⇒ `CliError::PinMismatch`**
+  · first sight + matching `--safety-number` ⇒ **`VerifiedFirstSight`** · first sight + wrong
+  number ⇒ **`CliError::SafetyNumberMismatch`** · first sight + **recipient is a recovery kit**
+  + no number ⇒ **`CliError::UnverifiedRecoveryKit`** (REFUSE) · first sight + ordinary device
+  ⇒ **`UnverifiedFirstSight`** (TOFU, warned, as ADR 0038 allows). ⭐ **EVERY refusal happens
+  BEFORE the key is pinned** — pinning a refused key would let a retry see `Match` and
+  silence its own alarm — and a supplied safety number is checked BEFORE the pin lookup, so
+  it applies to pinned keys too. `vault share`/`vault rotate` gained **`--safety-number`**
+  (bare digits with exactly one `--to`, else `<deviceID>=<digits>`, repeatable; compared
+  digit-only so spacing never false-alarms), and `vault rotate` gained **`--drop`/
+  `--drop-all-others`** with a fail-closed guard: it **REFUSES** when a current envelope
+  holder is named by neither, flagging **"⚠️ THIS IS YOUR RECOVERY KIT"**.
+  ⚠️⚠️ **THE RESIDUAL LIMIT, IN THESE WORDS:** the kit-DISCOVERY arm resolves a kit by device
+  **LABEL** (`RECOVERY_DEVICE_LABEL = "recovery-kit"`) from **`GET /v1/account`** — a listing
+  **the adversarial server serves**. **A server that renames or hides the label degrades
+  `vault share`/`vault rotate` to a kit back to ordinary first-sight TOFU (warned and pinned)
+  rather than a refusal.** The caller-ASSERTED paths (`recovery cover`, `recovery generate`,
+  which pass `known_recovery_kit: true`) do NOT depend on the server, and **NO path anywhere
+  accepts a CHANGED key or a mismatched safety number**. So the honest claim is **"refuses
+  first-sight kit wraps against a server that does not lie about labels"**, **NOT** "refuses
+  first-sight kit wraps". (A verifier judged this consistent with ADR 0038's accepted
+  TOFU-on-first-contact limit and asked that the ADR say it in exactly those words.)
+  ⚠️ **OTHER HONEST LIMITS:** whoever holds the paper has **FULL CONTROL of the account**
+  (read every covered vault, revoke every device) — **stronger than a stolen locked phone**,
+  since there is no OS lock and no vault password, and the kit's nominal `read` grant is
+  **cosmetic** because account ownership authorizes it anyway; it recovers **KEYS, not
+  DATA** (a vault never synced is gone); it opens only the vaults it was told to **COVER**;
+  **a kit cannot be created after the loss**; it consumes a **seat**; and revoking it cannot
+  un-learn what it already unwrapped. Local pin marker `PIN_ORIGIN_RECOVERY_KIT` (same
+  string, different concern from the label). Proof: **`cli/tests/e2e-recovery.sh`** (twelve
+  steps; **step 9c pins that SHARE and ROTATE obey the SAME rule as COVER**). ADR 0042.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.
@@ -1100,6 +1277,23 @@ public, make no security claims, until the audit completes and trademark clears.
   "every key is first-sight", i.e. the control degraded into a no-op. Proven by
   **`sigil-wasm/test/pinning-interop.mjs`** (below). It does **NO crypto itself** (SHA-256
   via `crypto.subtle`, KEM/AEAD in the wasm), so `Cargo.lock`s stay `getrandom`==0.
+  **Phase 54 added the JS half of the RECOVERY KIT (ADR 0042):** six thin-shell wasm exports
+  (`recovery_encode`/`recovery_decode`/`recovery_derive_ed25519_seed`/
+  `recovery_derive_x25519_secret`/`recovery_derive_mlkem_seed`/`recovery_format`, adding **no
+  cryptography and no codec** — all of it is `sigil-core`) plus a NEW framework-free ESM
+  module **`sigil-wasm/recovery.mjs`** (`verifyRecoveryKit`, `deriveRecoveryIdentity`,
+  `listRecoverableVaults`, `pinDerivedKey`/`derivedPin`, `generateRecoveryKit`, `coverVault`,
+  `restoreFromKit`, `revokeRecoveryKit`, `formatRecoveryCode`, `explainRecoveryStatus`,
+  `RECOVERY_DEVICE_LABEL`), and `sharing.mjs` gained the JS twin of the typed wrap gate —
+  **`verifyRecipientForWrap`**, `UnverifiedRecoveryKitError`, `SafetyNumberMismatchError`,
+  `RecipientsWouldBeDroppedError` and the four `TRUST_*` constants. The codec, the
+  derivation and the trust rules are **MIRRORED — not shared — from `cli/src/lib.rs` +
+  `libsigil/core/src/recovery.rs`** and MUST stay byte-identical (same KAT both sides;
+  `sigil-wasm/test/recovery-interop.mjs` is the guard). `web/packages/sigil-wasm/index.mjs`
+  re-exports all of `recovery.mjs`. ⚠️ **Known doc gap:** `interface SigilWasm` in
+  `web/packages/sigil-wasm/index.d.ts` was **not** extended with the `recovery_*` methods,
+  so those wasm calls are untyped at that boundary. ⚠️ **No browser client has a recovery
+  UI** — the webapp and the extension consume only the wrap gate.
 - `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
   whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
   as **WebAssembly inside the extension page** — the **second real product client
@@ -1138,7 +1332,9 @@ public, make no security claims, until the audit completes and trademark clears.
   share to a pasted recipient device id with read/write / accept a vault shared to this
   device) over a **vendored `sharing.mjs`** — `build.sh` now copies it beside
   `totp-vault.mjs` / `totp-migration.mjs` / `sync.mjs` / `device-auth.mjs` (it imports
-  two of them, so all five must stay siblings). Storage matches the webapp: the sealed
+  two of them, so all **six** must stay siblings — `build.sh` now also vendors
+  **`recovery.mjs`**, though ⚠️ **the extension popup has NO recovery UI**; it consumes only
+  the *wrap gate* (the safety-number field and the refusal)). Storage matches the webapp: the sealed
   device-identity container is the **v3 schema** carrying the hybrid secret, the vault
   keyring **and the Phase 50 pin store** beside the seed, so `chrome.storage.local` still
   holds only the two sealed
@@ -1397,23 +1593,38 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 # Optional, and the only gate that exercises migration 0005:
 # SIGILD_OPLOG_POSTGRES=<dsn> ./cli/tests/e2e-accounts.sh
 
+# RECOVERY KITS — the Phase 54 end-to-end proof (ADR 0042). Real sigild + real
+# CLI, no mocks, twelve steps: generate a kit; scan the server log + DB for any
+# leak of the printed secret; DESTROY device A and RESTORE on a clean machine
+# (ephemeral vs --adopt); reject a mistyped code OFFLINE (server pointed at a dead
+# port, so the checksum is doing the work); a foreign-account kit is 401; `vault
+# rotate` REFUSES to silently drop the kit; a vault created after the print is
+# uncovered until `recovery cover`; and — the security-critical step 9c — SHARE
+# and ROTATE obey the SAME recovery-kit safety-number rule as COVER (this is the
+# regression that the first implementation failed).
+./cli/tests/e2e-recovery.sh                       # prints PASS
+# MUTATION CHECK (run by hand, restore afterwards): disable the gate in
+# verify_recipient_for_wrap and this script must go RED with
+#   "expected 'recovery cover ...' to FAIL, but it succeeded".
+
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
-# clippy/test exercise the *_inner helpers (26 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the TEN Node tests below must all PASS.
+# clippy/test exercise the *_inner helpers (29 tests); build-wasm.sh emits
+# pkg-web/pkg-node (needs wasm-pack); then the ELEVEN Node tests below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/10 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/10 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/10 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/10 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/10 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/10 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/10 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/10 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
-node sigil-wasm/test/pinning-interop.mjs            # 9/10 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
-node sigil-wasm/test/accounts-interop.mjs            # 10/10 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/11 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/11 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/11 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/11 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/11 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/11 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/11 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/11 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/11 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/accounts-interop.mjs            # 10/11 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
+node sigil-wasm/test/recovery-interop.mjs           # 11/11 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
 grep -c 'name = "getrandom"' sigil-wasm/Cargo.lock  # must ALSO be 0 (JS supplies entropy)
 
 # Go server — fmt / vet / test / build
@@ -1531,12 +1742,16 @@ list of `.github/workflows/` (ten files):
   nothing. It needs Go + Rust + bash + curl + python3 and no wasm, so it is a separate,
   parallel job. `e2e-sharing.sh` now resolves its Go as `$GO` → Homebrew → PATH (it
   hardcoded the macOS Homebrew path), and the job sets `GO: go`.
-  ⚠️ **KNOWN CI GAP after Phase 52 — the workflow was NOT updated** (that phase's brief was
-  code + docs, and a workflow is neither): job 1's Node-test list does **not** include the
-  new **`sigil-wasm/test/accounts-interop.mjs`** (now 10/10 locally), and there is no job
-  running the new **`cli/tests/e2e-accounts.sh`**. Both pass locally; both are currently run
-  by nothing in CI. Adding them is a one-line step each (`accounts-interop.mjs` beside the
-  other nine in `interop`; `e2e-accounts.sh` beside `e2e-sharing.sh`, same `GO: go` env).
+  ⚠️ **KNOWN CI GAP, now WIDER after Phases 52 and 54 — the workflow has NOT been updated**
+  (both briefs were code + docs, and a workflow is neither): job 1's Node-test list does
+  **not** include **`sigil-wasm/test/accounts-interop.mjs`** (the tenth) or
+  **`sigil-wasm/test/recovery-interop.mjs`** (the **eleventh**, and the only automated guard
+  on the Rust↔JS recovery-kit codec + derivation), and there is no job running
+  **`cli/tests/e2e-accounts.sh`** or **`cli/tests/e2e-recovery.sh`** (the latter being the
+  proof that the wrap gate fires on share, rotate AND cover). All four pass locally; all four
+  are currently run by **nothing in CI**. Adding them is a one-line step each (the two
+  `*-interop.mjs` beside the other nine in `interop`; the two `e2e-*.sh` beside
+  `e2e-sharing.sh`, same `GO: go` env).
 - **`security.yml`** — gitleaks (full history) + govulncheck + **cargo-audit across a
   matrix of ALL FOUR Rust workspaces** (`libsigil`, `cli`, `sigil-wasm`, `desktop`;
   Phase 51 — it audited `libsigil` only, which says nothing about the other three, and

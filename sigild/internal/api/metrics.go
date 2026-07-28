@@ -45,6 +45,13 @@ type Metrics struct {
 	oplogVerifyTotal      atomic.Int64
 	oplogRateLimitedTotal atomic.Int64
 
+	// Abuse-bound counters (Phase 53), keyed by the CLOSED three-value surface
+	// set. Counts ONLY: never a source address (which is personal data this
+	// server otherwise never retains — see auditRateLimited), never an account,
+	// device or vault ID, never a token, key, signature or nonce. Built once at
+	// construction; only the atomic values mutate.
+	abuseRateLimited map[string]*atomic.Int64
+
 	// Device-model counters (Phase 41). Counts ONLY — never a device's public
 	// key, an enrollment token (or its digest), an admin token, a signature, a
 	// nonce, or a vault/device ID as a label (an ID label would let a scrape
@@ -71,6 +78,21 @@ type Metrics struct {
 	keyEnvelopePutsTotal    atomic.Int64
 	keyEnvelopeGetsTotal    atomic.Int64
 	keyEnvelopeDeletesTotal atomic.Int64
+	keyEnvelopeIndexTotal   atomic.Int64
+
+	// entitlementEnforcing is 1 when this router enforces payment on its three
+	// WRITE surfaces, 0 otherwise. Like schemaVersion it is a config-time value
+	// fixed before serving starts and never mutated, so it needs no atomic. It is
+	// exported as a gauge so an operator can see at a glance whether enforcement
+	// is actually on — a knob believed to be on but silently inert is exactly the
+	// failure this repo keeps refusing to ship.
+	entitlementEnforcing int64
+	// entitlementDecisions counts enforcement verdicts, keyed by the CLOSED
+	// four-value outcome set. Counts ONLY — never an account id, a subject, a
+	// provider reference, an amount or a timestamp. /metrics is always-on and
+	// unauthenticated, so an id label here would let a scrape enumerate which
+	// customers are behind on payment.
+	entitlementDecisions map[entitlementOutcome]*atomic.Int64
 
 	// authDenied counts request auth/authz denials, keyed by the fixed
 	// authReason enum so /metrics can label each by reason. Built once
@@ -156,6 +178,10 @@ var billingWebhookOutcomes = []string{
 // Like the auth reasons these are a fixed enum naming which class of check
 // failed; they are surfaced only to the operator (audit log + this metric),
 // never to the caller.
+//
+// There is deliberately NO "rate_limited" value: the webhook route carries no
+// rate limiter (see billingWebhook — shedding traffic there loses payment
+// events), so a counter for it would name a rejection that cannot happen.
 var billingRejectReasons = []string{
 	"bad_signature",
 	"malformed",
@@ -174,12 +200,20 @@ func newMetrics(version string, schemaVersion int64) *Metrics {
 	m := &Metrics{
 		version:                version,
 		schemaVersion:          schemaVersion,
+		abuseRateLimited:       make(map[string]*atomic.Int64, len(abuseRateLimitSurfaces)),
+		entitlementDecisions:   make(map[entitlementOutcome]*atomic.Int64, len(entitlementOutcomes)),
 		authDenied:             make(map[authReason]*atomic.Int64, len(authDenyReasons)),
 		enrollDenied:           make(map[authReason]*atomic.Int64, len(enrollDenyReasons)),
 		billingCheckouts:       make(map[string]*atomic.Int64, len(billing.SupportedProviders)),
 		billingWebhooks:        make(map[string]*atomic.Int64),
 		billingWebhookRejected: make(map[string]*atomic.Int64, len(billingRejectReasons)),
 		billingSubTransitions:  make(map[billing.Status]*atomic.Int64, len(billing.Statuses)),
+	}
+	for _, s := range abuseRateLimitSurfaces {
+		m.abuseRateLimited[s] = new(atomic.Int64)
+	}
+	for _, o := range entitlementOutcomes {
+		m.entitlementDecisions[o] = new(atomic.Int64)
 	}
 	for _, r := range authDenyReasons {
 		m.authDenied[r] = new(atomic.Int64)
@@ -255,6 +289,25 @@ func (m *Metrics) incVerify() { m.oplogVerifyTotal.Add(1) }
 // incRateLimited records one op-log request rejected by the rate limiter.
 func (m *Metrics) incRateLimited() { m.oplogRateLimitedTotal.Add(1) }
 
+// incAbuseRateLimited records one request rejected by an abuse-bound limiter,
+// labeled by the closed surface set. An unknown surface (impossible — it comes
+// from the compile-time constants) is ignored rather than mutating the map
+// concurrently.
+func (m *Metrics) incAbuseRateLimited(surface string) {
+	if c := m.abuseRateLimited[surface]; c != nil {
+		c.Add(1)
+	}
+}
+
+// incEntitlement records one entitlement enforcement verdict, labeled by the
+// closed outcome set. An unknown outcome (impossible — it comes from the
+// compile-time constants) is ignored rather than mutating the map concurrently.
+func (m *Metrics) incEntitlement(outcome entitlementOutcome) {
+	if c := m.entitlementDecisions[outcome]; c != nil {
+		c.Add(1)
+	}
+}
+
 // incAuthDenied records one request auth/authz denial by reason. An unknown
 // reason (should not occur — reason comes from the fixed enum) is ignored rather
 // than mutating the map concurrently.
@@ -309,6 +362,10 @@ func (m *Metrics) incKeyEnvelopeGet() { m.keyEnvelopeGetsTotal.Add(1) }
 // key rotation (Phase 50). A counter only — no vault ID, no device ID, no blob.
 func (m *Metrics) incKeyEnvelopeDelete() { m.keyEnvelopeDeletesTotal.Add(1) }
 
+// incKeyEnvelopeIndex records one device asking which vaults hold a wrapped key
+// for it (Phase 54). A counter only — no device ID, no vault ID, no blob.
+func (m *Metrics) incKeyEnvelopeIndex() { m.keyEnvelopeIndexTotal.Add(1) }
+
 // incAuthzDenied records one AUTHORIZATION denial (a 403), i.e. an
 // authenticated device that was not permitted. It is counted separately from the
 // per-reason breakdown so an operator can alert on 403s alone.
@@ -348,6 +405,39 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 	writeCounter(&b, "sigild_oplog_ratelimit_rejected_total",
 		"Total op-log requests rejected by the per-vault rate limiter.", m.oplogRateLimitedTotal.Load())
 
+	// Abuse bounds. The surface label is a closed three-value set; there is
+	// deliberately no key label, so a scrape cannot learn WHICH address, account
+	// or provider was limited.
+	b.WriteString("# HELP sigild_abuse_ratelimit_rejected_total Total requests rejected by an abuse-bound rate limiter, by surface.\n")
+	b.WriteString("# TYPE sigild_abuse_ratelimit_rejected_total counter\n")
+	for _, s := range abuseRateLimitSurfaces {
+		b.WriteString(`sigild_abuse_ratelimit_rejected_total{surface="`)
+		b.WriteString(s)
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(m.abuseRateLimited[s].Load(), 10))
+		b.WriteByte('\n')
+	}
+
+	// Entitlement enforcement (Phase 55). The gauge says whether it is on; the
+	// counter says what it decided. The outcome label is a closed four-value set
+	// and there is deliberately NO account/subject label, so a scrape can never
+	// learn WHO was refused — only how often anyone was.
+	b.WriteString("# HELP sigild_entitlement_enforcing 1 when payment enforcement is active on the WRITE surfaces (reads are never enforced), else 0.\n")
+	b.WriteString("# TYPE sigild_entitlement_enforcing gauge\n")
+	b.WriteString("sigild_entitlement_enforcing ")
+	b.WriteString(strconv.FormatInt(m.entitlementEnforcing, 10))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP sigild_entitlement_decisions_total Total entitlement checks on WRITE requests, by outcome.\n")
+	b.WriteString("# TYPE sigild_entitlement_decisions_total counter\n")
+	for _, o := range entitlementOutcomes {
+		b.WriteString(`sigild_entitlement_decisions_total{outcome="`)
+		b.WriteString(string(o))
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(m.entitlementDecisions[o].Load(), 10))
+		b.WriteByte('\n')
+	}
+
 	writeCounter(&b, "sigild_device_enrollments_total",
 		"Total device enrollments accepted.", m.deviceEnrollmentsTotal.Load())
 	writeCounter(&b, "sigild_device_revocations_total",
@@ -372,6 +462,8 @@ func (m *Metrics) writePrometheus(w io.Writer) {
 		"Total opaque wrapped-vault-key envelopes collected by their recipient.", m.keyEnvelopeGetsTotal.Load())
 	writeCounter(&b, "sigild_key_envelope_deletes_total",
 		"Total opaque wrapped-vault-key envelopes deleted during a vault key rotation.", m.keyEnvelopeDeletesTotal.Load())
+	writeCounter(&b, "sigild_key_envelope_index_total",
+		"Total per-device key-envelope index reads (which vaults hold a wrapped key for the caller).", m.keyEnvelopeIndexTotal.Load())
 	writeCounter(&b, "sigild_oplog_authz_denied_total",
 		"Total requests denied by per-vault authorization (HTTP 403).", m.authzDeniedTotal.Load())
 

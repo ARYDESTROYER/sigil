@@ -1229,9 +1229,12 @@ function AccountBlock({
             </p>
           )}
           <p className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
-            No recovery: an account is reachable only through a member device&rsquo;s
-            private key. Membership is flat — any member may invite, and may revoke
-            any other member.
+            An account is reachable only through a member device&rsquo;s private key,
+            so losing every device is unrecoverable <em>unless a recovery kit was
+            printed in advance</em> (<code>sigil recovery generate</code>) — one
+            cannot be created after the fact, and this app cannot print one.
+            Membership is flat — any member may invite, and may revoke any other
+            member.
           </p>
         </>
       )}
@@ -1514,6 +1517,18 @@ function SharingPanel({
     presented: string;
   } | null>(null);
   const [rotateTo, setRotateTo] = useState("");
+  // ⭐ Phase 53-55 fix round. `shareSafety` is the recipient's safety number read
+  // out of band — optional for an ordinary device, REQUIRED by the wrap gate for
+  // a RECOVERY KIT this browser has never pinned. `rotateDrop` / `dropAllOthers`
+  // exist because rotateVaultKey's drop guard defaults to "drop nothing", so a
+  // rotation that excludes ANY current envelope holder — the entire point of
+  // rotating — threw RecipientsWouldBeDroppedError with no way for this UI to
+  // proceed. `rotateSafety` carries "deviceId=digits" pairs for the same reason
+  // as shareSafety.
+  const [shareSafety, setShareSafety] = useState("");
+  const [rotateDrop, setRotateDrop] = useState("");
+  const [rotateSafety, setRotateSafety] = useState("");
+  const [dropAllOthers, setDropAllOthers] = useState(false);
 
   // 401 (not authenticated) vs 403 (authenticated but not permitted) vs 404
   // (nothing shared yet) are spelled out rather than shown as a generic error —
@@ -1609,6 +1624,8 @@ function SharingPanel({
         recipientDeviceId: to,
         vaultKey: key,
         permission,
+        // Checked BEFORE anything is wrapped. Blank = not supplied.
+        expectedSafetyNumber: shareSafety.trim() === "" ? null : shareSafety.trim(),
       });
       // Persist the (possibly newly-pinned) store INSIDE the sealed container.
       onUpdateDevice({ pins: res.pins });
@@ -1689,6 +1706,30 @@ function SharingPanel({
       if (recipients.length === 0) {
         throw new Error("list every device id that KEEPS access (comma or space separated)");
       }
+      // ⭐ THE DROP LIST. rotateVaultKey REFUSES to delete an envelope its caller
+      // did not name (Phase 54), and this UI used to pass none — so any rotation
+      // that actually excluded somebody, which is the whole point of rotating,
+      // hard-failed with no way through. "Drop everyone else" resolves the list
+      // from the server so the destruction is still stated, just not retyped.
+      const drop = rotateDrop
+        .split(/[\s,]+/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+      if (dropAllOthers) {
+        for (const holder of await wasm.listKeyEnvelopes(wasm, auth, id)) {
+          if (!recipients.includes(holder.deviceId) && !drop.includes(holder.deviceId)) {
+            drop.push(holder.deviceId);
+          }
+        }
+      }
+      // "dev_x=12345 67890 …" pairs, so a recovery kit among the recipients can
+      // be verified against its printed sheet before anything is wrapped.
+      const safetyNumbers: Record<string, string> = {};
+      for (const entry of rotateSafety.split(",")) {
+        const at = entry.indexOf("=");
+        if (at <= 0) continue;
+        safetyNumbers[entry.slice(0, at).trim()] = entry.slice(at + 1).trim();
+      }
       // The sealed container as it sits in localStorage — rotation re-seals THOSE
       // exact bytes under the new key without ever handling the plaintext here.
       const storedVault = window.localStorage.getItem(STORAGE_KEY);
@@ -1700,6 +1741,8 @@ function SharingPanel({
         sealedVault: sealed,
         oldVaultKey: key,
         params: ARGON2,
+        drop,
+        safetyNumbers,
       });
       onUpdateDevice({ pins: res.pins });
       onRekey(id, res.vaultKey);
@@ -1923,6 +1966,26 @@ function SharingPanel({
         </div>
       )}
 
+      {/* ⭐ The out-of-band check, entered BEFORE the wrap. Optional for an
+          ordinary device (a first sight is pinned and warned about), MANDATORY
+          for a RECOVERY KIT this browser has never pinned — the digits are on
+          the printed sheet, and a kit reconstructs the whole account. */}
+      <label className="mt-3 block text-sm">
+        <span className="mb-1 block font-medium">
+          Their safety number (optional — required for a recovery kit)
+        </span>
+        <input
+          data-testid="sharing-share-safety"
+          className={`${inputCls} font-mono`}
+          value={shareSafety}
+          onChange={(e) => setShareSafety(e.target.value)}
+          placeholder="83791 28129 67801 50284 55242 77845"
+          spellCheck={false}
+          autoComplete="off"
+          inputMode="numeric"
+        />
+      </label>
+
       {/* Rotation: a fresh vault key re-wrapped to exactly these devices. */}
       <div className="mt-4 border-t border-neutral-200 pt-4 dark:border-neutral-800">
         <label className="block text-sm">
@@ -1935,6 +1998,51 @@ function SharingPanel({
             value={rotateTo}
             onChange={(e) => setRotateTo(e.target.value)}
             placeholder="dev_…, dev_… (include THIS device)"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        {/* ⭐ Rotation DELETES the envelope of everyone left out, so it refuses
+            to do that by omission. Name them, or tick the box. */}
+        <label className="mt-2 block text-sm">
+          <span className="mb-1 block font-medium">
+            …and device ids whose access is being REMOVED (comma separated)
+          </span>
+          <input
+            data-testid="sharing-rotate-drop"
+            className={`${inputCls} font-mono`}
+            value={rotateDrop}
+            onChange={(e) => setRotateDrop(e.target.value)}
+            placeholder="dev_… (their envelope is deleted)"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </label>
+        <label className="mt-2 flex items-center gap-2 text-sm">
+          <input
+            data-testid="sharing-rotate-drop-all"
+            type="checkbox"
+            checked={dropAllOthers}
+            onChange={(e) => setDropAllOthers(e.target.checked)}
+          />
+          <span>
+            Remove every other device that currently holds a key for this vault
+            <span className="block text-xs text-neutral-600 dark:text-neutral-400">
+              Includes a RECOVERY KIT if one holds a key — after this the printed sheet no longer
+              recovers this vault.
+            </span>
+          </span>
+        </label>
+        <label className="mt-2 block text-sm">
+          <span className="mb-1 block font-medium">
+            Safety numbers for first-sight recipients (dev_x=digits, comma separated)
+          </span>
+          <input
+            data-testid="sharing-rotate-safety"
+            className={`${inputCls} font-mono`}
+            value={rotateSafety}
+            onChange={(e) => setRotateSafety(e.target.value)}
+            placeholder="dev_abc=83791 28129 67801 50284 55242 77845"
             spellCheck={false}
             autoComplete="off"
           />

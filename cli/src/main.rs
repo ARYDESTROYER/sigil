@@ -18,23 +18,31 @@ use sigil_cli::{
     load_hybrid_secret, load_identity, load_key_file, load_keyring, migration_otp_to_entry,
     new_totp_entry, open_container, open_vault, parse_otpauth_uri, publish_hybrid_key,
     pull_ops_auth, push_op_auth, put_key_envelope, read_cursor, revoke_device, save_hybrid_public,
-    save_hybrid_secret, save_key, seal_to_container, seal_vault, totp_algorithm_from_str,
-    unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, write_cursor, CliError,
-    DeviceIdentity, ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE,
+    save_hybrid_secret, save_key, seal_to_container, seal_vault, share_vault_to_known_key,
+    totp_algorithm_from_str, unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, write_cursor,
+    CliError, DeviceIdentity, ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE,
     TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD, VAULT_KEYRING_FILE,
 };
 // Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
 // All of it lives in the sigil-cli LIBRARY so the native desktop app gets the
 // same semantics by calling the same functions (ADR 0037).
 use sigil_cli::{
-    fetch_hybrid_key_pinned, hybrid_safety_number, load_pins, pairwise_safety_number,
-    repin_hybrid_key, rotate_vault_key, HybridPublicIdentity, HYBRID_PIN_FILE,
+    hybrid_safety_number, list_key_envelopes, load_pins, pairwise_safety_number, repin_hybrid_key,
+    rotate_vault_key, verify_recipient_for_wrap, HybridPublicIdentity, HYBRID_PIN_FILE,
 };
 // Phase 52 — the ACCOUNT model. Membership is what entitlement and vault
 // ownership key off, so a second device inherits both. Every call rides the
 // EXISTING contract v3 request path: no new signed message, no new header.
 use sigil_cli::{create_account_invite, get_account, list_account_invites, revoke_account_invite};
 use sigil_core::Argon2Params;
+// Phase 54 — THE RECOVERY KIT. All of it lives in the sigil-cli LIBRARY so the
+// desktop app gets the same semantics by calling the same functions (ADR 0037),
+// and so the code that talks to the server has exactly ONE implementation.
+use sigil_cli::{
+    derive_recovery_identity, recovery_check, recovery_cover, recovery_generate, recovery_restore,
+    recovery_revoke, recovery_verify,
+};
+use sigil_core::format_recovery_kit;
 
 /// Environment variable the password is read from. Empty/unset is a hard error.
 const PASSWORD_ENV: &str = "SIGIL_PASSWORD";
@@ -110,15 +118,52 @@ USAGE:
                                          Re-seal a PASSWORD vault under a fresh random VAULT KEY
                                          (--publish also wraps it to THIS device and uploads it)
   sigil vault share --vault <id> --to <deviceID> [--permission read|write] [--keyring <f>]
-                    [--key <f>] [--pins <f>] [--server <url>] [--envelope-out <f>]
+                    [--safety-number \"<digits>\"] [--key <f>] [--pins <f>] [--server <url>]
+                    [--envelope-out <f>]
                                          Wrap the vault key to that device's hybrid public key,
-                                         upload the opaque envelope, and grant it access.
-                                         REFUSES if that device's key CHANGED since it was pinned
-  sigil vault rotate --vault <id> --to <deviceID> [--to <deviceID> ...] [--file <vaultfile>]
-                     [--keyring <f>] [--pins <f>] [--key <f>] [--server <url>]
+                                         upload the opaque envelope, and grant it access. Prints
+                                         the safety number BEFORE wrapping. REFUSES if that
+                                         device's key CHANGED since it was pinned, if a supplied
+                                         --safety-number does not match, or if the recipient is a
+                                         RECOVERY KIT this client has never pinned and no
+                                         --safety-number was given
+  sigil vault rotate --vault <id> --to <deviceID> [--to <deviceID> ...] [--drop <deviceID> ...]
+                     [--drop-all-others] [--safety-number \"<deviceID>=<digits>\" ...]
+                     [--file <vaultfile>] [--keyring <f>] [--pins <f>] [--key <f>] [--server <url>]
                                          Draw a FRESH vault key, re-seal the vault under it, re-wrap
-                                         it to EXACTLY those devices, and delete every other
-                                         device's envelope. Protects FUTURE content only
+                                         it to EXACTLY those devices, and delete the envelope of
+                                         every device named by --drop. Every recipient goes through
+                                         the SAME wrap gate as share. REFUSES if some device holds
+                                         an envelope and is in neither list (it would lose access
+                                         silently — including your RECOVERY KIT).
+                                         Protects FUTURE content only
+  sigil recovery generate [--vault <id> ...] [--keyring <f>] [--pins <f>] [--key <f>]
+                          [--server <url>] [--out <sheet>]
+                                         Print a RECOVERY KIT: 56 characters of paper that are a
+                                         full member device. Verifies itself end to end BEFORE
+                                         printing. ⚠️ whoever holds the paper holds the account
+  sigil recovery verify [--code \"<56 chars>\" | --code-stdin]
+                                         Check a printed code OFFLINE (checksum only, no network).
+                                         With no --code it PROMPTS (echo off) or reads one line
+                                         from stdin. ⚠️ --code puts the SECRET in argv (readable
+                                         via /proc on Linux) and in your shell history
+  sigil recovery check --device-id <kitID> [--keyring <f>] [--key <f>] [--server <url>]
+                                         Which of THIS device's vaults the kit still covers
+  sigil recovery cover --device-id <kitID> --vault <id> [--safety-number \"<digits>\"]
+                       [--keyring <f>] [--pins <f>] [--key <f>] [--server <url>]
+                                         Cover one more vault. From a device that did NOT generate
+                                         the kit, --safety-number is REQUIRED and must match
+  sigil recovery restore --device-id <kitID> [--code \"<56 chars>\" | --code-stdin]
+                         [--out-dir <dir>] [--adopt] [--server <url>]
+                                         Recover every covered vault on a machine with NO local
+                                         state. The code is PROMPTED for (echo off) or read from
+                                         stdin; --code still works for scripts but exposes the
+                                         SECRET in argv and shell history. --adopt ALSO persists
+                                         the kit's secrets here, making this machine a second
+                                         copy of the paper
+  sigil recovery revoke --device-id <kitID> [--vault <id> ...] [--keyring <f>] [--key <f>]
+                        [--server <url>]
+                                         Revoke the kit and take back its envelopes (then rotate)
   sigil device safety-number [<deviceID>] [--pair <deviceID>] [--key <f>] [--server <url>]
                                          Print the human-comparable SAFETY NUMBER of a hybrid public
                                          key — read it aloud over a TRUSTED channel to verify a key
@@ -318,10 +363,13 @@ ACCOUNTS (sigil account ...) — WHO OWNS THE VAULT AND WHO IS ENTITLED, DEV-ONL
   just verified, which is why there is no --account flag anywhere.
 
   !! HONEST SCOPE: dev-gated, plain HTTP, UNAUDITED.
-  * NO RECOVERY. An account is reachable only through a member device's private
-    key. Lose or revoke every device and the account, its vaults and its
-    subscription are permanently unreachable — by you and by us. Keep two
-    devices enrolled.
+  * NO RECOVERY UNLESS YOU PRINTED A KIT FIRST. An account is reachable only
+    through a member device's private key. Lose or revoke every device and the
+    account, its vaults and its subscription are permanently unreachable — by
+    you and by us — UNLESS `sigil recovery generate` was run in advance and the
+    sheet survived. A kit CANNOT be made after the loss, and it only opens the
+    vaults it was told to cover (`sigil recovery cover`). Keep two devices
+    enrolled AND print a kit.
   * Joining grants AUTHORIZATION, never DECRYPTION. A new device reads nothing
     until a member wraps the vault key to it (`sigil vault share`).
   * Membership is FLAT: any member may invite, revoke every other member, and
@@ -492,6 +540,7 @@ fn run() -> Result<(), String> {
         "device" => cmd_device(args),
         "account" => cmd_account(args),
         "vault" => cmd_vault(args),
+        "recovery" => cmd_recovery(args),
         "push" => {
             let p = parse_push(args)?;
             cmd_push(&p)
@@ -1539,7 +1588,7 @@ fn cmd_device_pins(f: &DeviceFlags) -> Result<(), String> {
     Ok(())
 }
 
-/// `sigil device repin <deviceID> --yes [--safety-number "<digits>"]`
+/// `sigil device repin <deviceID> --yes [--safety-number \"<digits>\"]`
 ///
 /// ⚠️⚠️ DANGEROUS — READ THIS BEFORE USING IT. ⚠️⚠️
 ///
@@ -1558,7 +1607,7 @@ fn cmd_device_pins(f: &DeviceFlags) -> Result<(), String> {
 /// This is the ONLY operation that ever replaces a pin; no share, rotate or fetch
 /// path will do it for you, and none of them will ever accept a changed key.
 ///
-/// `--yes` is required. If you pass `--safety-number "<digits>"` it must match
+/// `--yes` is required. If you pass `--safety-number \"<digits>\"` it must match
 /// the number of the key the server is presenting, so a mistyped or stale value
 /// refuses rather than blessing the wrong key.
 fn cmd_device_repin(target: Option<String>, f: &DeviceFlags) -> Result<(), String> {
@@ -1992,6 +2041,28 @@ struct VaultFlags {
     /// `rekey` only: also wrap the new vault key to THIS device and upload it,
     /// so the owner's own key is recoverable from the server.
     publish: bool,
+    /// `rotate` only (Phase 54): devices whose envelope may be DELETED. A device
+    /// that holds an envelope and is named by neither `--to` nor `--drop` aborts
+    /// the rotation, so destroying access is an explicit act rather than the
+    /// silent default it used to be.
+    drop: Vec<String>,
+    /// `rotate` only: shorthand for "drop every current holder not in `--to`".
+    /// Still explicit — you have to type it.
+    drop_all_others: bool,
+    /// ⭐ Out-of-band verification of a recipient's hybrid key, checked by the
+    /// WRAP GATE before anything is wrapped (`sigil_cli::verify_recipient_for_wrap`).
+    ///
+    /// Two accepted forms, so `share` (one recipient) stays as simple as it was
+    /// and `rotate` (many) is still expressible:
+    ///
+    ///   --safety-number "83791 28129 ..."                (applies to the single --to)
+    ///   --safety-number "dev_abc=83791 28129 ..."        (repeatable, per device)
+    ///
+    /// REQUIRED when the recipient is a RECOVERY KIT this client has never
+    /// pinned: the digits are printed on the sheet, so the channel exists and
+    /// trusting the registry instead is not acceptable for the one credential
+    /// that reconstructs the whole account.
+    safety_number: Vec<String>,
 }
 
 fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
@@ -2018,11 +2089,70 @@ fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
             "--server" => set_once(&mut f.server, &mut it, "--server")?,
             "--permission" => set_once(&mut f.permission, &mut it, "--permission")?,
             "--envelope-out" => set_once(&mut f.envelope_out, &mut it, "--envelope-out")?,
+            "--drop" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--drop requires a value".to_string())?;
+                if f.drop.contains(&v) {
+                    return Err(format!("--drop {v:?} given more than once"));
+                }
+                f.drop.push(v);
+            }
+            "--safety-number" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--safety-number requires a value".to_string())?;
+                f.safety_number.push(v);
+            }
             "--publish" => f.publish = true,
+            "--drop-all-others" => f.drop_all_others = true,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
     }
     Ok(f)
+}
+
+/// Resolve `--safety-number` values into `(device id, digits)` pairs.
+///
+/// Bare digits are allowed only when there is exactly ONE recipient, because
+/// silently applying them to a set would let a human verify one device and
+/// believe they had verified all of them.
+fn resolve_safety_numbers(
+    raw: &[String],
+    recipients: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let (device, digits) = match entry.split_once('=') {
+            Some((d, n)) => (d.trim().to_string(), n.trim().to_string()),
+            None => {
+                if recipients.len() != 1 {
+                    return Err(
+                        "--safety-number without a device needs exactly one --to; with several \
+                         recipients use --safety-number \"<deviceID>=<the six 5-digit groups>\""
+                            .to_string(),
+                    );
+                }
+                (recipients[0].clone(), entry.trim().to_string())
+            }
+        };
+        if !recipients.contains(&device) {
+            return Err(format!(
+                "--safety-number names {device:?}, which is not one of the --to recipients"
+            ));
+        }
+        if out.iter().any(|(d, _)| d == &device) {
+            return Err(format!("--safety-number given twice for {device:?}"));
+        }
+        if digits.chars().filter(|c| c.is_ascii_digit()).count() == 0 {
+            return Err(format!(
+                "--safety-number for {device:?} contains no digits; it should be the six 5-digit \
+                 groups printed on the sheet"
+            ));
+        }
+        out.push((device, digits));
+    }
+    Ok(out)
 }
 
 /// Dispatch `sigil vault <sub> ...`.
@@ -2113,7 +2243,7 @@ fn explain_sharing_error(e: CliError, what: &str) -> String {
 /// key and uploads the envelope, so the owner can recover its own vault key from
 /// the server (and, as a side effect, claims the vault ID for this device).
 fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
-    if !f.to.is_empty() || f.addressee.is_some() {
+    if !f.to.is_empty() || f.addressee.is_some() || !f.drop.is_empty() || f.drop_all_others {
         return Err("vault rekey takes --vault/--file/--keyring/--publish (plus --key/--hybrid-key/--server) only".to_string());
     }
     let vault_id = f
@@ -2153,6 +2283,12 @@ fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
             format!("{e}\n  -> run `sigil device hybrid-publish` first so this device has a hybrid identity")
         })?;
 
+        // ⭐ THE ONE WRAP THAT DOES NOT GO THROUGH verify_recipient_for_wrap, and
+        // why that is correct: the recipient is THIS DEVICE, and its hybrid
+        // PUBLIC key was just read off the LOCAL 0600 file — the server was
+        // never asked, so there is no fetched answer to verify. Every wrap whose
+        // recipient key came from the server goes through the gate (share,
+        // rotate, cover, recovery generate); this one has no such input.
         let envelope = wrap_vault_key(&public, &key).map_err(|e| e.to_string())?;
         let identity_opt = Some(identity);
         let auth = auth_for(&identity_opt);
@@ -2173,7 +2309,12 @@ fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
 /// The vault key itself is never printed and never leaves this machine
 /// unwrapped.
 fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
-    if f.file.is_some() || f.addressee.is_some() || f.publish {
+    if f.file.is_some()
+        || f.addressee.is_some()
+        || f.publish
+        || !f.drop.is_empty()
+        || f.drop_all_others
+    {
         return Err(
             "vault share takes --vault/--to/--permission/--keyring/--key/--server/--envelope-out only"
                 .to_string(),
@@ -2212,26 +2353,44 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
             )
         })?;
 
-    // 1) The recipient's PUBLIC hybrid key — through the PIN CHOKE POINT
-    //    (Phase 50). If the key the server hands back differs from the one this
-    //    client pinned, this returns CliError::PinMismatch and we stop HERE:
-    //    nothing is wrapped, nothing is uploaded, and the vault key never
-    //    touches the substituted key.
+    // 1) ⭐ THE WRAP GATE. Resolve the recipient's PUBLIC hybrid key AND settle
+    //    trust in it in ONE call, before anything can be wrapped. A changed key
+    //    (PinMismatch), a wrong --safety-number, or an unverified RECOVERY KIT
+    //    all stop HERE: nothing is wrapped, nothing is uploaded, and the pin
+    //    store is not mutated. This is the same gate `vault rotate`,
+    //    `recovery cover` and `recovery generate` use — the point of ADR 0038.
     let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
-    let (recipient, pin_status) = fetch_hybrid_key_pinned(&server, &to, &auth, &pins)
-        .map_err(|e| explain_sharing_error(e, "fetching the recipient's hybrid public key"))?;
-    let safety = hybrid_safety_number(&to, &recipient).map_err(|e| e.to_string())?;
+    let safety_numbers = resolve_safety_numbers(&f.safety_number, std::slice::from_ref(&to))?;
+    let expected = safety_numbers.first().map(|(_, n)| n.as_str());
+    let recipient = verify_recipient_for_wrap(&server, &to, &auth, &pins, expected, false)
+        .map_err(|e| explain_sharing_error(e, "verifying the recipient's hybrid public key"))?;
 
-    // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
-    let envelope = wrap_vault_key(&recipient, &key).map_err(|e| e.to_string())?;
+    // ⭐ SHOW THE TRUST DECISION BEFORE ACTING ON IT. The previous version
+    // printed the safety number AFTER the wrap, the deposit and the grant had
+    // all completed, which is exactly backwards: by then the vault key was
+    // already in the server's hands and no human decision could undo it.
+    println!(
+        "about to wrap vault {vault_id} to device {to}\n  \
+         key trust:   {trust}\n  \
+         safety no.:  {safety}",
+        trust = recipient.trust().label(),
+        safety = recipient.safety_number(),
+    );
+    if recipient.trust().needs_out_of_band_check() {
+        eprintln!(
+            "warning: this is the FIRST time this client has seen {to}'s hybrid key, and nothing \n  \
+             out of band has confirmed it. Pinning cannot protect first contact. Confirm the safety\n  \
+             number above with {to}'s owner over a channel the server does NOT control (a phone\n  \
+             call, in person); re-run with --safety-number \"<digits>\" to have it checked here."
+        );
+    }
 
-    // 3) Deposit the OPAQUE envelope; the server cannot read it.
-    put_key_envelope(&server, &vault_id, &to, &envelope, &auth)
-        .map_err(|e| explain_sharing_error(e, "depositing the key envelope"))?;
-
-    // 4) Authorize through the EXISTING grant API, so access and keys agree.
-    grant_vault_access(&server, &vault_id, &to, &permission, &auth)
-        .map_err(|e| explain_device_error(e, "granting vault access"))?;
+    // 2-4) ⭐ THE ONE wrap -> deposit -> grant path. It takes the VerifiedRecipient
+    //      produced above, and `VerifiedRecipient` has no other constructor — so
+    //      this call is unreachable with an unchecked key.
+    let envelope =
+        share_vault_to_known_key(&server, &vault_id, &recipient, &permission, &key, &auth)
+            .map_err(|e| explain_sharing_error(e, "sharing the vault (wrap, deposit, grant)"))?;
 
     if let Some(path) = &f.envelope_out {
         write_envelope_file(path, &envelope)?;
@@ -2241,14 +2400,9 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
          wrapped the vault key to that device's hybrid public key (X25519 + ML-KEM-768)\n  \
          envelope:    {} bytes, opaque to the server\n  \
          permission:  {permission}\n  \
-         key sha256:  {fp} (fingerprint only)\n  \
-         key pin:     {status}\n  \
-         safety no.:  {safety}\n  \
-         Verify that safety number with {to}'s owner over a channel the server does NOT\n  \
-         control (a phone call, in person). Pinning alone cannot protect FIRST contact.",
+         key sha256:  {fp} (fingerprint only)",
         envelope.len(),
         fp = vault_key_fingerprint(&key),
-        status = pin_status.label(),
     );
     Ok(())
 }
@@ -2263,7 +2417,13 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
 /// ANOTHER device. The server must refuse it with 403 — the flag exists so that
 /// rule is testable from the outside. It never attempts to unwrap.
 fn cmd_vault_accept(f: &VaultFlags) -> Result<(), String> {
-    if f.file.is_some() || !f.to.is_empty() || f.publish || f.permission.is_some() {
+    if f.file.is_some()
+        || !f.to.is_empty()
+        || f.publish
+        || f.permission.is_some()
+        || !f.drop.is_empty()
+        || f.drop_all_others
+    {
         return Err(
             "vault accept takes --vault/--keyring/--key/--hybrid-key/--server/--envelope-out/--for only"
                 .to_string(),
@@ -2366,12 +2526,15 @@ fn resolve_pins_path(
 /// that already unwrapped the previous key keeps that key and whatever it has
 /// already copied — nothing can retract a secret that has already been read.
 ///
-/// Every recipient's hybrid key goes through the PIN CHECK first, and a mismatch
-/// aborts the WHOLE rotation before anything local or remote is modified.
+/// Every recipient's hybrid key goes through the WRAP GATE
+/// (`sigil_cli::verify_recipient_for_wrap`) first, and a pin mismatch, a wrong
+/// `--safety-number` or an unverified RECOVERY KIT recipient aborts the WHOLE
+/// rotation before anything local or remote is modified.
 fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
     if f.addressee.is_some() || f.publish || f.permission.is_some() {
         return Err(
-            "vault rotate takes --vault/--to (repeatable)/--file/--keyring/--pins/--key/--server only"
+            "vault rotate takes --vault/--to (repeatable)/--drop (repeatable)/--drop-all-others/\
+             --file/--keyring/--pins/--key/--server only"
                 .to_string(),
         );
     }
@@ -2395,6 +2558,21 @@ fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
     let identity_opt = Some(identity);
     let auth = auth_for(&identity_opt);
 
+    // `--drop-all-others` is resolved HERE, into an explicit list, so the
+    // library still receives named devices and the report can name every one it
+    // removed. The rotation itself refuses any holder named by neither list.
+    let mut drop = f.drop.clone();
+    if f.drop_all_others {
+        for holder in list_key_envelopes(&server, &vault_id, &auth)
+            .map_err(|e| explain_sharing_error(e, "listing this vault's key envelopes"))?
+        {
+            if !f.to.contains(&holder.device_id) && !drop.contains(&holder.device_id) {
+                drop.push(holder.device_id);
+            }
+        }
+    }
+
+    let safety_numbers = resolve_safety_numbers(&f.safety_number, &f.to)?;
     let report = rotate_vault_key(
         &server,
         &vault_id,
@@ -2402,6 +2580,8 @@ fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
         &keyring,
         &pins,
         &f.to,
+        &drop,
+        &safety_numbers,
         &auth,
         Argon2Params::RECOMMENDED,
     )
@@ -2416,8 +2596,8 @@ fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
         old = report.old_key_fingerprint,
         new = report.new_key_fingerprint,
     );
-    for (device, status) in &report.rewrapped {
-        println!("  re-wrapped:  {device} ({})", status.label());
+    for (device, trust) in &report.rewrapped {
+        println!("  re-wrapped:  {device} ({})", trust.label());
     }
     if report.removed.is_empty() {
         println!("  removed:     (no stale envelopes)");
@@ -3040,4 +3220,582 @@ fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
         None => println!("{output}"),
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `sigil recovery` — THE RECOVERY KIT (Phase 54).
+//
+// A recovery kit is an ORDINARY MEMBER DEVICE whose private keys are derived
+// from 32 bytes printed on paper. The server gains no concept of "recovery": it
+// sees one more device row, one more hybrid public key and one more opaque
+// envelope per covered vault — exactly the shapes it already relays.
+//
+// ⚠️ THE PRINTED CODE IS PRINTED ONCE, TO STDOUT, AND NEVER WRITTEN ANYWHERE BY
+// THIS BINARY (unless the user explicitly redirects it with `--out`, which is a
+// deliberate act). It is never logged and never sent to the server.
+// ---------------------------------------------------------------------------
+
+/// Parsed flags for the `recovery` subcommands.
+#[derive(Default)]
+struct RecoveryFlags {
+    server: Option<String>,
+    key: Option<String>,
+    /// The printed 56-character code (`restore` / `verify`). ⚠️ SECRET.
+    ///
+    /// ⚠️ PASSING IT AS AN ARGUMENT EXPOSES IT: on Linux every process on the
+    /// box can read it from /proc/<pid>/cmdline while the command runs, and the
+    /// shell writes it to history. It is kept for scripts, but it is no longer
+    /// the only way in — see `code_stdin` and `resolve_recovery_code`.
+    code: Option<String>,
+    /// Read the recovery code from STDIN (one line) instead of argv. This is
+    /// also the automatic behaviour when `--code` is absent, so a pipe or a
+    /// redirect needs no flag at all; the flag exists to say so explicitly.
+    code_stdin: bool,
+    /// The kit's server-assigned device id. NOT secret — it is printed on the
+    /// sheet precisely so a restore can address the kit's own envelope index.
+    device_id: Option<String>,
+    /// Repeatable: which vaults to cover at generate time (default: every vault
+    /// in the local keyring).
+    vault: Vec<String>,
+    keyring: Option<String>,
+    pins: Option<String>,
+    /// Where `restore` writes the recovered vaults + keyring.
+    out_dir: Option<String>,
+    /// Write the rendered sheet to a file (0600) instead of only stdout.
+    out: Option<String>,
+    /// The safety number printed on the sheet, required when covering a vault
+    /// from a device that did NOT generate the kit.
+    safety_number: Option<String>,
+    /// `restore` only: ALSO persist the kit's own secrets on this machine.
+    adopt: bool,
+}
+
+fn parse_recovery_flags(args: Vec<String>) -> Result<RecoveryFlags, String> {
+    let mut f = RecoveryFlags::default();
+    let mut it = args.into_iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--server" => set_once(&mut f.server, &mut it, "--server")?,
+            "--key" => set_once(&mut f.key, &mut it, "--key")?,
+            "--code" => set_once(&mut f.code, &mut it, "--code")?,
+            "--code-stdin" => f.code_stdin = true,
+            "--device-id" => set_once(&mut f.device_id, &mut it, "--device-id")?,
+            "--vault" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "--vault requires a value".to_string())?;
+                if f.vault.contains(&v) {
+                    return Err(format!("--vault {v:?} given more than once"));
+                }
+                f.vault.push(v);
+            }
+            "--keyring" => set_once(&mut f.keyring, &mut it, "--keyring")?,
+            "--pins" => set_once(&mut f.pins, &mut it, "--pins")?,
+            "--out-dir" => set_once(&mut f.out_dir, &mut it, "--out-dir")?,
+            "--out" => set_once(&mut f.out, &mut it, "--out")?,
+            "--safety-number" => set_once(&mut f.safety_number, &mut it, "--safety-number")?,
+            "--adopt" => f.adopt = true,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    Ok(f)
+}
+
+/// Dispatch `sigil recovery <sub> ...`.
+fn cmd_recovery(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let Some(sub) = args.next() else {
+        return Err(
+            "missing recovery subcommand: generate | verify | check | cover | restore | revoke"
+                .to_string(),
+        );
+    };
+    let rest: Vec<String> = args.collect();
+    let f = parse_recovery_flags(rest)?;
+    match sub.as_str() {
+        "generate" => cmd_recovery_generate(&f),
+        "verify" => cmd_recovery_verify(&f),
+        "check" => cmd_recovery_check(&f),
+        "cover" => cmd_recovery_cover(&f),
+        "restore" => cmd_recovery_restore(&f),
+        "revoke" => cmd_recovery_revoke(&f),
+        other => Err(format!(
+            "unknown recovery subcommand {other:?}; try generate | verify | check | cover | \
+             restore | revoke"
+        )),
+    }
+}
+
+/// Explain a recovery HTTP failure in the THREE distinct terms a user can act
+/// on. Never echoes the code, a seed, or a key.
+fn explain_recovery_error(e: CliError, what: &str) -> String {
+    match &e {
+        // The offline decode already ran, so a 401 here means exactly one thing.
+        CliError::Server { status: 401, .. } => format!(
+            "{e}\n  -> valid code, but this server has no such device.\n     \
+             The kit may belong to a DIFFERENT server, or it has been REVOKED. The server\n     \
+             deliberately will not say which."
+        ),
+        CliError::Server { status: 403, .. } => format!(
+            "{e}\n  -> HTTP 403: authenticated, but not permitted while {what}. A kit may read only\n     \
+             its OWN envelope index and only the envelopes addressed to it."
+        ),
+        CliError::Server { status: 501, .. } => format!(
+            "{e}\n  -> HTTP 501: this server has the device model turned off, so recovery routes\n     \
+             are not serving. Start sigild with SIGILD_ENABLE_DEV_OPS=1 and SIGILD_DEVICE_AUTH=1."
+        ),
+        _ => e.to_string(),
+    }
+}
+
+/// Render the printed sheet. ONE renderer, so every surface shows the same
+/// warnings.
+fn render_recovery_sheet(kit: &sigil_cli::RecoveryKitOutcome) -> String {
+    let rule = "─".repeat(70);
+    let mut s = String::new();
+    s.push_str("SIGIL RECOVERY KIT — v1\n");
+    s.push_str(&rule);
+    s.push('\n');
+    s.push_str(&format!("SECRET   {}\n", format_recovery_kit(&kit.code)));
+    s.push_str(&rule);
+    s.push('\n');
+    s.push_str(&format!("device id     {}\n", kit.public.device_id));
+    s.push_str(&format!("account       {}\n", kit.public.account_id));
+    s.push_str(&format!("server        {}\n", kit.public.server));
+    s.push_str(&format!("safety no.    {}\n", kit.public.safety_number));
+    if kit.public.covered.is_empty() {
+        s.push_str("covers        (nothing yet — run `sigil recovery cover --vault <id>`)\n");
+    } else {
+        s.push_str(&format!(
+            "covers        {}   (as of the print date)\n",
+            kit.public.covered.join(", ")
+        ));
+    }
+    s.push('\n');
+    s.push_str(
+        "⚠ Anyone holding the SECRET line has FULL CONTROL of this account: they can\n  \
+         read every covered vault, revoke every one of your devices and lock you out.\n  \
+         It is stronger than a stolen locked phone — no OS lock, no vault password.\n  \
+         Store it where your devices are not. Never photograph it.\n\
+         ⚠ Losing every device AND this sheet is unrecoverable, by you and by us.\n\
+         ⚠ This kit recovers KEYS, not DATA: a vault that was never synced is gone.\n\
+         ⚠ Pre-audit, UNAUDITED, dev-only. Do not store real 2FA secrets.\n",
+    );
+    s
+}
+
+/// `sigil recovery generate [--vault <id>]... [--out <sheet>]`
+fn cmd_recovery_generate(f: &RecoveryFlags) -> Result<(), String> {
+    if f.code.is_some() || f.adopt || f.device_id.is_some() || f.out_dir.is_some() {
+        return Err(
+            "recovery generate takes --vault (repeatable)/--keyring/--pins/--key/--server/--out only"
+                .to_string(),
+        );
+    }
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+    let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
+    let (_identity_path, identity) = sharing_identity(f.key.clone())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    // Default coverage: every shared vault this device holds a key for. A
+    // PASSWORD vault has no key to wrap and is deliberately not silently
+    // included — recovery_generate says so by name if one is asked for.
+    let vaults: Vec<String> = if f.vault.is_empty() {
+        load_keyring(&keyring)
+            .map_err(|e| e.to_string())?
+            .keys
+            .keys()
+            .cloned()
+            .collect()
+    } else {
+        f.vault.clone()
+    };
+
+    let kit = recovery_generate(&server, &auth, &vaults, &keyring, &pins, None)
+        .map_err(|e| explain_recovery_error(e, "generating the recovery kit"))?;
+
+    // The verification line comes FIRST, because it is the evidence that the
+    // sheet below actually works.
+    println!(
+        "verified before printing: authenticated as {device} in account {account}, \
+         index listed {n} vault(s), unwrapped {vault} -> key sha256 {fp}",
+        device = kit.public.device_id,
+        account = kit.verification.account_id,
+        n = kit.verification.indexed_vaults,
+        vault = if kit.verification.unwrapped_vault.is_empty() {
+            "(nothing — the kit covers no vault yet)"
+        } else {
+            &kit.verification.unwrapped_vault
+        },
+        fp = if kit.verification.key_fingerprint.is_empty() {
+            "-"
+        } else {
+            &kit.verification.key_fingerprint
+        },
+    );
+    for (vault_id, fp) in &kit.covered {
+        println!("  covered:     {vault_id}  key_sha256={fp}");
+    }
+    println!(
+        "  seats:       {}/{} active devices in this account (the kit consumes one)",
+        kit.seats_used, kit.seat_limit
+    );
+    println!(
+        "  pin:         {} (origin \"recovery-kit\" — DERIVED locally, never fetched)",
+        pins.display()
+    );
+    println!();
+
+    let sheet = render_recovery_sheet(&kit);
+    print!("{sheet}");
+    if let Some(path) = &f.out {
+        write_envelope_file(path, sheet.as_bytes())?;
+        eprintln!(
+            "sigil: wrote the sheet to {path} (mode 0600). ⚠️ IT CONTAINS THE SECRET — print it \
+             and delete the file."
+        );
+    }
+    println!();
+    println!(
+        "Next: print this sheet, verify the safety number, and store the paper somewhere your \
+         devices are NOT."
+    );
+    Ok(())
+}
+
+/// `sigil recovery verify --code "<56 chars>"` — OFFLINE. No network at all.
+/// Resolve the printed recovery code WITHOUT requiring it on the command line.
+///
+/// ⚠️ THE PROBLEM THIS SOLVES. The recovery code is, by this design's own
+/// admission, a stronger credential than a stolen locked phone: it is a full
+/// account takeover. Until now `--code "<56 chars>"` was the ONLY way to supply
+/// it, which put it in `argv` — world-readable through `/proc/<pid>/cmdline` on
+/// Linux for the life of the process — and in the shell history file. The vault
+/// PASSWORD has never had to travel that way (`SIGIL_PASSWORD`), and neither
+/// should this.
+///
+/// Precedence:
+///
+///   1. `--code <value>` — kept working for scripts, and now WARNS on stderr,
+///      because a credential you cannot rotate deserves to be told about.
+///   2. `--code-stdin`, or no `--code` at all with stdin NOT a terminal — read
+///      one line from stdin, so `sigil recovery restore … < code.txt` and
+///      `pass show … | sigil recovery restore …` both work with nothing in argv.
+///   3. otherwise — PROMPT on the controlling terminal, with echo disabled where
+///      the terminal allows it.
+///
+/// There is deliberately NO environment variable: an env var is inherited by
+/// every child process and shows up in `/proc/<pid>/environ`, which is barely
+/// better than argv for a credential of this weight.
+fn resolve_recovery_code(f: &RecoveryFlags) -> Result<String, String> {
+    use std::io::BufRead as _;
+
+    if let Some(code) = &f.code {
+        eprintln!(
+            "warning: --code puts the RECOVERY SECRET in this process's argv, where any local \n               user can read it (/proc/<pid>/cmdline on Linux) and where your shell records it in \n               history. Prefer piping it in (sigil recovery restore --code-stdin < file) or letting \n               it prompt."
+        );
+        return Ok(code.clone());
+    }
+
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if f.code_stdin || !stdin_is_tty {
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("could not read the recovery code from stdin: {e}"))?;
+        let code = line.trim().to_string();
+        if code.is_empty() {
+            return Err(
+                "no recovery code on stdin: pipe the printed code in, or pass --code \"<56 \
+                 characters>\" (which exposes it in argv)"
+                    .to_string(),
+            );
+        }
+        return Ok(code);
+    }
+
+    // Interactive. Turn echo off if we can; say so plainly if we cannot, rather
+    // than silently printing a recovery secret onto somebody's screen.
+    let echo_off = set_terminal_echo(false);
+    if !echo_off {
+        eprintln!(
+            "warning: could not disable terminal echo — the code WILL be visible as you type"
+        );
+    }
+    eprint!("Recovery code (from the printed sheet): ");
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    if echo_off {
+        set_terminal_echo(true);
+        eprintln!();
+    }
+    read.map_err(|e| format!("could not read the recovery code: {e}"))?;
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        return Err("no recovery code entered".to_string());
+    }
+    Ok(code)
+}
+
+/// Best-effort terminal echo control, via `stty` on the controlling terminal.
+///
+/// Done by shelling out on purpose: the alternative is a `libc`/`termios`
+/// dependency for one `ioctl`, and this crate's dependency list is deliberately
+/// short. Returns whether the change actually took effect — the caller warns the
+/// user when it did not, so a recovery secret is never echoed silently.
+fn set_terminal_echo(on: bool) -> bool {
+    let Ok(tty) = std::fs::File::open("/dev/tty") else {
+        return false;
+    };
+    std::process::Command::new("stty")
+        .arg(if on { "echo" } else { "-echo" })
+        .stdin(tty)
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
+fn cmd_recovery_verify(f: &RecoveryFlags) -> Result<(), String> {
+    let code = resolve_recovery_code(f)?;
+    // Nothing here talks to a server: a mistyped code must never leak to one.
+    let seed = recovery_verify(&code).map_err(|e| e.to_string())?;
+    let identity = derive_recovery_identity(&seed);
+    println!(
+        "that recovery code is well-formed (checksum OK, version 1) — checked OFFLINE, no request \
+         was made.\n  \
+         normalized:   {}\n  \
+         hybrid key:   x25519 {}… / ml-kem {}…\n  \
+         NOTE: this proves the code was typed correctly. It does NOT prove any server knows this \
+         kit, nor that the kit covers anything.",
+        format_recovery_kit(&code),
+        &identity.hybrid_public.x25519_public_key[..12],
+        &identity.hybrid_public.mlkem_encaps_key[..12],
+    );
+    Ok(())
+}
+
+/// `sigil recovery check --device-id <kitID>`
+fn cmd_recovery_check(f: &RecoveryFlags) -> Result<(), String> {
+    let kit_id = f.device_id.clone().ok_or_else(|| {
+        "missing required --device-id <kit device id> (it is on the sheet)".to_string()
+    })?;
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+    let (_p, identity) = sharing_identity(f.key.clone())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    let rows = recovery_check(&server, &auth, &kit_id, &keyring)
+        .map_err(|e| explain_recovery_error(e, "checking recovery coverage"))?;
+    if rows.is_empty() {
+        println!("no shared vaults in {} to check", keyring.display());
+        return Ok(());
+    }
+    println!("recovery coverage for kit {kit_id}, CHECKED FROM THIS DEVICE:");
+    let mut uncovered = 0usize;
+    for row in &rows {
+        let state = if row.covered {
+            "COVERED"
+        } else {
+            "NOT COVERED"
+        };
+        let synced = if row.synced {
+            "synced"
+        } else {
+            "⚠ NEVER SYNCED — the key would be recovered but there is no data on the server"
+        };
+        if !row.covered {
+            uncovered += 1;
+        }
+        println!(
+            "  {vault}  {state}{at}  ({synced})",
+            vault = row.vault_id,
+            at = if row.covered_at.is_empty() {
+                String::new()
+            } else {
+                format!(" since {}", row.covered_at)
+            },
+        );
+    }
+    if uncovered > 0 {
+        println!(
+            "\n{uncovered} vault(s) are NOT covered. Fix each with:\n  \
+             sigil recovery cover --device-id {kit_id} --vault <id>"
+        );
+    }
+    println!(
+        "\n⚠ This is coverage as seen FROM THIS DEVICE, not \"you are covered\". A vault created \
+         on another device that never heard of this kit is invisible here."
+    );
+    Ok(())
+}
+
+/// `sigil recovery cover --device-id <kitID> --vault <id> [--safety-number "..."]`
+fn cmd_recovery_cover(f: &RecoveryFlags) -> Result<(), String> {
+    let kit_id = f.device_id.clone().ok_or_else(|| {
+        "missing required --device-id <kit device id> (it is on the sheet)".to_string()
+    })?;
+    if f.vault.len() != 1 {
+        return Err("recovery cover takes exactly one --vault <id>".to_string());
+    }
+    let vault_id = f.vault[0].clone();
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+    let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
+    let (_p, identity) = sharing_identity(f.key.clone())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    let (fp, derived) = recovery_cover(
+        &server,
+        &auth,
+        &kit_id,
+        &vault_id,
+        &keyring,
+        &pins,
+        f.safety_number.as_deref(),
+    )
+    .map_err(|e| explain_recovery_error(e, "covering a vault with the recovery kit"))?;
+
+    println!(
+        "vault {vault_id} is now covered by recovery kit {kit_id}\n  \
+         key sha256:  {fp} (fingerprint only — the key is never printed)\n  \
+         key source:  {source}",
+        source = if derived {
+            "DERIVED locally from the recovery secret (pinned with origin \"recovery-kit\") — \
+             no key was fetched, so there was nothing to substitute"
+        } else {
+            "fetched from the server and verified against the SAFETY NUMBER you supplied"
+        },
+    );
+    Ok(())
+}
+
+/// `sigil recovery restore --device-id <kitID>` — the code is PROMPTED for, or
+/// read from stdin; `--code` still works for scripts but exposes it in argv.
+fn cmd_recovery_restore(f: &RecoveryFlags) -> Result<(), String> {
+    let code = resolve_recovery_code(f)?;
+    // The device id is on the sheet and is NOT secret. It is required because
+    // sigild assigns it — nothing about the printed secret determines it, and
+    // there is deliberately no route that looks a device up by public key.
+    let kit_id = f.device_id.clone().ok_or_else(|| {
+        "missing required --device-id <kit device id>: it is printed on the sheet under the \
+         SECRET line (it is not itself a secret)"
+            .to_string()
+    })?;
+    let server = resolve_server(f.server.clone());
+    let out_dir = match &f.out_dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => default_state_dir(),
+    };
+
+    let report = recovery_restore(&code, &server, &kit_id, &out_dir, f.adopt)
+        .map_err(|e| explain_recovery_error(e, "restoring from the recovery kit"))?;
+
+    println!(
+        "restored from the recovery kit\n  \
+         device:      {device} (account {account})\n  \
+         out dir:     {dir} (mode 0700; every file inside is 0600)",
+        device = report.device_id,
+        account = report.account_id,
+        dir = out_dir.display(),
+    );
+    for (vault_id, path, fp, entries) in &report.vaults {
+        println!(
+            "  recovered:   {vault_id} -> {path} ({entries} entr{plural}, key_sha256={fp})",
+            path = path.display(),
+            plural = if *entries == 1 { "y" } else { "ies" },
+        );
+        println!(
+            "               sigil totp list --vault {path} --vault-id {vault_id} --keyring {kr}",
+            path = path.display(),
+            kr = out_dir.join(VAULT_KEYRING_FILE).display()
+        );
+    }
+    for (vault_id, why) in &report.skipped {
+        println!("  ⚠ skipped:   {vault_id}: {why}");
+    }
+    if report.adopted {
+        println!(
+            "\n⚠ --adopt: this machine now holds the kit's OWN Ed25519 seed and hybrid secret\n  \
+             (0600 in {dir}). IT IS A SECOND COPY OF THE PAPER. Anyone with this machine has\n  \
+             everything the sheet has.",
+            dir = out_dir.display()
+        );
+    } else {
+        println!(
+            "\nThe kit's own secrets were NOT written to disk (that is the default). This machine\n\
+             recovered the vaults and is otherwise an ordinary machine."
+        );
+    }
+    println!(
+        "\nRecovery is a TRANSITION, not a destination. Now:\n  \
+         1. enroll a real device:  sigil account invite   then  sigil device enroll --token <invite>\n  \
+         2. share each vault to it: sigil vault share --vault <id> --to <newDeviceID>\n  \
+         3. retire this kit:        sigil recovery revoke --device-id {kit}\n  \
+         4. rotate each vault:      sigil vault rotate --vault <id> --to <newDeviceID> --drop {kit}\n  \
+         5. print a FRESH kit:      sigil recovery generate",
+        kit = report.device_id
+    );
+    Ok(())
+}
+
+/// `sigil recovery revoke --device-id <kitID>`
+fn cmd_recovery_revoke(f: &RecoveryFlags) -> Result<(), String> {
+    let kit_id = f
+        .device_id
+        .clone()
+        .ok_or_else(|| "missing required --device-id <kit device id>".to_string())?;
+    let server = resolve_server(f.server.clone());
+    let keyring = resolve_keyring_path(f.keyring.clone());
+    let (_p, identity) = sharing_identity(f.key.clone())?;
+    let identity_opt = Some(identity);
+    let auth = auth_for(&identity_opt);
+
+    let vaults: Vec<String> = if f.vault.is_empty() {
+        load_keyring(&keyring)
+            .map_err(|e| e.to_string())?
+            .keys
+            .keys()
+            .cloned()
+            .collect()
+    } else {
+        f.vault.clone()
+    };
+
+    let report = recovery_revoke(&server, &auth, &kit_id, &vaults)
+        .map_err(|e| explain_recovery_error(e, "revoking the recovery kit"))?;
+    println!("revoked recovery kit {}", report.device_id);
+    for vault_id in &report.envelopes_removed {
+        println!("  envelope removed: {vault_id}");
+    }
+    for vault_id in &report.already_clear {
+        println!("  already clear:    {vault_id}");
+    }
+    println!(
+        "\n⚠ Revocation stops the kit talking to the server. It CANNOT un-learn a vault key the\n  \
+         kit already unwrapped. Rotate each vault so future content is unreadable to it — this\n  \
+         command deliberately does NOT do it for you, because rotation re-seals your data:"
+    );
+    for vault_id in report
+        .envelopes_removed
+        .iter()
+        .chain(report.already_clear.iter())
+    {
+        println!(
+            "  sigil vault rotate --vault {vault_id} --to <yourDeviceID> --drop {}",
+            report.device_id
+        );
+    }
+    Ok(())
+}
+
+/// The default LOCAL state directory (`$HOME/.sigil`, else the CWD).
+fn default_state_dir() -> std::path::PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home).join(".sigil"),
+        _ => std::path::PathBuf::from("."),
+    }
 }

@@ -181,6 +181,22 @@ type KeySharing interface {
 	//
 	// An unknown vault is not an error — it yields an empty slice.
 	ListKeyEnvelopeRecipients(ctx context.Context, vaultID string) ([]KeyEnvelopeMeta, error)
+
+	// ListKeyEnvelopesForRecipient returns METADATA for every envelope
+	// addressed TO one device, across all vaults, sorted by vault ID so the
+	// order is stable. Like ListKeyEnvelopeRecipients it deliberately does NOT
+	// return blobs.
+	//
+	// WHY IT EXISTS (Phase 54): a client restored from a RECOVERY KIT — or any
+	// device that joined by invite — knows no vault IDs at all, and cannot
+	// discover what it is able to decrypt without asking. The API layer only
+	// ever calls this for the CALLER's own device id and then filters the rows
+	// by per-vault read authorization, so it grants no capability the caller did
+	// not already hold: it could already fetch each of these envelopes one by
+	// one if it happened to know the vault ids.
+	//
+	// An unknown recipient is not an error — it yields an empty slice.
+	ListKeyEnvelopesForRecipient(ctx context.Context, recipientDeviceID string) ([]KeyEnvelopeMeta, error)
 	// DeleteKeyEnvelope removes the envelope addressed to (vaultID,
 	// recipientDeviceID). It is IDEMPOTENT: deleting an envelope that is not
 	// there returns ErrKeyEnvelopeNotFound so a caller can distinguish "removed"
@@ -304,6 +320,31 @@ func (s *MemDeviceStore) ListKeyEnvelopeRecipients(ctx context.Context, vaultID 
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].RecipientDeviceID < out[j].RecipientDeviceID })
+	return out, nil
+}
+
+// ListKeyEnvelopesForRecipient returns metadata (never blobs) for every envelope
+// addressed to one device, sorted by vault ID for a stable order.
+func (s *MemDeviceStore) ListKeyEnvelopesForRecipient(ctx context.Context, recipientDeviceID string) ([]KeyEnvelopeMeta, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]KeyEnvelopeMeta, 0, 8)
+	for k, e := range s.envelopes {
+		if k.recipient != recipientDeviceID {
+			continue
+		}
+		out = append(out, KeyEnvelopeMeta{
+			VaultID:           e.VaultID,
+			RecipientDeviceID: e.RecipientDeviceID,
+			SenderDeviceID:    e.SenderDeviceID,
+			SizeBytes:         len(e.Blob),
+			CreatedAt:         e.CreatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].VaultID < out[j].VaultID })
 	return out, nil
 }
 

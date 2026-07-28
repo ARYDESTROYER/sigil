@@ -459,14 +459,16 @@ http
     "read",
   ]);
   assert(
-    shareOut.includes("first-sight (pinned now)"),
+    // The CLI now reports the WRAP GATE's verdict rather than the raw pin
+    // status, so the wording changed with the gate (RecipientTrust::label).
+    shareOut.includes("FIRST SIGHT — NOT verified out of band (pinned now)"),
     `the first share should PIN B's key on first sight; got:\n${shareOut}`,
   );
   sigil("A", ["vault", "share", "--vault", VAULT, "--to", ids.C, "--permission", "read"]);
   // A second share to B must report a MATCH, not another first sight.
   const shareAgain = sigil("A", ["vault", "share", "--vault", VAULT, "--to", ids.B]);
   assert(
-    shareAgain.includes("matches the pinned key"),
+    shareAgain.includes("matches the key this client pinned earlier"),
     `an unchanged key must proceed as a MATCH; got:\n${shareAgain}`,
   );
 
@@ -613,6 +615,20 @@ http
 
   sigil("A", ["device", "revoke", ids.B, "--admin-token", ADMIN_TOKEN]);
 
+  // Phase 54: a rotation that would silently delete a current holder's envelope
+  // is REFUSED. B is the device being rotated away from, so dropping it has to
+  // be stated — that is the whole point of the guard.
+  let refusedRotate = "";
+  try {
+    sigil("A", ["vault", "rotate", "--vault", VAULT, "--to", ids.A, "--to", ids.C, "--file", vaultFile]);
+  } catch (err) {
+    refusedRotate = `${err.stdout ?? ""}${err.stderr ?? ""}${err.message ?? ""}`;
+  }
+  assert(
+    refusedRotate.includes("REFUSING TO ROTATE") && refusedRotate.includes(ids.B),
+    `a rotation that would silently drop ${ids.B} must be refused; got:\n${refusedRotate}`,
+  );
+
   const rotateOut = sigil("A", [
     "vault",
     "rotate",
@@ -622,6 +638,8 @@ http
     ids.A,
     "--to",
     ids.C,
+    "--drop",
+    ids.B,
     "--file",
     vaultFile,
   ]);
@@ -759,7 +777,7 @@ http
   assert(repinOut.includes("RE-PINNED"), `the deliberate re-pin should succeed:\n${repinOut}`);
   const shareAfterRepin = sigil("A", ["vault", "share", "--vault", VAULT, "--to", ids.C]);
   assert(
-    shareAfterRepin.includes("matches the pinned key"),
+    shareAfterRepin.includes("matches the key this client pinned earlier"),
     `after a deliberate re-pin the share must proceed:\n${shareAfterRepin}`,
   );
   const pinsOut = sigil("A", ["device", "pins"]);

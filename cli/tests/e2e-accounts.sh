@@ -268,7 +268,14 @@ run_as "$HOME_C" pull --vault "$VAULT" --out-dir "$HOME_C/inbox2" >/dev/null
 ok "C (a foreign account) now reads the vault BECAUSE it was granted, one device at a time"
 
 step "★ sibling B still ROTATES the vault key"
-run_as "$HOME_B" vault rotate --vault "$VAULT" --to "$B_ID" --file "$B_VAULT_FILE" >/dev/null
+# Phase 54: a rotation that would silently delete a current holder's envelope is
+# REFUSED. A (the revoked device that claimed the vault) still holds one, so
+# dropping it has to be stated — that is the guard, not a regression.
+if run_as "$HOME_B" vault rotate --vault "$VAULT" --to "$B_ID" --file "$B_VAULT_FILE" >/dev/null 2>&1; then
+	fail "a rotation that would silently drop $A_ID's envelope must be refused"
+fi
+ok "an unnamed current holder aborts the rotation (Phase 54 drop guard)"
+run_as "$HOME_B" vault rotate --vault "$VAULT" --to "$B_ID" --drop-all-others --file "$B_VAULT_FILE" >/dev/null
 B_FP2="$(run_as "$HOME_B" vault list | grep "$VAULT" | sed 's/.*key_sha256=//')"
 [[ -n "$B_FP2" && "$B_FP2" != "$B_FP" ]] || fail "rotation did not change the vault key"
 run_as "$HOME_B" push --vault "$VAULT" --in "$B_VAULT_FILE" >/dev/null

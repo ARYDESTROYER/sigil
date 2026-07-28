@@ -228,7 +228,7 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   forget a key it already accepted (see
   [`decisions/0035-device-to-device-vault-sharing.md`](decisions/0035-device-to-device-vault-sharing.md)).
   A **standalone crate** with its own lockfile (see
-  [§5](#5-build--dependency-isolation)). Keeps a loud UNAUDITED /
+  [§4](#4-build--dependency-isolation)). Keeps a loud UNAUDITED /
   not-for-real-secrets banner.
 - **`sigil-wasm`** ([`../sigil-wasm/`](../sigil-wasm/)) — a thin
   [`wasm-bindgen`](https://rustwasm.github.io/wasm-bindgen/) binding over the
@@ -574,8 +574,11 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   token is single-*attempt* (spent before the device row is created), the replay
   cache is still **per-process**, the in-memory registry is non-durable (a spent
   token becomes reusable after a restart) and the **file backend was not
-  extended**, and there is still no session model, no key rotation and no
-  enrollment rate limiting (see
+  extended**, and there is still no session model and no device-key rotation.
+  Enrollment **can** now be rate limited (opt-in, Phase 53) — but behind the only
+  topology this repo documents it is one global bucket, it charges only failed
+  attempts and it does not reduce load, so it is a **backstop, not a defence**
+  ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md); see
   [`decisions/0031-multi-device-auth-model.md`](decisions/0031-multi-device-auth-model.md)).
   ⚠️ Two of those limits were **revised by the account model below**: ownership is
   no longer per-device, and revoking a vault's claimant no longer orphans it.
@@ -584,8 +587,10 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   ([ADR 0040](decisions/0040-account-model.md)). An account is a
   **server-assigned id on the device row** (`sigil_accounts` +
   `sigil_devices.account_id`) and nothing else that could identify a human —
-  **auth metadata only**: no email, no password, no session, no PII, no key
-  material, **no recovery**. It exists because a device was too small a subject
+  **auth metadata only**: no email, no password, no session, no PII and no key
+  material — **not an identity system**, and the only recovery is a **paper kit
+  printed in advance** ([ADR 0042](decisions/0042-recovery-kit.md)).
+  It exists because a device was too small a subject
   twice over: a subscription bought on a phone did not entitle a laptop, and a
   vault owned by a device was **orphaned** when that device was revoked.
   Four parts:
@@ -617,13 +622,17 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   account) ⇒ **`sigild_schema_version` reports 5**; it names `sigil_vault_ops`
   nowhere, so the opaque blob and its hash chain are byte-for-byte unchanged.
   Honest scope: **dev-gated, `501` by default, UNAUDITED, and NOT an identity
-  system** — ⚠️ **there is NO RECOVERY** (lose or revoke every device in an
-  account and it is permanently unreachable; the orphan failure was *narrowed*,
-  not eliminated), membership is **FLAT** (any member may invite, revoke every
+  system** — ⚠️ **the only recovery is a kit printed BEFORE the loss** (lose or
+  revoke every device having printed nothing and the account is permanently
+  unreachable; the orphan failure was *narrowed* twice, not eliminated, and
+  ⚠️ **whoever holds the printed sheet holds the account**), membership is **FLAT** (any member may invite, revoke every
   sibling, run checkout and administer every account-owned vault) and
   **immutable** (no transfer, merge, split or deletion), **there is no account
   merge across the cutover** (a pre-0005 two-device customer ends up with two
-  accounts and two billing subjects), entitlement is **reported, never enforced**,
+  accounts and two billing subjects), entitlement is **reported unless
+  `SIGILD_ENTITLEMENT_ENFORCE` is set**, in which case a lapsed account's
+  **writes** answer `402` past a grace period while ⭐ **reads and same-account key
+  recovery are never refused** ([ADR 0043](decisions/0043-entitlement-enforcement.md)),
   and a **rolled-back pre-0005 binary** writes `account_id NULL` rows that are
   refused with a coarse `403` until an operator runs the explicit, idempotent
   **`sigild migrate adopt`** (warned at boot; adoption **never** happens
@@ -635,7 +644,11 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   **opaque wrapped vault key**) and — for rotation —
   `GET /v1/vaults/{vaultID}/keys` (recipient **metadata only**, never a blob) plus
   `DELETE /v1/vaults/{vaultID}/keys/{deviceID}`, both requiring **write** through the
-  *same* `authorizeOpsRequest` choke point as a deposit. It is deliberately the dullest possible component:
+  *same* `authorizeOpsRequest` choke point as a deposit — and, since Phase 54,
+  `GET /v1/devices/{deviceID}/keys`, a **self-only, metadata-only** index of which
+  vaults hold a wrapped key for one device (the route a **recovery kit** uses to
+  find itself on a fresh machine; it needed **no migration**, reusing the index
+  `0004` already created). It is deliberately the dullest possible component:
   it stores and returns the envelope **byte-for-byte**, holds **no decapsulation
   key**, decodes nothing, and its **only** inspection of key material is a length
   check (32 / 1184 bytes) — validating a curve point would be the server performing
@@ -707,11 +720,26 @@ the crypto) and a **server skeleton** (which does none). The pieces in this repo
   `sigild` consume an entitlement, not compute one. Nothing here has been run
   against a live provider account, the Juspay scheme is explicitly
   **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, the account that is now the subject is
-  **not an identity** (no email, no password, **no recovery**, and every pre-0005
-  device was adopted into its own singleton account, so an existing two-device
-  customer has two billing subjects), and there is no
-  fraud/chargeback/refund/proration/tax handling and no PCI attestation (see
+  **not an identity** (no email, no password, no operator break-glass — recovery
+  is a paper kit printed in advance — and every pre-0005 device was adopted into
+  its own singleton account, so an existing two-device customer has two billing
+  subjects), and there is no fraud/chargeback/refund/proration/tax handling and no
+  PCI attestation (see
   [`decisions/0034-billing-provider-seam.md`](decisions/0034-billing-provider-seam.md)).
+  **Entitlement enforcement (opt-in, Phase 55):** with
+  `SIGILD_ENTITLEMENT_ENFORCE` set, a lapsed account's **writes** answer **`402`**
+  past a grace period (default 14 days). ⭐ **Reads and same-account key recovery
+  are never refused** — the enforcement call set is *three write handlers*, pinned
+  by a test that parses the package's AST — so a lapsed customer keeps every 2FA
+  code they hold, can key a replacement device, can print a recovery kit and can
+  always pay. Every uncertainty **fails open**. Off by default and byte-identical
+  when unset ([`decisions/0043-entitlement-enforcement.md`](decisions/0043-entitlement-enforcement.md)).
+  ⛔ There is deliberately **no rate limiting on the webhook route**: the limiter
+  built for it in Phase 53 was **removed** after a live reproduction showed it
+  shedding genuine, correctly-signed provider deliveries — you cannot safely shed
+  traffic on a route where shedding costs money and the legitimate sender has a
+  finite retry budget
+  ([`decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md`](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)).
   Billing touches **nothing** in `sigil_vault_ops` and performs no cryptography
   on vault contents, so the trust boundary is unchanged.
   `sigild` performs **no cryptography** on vault contents and never sees plaintext
@@ -1357,13 +1385,18 @@ insert a device into any account** (it writes the registry) and **still cannot
 decrypt anything** — its only remaining move is to substitute a hybrid public key
 at §2b step 1, which is what §2c defends.
 
-⚠️ **And the failure that did not go away: there is NO RECOVERY.** An account is
-reachable only through a member device's private key. The orphan failure
-**narrowed** from "revoke one device" to "**lose every device**"; lose them all
-and the account, its vaults and its subscription are permanently unreachable — by
-the customer and by us. Membership is also **flat** (any member may invite,
-revoke every sibling and run checkout) and **immutable** (no transfer, merge,
-split or deletion). Full list: [ADR 0040](decisions/0040-account-model.md).
+⚠️ **And the failure that only narrowed: recovery exists ONLY if it was printed in
+advance.** An account is reachable only through a member device's private key —
+or through a **recovery kit**, which is exactly such a key, HKDF-derived from 32
+bytes printed on paper before the loss ([ADR 0042](decisions/0042-recovery-kit.md)).
+The orphan failure went from "revoke one device" to "lose every device" to "lose
+every device **having printed nothing**"; in that last case the account, its
+vaults and its subscription are permanently unreachable — by the customer and by
+us — and **a kit cannot be created afterwards**. ⚠️ In exchange, **whoever holds
+the printed sheet holds the account**, immediately and without notification.
+Membership is also **flat** (any member may invite, revoke every sibling and run
+checkout) and **immutable** (no transfer, merge, split or deletion). Full lists:
+[ADR 0040](decisions/0040-account-model.md), [ADR 0042](decisions/0042-recovery-kit.md).
 
 ### 2c. Trust in a fetched public key — the client-side pin store
 
@@ -1658,14 +1691,18 @@ authoritative list, with rationale, is the **defer ledger** in
   ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)) and an **account
   model** that makes entitlement and vault ownership survive a device change
   ([ADR 0040](decisions/0040-account-model.md)). What is still missing
-  is the **product** layer: ⚠️ **no identity and NO RECOVERY of any kind** (an
-  account is reachable only through a member device's private key — lose them all
-  and it is gone), no roles inside an account (membership is **flat**: any member
+  is the **product** layer: ⚠️ **no identity system** (no email, no password, no
+  operator break-glass; the only recovery is a **paper kit printed in advance**,
+  [ADR 0042](decisions/0042-recovery-kit.md), and a kit cannot be created after
+  the loss), no roles inside an account (membership is **flat**: any member
   may invite, revoke every sibling and run checkout), no account transfer, merge,
   split or deletion, no session or JWT token
   issuance ([`../sigild/internal/auth/`](../sigild/internal/auth/) is still a
-  placeholder), no key rotation or re-enrollment, no rate limiting on
-  enrollment attempts or invite minting, a replay cache that is still
+  placeholder), no **device-key** rotation or re-enrollment, only a
+  **proxy-blind backstop** for rate limiting enrollment and invite minting
+  ([ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md);
+  real per-source limiting belongs at the edge and is configured nowhere in
+  `deploy/`), a replay cache that is still
   **per-process** (a multi-instance deploy needs a shared store), and an ownership
   rule (trust-on-first-write, now by account) that is a dev heuristic rather than
   an identity. All of it is **dev-gated and UNAUDITED**.
@@ -1682,11 +1719,12 @@ authoritative list, with rationale, is the **defer ledger** in
   **UNVERIFIED-AGAINST-LIVE-DASHBOARD**, recurring *subscription creation* is
   unimplemented for the two India adapters (their webhook sides map the events,
   but checkout creates a one-time hosted page), the subject is now an **account**
-  but that account is **not an identity** (no email, no password, no recovery —
-  and every pre-`0005` device was adopted into its own singleton account, so an
-  existing two-device customer has two billing subjects), there is no entitlement
-  enforcement
-  anywhere, and no fraud, chargeback, refund, proration, tax, dunning or
+  but that account is **not an identity** (no email, no password, no operator
+  break-glass — and every pre-`0005` device was adopted into its own singleton
+  account, so an existing two-device customer has two billing subjects),
+  entitlement enforcement exists but is **opt-in, write-only and never refuses
+  reads** ([ADR 0043](decisions/0043-entitlement-enforcement.md)), and there is
+  no fraud, chargeback, refund, proration, tax, dunning or
   reconciliation handling, and **no PCI attestation** (hosted checkout keeps
   scope minimal; it certifies nothing). **Billing living inside the sync server
   is provisional**: it is a scaffold placed where the identity, config, storage
@@ -1753,15 +1791,19 @@ authoritative list, with rationale, is the **defer ledger** in
   but still **no signed ops**, no Lamport/Merkle ordering, no conflict-free
   merge, and the chain is **tamper-evident, not tamper-proof** (a hostile server
   can lie about `/ops/verify`; the real check is client-side).
-- **No accounts / sync protocol / recovery.** Device-to-device
+- **No real sync protocol, and recovery only as a printed kit.** Device-to-device
   **vault sharing** now exists ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)),
   a **vault key can now be rotated and re-wrapped**
-  ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)), and
+  ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)),
+  a **recovery kit** can be printed in advance
+  ([ADR 0042](decisions/0042-recovery-kit.md)), and
   billing exists in code (above), but the rest of the product workflows do
-  not — and sharing still has **no rotation schedule, no automatic re-wrap on revoke,
-  no recovery path, and no key-transparency log or cross-signature** binding a
+  not — and sharing still has **no rotation schedule, no automatic re-wrap on
+  revoke, and no key-transparency log or cross-signature** binding a
   recipient's hybrid public key to its enrolled identity (the safety number puts a
-  **human** in that loop rather than removing the loop).
+  **human** in that loop rather than removing the loop). ⚠️ Recovery is
+  **CLI-only**: the webapp, the extension and the desktop have **no recovery UI**,
+  so a user whose only client was a browser cannot restore there today.
 - **No live PQ-TLS proof.** `sigild` serves plain HTTP in the skeleton; the hybrid
   `X25519MLKEM768` handshake is unproven on this machine (see
   [`deployment.md`](deployment.md) §3).

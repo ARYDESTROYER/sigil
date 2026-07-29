@@ -51,7 +51,7 @@ ed25519-dalek = { version = "2", default-features = false }
 # generate keys here — the caller supplies the 32-byte secret scalar, exactly as
 # it supplies the Argon2id salt, AEAD nonce, and Ed25519 seed. This shares the
 # already-resolved `curve25519-dalek` 4.x with `ed25519-dalek`, so it adds little.
-x25519-dalek = { version = "2", default-features = false }
+x25519-dalek = { version = "3", default-features = false }
 # Post-quantum ML-KEM-768 (FIPS 203) key encapsulation (pre-audit) — the
 # post-quantum KEM half of the hybrid X25519&ML-KEM-768 suite (the classical
 # X25519 KEX half lives in `kx.rs`). `default-features = false` keeps `getrandom`

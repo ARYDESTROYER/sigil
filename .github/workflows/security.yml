@@ -25,7 +25,7 @@ jobs:
     name: gitleaks secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so gitleaks can scan all commits, not just the tip.
           fetch-depth: 0
@@ -39,7 +39,7 @@ jobs:
     name: govulncheck (sigild)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           # pgx (the Postgres op-log backend) requires go >= 1.25, which bumps
@@ -70,7 +70,7 @@ jobs:
       matrix:
         workspace: [libsigil, cli, sigil-wasm, desktop]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: cargo audit
         uses: rustsec/audit-check@v2
         with:

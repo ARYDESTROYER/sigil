@@ -20,6 +20,6 @@ jobs:
     if: false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: placeholder
         run: echo "TODO reproducible build then cosign sign then SLSA provenance then upload"

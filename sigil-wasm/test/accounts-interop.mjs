@@ -74,9 +74,14 @@ const sigildDir = join(repoRoot, "sigild");
 const cliManifest = join(repoRoot, "cli", "Cargo.toml");
 const sigilBin = join(repoRoot, "cli", "target", "debug", "sigil");
 
+// ⚠️ THROW, NEVER process.exit(). `process.exit()` terminates immediately and
+// SKIPS the `finally` block below that kills the spawned sigild — which is how
+// twelve orphaned servers, the oldest ~46 hours old, accumulated on the dev
+// machine. Throwing unwinds properly, the finally runs, the server dies, and the
+// non-zero exit still comes from the uncaught error. `pinning-interop.mjs` has
+// carried this note for several phases; the other suites had not adopted it.
 function fail(msg) {
-  console.error(`FAIL: ${msg}`);
-  process.exit(1);
+  throw new Error(`FAIL: ${msg}`);
 }
 function assert(cond, msg) {
   if (!cond) fail(msg);

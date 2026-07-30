@@ -10173,3 +10173,52 @@ verification round failed because three load-bearing controls had no test; its s
 because the fix was only present on two of four clients. These three tooling defects are the
 same error one level up — *the thing that is supposed to notice was the thing that was
 broken.* That is the whole of `docs/engineering-lessons.md` in one commit.
+
+---
+
+## 2026-07-30 — The suites stop orphaning servers (root cause found, both directions proven)
+
+**The symptom**, found while diagnosing an unrelated SIGKILL: twelve `sigild` processes
+still running, the oldest **1 day 22 hours** old, from `sigil-recovery-*` and other harness
+temp dirs.
+
+**The cause**, one line in seven of eight suites:
+
+```js
+function fail(msg) {
+  console.error(`FAIL: ${msg}`);
+  process.exit(1);          // <- terminates NOW; the finally never runs
+}
+```
+
+Each suite spawns a real `sigild` inside a `try` whose `finally` kills it. `process.exit()`
+does not unwind, so **every failing run leaked its server**. ⭐ `pinning-interop.mjs` was the
+one exception and has carried the reason in a comment for several phases — *"THROW rather
+than process.exit: exiting here would skip the finally block and leave a sigild and a proxy
+running"* — but no other suite adopted it. `entitlement-interop.mjs` was safe for a
+different reason: it registers a `process.on("exit")` reaper, so it is left as it is.
+
+**The fix:** `fail()` throws in the six suites that have a killing `finally`.
+
+**Proven in BOTH directions** — the same deliberate failure planted immediately after the
+server reports ready:
+
+| `fail()` shape | exit | orphaned servers |
+|---|---|---|
+| `process.exit(1)` (old) | 1 | **1** ⛔ |
+| `throw new Error(...)` (new) | 1 | **0** ✅ |
+
+Then all eight suites re-run clean, with **0 orphans** afterwards.
+
+⚠️ **My own mistake, twice, while proving this.** My first two attempts planted the mutation
+with a regex that did not match, so the suite ran unmodified and reported `exit=0` with
+zero orphans — which I could easily have read as "the fix works". It proved nothing. The
+`assert` in the planting script is what caught it both times. **A mutation test is only
+evidence if you confirm the mutation actually landed** — print the mutated line, or grep for
+the marker, before believing the result. This is the same class as reading a stale file as
+CI output earlier today.
+
+⛔ **Still open:** a SIGKILL (`kill -9`, an OOM killer, a harness sandbox) skips `finally`
+too, and no language-level change can prevent that. A genuine reaper — a wrapper that
+records spawned pids and cleans them on the next run — is the durable answer; `pkill -x
+sigild` is the manual one.

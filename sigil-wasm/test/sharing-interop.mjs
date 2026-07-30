@@ -67,7 +67,16 @@ import {
   acceptVault,
   vaultKeyFingerprint,
   KEY_ENVELOPE_MAGIC,
-  WRAPPED_VAULT_KEY_LEN,
+  KEY_ENVELOPE_VERSION_ANONYMOUS,
+  KEY_ENVELOPE_VERSION_AUTHENTICATED,
+  wrappedVaultKeyLen,
+  vaultKeyWrapAad,
+  senderFromAuth,
+  verifySenderForUnwrap,
+  verifiedSenderFromLocal,
+  VerifiedSender,
+  UnauthenticatedEnvelopeError,
+  UnknownSenderError,
 } from "../sharing.mjs";
 import {
   newVault,
@@ -266,6 +275,11 @@ try {
   const authJs = {
     baseUrl: base, deviceId: devJs.deviceId, seed: seedJs, hybrid: hybridJs,
     pins: newPinStore(),
+    // ⭐ PHASE 60 SYMMETRY. `acceptVault` now refuses to silently REPLACE a key
+    // this client already holds, and its `heldKeys` FAILS CLOSED exactly like
+    // `pins` — so the keyring has to be stated even when it is empty. The
+    // browsers pass `device.vaultKeys` here; this client holds nothing.
+    vaultKeys: {},
   };
   await publishHybridKey(wasm, authJs);
 
@@ -424,9 +438,18 @@ try {
       permission: "read",
     });
     uploadedEnvelope = shared.envelope;
+    // ⭐ PHASE 60. The envelope is an AUTHENTICATED (version 2) container, and its
+    // length is now context-dependent because the AAD names the vault and both
+    // devices — the flat 1226 was only ever true while ONE fixed AAD was reused
+    // for everything, which is the defect this phase closed.
+    const wantLen = wrappedVaultKeyLen(VAULT_A, cliDeviceId, devJs.deviceId);
     assert(
-      shared.envelopeBytes === WRAPPED_VAULT_KEY_LEN,
-      `(a) a wrapped 32-byte vault key should be ${WRAPPED_VAULT_KEY_LEN} bytes, got ${shared.envelopeBytes}`,
+      shared.envelopeBytes === wantLen,
+      `(a) a wrapped 32-byte vault key for this context should be ${wantLen} bytes, got ${shared.envelopeBytes}`,
+    );
+    assert(
+      shared.envelope[8] === KEY_ENVELOPE_VERSION_AUTHENTICATED,
+      `(a) the envelope must be SIGILhyb version ${KEY_ENVELOPE_VERSION_AUTHENTICATED} (AUTHENTICATED), got ${shared.envelope[8]}`,
     );
     assert(shared.fingerprint === fingerprintA, "(a) shareVault reported a different fingerprint");
     console.log(
@@ -524,8 +547,13 @@ try {
       cliUploaded,
     ]);
 
-    // The JS client accepts: collect, unwrap, and hold the recovered vault key.
+    // The JS client accepts: collect, AUTHENTICATE against the depositing
+    // device's pinned key, unwrap, and hold the recovered vault key.
     const accepted = await acceptVault(wasm, authJs, { vaultId: VAULT_B });
+    assert(
+      accepted.senderDeviceId === cliDeviceId,
+      `(b) the accept should attribute the envelope to the CLI device ${cliDeviceId}, got ${accepted.senderDeviceId}`,
+    );
     assert(accepted.vaultKey.length === 32, "(b) the recovered vault key must be 32 bytes");
     assert(
       bytesEqual(accepted.envelope, new Uint8Array(readFileSync(cliUploaded))),
@@ -584,7 +612,13 @@ try {
       "C fetching an envelope addressed to itself on a vault it has no grant on",
     );
 
-    const junk = wrapVaultKey(wasm, hybridPublicIdentity(wasm, hybridC), generateVaultKey());
+    const junk = wrapVaultKey(
+      wasm,
+      { deviceId: devC.deviceId, hybrid: hybridC },
+      hybridPublicIdentity(wasm, hybridC),
+      { vaultId: VAULT_A, recipientDeviceId: devC.deviceId, senderDeviceId: devC.deviceId },
+      generateVaultKey(),
+    );
     await expectStatus(
       403,
       () => putKeyEnvelope(wasm, authC, VAULT_A, devC.deviceId, junk),
@@ -594,7 +628,13 @@ try {
     // Even holding the ciphertext, C cannot open an envelope addressed elsewhere.
     let opened = true;
     try {
-      unwrapVaultKey(wasm, hybridC, uploadedEnvelope);
+      unwrapVaultKey(
+        wasm,
+        hybridC,
+        await verifySenderForUnwrap(wasm, authC, devJs.deviceId, { pins: newPinStore() }),
+        { vaultId: VAULT_A, recipientDeviceId: cliDeviceId, senderDeviceId: devJs.deviceId },
+        uploadedEnvelope,
+      );
     } catch {
       opened = false;
     }
@@ -618,7 +658,13 @@ try {
     assert(!envBuf.includes(Buffer.from(RFC_SEED_B32, "utf8")), "the envelope contains the base32 seed!");
 
     // Two wraps of the SAME key must differ (fresh ephemeral entropy per call).
-    const again = wrapVaultKey(wasm, await fetchHybridKey(wasm, authJs, cliDeviceId), vaultKeyA);
+    const again = wrapVaultKey(
+      wasm,
+      senderFromAuth(authJs),
+      await fetchHybridKey(wasm, authJs, cliDeviceId),
+      { vaultId: VAULT_A, recipientDeviceId: cliDeviceId, senderDeviceId: devJs.deviceId },
+      vaultKeyA,
+    );
     assert(!bytesEqual(again, uploadedEnvelope), "two wraps of the same key were identical (entropy reuse!)");
 
     const log = readFileSync(logPath, "utf8");
@@ -633,6 +679,194 @@ try {
     console.log(
       "  ZK     OK: the envelope is a SIGILhyb container holding no plaintext key or seed, two wraps differ, and the server logged fingerprints only",
     );
+  }
+
+  // ===================================================================
+  // PHASE 60 -- THE FORGERY, ATTEMPTED FROM JAVASCRIPT, MUST BE REFUSED.
+  // ===================================================================
+  //
+  // THE BUG, reproduced with the shipped binary before this phase:
+  //
+  //     sigil hybrid-keygen --out b.hybrid        # only b.hybrid.pub is published
+  //     sigil hybrid-seal --recipient-pub b.hybrid.pub --in attacker_key.bin
+  //     -> 1226 bytes, magic SIGILhyb, byte-shaped IDENTICALLY to a real wrap
+  //     sigil hybrid-open --key b.hybrid --in forged.env   # the attacker's key
+  //
+  // The JS twin: mint the ANONYMOUS container from the victim's PUBLISHED hybrid
+  // public key alone -- which sigild serves to every authenticated device -- and
+  // check that every accept path refuses it. This is the whole phase in one
+  // block, and it must go RED if the version refusal or the authentication is
+  // removed.
+  {
+    const victim = hybridJs; // the JS client is the victim here
+    const victimPub = hybridPublicIdentity(wasm, victim);
+    const attackerChosenKey = generateVaultKey();
+
+    // The attacker needs NO secret of anyone's -- only public material.
+    const forged = new Uint8Array(
+      wasm.hybrid_seal_to_container(
+        victimPub.x25519PublicKey,
+        victimPub.mlkemEncapsKey,
+        webcrypto.getRandomValues(new Uint8Array(32)),
+        webcrypto.getRandomValues(new Uint8Array(32)),
+        webcrypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
+        attackerChosenKey,
+      ),
+    );
+    assert(
+      forged[8] === KEY_ENVELOPE_VERSION_ANONYMOUS,
+      "the forgery should be an ANONYMOUS version-1 container (that IS the bug)",
+    );
+    // It still opens ANONYMOUSLY -- the anonymous file path is unchanged and is
+    // honest about what it is. The point is that it is no longer a vault key.
+    const anon = new Uint8Array(
+      wasm.hybrid_open_container(victim.x25519Secret, victim.mlkemSeed, forged),
+    );
+    assert(bytesEqual(anon, attackerChosenKey), "the anonymous form should still open anonymously");
+
+    // ...but the vault-key path REFUSES it, with its own typed error.
+    const senderCli = await verifySenderForUnwrap(wasm, authJs, cliDeviceId, {
+      pins: newPinStore(),
+    });
+    let refusal = null;
+    try {
+      unwrapVaultKey(
+        wasm,
+        victim,
+        senderCli,
+        { vaultId: VAULT_A, recipientDeviceId: devJs.deviceId, senderDeviceId: cliDeviceId },
+        forged,
+      );
+    } catch (e) {
+      refusal = e;
+    }
+    assert(
+      refusal instanceof UnauthenticatedEnvelopeError,
+      `a forged ANONYMOUS envelope must throw UnauthenticatedEnvelopeError, got: ${refusal}`,
+    );
+    assert(refusal.foundVersion === KEY_ENVELOPE_VERSION_ANONYMOUS, "wrong foundVersion");
+
+    // And an unverified key off the wire cannot even reach the unwrap: the gate
+    // is a TYPE, not a convention.
+    let gateThrew = null;
+    try {
+      unwrapVaultKey(
+        wasm,
+        victim,
+        { deviceId: cliDeviceId, x25519PublicKey: victimPub.x25519PublicKey },
+        { vaultId: VAULT_A, recipientDeviceId: devJs.deviceId, senderDeviceId: cliDeviceId },
+        uploadedEnvelope,
+      );
+    } catch (e) {
+      gateThrew = e;
+    }
+    assert(
+      gateThrew && /VerifiedSender/.test(gateThrew.message),
+      `unwrapVaultKey must demand a VerifiedSender, got: ${gateThrew && gateThrew.message}`,
+    );
+    let ctorThrew = null;
+    try {
+      new VerifiedSender(null, cliDeviceId, victimPub, "pinned", "1");
+    } catch (e) {
+      ctorThrew = e;
+    }
+    assert(ctorThrew, "VerifiedSender must not be constructible from outside the module");
+
+    // THE FULL PRODUCT PATH. Deposit the forgery into the JS device's own
+    // mailbox on a vault it owns, then run the REAL acceptVault -- the one the
+    // webapp and the extension call. It must refuse.
+    await putKeyEnvelope(wasm, authJs, VAULT_A, devJs.deviceId, forged);
+    let acceptThrew = null;
+    try {
+      await acceptVault(wasm, authJs, {
+        vaultId: VAULT_A,
+        senderDeviceId: cliDeviceId,
+        pins: newPinStore(),
+      });
+    } catch (e) {
+      acceptThrew = e;
+    }
+    assert(
+      acceptThrew instanceof UnauthenticatedEnvelopeError,
+      `acceptVault must REFUSE a forged anonymous envelope, got: ${acceptThrew}`,
+    );
+
+    // An AUTHENTICATED envelope from the WRONG sender fails at the AEAD, and a
+    // re-filed one (right sender, wrong context) fails too. Neither leaks.
+    const genuine = wrapVaultKey(
+      wasm,
+      senderFromAuth(authJs),
+      victimPub,
+      { vaultId: VAULT_A, recipientDeviceId: devJs.deviceId, senderDeviceId: devJs.deviceId },
+      attackerChosenKey,
+    );
+    const selfSender = await verifiedSenderFromLocal(wasm, senderFromAuth(authJs));
+    for (const [what, sender, ctx] of [
+      [
+        "the WRONG sender",
+        senderCli,
+        { vaultId: VAULT_A, recipientDeviceId: devJs.deviceId, senderDeviceId: cliDeviceId },
+      ],
+      [
+        "a re-filed vault id",
+        selfSender,
+        { vaultId: VAULT_B, recipientDeviceId: devJs.deviceId, senderDeviceId: devJs.deviceId },
+      ],
+      [
+        "a re-filed recipient",
+        selfSender,
+        { vaultId: VAULT_A, recipientDeviceId: cliDeviceId, senderDeviceId: devJs.deviceId },
+      ],
+    ]) {
+      let threw = false;
+      try {
+        unwrapVaultKey(wasm, victim, sender, ctx, genuine);
+      } catch {
+        threw = true;
+      }
+      assert(threw, `an envelope opened under ${what} -- the context binding is not holding`);
+    }
+    // CONTROL: the CORRECT sender + context opens it, so the refusals above are
+    // not an artefact of some unrelated mismatch.
+    const back = unwrapVaultKey(
+      wasm,
+      victim,
+      selfSender,
+      { vaultId: VAULT_A, recipientDeviceId: devJs.deviceId, senderDeviceId: devJs.deviceId },
+      genuine,
+    );
+    assert(bytesEqual(back, attackerChosenKey), "the genuine sender + context must open it");
+
+    console.log(
+      "  FORGE  OK: a JS-minted envelope from the victim's PUBLISHED public key alone is REFUSED " +
+        "(UnauthenticatedEnvelopeError) by unwrapVaultKey AND by the real acceptVault; an " +
+        "unverified key cannot reach the unwrap; wrong-sender and re-filed contexts all fail " +
+        "while the correct pair still opens",
+    );
+  }
+
+  // ===================================================================
+  // THE GOLDEN AAD VECTOR -- the one number the Rust and JS sides share.
+  // ===================================================================
+  //
+  // The AAD is SINGLE-SOURCED (`sigil_core::vault_key_wrap_aad`, called by both
+  // the CLI and this wasm binding), so drift is structurally impossible -- but a
+  // known-answer vector costs nothing and would catch a change to the core that
+  // nobody meant to make. Duplicated in libsigil/core/src/hybrid_auth.rs and in
+  // sigil-wasm/src/lib.rs.
+  {
+    const aad = vaultKeyWrapAad(wasm, "demo", "dev_bob", "dev_alice");
+    const hex = [...aad].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const GOLDEN =
+      "736967696c2d7661756c742d6b65792d777261702d76310a0000000464656d6f" +
+      "000000076465765f626f62000000096465765f616c696365";
+    assert(hex === GOLDEN, `the vault-key-wrap AAD drifted:\n  got  ${hex}\n  want ${GOLDEN}`);
+    // Length-prefixing: no two distinct triples collide.
+    assert(
+      !bytesEqual(vaultKeyWrapAad(wasm, "ab", "c", "d"), vaultKeyWrapAad(wasm, "a", "bc", "d")),
+      "the AAD fields are not length-prefixed -- ('ab','c','d') collided with ('a','bc','d')",
+    );
+    console.log("  KAT    OK: the vault-key-wrap AAD matches the golden vector byte for byte");
   }
 } finally {
   if (sigild && sigild.exitCode === null) {

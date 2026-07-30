@@ -148,6 +148,27 @@ public, make no security claims, until the audit completes and trademark clears.
   and cannot read it, ADR 0035), making the hybrid KEM real product code and IN
   SCOPE for the audit.** Still UNAUDITED, still NOT the product's ACCOUNT model, and
   there is NO out-of-band verification of a recipient's hybrid public key. ADR 0013.**
+  ⛔⛔ **PHASE 60 (ADR 0048) — `hybrid_seal` IS ANONYMOUS, AND THIS FILE CALLED IT
+  "AUTHENTICATED" FOR FOURTEEN PHASES.** It is HPKE `mode_base`: there is **NO SENDER
+  KEY IN IT AT ALL**, so anyone holding the recipient's PUBLIC key can produce a
+  container the recipient will open. Correct for **FILE** encryption (which is all it
+  is used for now); a **VULNERABILITY** for delivering a **KEY**, which is what it was
+  doing. ⭐ **VAULT-KEY WRAPPING MOVED to a NEW module `hybrid_auth.rs`
+  (`hybrid_auth_seal`/`hybrid_auth_open`/`hybrid_auth_encapsulate`/
+  `hybrid_auth_decapsulate`/`vault_key_wrap_aad`, 13 tests):** HPKE `mode_auth`'s shape —
+  `ss = HKDF-SHA256(ss_e ‖ ss_kem ‖ ss_s ‖ transcript, info "sigil-hybrid-auth-v1")`
+  where **`ss_s = X25519(sender_static, recipient_static)`** is the authentication, and
+  the transcript (prefix `"sigil-hybrid-auth-v1\n"`, every field u32_be-length-prefixed)
+  binds eph_pub ‖ mlkem_ct ‖ **sender pub** ‖ **recipient pub**. ⭐ **The sender's static
+  public key is an INPUT to decapsulation and is deliberately NOT CARRIED IN THE
+  CONTAINER** — reading the sender's identity out of attacker-controlled bytes and then
+  "verifying" against it is the mistake being fixed. Composes kx/mlkem/hkdf/aead/envelope,
+  **NO new dep, NO randomness, NO clock**. Golden KATs pinned (AAD for
+  `("demo","dev_bob","dev_alice")` = 56 bytes; combined secret
+  `7d5cda4a…be8c42b0`). ⛔ **STILL a custom composition, NOT RFC 9180 HPKE, UNAUDITED —
+  and the AUTHENTICATION IS CLASSICAL X25519 ONLY** (ML-KEM has no static-static
+  analogue): **confidentiality is hybrid, authenticity is not**, and it is **implicit,
+  key-confirmed and NON-TRANSFERABLE**, not a signature.
   **The core now also has the FIRST primitive that implements an actual product
   FEATURE (not a building block): an **HOTP/TOTP** one-time-password primitive
   (`hotp`/`totp`/`format_code` over an `OtpAlgorithm` enum — SHA-1 (default)/
@@ -756,8 +777,9 @@ public, make no security claims, until the audit completes and trademark clears.
   ELSE.** ⭐ **`sigild` gained NO concept of "recovery"**: no table, no migration, no flag,
   no config. A recovery kit is an **ORDINARY MEMBER DEVICE** (label `"recovery-kit"`,
   visible in `GET /v1/account`), so the server sees only shapes it already relayed — one
-  device row, one hybrid PUBLIC key, one opaque ~1226-byte `SIGILhyb` envelope per covered
-  vault. The one addition is **`GET /v1/devices/{deviceID}/keys`** (`deviceKeyEnvelopeIndex`
+  device row, one hybrid PUBLIC key, one opaque ~1.3 KiB `SIGILhyb` envelope per covered
+  vault (⚠️ **NOT a fixed 1226 bytes** since Phase 60 — see ADR 0048; and ⛔ a kit covered
+  BEFORE Phase 60 must be **RE-COVERED**, because its v1 envelopes are now refused). The one addition is **`GET /v1/devices/{deviceID}/keys`** (`deviceKeyEnvelopeIndex`
   in `internal/api/sharing.go`), the index a kit needs on a **fresh machine** where it knows
   its own device id and nothing else: **SELF-ONLY** (a mismatched path id ⇒ **403 BEFORE any
   store read**; an **unknown device id is the SAME coarse 403, never 404** — no existence
@@ -936,9 +958,15 @@ public, make no security claims, until the audit completes and trademark clears.
   constrained by an **ALLOWLIST** (`/`, `/_next/`, static asset extensions); the first fix
   filtered only CROSS-origin entries, which was vacuous, since every plausible leak is
   same-origin and the extension caught the identical plant),
-  `entitlement.spec.ts`, and ⭐ **`cors.spec.ts` — the
+  `entitlement.spec.ts`, ⭐ **`cors.spec.ts` — the
   ONLY spec that drives the UI against a REAL `sigild`** (both directions: allowlisted ⇒
-  enrols, unlisted ⇒ blocked). ⚠️ It resolved Go as `process.env.GO ?? "/opt/homebrew/bin/go"`
+  enrols, unlisted ⇒ blocked) — and, from Phase 60 (ADR 0048), **`envelope-auth.spec.ts`**
+  (4 specs): it deposits a GENUINE authenticated v2 envelope, `sharing-rotate`s to a new
+  key, then restores the old envelope — a stale/replayed deposit that **authenticates
+  perfectly** — and asserts the browser refuses it (`does NOT open this vault`), that the
+  sealed store is byte-for-byte unchanged after the refusal, that the explicit
+  replace tick is the ONLY door and reports what it displaced, and that the tick does
+  **not stay armed** for a later accept. ⚠️ It resolved Go as `process.env.GO ?? "/opt/homebrew/bin/go"`
   with **no PATH lookup**, so in CI it **`test.skip`ped itself** and that only browser-level
   proof silently vanished while the job stayed green — Phase 57 gave it a PATH lookup **and**
   `GO: go` on the workflow step (`actions/setup-go` alone did NOT fix it: it sets PATH, never
@@ -1264,10 +1292,45 @@ public, make no security claims, until the audit completes and trademark clears.
   sealed under a random 32-byte **VAULT KEY** (`generate_vault_key`, `VAULT_KEY_LEN` =
   32) that goes into the **SAME `SIGILcli` container with NO format change** (the
   container takes arbitrary password BYTES); that key is **WRAPPED per recipient** with
-  `wrap_vault_key` → `hybrid_seal_to_container` (X25519 + ML-KEM-768 → AEAD, fresh
-  ephemeral entropy per call) into an opaque **`SIGILhyb` envelope** (~1.2 KiB; observed
-  1226 B) that sigild relays and cannot read; `unwrap_vault_key` reverses it and
-  **rejects any recovered plaintext that is not exactly 32 bytes**. Commands: `device
+  `wrap_vault_key` → **`hybrid_auth_seal_to_container`** (X25519 + ML-KEM-768 → AEAD, fresh
+  ephemeral entropy per call) into an opaque **`SIGILhyb` VERSION-2 envelope** that sigild
+  relays and cannot read; `unwrap_vault_key` reverses it and **rejects any recovered
+  plaintext that is not exactly 32 bytes**.
+  ⭐⭐ **PHASE 60 (ADR 0048) — THE WRAP IS NOW AUTHENTICATED AND CONTEXT-BOUND, AND THE OLD
+  ONE WAS FORGEABLE BY ANYONE.** `hybrid_seal` is ANONYMOUS (HPKE `mode_base`), so holding
+  the recipient's **PUBLISHED** hybrid public key — which sigild serves to every
+  authenticated device — was the entire input needed to mint an envelope it would accept
+  and install a vault key **of the attacker's choosing** (reproduced with the shipped
+  binary: `sigil hybrid-seal` output was byte-shaped identically to a genuine wrap and
+  `hybrid-open` returned the chosen key, exit 0). ⛔ **ADR 0038 pinning did NOT help — `vault
+  accept` fetched no hybrid key at all, so the pin store was NEVER CONSULTED.** THE FIX, all
+  three parts load-bearing: (1) `sigil_core::hybrid_auth_seal` folds in a **static-static
+  X25519 DH** (`ss_s = X25519(sender_static, recipient_static)`), so a forger needs the
+  **SENDER's** secret; (2) `vault_key_wrap_aad` binds **purpose + vault id + recipient
+  device id + sender device id** (the old fixed `"sigil-hybrid-cli/1"` bound NOTHING, which
+  is why a FILE container was a valid VAULT-KEY envelope); (3) container version **1→2 with
+  v1 REFUSED and NO compatibility flag** — accepting v1 IS accepting the vulnerability. Plus
+  a typed **`VerifiedSender`** unwrap gate (private fields, no public constructor; built only
+  by `verify_sender_for_unwrap` or `VerifiedSender::from_local`), **OPEN BEFORE WRITING**,
+  **NEVER SILENTLY REPLACE** (`--replace`), and **GRANT BEFORE DEPOSIT** (it was the other
+  way round, so a `write`-but-not-owner device's envelope LANDED and the 403 arrived after).
+  ⭐ **`sigild` changed by ZERO lines** — no route/header/canonical message/migration/table/
+  metric/dependency. ⚠️ **THE ENVELOPE IS NO LONGER A FIXED SIZE**: it is
+  `1244 + len(vault_id) + len(recipient_device_id) + len(sender_device_id)` (**measured 1310**
+  for a 14-char vault id + two 26-char device ids); the **anonymous v1 FILE** container is
+  still a flat **1226** — ⚠️ **do NOT conflate the two**, that conflation is how the forgery
+  stayed invisible. ⛔ **HONEST LIMITS:** sender authentication is **CLASSICAL X25519 ONLY**
+  (ML-KEM has no static-static analogue) — **confidentiality is hybrid, authenticity is
+  NOT**, and a quantum adversary could forge what it could not read (`hybrid_auth.rs:71-76`);
+  it is **implicit, key-confirmed and NON-TRANSFERABLE** (not a signature — the recipient
+  cannot prove to anyone else who sent it); **first sight of a sender is still TOFU** (pinned
+  + warned, closed only by `--safety-number`); and **EVERY EXISTING ENVELOPE MUST BE
+  RE-ISSUED**, with no migration possible. ⚠️ **Why NOT an Ed25519 signature:** `deviceJSON`
+  (`sigild/internal/api/devices.go:61`) **deliberately omits the public key**, so no route
+  serves a peer's Ed25519 key — a signature fix needs a NEW sigild route, a SECOND pinned key
+  type, and would either break **every already-printed recovery sheet's safety number** (if
+  added to the digest) or leave the spoken digits **not covering the authenticating key** (if
+  not). The hybrid key is already published, already pinned, already in the digest. Commands: `device
   hybrid-publish [--key <f>] [--hybrid-key <f>] [--regenerate] [--server <url>]` (creates
   the hybrid identity if absent and PUTs only the PUBLIC half; refuses to silently
   overwrite a secret whose `.pub` is missing), `vault rekey --vault <id> [--file <f>]
@@ -1589,9 +1652,36 @@ public, make no security claims, until the audit completes and trademark clears.
   operations **`shareVault`** (fetch key → wrap → PUT envelope → grant through the
   **EXISTING** `grantVaultAccess`, so authorization and key distribution cannot drift)
   and **`acceptVault`**, plus `explainSharingStatus` (401 vs 403 vs 404/409/413).
-  ⚠️ **NO Rust changed** — every wasm export it needs (`hybrid_x25519_public`,
+  ⭐ **PHASE 60 (ADR 0048) — `acceptVault` IS NOW FIVE STEPS, NOT THREE**, and the JS side
+  mirrors the CLI exactly: (1) work out WHO deposited (explicit `senderDeviceId` or this
+  device's own envelope index; none ⇒ **`UnknownSenderError`**, a REFUSAL); (2)
+  **`verifySenderForUnwrap`** — the pin store, at last, on the accept path (it was NEVER
+  consulted before, which is why pinning did not stop the forgery); (3) unwrap
+  AUTHENTICATED + CONTEXT-BOUND via `vaultKeyWrapAad` — a **version-1 (anonymous)**
+  container is refused with **`UnauthenticatedEnvelopeError`**; (4) ⭐ **OPEN BEFORE
+  RETURNING** — the recovered key must open the vault's newest op (`pullContainersAuthed`
+  + `open_container`), else **`VaultKeyDoesNotOpenError`**; no ops at all ⇒
+  `verifiedAgainstTip: false`; (5) **NEVER SILENTLY REPLACE** — a DIFFERENT held key needs
+  `replace: true`, else **`VaultKeyReplacementError`** carrying BOTH fingerprints (never
+  key bytes). New option **`heldKeys`** (defaults to `auth.vaultKeys`) is validated by
+  **`requireHeldVaultKeys`, which FAILS CLOSED** on null/undefined — deliberately copying
+  `requirePinStore`'s precedent, because the fallback would silently mean "this client
+  holds nothing" and degrade step 5 into a no-op. Result gains `verifiedAgainstTip`,
+  `tipContainer` (the exact bytes step 4 checked, so callers adopt with no second round
+  trip and no TOCTOU window) and `replaced`. `unwrapVaultKey` now demands a
+  **`VerifiedSender`** instance (from `verifySenderForUnwrap` or `verifiedSenderFromLocal`)
+  — the typed gate, mirrored from Rust. ⭐ **Both new checks live where the key is
+  PRODUCED, not at the call sites**, so a browser physically cannot obtain a key that opens
+  nothing or one that displaces a held key silently. ⚠️ **A DELIBERATE BEHAVIOUR CHANGE:** a
+  browser accept now REFUSES when the sender rotated the key and has not yet pushed the
+  re-sealed vault (step 4 sees a tip the new key cannot open). The CLI always behaved this
+  way; the browsers now match, and the error names the remedy. Sizing helpers
+  `WRAPPED_VAULT_KEY_OVERHEAD` (1208) + **`wrappedVaultKeyLen(vault, recipient, sender)`**
+  ⚠️ **REPLACE the old flat `WRAPPED_VAULT_KEY_LEN = 1226`**.
+  ⚠️ **NO Rust changed** in Phase 48 — every wasm export it needed (`hybrid_x25519_public`,
   `hybrid_mlkem_encaps_key`, `hybrid_seal_to_container`, `hybrid_open_container`)
-  already existed from Phase 31. It does **NO crypto itself**: the KEM/AEAD happens in
+  already existed from Phase 31. (Phase 60 DID add Rust: the `hybrid_auth_*` wasm shells
+  over the new core module.) It does **NO crypto itself**: the KEM/AEAD happens in
   the wasm and every signature goes through `device-auth.mjs`; ALL entropy (hybrid
   identity, vault key, per-wrap ephemeral X25519 secret + ML-KEM coin + AEAD nonce) is
   `crypto.getRandomValues`, so both `Cargo.lock`s stay `getrandom`==0. Semantics +
@@ -1612,7 +1702,8 @@ public, make no security claims, until the audit completes and trademark clears.
   `chrome.storage` in the clear. Proven by
   **`sigil-wasm/test/sharing-interop.mjs`** — boots a LIVE `sigild` + builds the REAL
   `sigil` binary and shares **BOTH ways**: (a) JS seals a vault under a random vault
-  key, pushes, shares a **1226-byte** envelope → the real CLI accepts, unwraps to the
+  key, pushes, shares a **1310-byte** (⚠️ context-dependent — see ADR 0048) AUTHENTICATED
+  v2 envelope → the real CLI accepts, unwraps to the
   SAME fingerprint, pulls and prints **94287082** at T=59 (the RFC 6238 vector);
   (b) CLI shares → JS accepts and both produce **94287082**, and the human password
   does NOT open that vault; an unauthorized third identity is **403** three ways; the
@@ -1838,7 +1929,9 @@ public, make no security claims, until the audit completes and trademark clears.
   `chrome.storage.local` must be a sealed `SIGILcli` container and
   `chrome.storage.session`/`sync`/`managed`, `sessionStorage`, cookies and IndexedDB must
   all be EMPTY) and `entitlement.spec.mjs` — brought it to **12 tests in 5 spec files** (now
-  **14 in 6** with Phase 59's `schema.spec.mjs`), and
+  **18 in 7** with Phase 59's `schema.spec.mjs` and Phase 60's `envelope-auth.spec.mjs`,
+  which drives a **replayed genuine AUTHENTICATED v2 envelope** past a rotation and asserts
+  the browser refuses it, stores nothing, and re-arms the `--replace` opt-in), and
   they DO drive the enrollment UI, closing the old "enrollment UI is not Playwright-covered"
   gap. ⚠️ They run against the **`fake-sigild.mjs` double**, not a real server.
   Phase 57 also gave `popup.js`'s `authErr` a **402 arm** — it rendered a lapsed-account
@@ -1855,7 +1948,7 @@ public, make no security claims, until the audit completes and trademark clears.
   **`schema.spec.mjs`** proves the preservation property **through the real unpacked
   extension** — seeding a vault with fields no Sigil build has heard of, driving a real
   popup edit, and decrypting what the extension actually wrote — bringing the suite to
-  **14 tests in 6 spec files**. ⚠️ It exists because a verifier reverted the PRODUCT half
+  **14 tests in 6 spec files** (**18 in 7** after Phase 60). ⚠️ It exists because a verifier reverted the PRODUCT half
   of the fix and the whole gate stayed green (see the webapp bullet); the module was
   covered and the popup was not.
   **Dev / UNAUDITED / loaded unpacked / published to NO store**; sync is **loopback
@@ -2303,11 +2396,12 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium: 50 tests in 10 spec files, PASS
+corepack pnpm --filter webapp exec playwright test   # headless chromium: 54 tests in 11 spec files, PASS
 # ⛔ It serves on http://localhost:3210, NOT 127.0.0.1 — Chrome refuses WebAuthn on an IP
 # literal, so every passkey spec (ADR 0046) fails there for a reason unrelated to the code.
 # `workers: 2` and `reuseExistingServer: false` are also deliberate (see the config's comments).
-# (wasm, offline, a11y, recovery, wrap-gate, leak, entitlement, and cors.spec.ts —
+# (wasm, offline, a11y, recovery, wrap-gate, leak, entitlement, schema, envelope-auth,
+#  and cors.spec.ts —
 #  the ONE spec that builds + boots a REAL sigild and drives the UI against it.
 #  ⚠️ cors.spec.ts test.skip()s ITSELF without a Go toolchain, so a run with no Go
 #  is green while proving nothing about CORS; CI now installs Go for this job.)
@@ -2321,7 +2415,7 @@ corepack pnpm --filter webapp exec playwright test   # headless chromium: 50 tes
 # the extension can be loaded unpacked or tested). NOT wired into CI.
 corepack pnpm -C extension install
 ./extension/build.sh                          # -> extension/vendor/ (gitignored)
-corepack pnpm -C extension test               # `pretest` re-runs build.sh; 14 tests in 6 spec files, PASS
+corepack pnpm -C extension test               # `pretest` re-runs build.sh; 18 tests in 7 spec files, PASS
 # ⚠️ Use `pnpm test`, NOT `pnpm -C extension exec playwright test`: only the former
 # runs the `pretest` vendor hook, so the latter can test a STALE extension/vendor/.
 # The suite loads the REAL unpacked extension in a full Chromium (channel:

@@ -15,14 +15,24 @@
 > **assembled as a standalone primitive** too, in `sigil-core` (`hybrid_sig.rs`),
 > composing the Ed25519 half (`sig.rs`) and the ML-DSA-65 half (`mldsa.rs`). So
 > **both hybrid constructions (KEM and signature) now exist**. The hybrid **KEM** is
-> further composed with the AEAD into **hybrid public-key authenticated encryption**
-> — `hybrid_seal` / `hybrid_open` (`hybrid_seal.rs`) — and **that flow is no longer
-> standalone: it now carries device-to-device VAULT-KEY WRAPPING** (see
-> [Key hierarchy and vault sharing](#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use)
-> and [ADR 0035](decisions/0035-device-to-device-vault-sharing.md)), which makes it
-> **load-bearing and squarely in scope for the audit**. It remains a **custom
-> KEM-then-AEAD composition — NOT RFC 9180 HPKE** — it remains **UNAUDITED**, and it
-> does **not** make the SYSTEM "post-quantum secure". The hybrid **signature**
+> further composed with the AEAD into public-key encryption in **two** forms:
+> the **ANONYMOUS** `hybrid_seal` / `hybrid_open` (`hybrid_seal.rs`, HPKE
+> `mode_base`) — ⚠️ **this document called that one "authenticated" until Phase
+> 60, which was WRONG: it has no sender key at all** — now used only for file
+> encryption; and the **AUTHENTICATED** `hybrid_auth_seal` / `hybrid_auth_open`
+> (`hybrid_auth.rs`, HPKE `mode_auth`'s shape, mixing in a **static-static X25519
+> DH** so a forger needs the *sender's* secret and not merely the recipient's
+> published public key), which **carries device-to-device VAULT-KEY WRAPPING**
+> (see
+> [Key hierarchy and vault sharing](#key-hierarchy-and-vault-sharing-hybrid_auth_seal--hybrid_auth_open-in-use),
+> [ADR 0035](decisions/0035-device-to-device-vault-sharing.md) and
+> [ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)), which makes it
+> **load-bearing and squarely in scope for the audit**. ⛔ **That sender
+> authentication is CLASSICAL X25519 ONLY** — ML-KEM has no static-static
+> analogue, so **confidentiality is hybrid while authenticity is not**. Both forms
+> remain a **custom
+> KEM-then-AEAD composition — NOT RFC 9180 HPKE** — both remain **UNAUDITED**, and
+> they do **not** make the SYSTEM "post-quantum secure". The hybrid **signature**
 > (`hybrid_sign` / `hybrid_verify`) is **still unused by every flow** — all request
 > authentication is classical Ed25519 only. Condensed
 > from the product brief §11/§20/§21. Subject to change. A Cure53 audit of the
@@ -225,10 +235,27 @@ model, and wiring either construction into the suite frame. The **SYSTEM is stil
 not "post-quantum secure"**. See
 [ADR 0012](decisions/0012-hybrid-signature-combiner.md).
 
-## Hybrid public-key authenticated encryption (`hybrid_seal` / `hybrid_open`)
+## Hybrid public-key encryption — ANONYMOUS (`hybrid_seal` / `hybrid_open`)
 
-**Status (pre-audit, UNAUDITED).** `sigil-core` now composes the hybrid **KEM**
-with the symmetric AEAD into **hybrid public-key authenticated encryption** —
+> ⚠️ **NAMING CORRECTION (Phase 60).** This section was titled *"hybrid public-key
+> **authenticated** encryption"*, and used that phrase throughout. **The word was
+> wrong and it mattered.** `hybrid_seal` is HPKE `mode_base` — it has **no sender
+> key at all** — so "authenticated" was describing only the AEAD's ciphertext
+> integrity, while it *read* as sender authentication. A reviewer scoping this
+> flow would have concluded a property existed that did not.
+>
+> The construction below is **ANONYMOUS**, and that is the correct shape for what
+> it is now used for: encrypting a **file** to a public key (`sigil hybrid-seal` /
+> `hybrid-open`), where "anyone may send to you" is the intended semantics.
+>
+> ⛔ It is **no longer used for vault-key wrapping**. Using an anonymous primitive
+> to deliver a **key** was a vulnerability — the recipient could not tell a key
+> its peer chose from a key an attacker chose. That path now uses the
+> **authenticated** construction in the next section
+> ([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)).
+
+**Status (pre-audit, UNAUDITED).** `sigil-core` composes the hybrid **KEM**
+with the symmetric AEAD into anonymous hybrid public-key encryption —
 `hybrid_seal` / `hybrid_open` in
 [`libsigil/core/src/hybrid_seal.rs`](../libsigil/core/src/hybrid_seal.rs). This is
 the **first time a hybrid primitive is wired into an encryption flow**: until now
@@ -278,14 +305,19 @@ Honest framing:
   **either** X25519 or ML-KEM-768 remains secure, and the transcript binding stops
   mix-and-match — asserted as design intent of an **UNAUDITED** primitive, **not** a
   claim that the SYSTEM is "post-quantum secure".
-- It is **real but UNAUDITED**, and it is **no longer standalone**: `hybrid_seal` /
-  `hybrid_open` now carry **device-to-device vault-key wrapping** (next section;
-  [ADR 0035](decisions/0035-device-to-device-vault-sharing.md)). That is the first
-  time a hybrid primitive does load-bearing work in a user-facing feature, and it
-  is why this composition must be treated as **in-scope product code** by the
-  audit rather than as a lab primitive. It is still **not** the product's *account*
-  model, and there is still **no key-transparency / out-of-band verification** of a
-  recipient's hybrid public key. The envelope's `kem_ct` field still stays
+- ⛔ **It is ANONYMOUS, and that is the property to understand before using it.**
+  The sender's only key is a per-message ephemeral, so **anyone holding the
+  recipient's public key can produce a container the recipient will open**. For
+  file-to-a-public-key encryption that is the intended semantics. For delivering a
+  **key** it is a vulnerability, and it was one here until Phase 60 — see
+  [ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md).
+- It is **real but UNAUDITED**. ⚠️ It **no longer carries device-to-device
+  vault-key wrapping** — that moved to the authenticated construction in the next
+  section — so this primitive is once again used only by `sigil hybrid-seal` /
+  `hybrid-open` (a file-encryption demo). The hybrid KEM as such **remains
+  load-bearing and in scope for the audit**, because the authenticated
+  construction is built from the same halves. It is still **not** the product's
+  *account* model. The envelope's `kem_ct` field still stays
   *reserved* but unused — the ML-KEM ciphertext travels alongside the envelope here,
   not inside it. See [ADR 0013](decisions/0013-hybrid-public-key-seal.md).
 - These hybrid primitives are also reachable over the **C-ABI** —
@@ -297,7 +329,118 @@ Honest framing:
   product consumer (the sharing flow reaches `hybrid_seal` through the Rust CLI
   crate, not through the FFI).
 
-## Key hierarchy and vault sharing (`hybrid_seal` / `hybrid_open` in use)
+## Hybrid public-key AUTHENTICATED encryption (`hybrid_auth_seal` / `hybrid_auth_open`)
+
+**Status (pre-audit, UNAUDITED). This is what wraps a vault key.**
+[`libsigil/core/src/hybrid_auth.rs`](../libsigil/core/src/hybrid_auth.rs),
+[ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md).
+
+It composes the **same** primitives as the anonymous form above — X25519,
+ML-KEM-768, HKDF-SHA256, the AEAD and the envelope codec — and adds **no new
+low-level cryptography, no dependency, no randomness and no clock**. The shape is
+HPKE's `mode_auth`: the sender **also** holds a long-term ("static") X25519 key
+pair, and a third Diffie–Hellman between the sender's static secret and the
+recipient's static public key is mixed into the KDF.
+
+```text
+  ss_e = X25519(eph_secret,           recipient_x25519_pub)   -- ephemeral-static
+  ss_s = X25519(sender_static_secret, recipient_x25519_pub)   -- static-static  <- THE AUTHENTICATION
+ (mlkem_ct, ss_kem) = ML-KEM-768.Encaps(recipient_encaps_key, coin)
+
+  transcript = SHA-256( "sigil-hybrid-auth-v1\n"
+                      ‖ u32_be(32)   ‖ eph_x25519_pub
+                      ‖ u32_be(1088) ‖ mlkem_ct
+                      ‖ u32_be(32)   ‖ sender_static_x25519_pub
+                      ‖ u32_be(32)   ‖ recipient_x25519_pub )
+
+  ss = HKDF-SHA256( ikm  = ss_e ‖ ss_kem ‖ ss_s ‖ transcript,
+                    salt = none,
+                    info = "sigil-hybrid-auth-v1" )            [32 bytes]
+
+  envelope = seal(master_key = ss, nonce, aad, plaintext)
+```
+
+An attacker who knows only **public** keys cannot compute `ss_s`, so it cannot
+produce a ciphertext this construction will open. Every transcript field is
+length-prefixed, so no two distinct field sets serialise to the same bytes, and
+the transcript binds **both identities** — a capture cannot be re-attributed to a
+different sender or re-aimed at a different recipient without changing the key.
+
+⭐ **The sender's static public key is an INPUT to decapsulation, not something
+read out of the ciphertext**, and is deliberately **not carried in the
+container**. It comes from the pin store, out of band. Passing the wrong sender
+yields a different key and therefore an AEAD failure — the recipient learns *"this
+did not come from who I expected"* with **no string comparison being trusted**.
+Reading the sender's identity from attacker-controlled bytes and then "verifying"
+against it is exactly the mistake this design avoids.
+
+The HKDF `info` (`"sigil-hybrid-auth-v1"`) domain-separates this from the
+anonymous combiner (`"sigil-hybrid-v1"`), so the same material can never yield the
+same key through both.
+
+### The context-bound AAD
+
+Authentication says *who* made a ciphertext. It does not say *what it was for*.
+Every hybrid container used to be sealed under one fixed tag
+(`"sigil-hybrid-cli/1"`), binding it to **no vault, no recipient, no sender and no
+purpose** — which is why a *file* container was a structurally valid *vault-key*
+envelope. A vault-key wrap now uses:
+
+```text
+  "sigil-vault-key-wrap-v1\n"
+  ‖ u32_be(len(vault_id))            ‖ vault_id
+  ‖ u32_be(len(recipient_device_id)) ‖ recipient_device_id
+  ‖ u32_be(len(sender_device_id))    ‖ sender_device_id
+```
+
+so a **file** envelope can never be presented as a **vault-key** envelope, an
+envelope for vault A cannot be moved to vault B, one addressed to device X cannot
+be re-filed under device Y, and one from sender S cannot be re-attributed to
+sender T. The AAD travels in the clear inside the envelope, authenticated by the
+AEAD tag, and is additionally compared **before** the AEAD is entered.
+
+⭐ **SINGLE-SOURCED, not mirrored.** The layout lives once, in
+`sigil_core::vault_key_wrap_aad`; the CLI, the desktop and JavaScript all reach it
+(JS through the wasm). **Golden vector** for
+`vault_key_wrap_aad("demo", "dev_bob", "dev_alice")` — 56 bytes:
+
+```
+736967696c2d7661756c742d6b65792d777261702d76310a
+0000000464656d6f 000000076465765f626f62 000000096465765f616c696365
+```
+
+The combined-secret KAT over fixed seeds is
+`7d5cda4ae644faeb3fe30d492886bcd7961ed08c196b990c34bc9760be8c42b0`.
+
+### ⚠️ What each half buys — the asymmetry, stated plainly
+
+| component | buys |
+|---|---|
+| `ss_e` (ephemeral-static X25519) | forward secrecy against later compromise of the **sender's** static secret |
+| `ss_kem` (ML-KEM-768) | the post-quantum half of **confidentiality** |
+| `ss_s` (static-static X25519) | **the authentication — classical only** |
+
+⛔ **The post-quantum half is NOT authenticated.** ML-KEM has no static-static
+analogue. So: breaking **confidentiality** is designed to require breaking **both**
+X25519 and ML-KEM-768; forging **authenticity** requires breaking **X25519 alone**.
+A quantum adversary could forge an envelope it still could not read. **This does
+not make the SYSTEM "post-quantum secure", and it does not claim post-quantum
+authentication.**
+
+⚠️ The authentication is **implicit and key-confirmed, not a signature, and NOT
+TRANSFERABLE**: it proves the ciphertext was made by *someone holding the sender's
+static X25519 secret*, and the recipient **cannot prove that to a third party**,
+because the recipient could have made it too. For *"did MY peer choose this vault
+key?"* that is exactly right, and deliberately weaker than non-repudiation — but
+**no audit or dispute process can rest on an envelope**.
+
+Also unchanged from the anonymous form: it is a **CUSTOM composition — NOT RFC
+9180 HPKE**, sharing none of its test vectors; the caller supplies the ephemeral
+secret, the ML-KEM coin and the nonce ([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md));
+a non-contributory recipient public key is rejected for **both** DH halves; and
+there is **no zeroization** of component secrets beyond what the dependencies do.
+
+## Key hierarchy and vault sharing (`hybrid_auth_seal` / `hybrid_auth_open` in use)
 
 **Status (pre-audit, UNAUDITED, dev-gated).** This is where the hybrid public-key
 seal above stops being a demo. Device-to-device **vault sharing**
@@ -318,16 +461,45 @@ vault key = 32 bytes from the OS CSPRNG
                       key drops in with NO format change)
      │
      └── per recipient device:
-         hybrid_seal( recipient_x25519_pub, recipient_mlkem_encaps_key,
-                      eph_x25519_secret, mlkem_coin, nonce,
-                      plaintext = the 32-byte vault key )
+         hybrid_auth_seal( sender_static_x25519_secret,          <- THE SENDER'S IDENTITY
+                           recipient_x25519_pub, recipient_mlkem_encaps_key,
+                           eph_x25519_secret, mlkem_coin, nonce,
+                           aad = vault_key_wrap_aad(vault_id,
+                                                    recipient_device_id,
+                                                    sender_device_id),
+                           plaintext = the 32-byte vault key )
                  ──▶ (eph_x25519_pub, mlkem_ct, envelope)
-                     packaged as a SIGILhyb container ≈ 1.2 KiB  ("the envelope")
+                     packaged as a SIGILhyb container, VERSION 2  ("the envelope")
 ```
 
-The recipient reverses it with `hybrid_open` under its hybrid **secret** identity
-(an X25519 secret scalar + an ML-KEM-768 keygen seed), recovering exactly 32 bytes;
-anything other than 32 bytes is rejected rather than used as a key.
+The recipient reverses it with `hybrid_auth_open` under its hybrid **secret**
+identity (an X25519 secret scalar + an ML-KEM-768 keygen seed) **and the sender's
+static X25519 public key**, recovering exactly 32 bytes; anything other than 32
+bytes is rejected rather than used as a key.
+
+⛔ **A version-1 (anonymous) container is REFUSED wherever a vault key is
+expected**, before any cryptography runs. There is no flag, option or default
+anywhere that accepts one — a v1 container proves nothing about who made it, so
+accepting it would *be* the vulnerability
+([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)). ⚠️ Consequently
+**every envelope deposited before Phase 60 must be re-issued**, including those
+covering a recovery kit; there is no migration and there cannot be one.
+
+⚠️ **The envelope is NOT a fixed size.** It carries its context AAD, so its length
+depends on the identifiers:
+
+```
+  bytes = 1244 + len(vault_id) + len(recipient_device_id) + len(sender_device_id)
+        = 1129 (magic + version + eph_x25519_pub + mlkem_ct)
+        +   79 (nonce + framing + the sealed 32-byte key)
+        +   36 + those three lengths   (the AAD)
+```
+
+Measured **1310 bytes** for a 14-character vault id and two 26-character
+server-assigned device ids (`dev_` + 22 base64url chars). The **anonymous v1
+file** container is still a flat **1226** bytes, and conflating the two is how a
+forged file container came to be byte-shaped like a genuine wrap — do not
+"correct" one to the other.
 
 - **The human password is never shared and never wrapped.** Sharing it would hand a
   recipient every *other* vault sealed under it and would make revocation mean
@@ -350,11 +522,12 @@ identical construction through [`../sigil-wasm/sharing.mjs`](../sigil-wasm/shari
 (`generateVaultKey` → `wrapVaultKey` / `shareVault` → `acceptVault` /
 `unwrapVaultKey`, with `vaultKeyFingerprint` computing the same 16-hex SHA-256 prefix
 via `crypto.subtle`). **The wrap and unwrap still happen inside the wasm** —
-`hybrid_seal_to_container` / `hybrid_open_container`, i.e. `sigil-core`'s
-`hybrid_seal` / `hybrid_open` — so there is no second implementation of the
+`hybrid_auth_seal_to_container` / `hybrid_auth_open_container`, i.e. `sigil-core`'s
+`hybrid_auth_seal` / `hybrid_auth_open` — so there is no second implementation of the
 construction and no JS-side cryptography; the JS supplies entropy and moves bytes. The
 recovered-plaintext length check (exactly 32 bytes, else reject) is mirrored in
-`unwrapVaultKey`. A shared vault sealed by a browser is byte-compatible with one sealed
+`unwrapVaultKey`, which additionally requires a `VerifiedSender` instance and
+rejects a version-1 container with `UnauthenticatedEnvelopeError`. A shared vault sealed by a browser is byte-compatible with one sealed
 by the CLI, and vice versa: `sharing-interop.mjs` shares a vault **both ways** between
 the JS client and the real `sigil` binary and both ends reach the same fingerprint and
 the same RFC 6238 code. Where the CLI keeps the hybrid secret and the keyring in `0600`
@@ -382,10 +555,38 @@ server holds:
 | device IDs, a vault ID, a size, a timestamp | the user's password, or anything derived from it |
 | a SHA-256 **fingerprint** of the envelope in the audit log | the envelope's contents in any log or metric |
 
-So the server **cannot decapsulate** (no secret key), **cannot decrypt** the vault
-that key protects, and **cannot mint** a valid envelope for a device without that
-device's public key producing ciphertext only that device can open. Its **only**
-inspection of key material is a **length check** (32 / 1184 bytes) — it does not
+So the server **cannot decapsulate** (no secret key) and **cannot decrypt** the
+vault that key protects.
+
+> ### ⚠️ CORRECTION — this paragraph claimed a defense that did not exist (Phase 60)
+>
+> Until Phase 60 the sentence above continued: *"and **cannot mint** a valid
+> envelope for a device without that device's public key producing ciphertext only
+> that device can open."*
+>
+> **That was false, and self-evidently so: the table immediately above lists device
+> hybrid PUBLIC keys among the things the server HAS.** The sentence treated
+> possession of the recipient's public key as the barrier; it was the entire
+> *requirement*. The wrap used the **anonymous** `hybrid_seal` (HPKE `mode_base`),
+> so **anyone** holding a published hybrid public key — the server, or any
+> authenticated device it serves that key to — could mint a container the
+> recipient would open, and install a vault key of their own choosing. It was
+> reproduced with the shipped binary alone.
+>
+> ⛔ **Nor did pinning help:** `vault accept` fetched no hybrid key, so the pin
+> store was never consulted on the unwrap path.
+>
+> **What is true now** ([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md),
+> and see the next section for the construction): minting a vault-key envelope
+> requires the **sender's static X25519 secret**, not merely the recipient's
+> published public key. So the server **cannot mint one that any client will
+> accept as coming from a device the client has pinned** — but ⚠️ **on FIRST sight
+> of a sender it still can**, by serving its own key as the sender's and forging
+> under it. That is adversary **X**'s accepted trust-on-first-use limit, now
+> symmetric across wrap and unwrap, and only a human comparing a safety number
+> closes it.
+
+Its **only** inspection of key material is a **length check** (32 / 1184 bytes) — it does not
 decode a curve point, screen for low-order elements, or verify that the two halves
 of a hybrid public key belong together. That is deliberate: validating key material
 would be the server performing cryptography on it. Correctness of a published key
@@ -515,6 +716,45 @@ Where the pin store lives is a **client storage** decision, in
 inside the sealed device-identity container in the browsers. Either way it holds only
 **public** key material, and either way it is **security-critical local state**: an
 attacker who can rewrite it can silence the alarm before it fires.
+
+### The UNWRAP gate — the same rule, on the receiving side (Phase 60)
+
+⚠️ **Everything above describes the WRAP side, and until Phase 60 that was the
+only side that had it.** `vault accept` fetched an envelope and opened it: it
+fetched **no hybrid key at all**, so the pin store was not merely bypassed on the
+unwrap path — it was **never consulted**. That is why pinning did not mitigate the
+envelope forgery ([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)).
+
+The rule is now symmetric, and enforced the same way — by type.
+`unwrap_vault_key` takes a **`VerifiedSender`** (Rust: private fields, no public
+struct literal; JS: an `instanceof` check), constructible in exactly two ways:
+
+| constructor | what it establishes |
+|---|---|
+| `verify_sender_for_unwrap` / `verifySenderForUnwrap` | fetches the **depositing** device's hybrid public key and pin-checks it, honouring a supplied safety number — the **same trust table** as the wrap side |
+| `VerifiedSender::from_local` / `verifiedSenderFromLocal` | this process holds the sender's **secret** half, so nothing was fetched and there is nothing to substitute. Not a bypass: whoever can build it already **is** the sender |
+
+Trust outcomes match the wrap side: `Derived` (locally derived, no fetch) ·
+`Pinned` (identical) · **different ⇒ `PinMismatch`, a hard stop with the pin store
+unmutated** · first sight with a matching safety number ⇒ `VerifiedFirstSight` ·
+first sight with a **wrong** one ⇒ `SafetyNumberMismatch` · first sight with none
+⇒ `UnverifiedFirstSight` (proceeds, **warns**). As on the wrap side, **every
+refusal happens before the key is pinned**, so a retry cannot silence its own
+alarm by pinning what was just refused.
+
+Two further controls sit behind the gate, and they are **each other's only
+backstop**:
+
+- ⭐ **OPEN BEFORE WRITING** — the recovered key must actually open the vault's
+  newest op before it reaches the keyring. A key that opens nothing never becomes
+  local state. (A vault with no ops is the one exception, reported explicitly
+  rather than silently.)
+- **NEVER SILENTLY REPLACE** — displacing a *different* held key requires an
+  explicit `--replace` / `replace: true`, and the refusal names both fingerprints
+  and never a key byte.
+
+Both live where the key is **produced**, not at the call sites, so a client cannot
+obtain a key that opens nothing or one that silently displaces a held key.
 
 ### Vault key rotation — the key lifecycle
 

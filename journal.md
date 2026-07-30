@@ -9860,3 +9860,316 @@ code moves; the gate then fails loudly, which is the right direction.
 **A partial fix to "the gate is a subset of CI" is still that bug.** When closing a
 coverage gap, enumerate the whole surface — every job in the workflow — rather than the
 instances that happened to fail. I had the list in front of me and used two thirds of it.
+
+---
+
+## 2026-07-30 — Full-repo gap analysis (four lenses, all findings reproduced against running code)
+
+Four independent lenses swept the repository with one instruction: **ground every finding
+in `file:line` and observed behaviour, not in what the documentation says.** What follows
+is the backlog. Severities are theirs; the CRITICAL one at the top I re-verified myself
+before acting on it.
+
+### ⛔ CRITICAL — the vault-key envelope has no sender (Phase 60, in flight)
+
+Reproduced by me with the shipped binary and nothing else:
+
+```
+$ sigil hybrid-keygen --out b.hybrid        # victim; only b.hybrid.pub is ever published
+$ head -c 32 /dev/urandom > attacker_key.bin
+$ sigil hybrid-seal --recipient-pub b.hybrid.pub --in attacker_key.bin --out forged.env
+    forged.env: 1226 bytes, magic=SIGILhyb        <- byte-shaped identically to a real wrap
+$ sigil hybrid-open --key b.hybrid --in forged.env --out recovered.bin
+    exit=0  recovered=32 bytes  IDENTICAL to the attacker's chosen key
+```
+
+`hybrid_seal` is an anonymous ephemeral-static KEM (HPKE `mode_base`); `HYBRID_AAD` is the
+fixed `b"sigil-hybrid-cli/1"`, so an envelope is bound to no vault, no recipient, no sender
+**and no purpose** — which is why the *file-encryption* command's output is a valid
+*vault-key* envelope. `unwrap_vault_key`'s only check is `len == 32`. `sigild` serves every
+device's hybrid **public** key to any authenticated device, which is the entire input
+needed to mint one. ⛔ **ADR 0038 pinning does not help: `vault accept` fetches no hybrid
+key at all, so the pin store is never consulted.**
+
+Two working attacks were demonstrated against a live `sigild`: a **rewriting proxy** minted
+an envelope from the victim's published key and `vault accept` took it with **exit 0, no
+warning** (a 2FA secret was then read out of the victim's vault in plaintext); and a
+**co-tenant with `write` but not ownership** deposited a key it invented, because
+`share_vault_to_known_key` **PUTs the envelope before the grant**, so the deposit lands and
+the `403` arrives afterwards.
+
+⚠️ **And two load-bearing documents say the opposite**, in the paragraphs a reviewer uses to
+scope this flow out. `docs/threat-model.md` row V: *"A substituted envelope also **fails to
+open**"* — true of a **tampered** envelope, false of a freshly minted valid one.
+`docs/crypto-spec.md`: *"the server … **cannot mint** a valid envelope for a device without
+that device's public key"* — the table immediately above lists that public key among the
+things the server **has**. Both corrected in Phase 60.
+
+### ⛔ CRITICAL — two ways a user silently loses 2FA accounts
+
+- **Google Authenticator import drops every account sharing a name across issuers.** Entry
+  identity is the `label` alone, so `work` at two different issuers collapses to one.
+- **Multi-device sync is last-writer-wins over the WHOLE vault.** A concurrent add on two
+  devices destroys one of them — **and reports success.** The op-log is append-only with no
+  merge, so the oldest writer wins a race nobody is told about.
+
+### HIGH
+
+| finding | note |
+|---|---|
+| `vault accept` overwrites a known-good key without checking it opens the vault | the mitigation already exists — `recovery_restore` does *"⭐ OPEN BEFORE WRITING"* |
+| Six node suites **orphan a live `sigild`** on any assertion failure | `fail()` calls `process.exit()`, which **skips the `finally`** that kills the server. ⭐ This is the root cause of the twelve orphans found earlier today |
+| One click permanently deletes a 2FA secret in both browser clients | no confirmation, no undo, button adjacent to the code |
+| `vault rekey` silently removes the vault password on the native clients | writes the key in cleartext, while its own output implies otherwise |
+| Both browser clients say the user **cannot** print a recovery kit | while both have a working Generate button |
+| Cross-account key-envelope spam disables a victim's recovery discovery | ~30 KB of attacker payload |
+| Vault-id squatting is **irreversible** | no release path anywhere in the codebase |
+
+### MEDIUM / LOW (recorded so they are not re-derived)
+
+No QR code support in any client, in either direction; no clock-skew diagnostic anywhere
+(the top real-world TOTP failure mode); a webapp/extension-only user **cannot enroll a
+second device**, making the product's own prescribed mitigation for permanent account loss
+unreachable; no domain separation between the two uses of `SIGILhyb`; the op-log hash chain
+is verified only by the party it is evidence against; a vault grant can never be withdrawn;
+no storage quota at any level (125 MiB into one vault in 310 ms); Phase 58's
+recovery-truncation refusal was **JavaScript-only** — the CLI and desktop still restore a
+silent prefix of a >500-vault kit; and `cmd/worker-rehash` claims server-side
+master-password Argon2id verifiers that do not exist, the same reviewer trap Phase 58 fixed
+in the other four stub packages.
+
+⭐ **One negative finding, stated so nobody re-derives it:** the lens looking for dead code
+and inert scaffolding found the tree genuinely clean, and answered a standing question —
+**there is no flow where making `hybrid_sign` load-bearing closes a real gap**, so the
+roadmap sentence pointing at it was aimed at the wrong work.
+
+---
+
+## 2026-07-30 — Phase 60: the vault-key envelope had no sender
+
+The CRITICAL finding at the top of the gap analysis above, closed. One sentence:
+**we were delivering a KEY with an ANONYMOUS public-key seal**, so the recipient
+could not tell a key its peer chose from a key an attacker chose.
+
+### What was actually broken
+
+`hybrid_seal` is HPKE `mode_base` — ephemeral-static, no sender key anywhere in
+it. Holding the **recipient's public key** is the whole input needed to produce a
+container it will open, and `sigild` serves every device's published hybrid public
+key to every authenticated device, by design. `HYBRID_AAD` was the fixed
+`b"sigil-hybrid-cli/1"`, binding a container to no vault, no recipient, no sender
+**and no purpose** — which is exactly why the *file-encryption* command's output
+was a structurally valid *vault-key envelope*. And `unwrap_vault_key`'s only check
+was `len == 32`, which a forged key passes trivially.
+
+⛔ **The part worth sitting with: ADR 0038's pinning did not mitigate any of it,
+and not because it was bypassed.** `vault accept` fetched no hybrid key at all, so
+the pin store was **never consulted**. Every key-substitution control we had built
+lived on the **wrap** side. The **unwrap** side had nothing — we had written the
+choke-point rule down, enforced it by type, tested it, documented it, and applied
+it to exactly one of the two directions.
+
+### Three fixes, all of which must hold
+
+1. **An authenticated hybrid KEM** — `libsigil/core/src/hybrid_auth.rs`, HPKE
+   `mode_auth`'s shape: `ss = HKDF(ss_e ‖ ss_kem ‖ ss_s ‖ transcript)` where
+   `ss_s = X25519(sender_static, recipient_static)`. A forger who knows only
+   public keys cannot compute `ss_s`. The sender's static public key is an
+   **input** to decapsulation, deliberately **not carried in the container** —
+   reading the sender's identity out of attacker-controlled bytes and then
+   "verifying" against it is the mistake being fixed.
+2. **A context-bound AAD** — `vault_key_wrap_aad` over purpose + vault id +
+   recipient device id + sender device id, length-prefixed. Four re-filing attacks
+   the AEAD could not otherwise see become authentication failures.
+3. **`SIGILhyb` version 1 → 2, with v1 REFUSED and no compatibility flag.** This
+   repo is otherwise careful about backward compatibility, and this is the case
+   where it would be wrong: **accepting v1 IS accepting the vulnerability**, and a
+   fallback is something the beneficiary can force. A "warn and accept" mode would
+   have been worse than no fix, because it carries the appearance of one.
+
+Plus, on the receiving side: a typed **`VerifiedSender`** gate (private fields, no
+public constructor — the same enforcement-by-type as `VerifiedRecipient`),
+**open-before-write**, and **never silently replace**. And on the sending side,
+**grant before deposit** — it was the other way round, so a device with `write`
+but no ownership got its envelope **stored** and only then met the `403`.
+
+⭐ **`sigild` changed by ZERO lines.** No route, header, canonical message,
+migration, table, metric or dependency. The blob was opaque before and is opaque
+now; only its bytes changed, and the server never looked at them. That is not a
+coincidence — it is the consequence of authenticating with the **hybrid** key,
+which is already published, already pinned and already covered by the safety
+number. A signature-based fix would have needed a new `sigild` route (`deviceJSON`
+**deliberately omits the public key**, so nothing serves a peer's Ed25519 key), a
+second pinned key type, and then an impossible choice: put the Ed25519 key in the
+safety-number digest and **invalidate every already-printed recovery sheet**, or
+leave it out and have the digits people read to each other **not cover the key
+that authenticates the envelope**.
+
+### ⚠️ What the FIRST verification round found, and why it is the real lesson
+
+The implementation was complete, the gate was green, and **three load-bearing
+controls had no test in either language**. All three mutations survived the entire
+suite:
+
+- delete the safety-number comparison in `verify_sender_for_unwrap` — green;
+- delete the `check_and_pin` call in the same function — green;
+- discard the result of the `open_container` in step 4 (open-before-write) — green.
+
+A verifier then drove the neutered build against a rewriting proxy and **the
+hostile key was installed in the victim's keyring**. So we had written the fix,
+convinced ourselves by reading it, and shipped a state where deleting the fix
+changed no observable signal. This is [`docs/engineering-lessons.md`](docs/engineering-lessons.md)'s
+standing theme in its purest form: *work that quietly does not run looks exactly
+like work that passes* — and it applies to a **control** as much as to a suite.
+`cli/src/lib.rs`'s `unwrap_gate_tests` now pins each one, each written to go RED
+for exactly one deleted control, and the mutations were run rather than imagined.
+No `sigild` is needed there: a bare `TcpListener` answering canned responses **is**
+the hostile server, which is the honest shape, since the whole point is that the
+client must not believe what the server says.
+
+### ⚠️ And what the SECOND round found: the clients had drifted apart
+
+With the Rust side pinned, a second pass asked the obvious question — *do the
+browsers do the same thing?* They did not. `acceptVault` in
+`sigil-wasm/sharing.mjs` had the unwrap gate but **not** open-before-write and
+**not** the no-silent-replace rule. The CLI and desktop had always had both. So a
+control existed in two of four clients, and the two missing it are the ones most
+likely to meet a hostile relay.
+
+Both were added **inside `acceptVault`**, where the key is *produced*, not at the
+call sites — a call-site check would have been duplicated in two clients and
+forgettable in both, which is the exact shape of engineering-lessons entry 10.
+`requireHeldVaultKeys` **fails closed** on a missing keyring, deliberately copying
+`requirePinStore`'s precedent: the fallback would have silently meant "this client
+holds nothing" and degraded the control into a no-op. Six mutations were run at
+two levels (module, against a real `sigild` behind a rewriting proxy; and product,
+against the real UI in both browser clients), each restored by byte-diff rather
+than by eye.
+
+⚠️ **A deliberate behaviour change fell out of it:** a browser accept now REFUSES
+when the sender rotated the vault key and has not yet pushed the re-sealed vault,
+because open-before-write sees a tip the new key cannot open. The CLI always
+behaved this way; the browsers now match. The error names the remedy, but it is a
+new refusal on a path that used to succeed.
+
+### ⛔ Two documents said the opposite of the truth
+
+This is the part that must not be quietly rewritten. `docs/threat-model.md` row V
+claimed *"a substituted envelope also fails to open"* — true of a **tampered**
+envelope, false of a freshly minted valid one, which is the actual attack — and
+cited `unwrap_vault_key`'s 32-byte check as a mitigation, which is true and
+**irrelevant**, because a forged key is exactly 32 bytes. `docs/crypto-spec.md`
+claimed the server *"cannot mint a valid envelope for a device without that
+device's public key"* while **the table immediately above it lists that public key
+among the things the server has**. The same section called the construction
+"hybrid public-key **authenticated** encryption" while it was `mode_base` with no
+sender key at all — the word was describing the AEAD and reading as sender
+authentication.
+
+Both are corrected **in place, as corrections**, with the old text quoted.
+
+⚠️ **Neither was stale.** They were written alongside the code and were wrong on
+the day they were written, because both described the *intent* of the flow rather
+than what the primitive underneath it does. No drift check would have caught them,
+because nothing drifted. That is a failure mode this repo has not previously named:
+we have tooling for documentation that **falls behind** the code, and none for
+documentation that was **never true**.
+
+### Honest limits, stated as loudly as the fix
+
+- ⛔ **Sender authentication is CLASSICAL X25519 ONLY.** ML-KEM has no
+  static-static analogue, so the guarantees are asymmetric: breaking
+  **confidentiality** requires breaking **both** X25519 and ML-KEM-768; forging
+  **authenticity** requires breaking **X25519 alone**. A quantum adversary could
+  forge an envelope it still could not read. The core says so at
+  `libsigil/core/src/hybrid_auth.rs:71-76`, and nothing here claims post-quantum
+  authentication.
+- **First sight of a sender is still TOFU** — pinned and warned, closed only by a
+  human comparing a `--safety-number`. Symmetric with the wrap side, and the same
+  accepted limit. What authentication buys *unconditionally* is the other
+  adversary: a co-tenant, a revoked device, anyone who is not the server can no
+  longer mint an acceptable envelope at all.
+- **The authentication is implicit, key-confirmed and NON-TRANSFERABLE.** It is not
+  a signature; the recipient cannot prove to anyone else who sent it, because the
+  recipient could have made it too. Right for *"did my peer choose this key?"*, and
+  it means **no audit or dispute process can ever rest on an envelope**.
+- ⛔ **Every existing envelope must be re-issued**, including those covering a
+  recovery kit — a printed sheet whose vaults are never re-covered recovers
+  nothing. There is no migration and there cannot be one: a v1 envelope carries no
+  sender, so nothing can retroactively establish who made it. Defensible only
+  because this repo holds no real user data; it would not be later.
+- **Authorize-first exposed a cliff the old order hid:** the first share of a
+  never-pushed vault is now refused, because ownership is trust-on-first-*write*
+  and an unwritten vault has no owner. The deposit used to claim it silently. The
+  `403` carries prose naming both causes, because the bare server message is true
+  and useless.
+
+### Measurements, not recollections
+
+- The wrapped vault key is **no longer a fixed 1226 bytes**. It is
+  `1244 + len(vault_id) + len(recipient_device_id) + len(sender_device_id)`,
+  because the envelope carries its context AAD. **Measured 1310 bytes** live in
+  `sharing-interop.mjs` (vault id `browser-shared`, 14 chars; two 26-char
+  server-assigned device ids). The **anonymous v1 file** container is still a flat
+  1226 — ⚠️ do not "correct" one to the other, since a forged file container being
+  byte-shaped like a genuine wrap is precisely how this defect stayed invisible.
+  Every stale `1226` in `docs/api.md`, `docs/threat-model.md`, ADR 0035, ADR 0042
+  and CLAUDE.md is fixed.
+- `hybrid_auth.rs` carries **13 tests**; `libsigil` is at **154** (135 lib + 19).
+- Golden vectors pinned on both sides: the AAD layout for
+  `("demo","dev_bob","dev_alice")` (56 bytes) and the combined-secret KAT
+  `7d5cda4a…be8c42b0`.
+
+Docs updated in the same change: **ADR 0048** (new), `docs/crypto-spec.md` (the
+anonymous section retitled and marked, a new authenticated section, the corrected
+"cannot mint" paragraph, the unwrap gate beside the pinning section),
+`docs/threat-model.md` (row V rewritten plus an explicit correction block),
+`docs/api.md`, `docs/README.md`, `docs/decisions/README.md`, ADR 0013's and
+ADR 0035's index rows, ADR 0035 and ADR 0042 addenda, `README.md` and `CLAUDE.md`.
+
+### ⚠️ Three defects the Phase 60 gate runs exposed in the TOOLING, not the code
+
+All three are mine, all three were caught before this commit, and all three have the same
+shape: **a measurement that fails in a way indistinguishable from the thing it measures.**
+
+**1. `gate.sh` invented a security finding.** An advisory-database fetch blip made
+`cargo audit` exit non-zero, and the failure message greps only for
+`^(Crate|ID|Warning|Title|error):` — which a git fetch error does not match. The result was
+`✗ cargo audit sigil-wasm:` **with an empty reason**, byte-identical in shape to a real
+advisory. Two independent verifiers hit it; one needed **three full gate runs** to get one
+ALL GREEN. Worse, the block ran the scan a **second time** just to build the message,
+doubling the fetches and so doubling the flake window. Now: the scan runs **once**, a
+result with no finding rows is retried against the **cached** DB (`-n`, which skips the
+fetch), and a genuine inability to complete is reported as **"COULD NOT RUN — this is not a
+finding"**. A gate that intermittently invents a security finding gets ignored exactly like
+the always-red `cargo-audit` job it replaced.
+
+**2. `pw()` reported a PASS with no measurement behind it.** It printed
+`ok "$1: $(grep -oE '[0-9]+ passed')"` — and when the summary line fell outside the captured
+`tail -3`, that substitution was **empty**, rendering as `✓ webapp playwright:` /
+`undefined`. A pass with nothing behind it, in the helper whose entire job is to count.
+Now the capture is `tail -15` and an unreadable count is a **failure to measure**, not a
+success. Proven by feeding it truncated output: `✗ … could NOT read a pass count`.
+
+**3. The test double could hang its own teardown.** `sigil-wasm/test/fake-sigild.mjs`
+closed with `new Promise((resolve) => server.close(resolve))`. `server.close()` stops
+accepting new connections and then **waits for every in-flight one** — and a real Chromium
+holds HTTP/1.1 keep-alive sockets open for reuse. Under the parallel load of a full gate it
+outlived Playwright's hook timeout and surfaced as
+
+```
+1 failed
+  [chromium] › tests/passkey.spec.ts:642:5 › 14. ⚠️ REPRINT: … re-seals the slot
+      at tests/passkey.spec.ts:46:6      <- `await fake?.close()`, an afterEach
+```
+
+— a **teardown race reported as a product failure, in a security suite**. The same spec
+passed alone in 1.6 s. Fixed with `server.closeAllConnections?.()` before `close()`, and by
+ignoring the "already closed" callback error. Verified by running the full 26-spec passkey
+suite three times: **26 passed, 26 passed, 26 passed.**
+
+⭐ **Note what fixture #2 and #3 have in common with the phase itself.** Phase 60's first
+verification round failed because three load-bearing controls had no test; its second failed
+because the fix was only present on two of four clients. These three tooling defects are the
+same error one level up — *the thing that is supposed to notice was the thing that was
+broken.* That is the whole of `docs/engineering-lessons.md` in one commit.

@@ -181,3 +181,92 @@ fn hybrid_keygen_seal_open_round_trips_via_binary() {
     let round_tripped = std::fs::read(&recovered).expect("read recovered");
     assert_eq!(round_tripped, original);
 }
+
+/// ⭐⭐ THE ORIGINAL REPRODUCTION, DRIVEN THROUGH THE REAL BINARY, asserting it
+/// no longer produces a usable vault-key envelope.
+///
+/// The forgery was, verbatim:
+///
+/// ```text
+///   sigil hybrid-keygen --out b.hybrid            # victim; only b.hybrid.pub is published
+///   head -c 32 /dev/urandom > attacker_key.bin
+///   sigil hybrid-seal --recipient-pub b.hybrid.pub --in attacker_key.bin --out forged.env
+///   sigil hybrid-open --key b.hybrid --in forged.env      # 32 bytes, the attacker's key
+/// ```
+///
+/// Every step still RUNS — `hybrid-seal`/`hybrid-open` are honest anonymous file
+/// encryption to a public key and were never the bug. What has changed is that
+/// the bytes they produce are no longer a vault-key envelope: they carry
+/// container version 1 (anonymous), a vault-key envelope is version 2
+/// (AUTHENTICATED), and `unwrap_vault_key` — the one function every client's
+/// accept path goes through — refuses version 1 outright.
+#[test]
+fn the_forged_vault_key_envelope_is_no_longer_accepted() {
+    use sigil_cli::{
+        load_hybrid_secret, unwrap_vault_key, CliError, SenderIdentity, VaultKeyWrapContext,
+        VerifiedSender, HYBRID_AUTH_FORMAT_VERSION,
+    };
+
+    let dir = TempDir::new("forge");
+    let victim = dir.join("b.hybrid");
+    let victim_pub = dir.join("b.hybrid.pub");
+    let attacker_key = dir.join("attacker_key.bin");
+    let forged = dir.join("forged.env");
+
+    // The victim's identity. ONLY b.hybrid.pub is ever published.
+    assert!(bin()
+        .args(["hybrid-keygen", "--out"])
+        .arg(&victim)
+        .status()
+        .expect("run hybrid-keygen")
+        .success());
+
+    // 32 attacker-chosen bytes, exactly the shape of a vault key.
+    let attacker_chosen = [0x5au8; 32];
+    std::fs::write(&attacker_key, attacker_chosen).expect("write attacker key");
+
+    // The forgery, minted from the victim's PUBLIC key and nothing else.
+    assert!(bin()
+        .args(["hybrid-seal", "--recipient-pub"])
+        .arg(&victim_pub)
+        .arg("--in")
+        .arg(&attacker_key)
+        .arg("--out")
+        .arg(&forged)
+        .status()
+        .expect("run hybrid-seal")
+        .success());
+
+    let bytes = std::fs::read(&forged).expect("read forged envelope");
+    assert_eq!(&bytes[..8], b"SIGILhyb", "still the same magic");
+    assert_eq!(
+        bytes[8], 1,
+        "the anonymous FILE path writes container version 1"
+    );
+    assert_ne!(
+        bytes[8], HYBRID_AUTH_FORMAT_VERSION,
+        "and version 1 is NOT the authenticated vault-key version"
+    );
+
+    // ⛔ THE ASSERTION THAT MATTERS: presented as a vault-key envelope, it is
+    // refused. Before Phase 60 this returned Ok(attacker_chosen).
+    let secret = load_hybrid_secret(&victim).expect("load victim secret");
+    let (sender_secret, _) = sigil_cli::generate_hybrid_identity().expect("peer identity");
+    let peer = SenderIdentity::new("dev_peer", sender_secret).expect("sender");
+    let verified = VerifiedSender::from_local(&peer).expect("verified");
+    let ctx = VaultKeyWrapContext::new("demo", "dev_victim", "dev_peer").expect("ctx");
+
+    let result = unwrap_vault_key(&secret, &verified, &ctx, &bytes);
+    assert_eq!(
+        result,
+        Err(CliError::WrongEnvelopeKind {
+            found_version: 1,
+            expected_version: 2,
+        }),
+        "the forged envelope must be REFUSED, not opened"
+    );
+    assert!(
+        !format!("{:?}", result).contains("5a5a5a"),
+        "no plaintext may leak into the error"
+    );
+}

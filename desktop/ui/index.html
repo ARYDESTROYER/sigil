@@ -277,14 +277,35 @@
                for trusting the registry with the one credential that
                reconstructs a whole account. The wrap gate enforces it. -->
           <label for="share-safety">
-            Their safety number <span class="hint">(from the sheet or a phone call — required for a recovery kit)</span>
+            The other device&rsquo;s safety number <span class="hint">(from the sheet or a phone call — used when SHARING and when ACCEPTING; required for a recovery kit)</span>
           </label>
           <input id="share-safety" spellcheck="false" inputmode="numeric"
                  placeholder="83791 28129 67801 50284 55242 77845" />
           <button type="submit" class="primary">Share</button>
         </form>
+        <!-- ⭐ PHASE 60. The SENDER of an envelope is now a CHECKED fact. Blank,
+             it is read from this device's own self-only envelope index; naming it
+             pins the provenance when you know who shared with you. Either way the
+             envelope must be AUTHENTICATED to that device's static hybrid key —
+             an anonymous version-1 container is REFUSED, because anyone who can
+             read this device's PUBLISHED public key could have minted one. -->
+        <label for="accept-from">
+          Accept from device id <span class="hint">(optional — who shared with you)</span>
+        </label>
+        <input id="accept-from" spellcheck="false" autocomplete="off" placeholder="dev_…" />
         <div class="row">
           <button id="accept-btn" class="ghost">Accept a vault shared with me</button>
+        </div>
+
+        <!-- ⭐ THE PHASE 60 REFUSAL, in its own alert — deliberately NOT the
+             key-changed alarm below and NOT a toast: nothing was forbidden and no
+             key changed, the bytes simply do not prove who produced them. -->
+        <div id="envelope-refusal" class="alarm" role="alert" hidden>
+          <strong id="envelope-refusal-title"></strong>
+          <p id="envelope-refusal-text"></p>
+          <div class="row">
+            <button id="envelope-refusal-dismiss" class="link">Dismiss</button>
+          </div>
         </div>
 
         <!-- Phase 50 — KEY VERIFICATION. A published hybrid key is PINNED on

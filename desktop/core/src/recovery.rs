@@ -300,6 +300,9 @@ impl DeviceConfig {
             &self.keyring_path(),
             &self.pins_path(),
             None,
+            // Phase 60: the kit's envelopes are AUTHENTICATED as THIS device, so
+            // a restore can check who deposited them.
+            &self.sender_identity()?,
         )
         .map_err(|e| net_error(e, self.server(), "generating the recovery kit"))?;
 
@@ -371,6 +374,7 @@ impl DeviceConfig {
             &self.keyring_path(),
             &self.pins_path(),
             safety_number,
+            &self.sender_identity()?,
         )
         .map_err(|e| net_error(e, self.server(), "covering a vault with the recovery kit"))
     }
@@ -613,7 +617,7 @@ mod tests {
             created_at: 0,
             covered: vec![CoveredVault {
                 vault_id: "v".to_string(),
-                key_fingerprint: "0123456789abcdef".to_string(),
+                key_fingerprint: "00000000deadbeef".to_string(),
             }],
             seats_used: 2,
             seat_limit: 10,
@@ -621,7 +625,7 @@ mod tests {
                 account_id: "acct_1".to_string(),
                 indexed_vaults: 1,
                 unwrapped_vault: "v".to_string(),
-                key_fingerprint: "0123456789abcdef".to_string(),
+                key_fingerprint: "00000000deadbeef".to_string(),
             },
         };
         let rendered = format!("{sheet:?}");

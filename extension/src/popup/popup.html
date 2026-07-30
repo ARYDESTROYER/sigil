@@ -308,12 +308,14 @@
           </span>
         </div>
 
-        <!-- ⭐ The out-of-band check, entered BEFORE the wrap. Optional for an
-             ordinary device; MANDATORY for a RECOVERY KIT this browser has never
-             pinned — those digits are printed on the sheet, and a kit
-             reconstructs the whole account. -->
+        <!-- ⭐ The out-of-band check on the OTHER device's key. Entered BEFORE
+             the wrap when sharing, and BEFORE the unwrap when accepting (Phase
+             60 gave the receiving side the same gate) — so one field serves
+             both. Optional for an ordinary device; MANDATORY for a RECOVERY KIT
+             this browser has never pinned, because those digits are printed on
+             the sheet and a kit reconstructs the whole account. -->
         <label for="sharing-share-safety">
-          Their safety number (optional — required for a recovery kit)
+          The other device's safety number (optional — required for a recovery kit)
         </label>
         <input
           id="sharing-share-safety"
@@ -324,9 +326,50 @@
           data-testid="sharing-share-safety"
         />
 
+        <!-- ⭐ PHASE 60. The sender of an envelope is now a CHECKED fact, not an
+             assumption. Blank, it is read from this device's own self-only
+             envelope index; naming it pins the provenance when the user knows
+             who shared with them. Either way the envelope must be AUTHENTICATED
+             to that device's static hybrid key. -->
+        <label for="sharing-accept-from">
+          Accept from device id (optional — who shared with you)
+        </label>
+        <input
+          id="sharing-accept-from"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="dev_…"
+          data-testid="sharing-accept-from"
+        />
+
         <button type="button" id="sharing-accept" data-testid="sharing-accept">
           Accept a vault shared to this device
         </button>
+
+        <!-- ⭐ THE PHASE 60 REFUSAL, in its own alert. Deliberately distinct from
+             the 401/403 status line and from the pin-mismatch banner below:
+             nothing was forbidden and no key changed — the bytes simply do not
+             prove who produced them. -->
+        <div
+          id="sharing-envelope-refusal"
+          role="alert"
+          hidden
+          data-testid="sharing-envelope-refusal"
+        >
+          <p id="sharing-envelope-refusal-text"></p>
+          <!-- ⭐ The UI's `--replace`. Hidden until an accept is actually refused
+               for wanting to overwrite a DIFFERENT held key, so replacing is
+               always a deliberate answer to a specific warning and never a
+               checkbox someone leaves ticked. -->
+          <label id="sharing-accept-replace-row" hidden class="row">
+            <input
+              type="checkbox"
+              id="sharing-accept-replace"
+              data-testid="sharing-accept-replace"
+            />
+            Replace the key I hold for this vault (the CLI spells this --replace)
+          </label>
+        </div>
 
         <!-- Phase 50 — key verification. The safety number is what a human reads
              aloud to verify a key BEFORE the first share; pinning cannot protect

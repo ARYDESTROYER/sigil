@@ -7,8 +7,11 @@
 // are printed on paper, never transmitted, never stored on any device, and never
 // derivable from anything the server holds. `sigild` gains NO concept of
 // "recovery": it sees one more device row, one more hybrid PUBLIC key and one
-// more opaque ~1226-byte `SIGILhyb` envelope per covered vault — byte-for-byte
+// more opaque ~1.3 KiB `SIGILhyb` envelope per covered vault — byte-for-byte
 // the shapes it already relays for device-to-device sharing (ADR 0035).
+// ⚠️ NOT the flat 1226 bytes this comment used to claim: from Phase 60 a
+// vault-key envelope carries its context AAD, so its length depends on the
+// vault id and both device ids (see `wrappedVaultKeyLen` in sharing.mjs).
 //
 // ⭐ THERE IS NO NEW MIRROR TO KEEP IN SYNC HERE, AND THAT IS DELIBERATE. The
 // Crockford codec, the 16-bit checksum, the version byte and the HKDF-SHA256
@@ -61,12 +64,17 @@ import {
   deleteKeyEnvelope,
   getKeyEnvelope,
   hybridPublicIdentity,
+  newPinStore,
   publishHybridKey,
   safetyNumber,
+  senderFromAuth,
   unwrapVaultKey,
   vaultKeyFingerprint,
+  verifiedSenderFromLocal,
   verifyRecipientForWrap,
+  verifySenderForUnwrap,
   wrapVaultKey,
+  UnknownSenderError,
 } from "./sharing.mjs";
 import { putKeyEnvelope } from "./sharing.mjs";
 import { grantVaultAccess } from "./device-auth.mjs";
@@ -437,11 +445,20 @@ export async function generateRecoveryKit(
 
     // 6) Cover each vault by wrapping OUR copy of the key to the DERIVED
     //    identity, then granting through the EXISTING grant route.
+    // ⭐ AUTHENTICATED as the GENERATING device (Phase 60): the kit's envelopes
+    // carry a sender, so a restore can check who deposited them. Grant BEFORE
+    // deposit, matching shareVault and the CLI.
+    const from = senderFromAuth(auth);
     const covered = [];
     for (const { vaultId, vaultKey } of vaultKeys) {
       checkId("vault id", vaultId);
-      const envelope = wrapVaultKey(wasm, publicIdentity, vaultKey);
-      await putKeyEnvelope(wasm, auth, vaultId, kitId, envelope);
+      const envelope = wrapVaultKey(
+        wasm,
+        from,
+        publicIdentity,
+        { vaultId, recipientDeviceId: kitId, senderDeviceId: from.deviceId },
+        vaultKey,
+      );
       await grantVaultAccess(
         wasm,
         { deviceId: auth.deviceId, seed: auth.seed },
@@ -450,6 +467,7 @@ export async function generateRecoveryKit(
         kitId,
         "read",
       );
+      await putKeyEnvelope(wasm, auth, vaultId, kitId, envelope);
       covered.push({ vaultId, fingerprint: await vaultKeyFingerprint(vaultKey) });
     }
 
@@ -489,7 +507,15 @@ export async function generateRecoveryKit(
         );
       }
       const envelope = await getKeyEnvelope(wasm, rebornAuth, first.vaultId, kitId);
-      const recovered = unwrapVaultKey(wasm, rebornAuth.hybrid, envelope);
+      // ⭐ The SENDER here is THIS device, whose secret half we hold — so the
+      // gate is satisfied with NO fetch and nothing a server could substitute.
+      const recovered = unwrapVaultKey(
+        wasm,
+        rebornAuth.hybrid,
+        await verifiedSenderFromLocal(wasm, from),
+        { vaultId: first.vaultId, recipientDeviceId: kitId, senderDeviceId: from.deviceId },
+        envelope,
+      );
       const fingerprint = await vaultKeyFingerprint(recovered);
       if (fingerprint !== (await vaultKeyFingerprint(first.vaultKey))) {
         throw new RecoveryError(
@@ -565,8 +591,16 @@ export async function coverVault(
   const derived = verified.trust === TRUST_DERIVED;
   const identity = verified.identity;
 
-  const envelope = wrapVaultKey(wasm, identity, vaultKey);
-  await putKeyEnvelope(wasm, auth, vaultId, kitDeviceId, envelope);
+  // ⭐ AUTHENTICATED as THIS device, BOUND to (vault, kit, this device).
+  const from = senderFromAuth(auth);
+  const envelope = wrapVaultKey(
+    wasm,
+    from,
+    identity,
+    { vaultId, recipientDeviceId: kitDeviceId, senderDeviceId: from.deviceId },
+    vaultKey,
+  );
+  // AUTHORIZE FIRST, then deposit (mirrors shareVault and the CLI).
   await grantVaultAccess(
     wasm,
     { deviceId: auth.deviceId, seed: auth.seed },
@@ -575,6 +609,7 @@ export async function coverVault(
     kitDeviceId,
     "read",
   );
+  await putKeyEnvelope(wasm, auth, vaultId, kitDeviceId, envelope);
   return {
     vaultId,
     kitDeviceId,
@@ -640,26 +675,65 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
     );
   }
 
+  // ⭐ PHASE 60. A restore runs on a machine with NO local state, so it starts
+  // with an EMPTY pin store — every sender is first sight, which is honest TOFU
+  // and exactly what ADR 0038 accepts. What it will NOT do is unwrap
+  // anonymously: a vault whose depositing device the index does not name is
+  // SKIPPED with a reason rather than opened from "whoever". A forged envelope
+  // therefore fails at the AEAD instead of installing an attacker's key.
+  const pins = newPinStore();
   const vaults = [];
   const skipped = [];
   for (const entry of indexed) {
+    if (!entry.senderDeviceId) {
+      skipped.push({
+        vaultId: entry.vaultId,
+        reason: new UnknownSenderError(
+          `the server's envelope index does not name the device that deposited the key for ` +
+            `vault ${JSON.stringify(entry.vaultId)}`,
+        ).message,
+      });
+      continue;
+    }
     let envelope;
+    let sender;
     try {
+      sender = await verifySenderForUnwrap(wasm, auth, entry.senderDeviceId, { pins });
       envelope = await getKeyEnvelope(wasm, auth, entry.vaultId, deviceId);
     } catch (err) {
       skipped.push({ vaultId: entry.vaultId, reason: String(err?.message ?? err) });
       continue;
     }
-    // Rejects any recovered plaintext that is not exactly 32 bytes.
-    const vaultKey = unwrapVaultKey(wasm, auth.hybrid, envelope);
+    let vaultKey;
+    try {
+      // AUTHENTICATED + CONTEXT-BOUND, and rejects any recovered plaintext that
+      // is not exactly 32 bytes.
+      vaultKey = unwrapVaultKey(
+        wasm,
+        auth.hybrid,
+        sender,
+        {
+          vaultId: entry.vaultId,
+          recipientDeviceId: deviceId,
+          senderDeviceId: entry.senderDeviceId,
+        },
+        envelope,
+      );
+    } catch (err) {
+      skipped.push({ vaultId: entry.vaultId, reason: String(err?.message ?? err) });
+      continue;
+    }
     vaults.push({
       vaultId: entry.vaultId,
       vaultKey,
+      senderDeviceId: entry.senderDeviceId,
+      senderTrust: sender.trust,
+      senderSafetyNumber: sender.safetyNumber,
       fingerprint: await vaultKeyFingerprint(vaultKey),
     });
   }
 
-  return { deviceId, accountId: account.account_id ?? "", vaults, skipped, identity };
+  return { deviceId, accountId: account.account_id ?? "", vaults, skipped, identity, pins };
 }
 
 /**

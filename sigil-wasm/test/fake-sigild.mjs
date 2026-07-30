@@ -452,6 +452,26 @@ export async function startFakeSigild({ accountId = "acc_fake_1", corsOrigins = 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
   api.baseUrl = `http://127.0.0.1:${port}`;
-  api.close = () => new Promise((resolve) => server.close(resolve));
+  // ⚠️ DROP KEEP-ALIVE SOCKETS FIRST, or close() can outlive the test hook.
+  //
+  // `server.close()` stops accepting NEW connections and then waits for every
+  // in-flight one to end. A browser holds its HTTP/1.1 connections open for
+  // reuse, so with a real Chromium driving this double there is usually at least
+  // one idle keep-alive socket and `close()` waits on it — under parallel load,
+  // past Playwright's hook timeout. That surfaced as
+  //   `1 failed … passkey.spec.ts:46:6  await fake?.close()`
+  // during a full gate run, while the same spec passed in 1.6 s on its own: a
+  // TEARDOWN race reported as a product failure, in a security suite, which is
+  // exactly the kind of noise that gets a red result waved through.
+  //
+  // `closeAllConnections()` (Node >= 18.2) severs them immediately. It is
+  // optional-chained so an older runtime degrades to the previous behaviour
+  // rather than throwing, and the callback's error is ignored deliberately —
+  // "the server was already closed" is not a test failure.
+  api.close = () =>
+    new Promise((resolve) => {
+      server.closeAllConnections?.();
+      server.close(() => resolve());
+    });
   return api;
 }

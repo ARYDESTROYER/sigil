@@ -15,8 +15,9 @@
 // │   * sigild/internal/api/sharing.go — the four routes, their request and     │
 // │     response shapes, and the 401-vs-403 rules (the SERVER, source of truth);│
 // │   * sigil-wasm/src/lib.rs — the `SIGILhyb` container layout produced by     │
-// │     hybrid_seal_to_container (magic 8 ‖ version 1 ‖ eph_x25519_pub 32 ‖     │
-// │     mlkem_ct 1088 ‖ envelope). A 32-byte vault key wraps to 1226 bytes.     │
+// │     hybrid_auth_seal_to_container (magic 8 ‖ version 2 ‖ eph_x25519_pub 32  │
+// │     ‖ mlkem_ct 1088 ‖ envelope). ⚠️ The length is NO LONGER FIXED at 1226:   │
+// │     the envelope carries its context AAD, so see wrappedVaultKeyLen().      │
 // │ A drift here does not fail loudly — it yields a 400/403 or an envelope the  │
 // │ CLI cannot open. The cross-client Node test (test/sharing-interop.mjs) is   │
 // │ the guard: it shares BOTH ways against a live sigild and the real CLI.      │
@@ -31,9 +32,46 @@
 //                                random 32-byte key drops in exactly where a
 //                                password goes — no format change at all.
 //        │
-//        └── wrapped per recipient with `hybrid_seal_to_container`
+//        └── wrapped per recipient with `hybrid_auth_seal_to_container`
 //            (X25519 + ML-KEM-768 -> XChaCha20-Poly1305) into an OPAQUE
-//            `SIGILhyb` envelope that sigild relays and cannot read.
+//            `SIGILhyb` VERSION 2 envelope that sigild relays and cannot read.
+//
+// ⭐⭐ PHASE 60 — THE ENVELOPE IS NOW AUTHENTICATED AND CONTEXT-BOUND.
+//
+// THE HOLE, reproduced with the shipped binary and nothing else:
+//
+//     sigil hybrid-keygen --out b.hybrid          # victim; only b.hybrid.pub is published
+//     sigil hybrid-seal --recipient-pub b.hybrid.pub --in attacker_key.bin --out forged.env
+//     -> 1226 bytes, magic SIGILhyb, byte-shaped IDENTICALLY to a genuine wrap
+//     sigil hybrid-open --key b.hybrid --in forged.env   # the attacker's key, cleanly
+//
+// `hybrid_seal_to_container` is an ANONYMOUS (ephemeral-static) KEM, so holding
+// the recipient's PUBLISHED hybrid public key — which sigild serves to every
+// authenticated device — was enough to mint an envelope any client accepted;
+// the AAD was one FIXED tag binding no vault, no recipient, no sender and no
+// PURPOSE; and the only check on the recovered plaintext was `length === 32`.
+// A hostile server, or any co-tenant with WRITE, could install a vault key IT
+// chose and read everything the victim wrote afterwards. ADR 0038 pinning did
+// not help: `acceptVault` fetched no hybrid key at all, so the pin store was
+// never consulted on the receiving side.
+//
+// THE FIX, three parts, all of which must hold:
+//
+//   * the KEM is AUTHENTICATED — `hybrid_auth_seal_to_container` mixes a
+//     static-static X25519 DH from the SENDER's long-term secret into the KDF,
+//     so a forger needs the sender's SECRET, not just public material;
+//   * the AAD is CONTEXT-BOUND — {@link vaultKeyWrapAad} over (purpose, vault
+//     id, recipient device id, sender device id), so an envelope cannot be
+//     re-filed under another vault/recipient/sender or replayed as a file;
+//   * the container VERSION is 2, and a version-1 container is REFUSED wherever
+//     a vault key is expected ({@link UnauthenticatedEnvelopeError}). There is
+//     deliberately NO compatibility flag — accepting v1 is accepting the bug.
+//
+// ⭐ AND THE RECEIVING SIDE NOW HAS A GATE. {@link verifySenderForUnwrap} is the
+// mirror of {@link verifyRecipientForWrap}: it resolves the DEPOSITING device's
+// hybrid public key, pin-checks it, honours a supplied safety number, and is the
+// only thing that can construct the {@link VerifiedSender} that
+// {@link unwrapVaultKey} demands — enforced by the type, not by convention.
 //
 // WHAT THIS FILE DOES NOT DO: cryptography. Every KEM/AEAD operation happens
 // inside the libsigil WebAssembly core; every request signature is produced by
@@ -70,6 +108,11 @@
 import {
   signedFetch,
   grantVaultAccess,
+  // ⭐ PHASE 60 SYMMETRY. `acceptVault` needs to OPEN the vault's newest op with
+  // the recovered key BEFORE that key is handed back to be persisted — the same
+  // step 4 the CLI's `accept_vault_key` performs with `pull_ops_auth`. Without
+  // it a key that opens NOTHING still reaches local state.
+  pullContainersAuthed,
   getAccount,
   DeviceAuthError,
   explainAuthStatus,
@@ -95,8 +138,59 @@ export const HYBRID_MLKEM_SEED_LEN = 64;
 export const HYBRID_MLKEM_ENCAPS_LEN = 1184;
 /** The 8-byte magic every wrapped-key envelope starts with. */
 export const KEY_ENVELOPE_MAGIC = "SIGILhyb";
-/** Byte length of a wrapped 32-byte vault key: 8+1+32+1088+(24+32+16). */
-export const WRAPPED_VAULT_KEY_LEN = 1226;
+
+/**
+ * `SIGILhyb` container version 1 — the ANONYMOUS, ephemeral-static form.
+ *
+ * ⛔ NEVER a vault-key envelope. Its only sender-side key is a per-message
+ * ephemeral, so anybody holding the recipient's PUBLISHED public key can mint
+ * one. Mirrors `cli/src/lib.rs::HYBRID_FORMAT_VERSION`.
+ */
+export const KEY_ENVELOPE_VERSION_ANONYMOUS = 1;
+
+/**
+ * `SIGILhyb` container version 2 — the AUTHENTICATED form, and the ONLY version
+ * a vault-key unwrap accepts. Mirrors `cli/src/lib.rs::HYBRID_AUTH_FORMAT_VERSION`.
+ */
+export const KEY_ENVELOPE_VERSION_AUTHENTICATED = 2;
+
+/**
+ * Fixed byte overhead of a wrapped 32-byte vault key, EXCLUDING the AAD:
+ * magic(8) + version(1) + eph_x25519_pub(32) + mlkem_ct(1088) + the envelope's
+ * nonce/framing/ciphertext(79) = 1208.
+ *
+ * ⚠️ REPLACES the old flat `WRAPPED_VAULT_KEY_LEN = 1226`. That constant was true
+ * only while every hybrid container shared ONE fixed 18-byte AAD — which is
+ * precisely the defect Phase 60 closed. The AAD now names the vault and both
+ * devices, so the envelope length depends on those identifiers. Use
+ * {@link wrappedVaultKeyLen}.
+ */
+export const WRAPPED_VAULT_KEY_OVERHEAD = 1208;
+
+/** Exact byte length a wrapped 32-byte vault key will have for a given context. */
+export function wrappedVaultKeyLen(vaultId, recipientDeviceId, senderDeviceId) {
+  return (
+    WRAPPED_VAULT_KEY_OVERHEAD +
+    VAULT_KEY_WRAP_AAD_PREFIX_LEN +
+    12 +
+    TEXT_ENCODER.encode(vaultId).length +
+    TEXT_ENCODER.encode(recipientDeviceId).length +
+    TEXT_ENCODER.encode(senderDeviceId).length
+  );
+}
+
+/**
+ * Byte length of the vault-key-wrap AAD's domain-separation prefix — the string
+ * `sigil` + `-vault-key-wrap-v1` + a trailing newline, 24 bytes, defined once in
+ * `sigil_core::VAULT_KEY_WRAP_AAD_PREFIX`.
+ *
+ * ⭐ Deliberately a LENGTH and not a copy of the literal. The AAD itself is
+ * SINGLE-SOURCED through {@link vaultKeyWrapAad} -> the wasm -> `sigil-core`, so
+ * a JS copy of the domain string would be a mirror with nothing to keep it in
+ * sync — a drift surface for no benefit. The only thing JS needs it for is
+ * predicting an envelope's size in {@link wrappedVaultKeyLen}.
+ */
+export const VAULT_KEY_WRAP_AAD_PREFIX_LEN = 24;
 
 const TEXT_ENCODER = new TextEncoder();
 
@@ -356,50 +450,367 @@ function requireVaultKey(key) {
   return key;
 }
 
+// ── the wrap context + the sender identity ───────────────────────────────────
+
 /**
- * WRAP a vault key to a recipient's hybrid public identity, producing the OPAQUE
- * `SIGILhyb` envelope the server relays. Mirrors the CLI's `wrap_vault_key`.
+ * ⭐ THE CONTEXT a vault-key envelope is bound to. Both sides MUST build the
+ * identical value or the AEAD refuses to open — which IS the point.
  *
- *   wrapVaultKey(wasm, { x25519PublicKey, mlkemEncapsKey }, vaultKey) -> Uint8Array
+ *   vaultKeyWrapAad(wasm, vaultId, recipientDeviceId, senderDeviceId) -> Uint8Array
+ *
+ * ⭐ SINGLE-SOURCED, NOT MIRRORED. This is a one-line call into the wasm, which
+ * is a one-line shell over `sigil_core::vault_key_wrap_aad` — the very function
+ * the `sigil` CLI calls. The Rust and JS clients therefore compute the same bytes
+ * BY CONSTRUCTION rather than by two hand-written implementations agreeing.
+ * (`sigil-wasm/test/sharing-interop.mjs` still pins the golden vector, because a
+ * drift alarm costs nothing.)
+ *
+ * Layout, for the record:
+ *
+ *   "sigil-vault-key-wrap-v1\n"
+ *   ‖ u32_be(len(vaultId))            ‖ vaultId
+ *   ‖ u32_be(len(recipientDeviceId))  ‖ recipientDeviceId
+ *   ‖ u32_be(len(senderDeviceId))     ‖ senderDeviceId
+ *
+ * Every field is length-prefixed, so ("ab","c","d") cannot collide with
+ * ("a","bc","d").
+ */
+export function vaultKeyWrapAad(wasm, vaultId, recipientDeviceId, senderDeviceId) {
+  checkId("vault id", vaultId);
+  checkId("recipient device id", recipientDeviceId);
+  checkId("sender device id", senderDeviceId);
+  return new Uint8Array(wasm.vault_key_wrap_aad(vaultId, recipientDeviceId, senderDeviceId));
+}
+
+/**
+ * Normalize a wrap CONTEXT: `{ vaultId, recipientDeviceId, senderDeviceId }`.
+ * Mirrors the CLI's `VaultKeyWrapContext::new`.
+ */
+function requireWrapContext(ctx) {
+  if (!ctx || typeof ctx !== "object") {
+    throw new Error(
+      "sharing: a wrap context { vaultId, recipientDeviceId, senderDeviceId } is required — " +
+        "a vault-key envelope is bound to all three",
+    );
+  }
+  checkId("vault id", ctx.vaultId);
+  checkId("recipient device id", ctx.recipientDeviceId);
+  checkId("sender device id", ctx.senderDeviceId);
+  return ctx;
+}
+
+/**
+ * The SENDING half of a wrap: which device we are, and the hybrid SECRET
+ * identity that proves it — `{ deviceId, hybrid: { x25519Secret, mlkemSeed } }`.
+ *
+ * Bundled so a call site cannot pass one device's id with another's secret.
+ * Mirrors the CLI's `SenderIdentity`.
+ */
+export function senderIdentity(deviceId, hybridSecret) {
+  checkId("sender device id", deviceId);
+  return { deviceId, hybrid: requireSecretIdentity(hybridSecret) };
+}
+
+/**
+ * The sender identity implied by an unlocked client's `auth`
+ * (`{ deviceId, hybrid }`). This is what every client passes.
+ */
+export function senderFromAuth(auth) {
+  checkAuth(auth);
+  if (!auth.hybrid) {
+    // ⚠️ A REAL BEHAVIOUR CHANGE, said plainly rather than surfaced as a shape
+    // error. Before Phase 60 a wrap needed only the RECIPIENT's public key, so a
+    // device with no hybrid identity of its own could still hand out vault keys
+    // — which is exactly why anybody else could too. Authenticating the envelope
+    // means the sender must hold a long-term secret, and the recipient must be
+    // able to FETCH the matching public half, so it has to be published.
+    throw new Error(
+      "sharing: this device has no hybrid identity, so it cannot AUTHENTICATE a vault-key " +
+        "envelope. Publish this device's hybrid key first (Sharing → Publish this device's " +
+        "hybrid key); the recipient needs the public half to check who the envelope came from.",
+    );
+  }
+  return senderIdentity(auth.deviceId, auth.hybrid);
+}
+
+function requireSenderIdentity(sender) {
+  if (!sender || typeof sender !== "object") {
+    throw new Error(
+      "sharing: a sender identity { deviceId, hybrid } is required — a vault-key envelope is " +
+        "AUTHENTICATED to the device that produced it, so the wrap needs that device's secret",
+    );
+  }
+  checkId("sender device id", sender.deviceId);
+  requireSecretIdentity(sender.hybrid);
+  return sender;
+}
+
+/**
+ * ⛔ Thrown when a vault-key slot is handed a container that is NOT an
+ * AUTHENTICATED (version 2) envelope — in practice, a version-1 anonymous one.
+ *
+ * ⭐ THIS IS ITS OWN CLASS ON PURPOSE. It is NOT a 401 (the request authenticated
+ * fine), NOT a 403 (nothing was forbidden) and NOT a
+ * {@link KeyPinMismatchError} (no key changed). It means the BYTES prove nothing
+ * about who produced them, and every client renders it distinctly.
+ */
+export class UnauthenticatedEnvelopeError extends Error {
+  constructor(foundVersion) {
+    super(
+      `REFUSING TO UNWRAP: this is a version ${foundVersion} SIGILhyb container, and a vault-key ` +
+        `envelope must be version ${KEY_ENVELOPE_VERSION_AUTHENTICATED} (AUTHENTICATED).\n  ` +
+        `A version ${KEY_ENVELOPE_VERSION_ANONYMOUS} container carries NO SENDER: anyone who can ` +
+        `read this device's published hybrid PUBLIC key can mint one, so accepting it would let ` +
+        `an attacker install a vault key of their own choosing and read everything written ` +
+        `afterwards.\n  There is deliberately no compatibility flag. Ask the sender to re-issue ` +
+        `it (sigil vault share / vault rotate / recovery cover, or the Share panel).`,
+    );
+    this.name = "UnauthenticatedEnvelopeError";
+    /** @type {number} the container version actually found. */
+    this.foundVersion = foundVersion;
+    /** @type {number} the version a vault-key envelope must be. */
+    this.expectedVersion = KEY_ENVELOPE_VERSION_AUTHENTICATED;
+  }
+}
+
+/**
+ * ⛔ Thrown when an envelope cannot be attributed to an EXPECTED SENDER: the
+ * caller could not work out which device deposited it, so there was nothing to
+ * authenticate against and nothing was unwrapped.
+ *
+ * A REFUSAL, not a fallback — unwrapping "from whoever" is exactly the anonymous
+ * behaviour that made a forgery indistinguishable from a real envelope.
+ */
+export class UnknownSenderError extends Error {
+  constructor(detail) {
+    super(
+      `REFUSING TO UNWRAP: ${detail}\n  A vault-key envelope is authenticated to the device that ` +
+        `deposited it, so there is nothing to check it against until that device is known. Name ` +
+        `it explicitly (senderDeviceId).`,
+    );
+    this.name = "UnknownSenderError";
+  }
+}
+
+/**
+ * ⛔ Thrown when the key recovered from an envelope does NOT open the vault it
+ * claims to be for — step 4 of {@link acceptVault}, mirroring the CLI's
+ * `accept_vault_key` ("the recovered key does NOT open vault …'s newest op").
+ *
+ * ⭐ WHY IT IS A REFUSAL AND NOT A WARNING. A key that decrypts nothing is
+ * useless at best and hostile at worst: it is exactly what a forged or misfiled
+ * deposit produces, and once it is in local state it can DISPLACE the real key
+ * (see {@link VaultKeyReplacementError}). So nothing is returned to be persisted.
+ *
+ * ⚠️ It can also be honest and benign: a sender who ROTATED the vault key but has
+ * not yet PUSHED the re-sealed vault leaves the server's newest op sealed under
+ * the OLD key. The remedy is for them to push, then accept again.
+ */
+export class VaultKeyDoesNotOpenError extends Error {
+  constructor(vaultId, detail) {
+    super(
+      `REFUSING TO ACCEPT: the recovered key does NOT open vault ${JSON.stringify(vaultId)}'s ` +
+        `newest op (${detail}); nothing was stored.\n  ` +
+        `A vault key that opens nothing is either a forged or misfiled deposit, or a sender who ` +
+        `rotated the key and has not pushed the re-sealed vault yet. Ask them to push and try ` +
+        `again.`,
+    );
+    this.name = "VaultKeyDoesNotOpenError";
+    /** @type {string} the vault the key failed to open. */
+    this.vaultId = vaultId;
+  }
+}
+
+/**
+ * ⛔ Thrown when accepting would REPLACE a DIFFERENT key this client already
+ * holds for the vault — step 5 of {@link acceptVault}, mirroring the CLI's
+ * `accept_vault_key` ("this client already holds a DIFFERENT key for vault …").
+ *
+ * ⭐ WHY. Silently overwriting is how a hostile deposit TAKES A VAULT AWAY from a
+ * device that already had it: the old key is the only thing that opens everything
+ * sealed under it, and this client may hold the last copy. Replacing is
+ * legitimate (a rotation the sender pushed), so it is allowed — but only as an
+ * explicit `replace: true`, never by default.
+ *
+ * Both fingerprints are SHA-256 prefixes, never key bytes, so a UI can show a
+ * human what would be swapped without printing key material.
+ */
+export class VaultKeyReplacementError extends Error {
+  constructor(vaultId, heldFingerprint, offeredFingerprint) {
+    super(
+      `REFUSING TO ACCEPT: this client already holds a DIFFERENT key for vault ` +
+        `${JSON.stringify(vaultId)} (sha256 ${heldFingerprint}); accepting would replace it with ` +
+        `sha256 ${offeredFingerprint} and lose access to everything sealed under it.\n  ` +
+        `If the sender ROTATED the key that is exactly what you want — accept again with ` +
+        `replace: true (the CLI spells this --replace). If they did not, someone deposited a key ` +
+        `you did not ask for.`,
+    );
+    this.name = "VaultKeyReplacementError";
+    /** @type {string} the vault whose key would be replaced. */
+    this.vaultId = vaultId;
+    /** @type {string} SHA-256 fingerprint (16 hex) of the key already held. */
+    this.heldFingerprint = heldFingerprint;
+    /** @type {string} SHA-256 fingerprint (16 hex) of the key offered. */
+    this.offeredFingerprint = offeredFingerprint;
+  }
+}
+
+/**
+ * Normalize/validate the map of vault keys this client ALREADY HOLDS.
+ *
+ * FAIL CLOSED, for exactly the reason {@link requirePinStore} does: a caller that
+ * forgot to pass its keyring would silently get "this client holds nothing", the
+ * never-silently-replace check would degrade into a no-op, and a hostile deposit
+ * would overwrite a good key with no refusal at all. `{}` is a valid, explicit
+ * statement that nothing is held; `null`/`undefined` is a programming error.
+ */
+export function requireHeldVaultKeys(keys) {
+  if (keys === null || keys === undefined) {
+    throw new Error(
+      "sharing: the vault keys this client already holds are required (they are what stops an " +
+        "accept silently REPLACING a key you depend on). Pass the keyring from the unlocked " +
+        "device identity (device.vaultKeys), or {} if you deliberately hold none.",
+    );
+  }
+  if (typeof keys !== "object" || Array.isArray(keys)) {
+    throw new Error("sharing: held vault keys must be { [vaultId]: Uint8Array(32) }");
+  }
+  // ⚠️ AND EVERY VALUE MUST BE RAW BYTES. A caller that handed base64 strings
+  // (the shape they are SEALED in) would compare unequal to every recovered key,
+  // so every accept would refuse — fail-closed, but as an unexplainable wall.
+  // Say so here instead.
+  for (const [vaultId, key] of Object.entries(keys)) {
+    if (!(key instanceof Uint8Array) || key.length !== VAULT_KEY_LEN) {
+      throw new Error(
+        `sharing: the held key for ${JSON.stringify(vaultId)} must be a ${VAULT_KEY_LEN}-byte ` +
+          `Uint8Array (raw bytes, not base64)`,
+      );
+    }
+  }
+  return keys;
+}
+
+/** The `SIGILhyb` container version byte, or `null` if the bytes are not one. */
+export function keyEnvelopeVersion(envelopeBytes) {
+  const bytes =
+    envelopeBytes instanceof Uint8Array ? envelopeBytes : new Uint8Array(envelopeBytes ?? []);
+  if (bytes.length < 9) return null;
+  for (let i = 0; i < 8; i += 1) {
+    if (bytes[i] !== KEY_ENVELOPE_MAGIC.charCodeAt(i)) return null;
+  }
+  return bytes[8];
+}
+
+/**
+ * ⭐ WRAP a vault key to a recipient's hybrid public identity, AUTHENTICATED as
+ * `sender` and BOUND to `ctx`. Mirrors the CLI's `wrap_vault_key`.
+ *
+ *   wrapVaultKey(wasm, sender, recipientPublic, ctx, vaultKey) -> Uint8Array
+ *
+ * `sender` is `{ deviceId, hybrid: { x25519Secret, mlkemSeed } }` — this device's
+ * LONG-TERM hybrid secret is what authenticates the envelope. `ctx` is
+ * `{ vaultId, recipientDeviceId, senderDeviceId }`.
  *
  * FRESH ephemeral entropy is drawn on EVERY call — an ephemeral X25519 secret, an
- * ML-KEM-768 encapsulation coin, and an AEAD nonce — so no two shares of the same
+ * ML-KEM-768 encapsulation coin, and an AEAD nonce — so no two wraps of the same
  * key ever reuse randomness. All three come from `crypto.getRandomValues`; the
  * wasm draws none.
+ *
+ * ⚠️ `ctx.senderDeviceId` MUST equal `sender.deviceId`: the caller says who it is
+ * twice — once for the AAD (which the recipient checks) and once for the key
+ * material (which the AEAD checks). They are compared here, so a mismatch is a
+ * local error rather than an envelope nobody can open.
  */
-export function wrapVaultKey(wasm, recipientPublic, vaultKey) {
+export function wrapVaultKey(wasm, sender, recipientPublic, ctx, vaultKey) {
+  const s = requireSenderIdentity(sender);
   const pub = requirePublicIdentity(recipientPublic);
+  const c2 = requireWrapContext(ctx);
   requireVaultKey(vaultKey);
+  if (c2.senderDeviceId !== s.deviceId) {
+    throw new Error(
+      `sharing: wrap context names sender ${JSON.stringify(c2.senderDeviceId)} but the signing ` +
+        `identity is ${JSON.stringify(s.deviceId)}`,
+    );
+  }
+  const aad = vaultKeyWrapAad(wasm, c2.vaultId, c2.recipientDeviceId, c2.senderDeviceId);
   const c = webcrypto();
   const ephemeralX25519Secret = c.getRandomValues(new Uint8Array(HYBRID_X25519_SECRET_LEN));
   const mlkemCoin = c.getRandomValues(new Uint8Array(32));
   const aeadNonce = c.getRandomValues(new Uint8Array(wasm.nonce_len()));
   return new Uint8Array(
-    wasm.hybrid_seal_to_container(
+    wasm.hybrid_auth_seal_to_container(
+      s.hybrid.x25519Secret,
       pub.x25519PublicKey,
       pub.mlkemEncapsKey,
       ephemeralX25519Secret,
       mlkemCoin,
       aeadNonce,
+      aad,
       vaultKey,
     ),
   );
 }
 
 /**
- * UNWRAP an envelope with this device's hybrid SECRET identity, recovering the
- * 32-byte vault key. Mirrors the CLI's `unwrap_vault_key`.
+ * ⭐ UNWRAP an envelope with this device's hybrid SECRET identity — but ONLY as a
+ * record from `sender`, and ONLY under `ctx`. Mirrors the CLI's
+ * `unwrap_vault_key`.
  *
- * The recovered plaintext MUST be exactly {@link VAULT_KEY_LEN} bytes — anything
- * else is REJECTED rather than silently used as a key. A wrong identity or a
- * tampered envelope throws (the AEAD tag fails) and leaks no plaintext.
+ *   unwrapVaultKey(wasm, mySecretIdentity, verifiedSender, ctx, envelopeBytes)
+ *     -> Uint8Array(32)
+ *
+ * Three checks, in this order, every one load-bearing:
+ *
+ *   1. the container must be AUTHENTICATED (version 2). A version-1 container is
+ *      {@link UnauthenticatedEnvelopeError} — it carries no sender at all;
+ *   2. the AEAD must authenticate under the secret derived with `sender`'s STATIC
+ *      X25519 public key. A forger holding only public material cannot produce
+ *      one, so a wrong or forged sender fails HERE, at the AEAD, not at a string
+ *      comparison that could be bypassed;
+ *   3. the recovered plaintext must be exactly {@link VAULT_KEY_LEN} bytes.
+ *
+ * ⭐ `sender` must be a {@link VerifiedSender}, which only
+ * {@link verifySenderForUnwrap} and {@link verifiedSenderFromLocal} can build —
+ * the receiving-side twin of the {@link verifyRecipientForWrap} gate. A caller
+ * cannot reach this function with a key it pulled straight off the wire.
  */
-export function unwrapVaultKey(wasm, mySecretIdentity, envelopeBytes) {
+export function unwrapVaultKey(wasm, mySecretIdentity, sender, ctx, envelopeBytes) {
   const secret = requireSecretIdentity(mySecretIdentity);
+  if (!(sender instanceof VerifiedSender)) {
+    throw new Error(
+      "sharing: unwrapVaultKey needs a VerifiedSender — obtain one from verifySenderForUnwrap() " +
+        "(which pin-checks the depositing device's key) or verifiedSenderFromLocal() (when this " +
+        "process holds the sender's own secret). An unverified key off the wire is exactly what " +
+        "this gate exists to refuse.",
+    );
+  }
+  const c2 = requireWrapContext(ctx);
+  if (c2.senderDeviceId !== sender.deviceId) {
+    throw new Error(
+      `sharing: unwrap context names sender ${JSON.stringify(c2.senderDeviceId)} but the ` +
+        `verified sender is ${JSON.stringify(sender.deviceId)}`,
+    );
+  }
   const envelope =
     envelopeBytes instanceof Uint8Array ? envelopeBytes : new Uint8Array(envelopeBytes);
+
+  // 1) ⛔ THE VERSION REFUSAL, before any cryptography, so the caller gets a
+  //    typed error rather than an opaque AEAD failure. (The wasm re-checks; this
+  //    is what makes the refusal renderable.)
+  const version = keyEnvelopeVersion(envelope);
+  if (version !== KEY_ENVELOPE_VERSION_AUTHENTICATED) {
+    throw new UnauthenticatedEnvelopeError(version ?? -1);
+  }
+
+  const aad = vaultKeyWrapAad(wasm, c2.vaultId, c2.recipientDeviceId, c2.senderDeviceId);
   const plaintext = new Uint8Array(
-    wasm.hybrid_open_container(secret.x25519Secret, secret.mlkemSeed, envelope),
+    wasm.hybrid_auth_open_container(
+      secret.x25519Secret,
+      secret.mlkemSeed,
+      sender.x25519PublicKey,
+      aad,
+      envelope,
+    ),
   );
   if (plaintext.length !== VAULT_KEY_LEN) {
     throw new Error(
@@ -472,14 +883,24 @@ export async function getKeyEnvelope(wasm, auth, vaultId, deviceId = null) {
  *   shareVault(wasm, auth, { vaultId, recipientDeviceId, vaultKey, permission })
  *     -> { recipientDeviceId, envelope, envelopeBytes, permission, fingerprint }
  *
- * Deliberately does BOTH halves together — wrap + deposit, THEN grant through the
- * EXISTING `grantVaultAccess` route — so authorization and key distribution can
- * never drift apart (mirrors `sigil vault share`). The steps:
+ * Deliberately does every half together — gate + wrap, THEN grant, THEN deposit,
+ * all through the EXISTING `grantVaultAccess` route — so authorization and key
+ * distribution can never drift apart (mirrors `sigil vault share`). The steps:
  *
- *   1. fetch the recipient's published hybrid PUBLIC key;
- *   2. WRAP this vault's key to it with fresh ephemeral entropy;
- *   3. DEPOSIT the opaque envelope (needs WRITE on the vault);
- *   4. GRANT the recipient `permission` ("read" | "write", default "read").
+ *   1. GATE: resolve + pin-check the recipient's published hybrid PUBLIC key;
+ *   2. WRAP this vault's key to it, AUTHENTICATED as this device and BOUND to
+ *      (vault, recipient, sender), with fresh ephemeral entropy;
+ *   3. GRANT the recipient `permission` ("read" | "write", default "read");
+ *   4. DEPOSIT the opaque envelope (needs WRITE on the vault).
+ *
+ * ⭐ **THE ORDER IS AUTHORIZE-THEN-DEPOSIT, AND IT USED TO BE THE OTHER WAY
+ * ROUND** (this file, like the CLI, deposited first). A device with WRITE but no
+ * ownership therefore got its envelope STORED and only THEN met the grant
+ * route's 403 — so a caller who could not legitimately share still landed a key
+ * envelope of its choosing in the recipient's mailbox. A failed grant now means
+ * nothing was deposited. The reverse failure (grant succeeds, deposit fails) is
+ * the safe one: the recipient can read ciphertext it has no key for, which is
+ * exactly the state every recipient is in before a share anyway.
  *
  * The vault key never leaves this device unwrapped and is never returned in a
  * loggable form — only its `fingerprint`.
@@ -494,6 +915,7 @@ export async function shareVault(
     permission = "read",
     pins = null,
     expectedSafetyNumber = null,
+    sender = null,
   },
 ) {
   checkAuth(auth);
@@ -503,6 +925,10 @@ export async function shareVault(
   if (permission !== "read" && permission !== "write") {
     throw new Error(`sharing: permission must be "read" or "write", got ${permission}`);
   }
+  // The AUTHENTICATING identity. Defaults to this unlocked client's own, which
+  // is what every shipping caller wants; a caller with no hybrid identity gets a
+  // loud local error instead of an envelope nobody can trust.
+  const from = requireSenderIdentity(sender ?? senderFromAuth(auth));
 
   // 1) ⭐ THE WRAP GATE. Resolve the recipient's PUBLIC hybrid key AND settle
   //    trust in it in ONE call, before anything can be wrapped. A changed key
@@ -522,11 +948,16 @@ export async function shareVault(
     expectedSafetyNumber,
   });
   const pinStatus = trust === TRUST_PINNED || trust === TRUST_DERIVED ? "match" : "first-sight";
-  // 2) WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
-  const envelope = wrapVaultKey(wasm, recipient, vaultKey);
-  // 3) DEPOSIT the OPAQUE envelope; the server cannot read it.
-  await putKeyEnvelope(wasm, auth, vaultId, recipientDeviceId, envelope);
-  // 4) AUTHORIZE through the EXISTING grant API, so access and keys agree.
+  // 2) WRAP: AUTHENTICATED as this device, BOUND to (vault, recipient, sender);
+  //    fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
+  const ctx = {
+    vaultId,
+    recipientDeviceId,
+    senderDeviceId: from.deviceId,
+  };
+  const envelope = wrapVaultKey(wasm, from, recipient, ctx, vaultKey);
+  // 3) AUTHORIZE FIRST through the EXISTING grant API, so a caller that may not
+  //    share cannot leave an envelope behind.
   await grantVaultAccess(
     wasm,
     { deviceId: auth.deviceId, seed: auth.seed },
@@ -535,6 +966,8 @@ export async function shareVault(
     recipientDeviceId,
     permission,
   );
+  // 4) DEPOSIT the OPAQUE envelope; the server cannot read it.
+  await putKeyEnvelope(wasm, auth, vaultId, recipientDeviceId, envelope);
 
   return {
     recipientDeviceId,
@@ -554,29 +987,190 @@ export async function shareVault(
 }
 
 /**
- * ACCEPT a vault shared TO this device: collect the envelope addressed to
- * `auth.deviceId`, unwrap it with this device's hybrid SECRET identity, and
- * return the recovered 32-byte vault key (mirrors `sigil vault accept`).
+ * ⭐ ACCEPT a vault shared TO this device — the receiving half of
+ * {@link shareVault}, and **where the forgery used to land**.
  *
- *   acceptVault(wasm, auth, { vaultId, secretIdentity? })
- *     -> { vaultId, vaultKey, envelope, fingerprint }
+ *   acceptVault(wasm, auth, {
+ *     vaultId, secretIdentity?, senderDeviceId?, expectedSafetyNumber?, pins?,
+ *     heldKeys?, replace?
+ *   }) -> { vaultId, vaultKey, envelope, fingerprint, senderDeviceId,
+ *           senderTrust, senderSafetyNumber, verifiedAgainstTip, tipContainer,
+ *           replaced }
  *
- * `secretIdentity` defaults to `auth.hybrid`. The CALLER decides what to do with
- * the returned key — the browser clients store it inside the SEALED
- * device-identity container, never in the clear.
+ * What it now does, in order, all of it load-bearing (mirrors the CLI's
+ * `accept_vault_key`, ALL FIVE STEPS):
+ *
+ *   1. **work out WHO deposited the envelope** — explicitly (`senderDeviceId`),
+ *      else from this device's OWN envelope index (`GET /v1/devices/{id}/keys`,
+ *      self-only). No sender ⇒ {@link UnknownSenderError}, a REFUSAL. The id is
+ *      server-supplied and therefore untrusted; naming the wrong device just
+ *      makes step 3 fail, because the sender's static key is an INPUT to the
+ *      derivation, not a string that gets compared;
+ *   2. **establish that sender's hybrid key** through
+ *      {@link verifySenderForUnwrap} — the pin store, at last, on the accept
+ *      path. Before Phase 60 this function fetched no hybrid key at all, so ADR
+ *      0038's pin store was never consulted here;
+ *   3. **unwrap AUTHENTICATED and CONTEXT-BOUND** — a version-1 (anonymous)
+ *      envelope is refused outright ({@link UnauthenticatedEnvelopeError}); a
+ *      forged or re-filed one fails at the AEAD;
+ *   4. ⭐ **OPEN BEFORE RETURNING.** The recovered key must actually open this
+ *      vault's newest op, or nothing comes back to be persisted
+ *      ({@link VaultKeyDoesNotOpenError}). A vault the server holds nothing for
+ *      yet is the one exception, reported as `verifiedAgainstTip: false`;
+ *   5. **never silently REPLACE.** A DIFFERENT key already held for this vault
+ *      needs an explicit `replace: true`, else {@link VaultKeyReplacementError}.
+ *      Overwriting is how a hostile deposit takes a vault away from a device
+ *      that already had it.
+ *
+ * ⭐⭐ STEPS 4 AND 5 LIVE **HERE**, NOT AT THE CALL SITES, AND THAT IS THE POINT.
+ * `acceptVault` returns the key for the caller to persist (the CLI writes its own
+ * keyring), so putting these checks in the webapp and the extension would have
+ * left them duplicated, forgettable, and — as this repository has shipped twice
+ * before — revertible with every suite still green. Enforcing them at the ONE
+ * place the key is produced means a client physically cannot store a key that
+ * opens nothing, and cannot overwrite a key it depends on without saying so. The
+ * `replace` opt-in is the only door, and it is explicit in both browsers' UI.
+ *
+ * `secretIdentity` defaults to `auth.hybrid`; `pins` to `auth.pins`; `heldKeys`
+ * to `auth.vaultKeys`. `heldKeys` FAILS CLOSED (see
+ * {@link requireHeldVaultKeys}) for the same reason `pins` does. The CALLER
+ * decides what to do with the returned key — the browser clients store it inside
+ * the SEALED device-identity container, never in the clear, and must ALSO
+ * persist the returned `pins` so the sender stays pinned.
+ *
+ * `tipContainer` is the newest op as pulled by step 4, handed back so a caller
+ * can adopt the vault WITHOUT a second round trip (and without the window in
+ * which a different op could arrive between the check and the open).
  */
-export async function acceptVault(wasm, auth, { vaultId, secretIdentity = null }) {
+export async function acceptVault(
+  wasm,
+  auth,
+  {
+    vaultId,
+    secretIdentity = null,
+    senderDeviceId = null,
+    expectedSafetyNumber = null,
+    pins = null,
+    heldKeys = null,
+    replace = false,
+  },
+) {
   checkAuth(auth);
   checkId("vault id", vaultId);
   const secret = requireSecretIdentity(secretIdentity ?? auth.hybrid);
+  const pinStore = requirePinStore(pins ?? auth.pins);
+  const held = requireHeldVaultKeys(heldKeys ?? auth.vaultKeys);
+
+  // 0) ⭐ COLLECT THE ENVELOPE FIRST — before anything else is asked of the
+  //    server, and mirroring the CLI's `accept_vault_key`. A device that may NOT
+  //    read this vault would otherwise be told "I cannot work out who deposited
+  //    the key" (its own index is empty) when the true and far more useful answer
+  //    is the mailbox's own 403. The fetch grants nothing — the envelope is
+  //    opaque ciphertext and is not unwrapped until step 3 — so surfacing the
+  //    authorization failure first costs no security.
   const envelope = await getKeyEnvelope(wasm, auth, vaultId, auth.deviceId);
-  const vaultKey = unwrapVaultKey(wasm, secret, envelope);
+
+  // 1) WHO SENT IT.
+  let from = senderDeviceId;
+  if (from) {
+    checkId("sender device id", from);
+  } else {
+    const index = await listKeyEnvelopesForSelf(wasm, auth);
+    from = index.find((e) => e.vaultId === vaultId)?.senderDeviceId || "";
+    if (!from) {
+      throw new UnknownSenderError(
+        `this device's envelope index does not say which device deposited the key for vault ` +
+          `${JSON.stringify(vaultId)}`,
+      );
+    }
+  }
+
+  // 2) ESTABLISH THE SENDER'S KEY (the pin store, on the accept path at last).
+  const sender = await verifySenderForUnwrap(wasm, auth, from, {
+    pins: pinStore,
+    expectedSafetyNumber,
+  });
+
+  // 3) UNWRAP, authenticated and context-bound.
+  const vaultKey = unwrapVaultKey(
+    wasm,
+    secret,
+    sender,
+    { vaultId, recipientDeviceId: auth.deviceId, senderDeviceId: from },
+    envelope,
+  );
+
+  // 4) ⭐ OPEN BEFORE RETURNING. Steps 1-3 prove WHO produced the envelope; they
+  //    say nothing about whether what came out is the key to THIS vault. The CLI
+  //    has always pulled the newest op and opened it before touching its keyring
+  //    — the browser clients did not, so a key that opened nothing was sealed
+  //    into the device identity and, worse, DISPLACED whatever was there (step
+  //    5). Pull once, open once, refuse loudly.
+  const ops = await pullContainersAuthed(wasm, auth, auth.baseUrl, vaultId, 0);
+  const tipContainer = ops.length > 0 ? ops[ops.length - 1].container : null;
+  if (tipContainer) {
+    try {
+      wasm.open_container(vaultKey, tipContainer);
+    } catch (e) {
+      throw new VaultKeyDoesNotOpenError(vaultId, (e && e.message) || String(e));
+    }
+  }
+
+  // 5) NEVER SILENTLY REPLACE. An identical key is a harmless re-accept; a
+  //    DIFFERENT one is either a rotation the user should confirm or a hostile
+  //    deposit that would cost them everything sealed under the key they hold.
+  // `sameBytes` is the module's existing comparison, declared with the pin store
+  // below and hoisted; there is deliberately no second copy of it here.
+  const heldKey = held[vaultId] ?? null;
+  let replaced = null;
+  if (heldKey && !sameBytes(heldKey, vaultKey)) {
+    const heldFingerprint = await vaultKeyFingerprint(heldKey);
+    if (!replace) {
+      throw new VaultKeyReplacementError(
+        vaultId,
+        heldFingerprint,
+        await vaultKeyFingerprint(vaultKey),
+      );
+    }
+    replaced = heldFingerprint;
+  }
+
   return {
     vaultId,
     vaultKey,
     envelope,
     fingerprint: await vaultKeyFingerprint(vaultKey),
+    senderDeviceId: from,
+    senderTrust: sender.trust,
+    senderSafetyNumber: sender.safetyNumber,
+    pins: pinStore,
+    // ⭐ Step 4's verdict. `false` ONLY when the server holds no vault yet, so
+    // there was nothing to open — never when an open was attempted and failed.
+    verifiedAgainstTip: tipContainer !== null,
+    // The newest op, already fetched and already proven to open. A caller adopts
+    // the vault from THIS rather than pulling again.
+    tipContainer,
+    // Step 5's verdict: the fingerprint of the key this one replaced, or null.
+    replaced,
   };
+}
+
+/**
+ * This device's OWN envelope index — which vaults hold a wrapped key for it, and
+ * WHICH DEVICE DEPOSITED EACH ONE. SELF-ONLY server-side (`GET
+ * /v1/devices/{id}/keys`; asking about another device is 403).
+ *
+ * Kept here rather than imported from recovery.mjs so the accept path has no
+ * dependency on the recovery module; it is METADATA ONLY, never a blob.
+ */
+async function listKeyEnvelopesForSelf(wasm, auth) {
+  const res = await signedFetch(wasm, auth, "GET", `/v1/devices/${auth.deviceId}/keys`, "", null);
+  if (res.status !== 200) await failResponse(res, "listKeyEnvelopesForSelf");
+  const json = await res.json();
+  return (json.vaults ?? []).map((v) => ({
+    vaultId: v.vaultID ?? "",
+    senderDeviceId: v.sender_device_id ?? "",
+  }));
 }
 
 // ===========================================================================
@@ -1140,6 +1734,150 @@ export async function verifyRecipientForWrap(
   return { deviceId, identity, trust, safetyNumber: presented, pins: store };
 }
 
+// ===========================================================================
+// ⭐⭐ THE UNWRAP GATE — MIRRORS cli/src/lib.rs::verify_sender_for_unwrap
+// ===========================================================================
+//
+// ADR 0038 put a gate on the FETCH so no wrap could reach an unverified key. The
+// RECEIVING side had no gate at all: `acceptVault` fetched nothing, opened
+// anything, and checked only that the plaintext was 32 bytes long. That is what
+// made a forged envelope indistinguishable from a real one.
+//
+// ⚠️ THE HONEST LIMIT, stated plainly because it is the same one ADR 0038
+// accepted: on FIRST SIGHT of a sender, a hostile server can serve its own key
+// as "the sender's" AND forge an envelope under it. Pinning cannot protect first
+// contact in either direction. What authentication buys UNCONDITIONALLY is the
+// other attacker in the threat model — a co-tenant with write access, or any
+// party that is not the server — who can no longer mint an acceptable envelope
+// at all. Against the server itself the defence is the same as for a wrap: a
+// pinned sender is a hard stop on change, and `expectedSafetyNumber` closes
+// first contact if a human uses it.
+
+/** Module-private construction token: the JS equivalent of private fields. */
+const VERIFIED_SENDER_GATE = Symbol("sigil.VerifiedSender");
+
+/**
+ * A sender whose hybrid public key has passed {@link verifySenderForUnwrap} (or
+ * is held locally in full).
+ *
+ * ⭐ It CANNOT be constructed from outside this module — `new VerifiedSender(...)`
+ * throws — so {@link unwrapVaultKey}'s signature is a proof rather than a
+ * convention. Mirrors the CLI's `VerifiedSender`, whose fields are private and
+ * which has no public literal.
+ */
+export class VerifiedSender {
+  constructor(gate, deviceId, identity, trust, safetyNumberText) {
+    if (gate !== VERIFIED_SENDER_GATE) {
+      throw new Error(
+        "sharing: VerifiedSender cannot be constructed directly — use verifySenderForUnwrap() " +
+          "(which pin-checks the depositing device's published key) or verifiedSenderFromLocal().",
+      );
+    }
+    /** @type {string} the device this key belongs to. */
+    this.deviceId = deviceId;
+    /** @type {{x25519PublicKey: Uint8Array, mlkemEncapsKey: Uint8Array}} */
+    this.identity = identity;
+    /** @type {string} how trust was established (one of the TRUST_* constants). */
+    this.trust = trust;
+    /** @type {string} the safety number of the key about to authenticate an envelope. */
+    this.safetyNumber = safetyNumberText;
+    Object.freeze(this);
+  }
+
+  /** The sender's static X25519 public key — the authentication input. */
+  get x25519PublicKey() {
+    return this.identity.x25519PublicKey;
+  }
+}
+
+/**
+ * ⭐ The sender is an identity THIS PROCESS HOLDS THE SECRET HALF OF.
+ *
+ * Nothing is fetched, so there is nothing for a server to substitute — the
+ * strongest trust outcome, stronger than a pin. It is NOT a bypass: constructing
+ * it requires the sender's SECRET identity, and anyone holding that already *is*
+ * the sender. Used when a device unwraps an envelope it wrapped itself (a
+ * recovery kit's mandatory pre-print round trip). Mirrors
+ * `VerifiedSender::from_local`.
+ */
+export async function verifiedSenderFromLocal(wasm, sender) {
+  const s = requireSenderIdentity(sender);
+  const identity = hybridPublicIdentity(wasm, s.hybrid);
+  return new VerifiedSender(
+    VERIFIED_SENDER_GATE,
+    s.deviceId,
+    identity,
+    TRUST_DERIVED,
+    await safetyNumber(s.deviceId, identity),
+  );
+}
+
+/**
+ * ⭐⭐ THE UNWRAP GATE. Resolve the hybrid public key of the device that
+ * DEPOSITED an envelope, and establish trust in it, before anything is opened.
+ *
+ *   await verifySenderForUnwrap(wasm, auth, deviceId, { pins, expectedSafetyNumber })
+ *     -> VerifiedSender
+ *
+ * | situation | outcome | pin store |
+ * |---|---|---|
+ * | key DERIVED locally (`origin: "recovery-kit"`) | `derived`, NO fetch | untouched |
+ * | pinned key, byte-identical | `pinned` | untouched |
+ * | pinned key, **different** | ⛔ {@link KeyPinMismatchError} | **untouched** |
+ * | first sight + matching safety number | `verified-first-sight` | pinned |
+ * | first sight + **wrong** safety number | ⛔ {@link SafetyNumberMismatchError} | **untouched** |
+ * | first sight, no safety number | `unverified-first-sight` (ADR 0038 TOFU) | pinned |
+ *
+ * Deliberately the SAME table as {@link verifyRecipientForWrap} minus the
+ * recovery-kit row: a kit is a RECIPIENT of wraps, and the one place a kit acts
+ * as a sender (its own pre-print verification) holds the secret and uses
+ * {@link verifiedSenderFromLocal}.
+ *
+ * As on the wrap side, every refusal happens BEFORE the key is pinned, so a
+ * retry cannot silence the alarm by pinning what was just refused.
+ */
+export async function verifySenderForUnwrap(
+  wasm,
+  auth,
+  deviceId,
+  { pins = null, expectedSafetyNumber = null } = {},
+) {
+  checkAuth(auth);
+  checkId("sender device id", deviceId);
+  const store = requirePinStore(pins ?? auth.pins);
+
+  // 1) A LOCALLY DERIVED key. Nothing was fetched, so nothing could be swapped.
+  const derived = derivedPinIdentity(store, deviceId);
+  if (derived) {
+    return new VerifiedSender(
+      VERIFIED_SENDER_GATE,
+      deviceId,
+      derived,
+      TRUST_DERIVED,
+      await safetyNumber(deviceId, derived),
+    );
+  }
+
+  // 2) Ask the server, then decide. Nothing below writes to the pin store until
+  //    every check has passed.
+  const identity = await fetchHybridKey(wasm, auth, deviceId);
+  const presented = await safetyNumber(deviceId, identity);
+
+  if (expectedSafetyNumber && !sameSafetyNumber(expectedSafetyNumber, presented)) {
+    throw new SafetyNumberMismatchError(deviceId, expectedSafetyNumber, presented);
+  }
+
+  const alreadyPinned = Boolean(store.pins[deviceId]);
+  // Throws KeyPinMismatchError on a changed key; mutates nothing in that case.
+  await checkAndPin(store, deviceId, identity);
+  const trust = alreadyPinned
+    ? TRUST_PINNED
+    : expectedSafetyNumber
+      ? TRUST_VERIFIED_FIRST_SIGHT
+      : TRUST_UNVERIFIED_FIRST_SIGHT;
+  return new VerifiedSender(VERIFIED_SENDER_GATE, deviceId, identity, trust, presented);
+}
+
 // ── rotation transport: list + delete envelopes ──────────────────────────────
 
 /** The URL PATH of a vault's envelope COLLECTION (mirrors `key_envelopes_path`). */
@@ -1246,10 +1984,13 @@ export async function rotateVaultKey(
     pins = null,
     drop = [],
     safetyNumbers = {},
+    sender = null,
   },
 ) {
   checkAuth(auth);
   checkId("vault id", vaultId);
+  // The AUTHENTICATING identity for every re-wrap (defaults to this client's).
+  const from = requireSenderIdentity(sender ?? senderFromAuth(auth));
   if (!Array.isArray(recipientDeviceIds) || recipientDeviceIds.length === 0) {
     throw new Error(
       "sharing: rotateVaultKey needs recipientDeviceIds — name EVERY device that keeps access " +
@@ -1325,7 +2066,13 @@ export async function rotateVaultKey(
   //    replaced, not appended to).
   const rewrapped = [];
   for (const { deviceId, identity, trust } of resolved) {
-    const envelope = wrapVaultKey(wasm, identity, vaultKey);
+    const envelope = wrapVaultKey(
+      wasm,
+      from,
+      identity,
+      { vaultId, recipientDeviceId: deviceId, senderDeviceId: from.deviceId },
+      vaultKey,
+    );
     await putKeyEnvelope(wasm, auth, vaultId, deviceId, envelope);
     rewrapped.push({ deviceId, trust, pinStatus: trust });
   }

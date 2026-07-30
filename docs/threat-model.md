@@ -548,7 +548,7 @@ sealed under a random 32-byte **vault key**; that key is wrapped to each recipie
 device with the PQ-hybrid `hybrid_seal` path (X25519 + ML-KEM-768 → XChaCha20-
 Poly1305) and relayed through `sigild` as an **opaque envelope**. The human
 password is **never shared and never wrapped**. The key hierarchy is specified in
-[`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use).
+[`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_auth_seal--hybrid_auth_open-in-use).
 
 Everything here is **dev-gated (`501` by default), opt-in, plain HTTP in dev, and
 UNAUDITED** — and the cryptography it now leans on (the hybrid combiner and the
@@ -584,12 +584,64 @@ the browsers; `0600` plaintext key files on the desktop.
 | S | **Unauthorized device requesting an envelope** | Enrolled and authenticated, but has no business with this vault | **Two** independent conditions on `GET …/keys/{deviceID}`: the caller must **be the addressee** *and* hold a **read** grant on the vault. Failing either is **`403`** (`forbidden_device` / `unauthorized_vault`) — never `401` (which would be a lie) and never `404` (which would leak whether an envelope exists). Depositing needs **write**, so a read-only grantee cannot inject one. Verified: a third enrolled device is refused fetching another device's envelope, fetching its own on someone else's vault, reading the op-log, and depositing on a vault it does not own | `sigild` authorization |
 | T | **Revoked device** | Was authorized; still holds its Ed25519 key and its hybrid secret identity | Revocation is checked **before** signature verification, so on its very next request the device gets **`401`** on *every* sharing route — collecting an envelope, publishing a hybrid key, and reading the op-log. Depositing an envelope **for** a revoked recipient is refused with `409 device_revoked` rather than silently stored. **This only stops FUTURE access** — see the limits below | `sigild` request auth |
 | U | **Device publishing a hybrid key it does not own** | Wants a vault key wrapped to *its* key by impersonating another device in the registry | A device may publish **only into its own slot**: the path `deviceID` must equal the authenticated device's ID, else **`403`** (`forbidden_device`). The registry FK means only an **enrolled** device can have a key on file at all. The `sigild` test `TestHybridKeyCannotPublishForAnotherDevice` pins this by forging the mismatch that the CLI cannot produce | `sigild` authorization |
-| V | **Envelope replayer / substituter** | Re-sends a captured envelope deposit, or swaps one envelope for another | The transport is the **v3 signed request contract** (see table above): the body is *inside* the signed message, so a mutated envelope invalidates the signature, and the ±300 s window plus the single-use nonce bound replay. Depositing requires **write** on the vault, so a passive observer cannot deposit anything. A substituted envelope also **fails to open**: `hybrid_open` authenticates, so a wrong or tampered container yields an authentication failure, never plaintext, and `unwrap_vault_key` additionally rejects any recovered plaintext that is not exactly 32 bytes rather than using it as a key | `sigild` request auth + crypto |
+| V | **Envelope forger / replayer / substituter** | Mints an envelope of its own, re-sends a captured deposit, or swaps one envelope for another | ⚠️ **THIS ROW WAS WRONG UNTIL PHASE 60 — see the correction directly below.** The transport is the **v3 signed request contract** (see table above): the body is *inside* the signed message, so a mutated envelope invalidates the signature, and the ±300 s window plus the single-use nonce bound replay. Depositing requires **write** on the vault, so a passive observer cannot deposit anything. And a **forged or re-filed** envelope now fails to open: the wrap is an **authenticated** hybrid KEM ([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)) mixing a **static-static X25519 DH between sender and recipient**, so producing an acceptable envelope needs the **sender's** secret and not merely the recipient's published public key; the AAD names the **purpose, vault, recipient and sender**, so an envelope cannot be moved between vaults, recipients, senders or purposes; a **version-1 (anonymous) container is refused outright**; and the unwrap runs only behind the typed `VerifiedSender` gate, which pin-checks the depositing device's hybrid key. ⛔ **First sight of a sender is still TOFU** (adversary **X**), and **authentication is classical X25519 only** — confidentiality is hybrid, authenticity is not | `sigild` request auth + crypto |
 | W | **Log / metrics scraper hunting for key material** | Reads `sigild`'s audit log or scrapes `/metrics` | The three sharing audit events carry **metadata plus a SHA-256 fingerprint** only (`vault.key_envelope_put` / `_get`: vault ID, device IDs, size, `blob_sha256`; `device.hybrid_key_published`: a device ID). **No envelope byte, no vault key, and no hybrid public key is ever logged** — the "no key material in logs" rule is kept absolute even for *public* keys, so there is no judgement call to get wrong later. The `/metrics` counters are counts with **no vault or device label** (Phase 50's `sigild_key_envelope_deletes_total` included). The two Phase 50 events (`vault.key_envelope_list` / `_delete`) carry device IDs and a count and have **no blob to fingerprint**. Asserted by a test and by the e2e script, which fails if `SIGILhyb` appears in the server log | `sigild` observability |
 | X | **Key-substituting server / rogue registry** (Phase 50) | Owns the registry; answers `GET /v1/devices/{B}/hybrid-key` with **its own** hybrid public key so the next share is wrapped to *it* | **Detected and blocked after first contact — not prevented at first contact.** Every client **pins** the first hybrid public key it sees for a device and compares on every later fetch, at the fetch itself (`verify_recipient_for_wrap` / `verifyRecipientForWrap` — the earlier `fetch_hybrid_key_pinned` / `fetchHybridKeyPinned` were superseded in Phase 54 and **deleted** in Phase 57, because an exported fetch-and-pin sitting next to a stricter gate is a ready-made bypass); a **changed** key is a hard refusal (`CliError::PinMismatch` / `KeyPinMismatchError` / `DesktopError::KeyPinMismatch`) with **nothing wrapped, nothing uploaded, and the pin store not mutated**. There is **no flag, option or default anywhere that accepts a changed key** — only the deliberate `sigil device repin <id> --yes`. For the **first** contact, pinning is worthless by construction, and the answer is the **safety number**: six 5-digit groups over the device id **and both halves** of the hybrid key, compared with the other person over a channel the server does not control. **This defense is only as good as that comparison actually happening.** Proven, not asserted: `pinning-interop.mjs` puts a **rewriting proxy** in front of a real `sigild`, and the client refuses while the stored envelope stays byte-identical to the honest one and does **not** open with the attacker's hybrid secret | Client-side trust store + human verification |
 
+### ⚠️ CORRECTION — row V asserted a defense that did not exist (Phase 60)
+
+**This is recorded rather than quietly rewritten, because the false sentence sat
+exactly where a reviewer decides whether to look further.** Until Phase 60, row V
+read:
+
+> *"A substituted envelope also **fails to open**: `hybrid_open` authenticates, so
+> a wrong or tampered container yields an authentication failure, never plaintext,
+> and `unwrap_vault_key` additionally rejects any recovered plaintext that is not
+> exactly 32 bytes rather than using it as a key."*
+
+**That was true of a TAMPERED envelope and false of a freshly minted valid one —
+which is the actual attack.** The wrap used the **anonymous** `hybrid_seal` (HPKE
+`mode_base`), so anyone holding the recipient's **published** hybrid public key —
+which `sigild` serves to every authenticated device — could mint a container that
+recipient would open, and install a vault key **of their own choosing**. The
+second clause was true and irrelevant: **a forged key is exactly 32 bytes**, so
+the length check passes. Reproduced with the shipped binary and nothing else:
+
+```
+$ sigil hybrid-seal --recipient-pub b.hybrid.pub --in attacker_key.bin --out forged.env
+    forged.env: 1226 bytes, magic SIGILhyb   <- byte-shaped IDENTICALLY to a genuine wrap
+$ sigil hybrid-open --key b.hybrid --in forged.env --out recovered.bin
+    exit=0   recovered = 32 bytes, IDENTICAL to the attacker's chosen key
+```
+
+⛔ **And adversary X's pinning did not mitigate it:** `vault accept` fetched no
+hybrid key at all, so the pin store was **never consulted** on the unwrap path.
+Two attacks were driven against a live `sigild` — a rewriting proxy whose forged
+envelope `vault accept` took with **exit 0 and no warning**, and a co-tenant with
+`write` but not ownership whose deposit landed because the envelope was **PUT
+before the grant was requested**.
+
+Fixed in Phase 60 by an authenticated hybrid KEM, a context-bound AAD, a
+container version bump that **refuses v1**, a typed `VerifiedSender` unwrap gate,
+open-before-write, and grant-before-deposit — see
+[ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md), whose *Honest
+limits* section is as load-bearing as its *Decision*.
+
+⚠️ **The generalisable lesson: this was not a stale doc.** It was written
+alongside the code and was wrong the day it was written, because it described the
+*intent* of the flow rather than what the primitive underneath it does. No drift
+check would have caught it, because nothing drifted.
+
 **What vault sharing does NOT defend (be explicit):**
 
+- ⛔ **Sender authentication is CLASSICAL X25519 ONLY** ([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)).
+  ML-KEM has no static-static analogue, so the guarantees are **asymmetric**:
+  breaking **confidentiality** requires breaking **both** X25519 and ML-KEM-768;
+  forging **authenticity** requires breaking **X25519 alone**. A quantum
+  adversary could forge an envelope it still could not read. The authentication
+  is also **implicit and NON-TRANSFERABLE** — it is key confirmation, not a
+  signature, so the recipient cannot prove to a third party who sent it, and no
+  audit or dispute process can rest on an envelope.
 - ⭐ **First contact is still trust-on-first-use unless a human actually compares
   the safety number.** Pinning fixes the *second* and every later fetch; it cannot
   fix the first, because a server that lies the very first time gets its lie
@@ -668,8 +720,12 @@ server holds.
 
 ⭐ **`sigild` gained no concept of "recovery"**: no table, no migration
 (`sigild_schema_version` stays **5**), no new auth path. It sees one more device
-row, one more hybrid **public** key, and one more opaque ~1226-byte envelope per
-covered vault — shapes it already relayed. So **adversary classes 4 and 5 are
+row, one more hybrid **public** key, and one more opaque ~1.3 KiB envelope per
+covered vault — shapes it already relayed. (⚠️ Since Phase 60 that envelope is
+**not a fixed size**: it is `1244 + len(vault_id) + len(recipient_device_id) +
+len(sender_device_id)` bytes, because it carries its context AAD —
+[ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md). ⛔ A kit covered
+**before** Phase 60 must be **re-covered**; its old envelopes are refused.) So **adversary classes 4 and 5 are
 unchanged**: the server still cannot decrypt anything, and it holds nothing that
 would help someone forge or recover a kit.
 

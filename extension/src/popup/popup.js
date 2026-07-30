@@ -72,6 +72,15 @@ import {
   KeyPinMismatchError,
   UnverifiedRecoveryKitError,
   SafetyNumberMismatchError,
+  // Phase 60 — the AUTHENTICATED vault-key envelope. Both are REFUSALS with
+  // their own meaning: neither is a 401, a 403, or a changed key.
+  UnauthenticatedEnvelopeError,
+  UnknownSenderError,
+  // …and the other two halves of the CLI's five-step accept, which this popup
+  // was missing entirely: a key that opens NOTHING, and one that would silently
+  // REPLACE a key this browser already depends on.
+  VaultKeyDoesNotOpenError,
+  VaultKeyReplacementError,
 } from "../../vendor/sharing.mjs";
 // THE RECOVERY KIT (ADR 0042). Same vendored module the webapp imports; this
 // file adds no cryptography and no codec of its own.
@@ -386,6 +395,97 @@ function authErr(e) {
 function sharingErr(e) {
   const status = e && typeof e.status === "number" ? e.status : 0;
   return status >= 400 ? explainSharingStatus(status) : err(e);
+}
+
+/**
+ * ⭐ PHASE 60 — THE ENVELOPE-AUTHENTICITY REFUSALS, rendered DISTINCTLY.
+ *
+ * An unauthenticated vault-key envelope is NOT a 401 (the request authenticated
+ * fine), NOT a 403 (nothing was forbidden) and NOT a pin mismatch (no key
+ * changed). It means the BYTES prove nothing about who produced them — anyone
+ * who could read this device's PUBLISHED hybrid public key could have minted
+ * them — so accepting one could install a vault key an attacker chose.
+ *
+ * Returns true when it handled the error (and told the user), like
+ * {@link showPinMismatch}.
+ */
+function showEnvelopeRefusal(e) {
+  const box = $("sharing-envelope-refusal");
+  const text = $("sharing-envelope-refusal-text");
+  if (e instanceof UnauthenticatedEnvelopeError) {
+    if (text) {
+      text.textContent =
+        `REFUSED — that vault-key envelope is NOT AUTHENTICATED (SIGILhyb version ` +
+        `${e.foundVersion}; a vault key must be version ${e.expectedVersion}). Nothing was opened ` +
+        `and no key was stored. This is NOT a sign-in problem and NOT a permission problem, and ` +
+        `no device's key changed: the envelope carries NO SENDER, so anyone who can read this ` +
+        `device's published hybrid public key could have minted it. Ask the owner to re-share.`;
+    }
+    if (box) box.hidden = false;
+    say("Accept REFUSED: that envelope is not authenticated. Nothing was opened.", "error");
+    return true;
+  }
+  if (e instanceof UnknownSenderError) {
+    if (text) {
+      text.textContent =
+        `REFUSED — nothing says which device deposited that vault key, so there is nothing to ` +
+        `authenticate it against. Nothing was opened and no key was stored. Type the sharing ` +
+        `device's id into "Accept from device id" and try again.`;
+    }
+    if (box) box.hidden = false;
+    say("Accept REFUSED: the depositing device is unknown. Nothing was opened.", "error");
+    return true;
+  }
+  // ⭐ STEP 4 of the CLI's accept_vault_key, which this popup did not have: the
+  // envelope authenticated fine, but the key inside opens NOTHING. Storing it
+  // would have been useless at best and would have DISPLACED the real key at
+  // worst (see the replacement branch below).
+  if (e instanceof VaultKeyDoesNotOpenError) {
+    if (text) {
+      text.textContent =
+        `REFUSED — that key does NOT open this vault. Nothing was opened and no key was stored. ` +
+        `The envelope WAS properly authenticated, so this is not a forgery the sender check can ` +
+        `name and not a permission problem: the key that came out simply does not decrypt this ` +
+        `vault's newest contents. Either it was deposited for a different vault, or the sender ` +
+        `ROTATED the key and has not pushed the re-sealed vault yet — ask them to push, then ` +
+        `accept again.`;
+    }
+    if (box) box.hidden = false;
+    say("Accept REFUSED: that key does not open this vault. Nothing was stored.", "error");
+    return true;
+  }
+  // ⭐ STEP 5. Everything checked out; what is refused is the OVERWRITE. Silently
+  // replacing is how a hostile deposit takes a vault away from a device that
+  // already had it — this browser may hold the last copy of the old key.
+  if (e instanceof VaultKeyReplacementError) {
+    if (text) {
+      text.textContent =
+        `REFUSED — that would REPLACE a different key this browser already holds for "${e.vaultId}" ` +
+        `(sha256 ${e.heldFingerprint}); the key offered is sha256 ${e.offeredFingerprint}. Nothing ` +
+        `was replaced. Overwriting would lose access to everything sealed under the key you have. ` +
+        `If the sender ROTATED the vault key that is exactly what you want: tick "Replace the key ` +
+        `I hold" and accept again. If they did not, someone deposited a key you did not ask for.`;
+    }
+    if (box) box.hidden = false;
+    const wrap = $("sharing-accept-replace-row");
+    if (wrap) wrap.hidden = false;
+    say("Accept REFUSED: it would replace a DIFFERENT key this browser holds.", "error");
+    return true;
+  }
+  return false;
+}
+
+function hideEnvelopeRefusal() {
+  const box = $("sharing-envelope-refusal");
+  if (box) box.hidden = true;
+  // ⭐ AND RE-ARM THE GUARD. A `--replace` opt-in that stayed ticked out of sight
+  // would silently authorize the NEXT accept — of a different vault, from a
+  // different sender — which is precisely the silent overwrite step 5 exists to
+  // stop. The caller reads the box BEFORE calling this.
+  const row = $("sharing-accept-replace-row");
+  if (row) row.hidden = true;
+  const box2 = $("sharing-accept-replace");
+  if (box2) box2.checked = false;
 }
 
 /**
@@ -930,6 +1030,26 @@ function sharingAuth() {
   return { ...device, baseUrl: $("sync-url").value.trim() };
 }
 
+/**
+ * ⭐ PHASE 60. A vault-key envelope is now AUTHENTICATED with the SENDING device's
+ * long-term hybrid secret, and the recipient checks it against the PUBLISHED
+ * public half — so wrapping a key requires this browser to have a hybrid identity
+ * AND to have published it. Before Phase 60 a wrap needed only the recipient's
+ * public key, which is exactly why anybody else could mint one. Create + publish
+ * on demand rather than failing with "publish first": the user did not choose to
+ * care about this.
+ *
+ * Returns the hybrid SECRET identity (never logged, never persisted in the clear
+ * — `persistDevice` re-seals it into the device-identity container).
+ */
+async function ensurePublishedHybrid() {
+  if (device.hybrid) return device.hybrid;
+  const hybrid = generateHybridIdentity();
+  await persistDevice({ ...device, hybrid });
+  await publishHybridKey(wasm, { ...sharingAuth(), hybrid });
+  return hybrid;
+}
+
 /** The vault id the Sharing panel operates on (shared with the Sync panel). */
 function sharingVaultId() {
   const id = $("sync-vault").value.trim();
@@ -984,12 +1104,20 @@ $("sharing-share").addEventListener("click", async () => {
     if (!key) throw new Error(`vault "${id}" is not shared yet — convert it to a shared vault first`);
     say("Wrapping the vault key and sharing…");
     hidePinMismatch();
+    hideEnvelopeRefusal();
     // shareVault goes through the PIN CHOKE POINT: an unchanged key proceeds, a
     // CHANGED key throws KeyPinMismatchError and nothing is wrapped or uploaded.
-    const res = await shareVault(wasm, auth, {
+    const hybrid = await ensurePublishedHybrid();
+    const res = await shareVault(wasm, { ...auth, hybrid }, {
       vaultId: id,
       recipientDeviceId: to,
       vaultKey: key,
+      // ⚠️ EXPLICIT, and it was MISSING. `requirePinStore` FAILS CLOSED, and a
+      // popup that has never pinned anything has no store — so the FIRST share
+      // from a fresh profile died with "a pin store is required" instead of
+      // pinning the recipient on first sight. Passing the empty store is the
+      // documented way to say "no pins yet"; it starts the check, not skips it.
+      pins: device.pins ?? newPinStore(),
       permission: $("sharing-permission").value === "write" ? "write" : "read",
       // Checked BEFORE anything is wrapped. Blank = not supplied; the wrap gate
       // still REFUSES a first-sight recovery kit without it.
@@ -1143,8 +1271,11 @@ $("sharing-rotate").addEventListener("click", async () => {
     const stored = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
     if (!stored) throw new Error("no sealed vault in this browser to rotate");
     say("Rotating the vault key and re-wrapping…");
-    const res = await rotateVaultKey(wasm, auth, {
+    const hybrid = await ensurePublishedHybrid();
+    const res = await rotateVaultKey(wasm, { ...auth, hybrid }, {
       vaultId: id,
+      // ⚠️ EXPLICIT for the same reason as the share above.
+      pins: device.pins ?? newPinStore(),
       recipientDeviceIds: recipients,
       sealedVault: base64ToBytes(stored),
       oldVaultKey: key,
@@ -1177,22 +1308,65 @@ $("sharing-accept").addEventListener("click", async () => {
     const auth = sharingAuth();
     const id = sharingVaultId();
     say("Collecting and unwrapping the shared vault key…");
-    const accepted = await acceptVault(wasm, auth, { vaultId: id });
-    // Seal the recovered key immediately, so a failed pull cannot lose it.
+    // ⚠️ READ THE OPT-IN BEFORE clearing the refusal — hideEnvelopeRefusal
+    // deliberately un-ticks the box so it can never authorize a LATER accept.
+    const replace = $("sharing-accept-replace").checked;
+    hideEnvelopeRefusal();
+    // ⭐ PHASE 60. This used to unwrap ANYTHING that decrypted to 32 bytes, from
+    // anybody — it fetched no hybrid key, so the pin store was never consulted
+    // on the accept path at all. It now resolves the DEPOSITING device (named
+    // here, else from this device's self-only envelope index), pin-checks that
+    // device's key, and refuses anything that is not an AUTHENTICATED version-2
+    // envelope bound to (this vault, this device, that sender).
+    const from = $("sharing-accept-from").value.trim();
+    const accepted = await acceptVault(wasm, auth, {
+      vaultId: id,
+      senderDeviceId: from || null,
+      expectedSafetyNumber: $("sharing-share-safety").value.trim() || null,
+      // ⚠️ EXPLICIT, because `requirePinStore` FAILS CLOSED. A browser that has
+      // only ever RECEIVED has never pinned anything, and an absent store is a
+      // caller bug rather than "everything is first-sight" — so the empty store
+      // has to be stated. Empty means the sender is first sight: honest TOFU,
+      // exactly like the CLI's empty pin file. It does not skip the check.
+      pins: device.pins ?? newPinStore(),
+      // ⭐ PHASE 60 SYMMETRY, steps 4 and 5 of the CLI's `accept_vault_key`.
+      // `heldKeys` FAILS CLOSED exactly like `pins`, and it is what stops an
+      // accept silently REPLACING a key this browser depends on; `replace` is
+      // the deliberate opt-in the refusal alert below offers. Both checks run
+      // INSIDE acceptVault — this call site only supplies the facts it alone
+      // knows, so the control cannot be lost by forgetting it here.
+      heldKeys: device.vaultKeys ?? {},
+      replace,
+    });
+    // Seal the recovered key immediately, so a failed pull cannot lose it — and
+    // the newly-pinned SENDER with it, or the next accept treats that device as
+    // first sight all over again. By this point acceptVault has already PROVED
+    // the key opens the vault (or that there is nothing to open) and that it is
+    // not quietly displacing another.
     await persistDevice({
       ...device,
       vaultKeys: { ...(device.vaultKeys ?? {}), [id]: accepted.vaultKey },
+      pins: accepted.pins,
     });
+    $("sharing-safety-number").textContent =
+      `Sender ${accepted.senderDeviceId} (${accepted.senderTrust}): ${accepted.senderSafetyNumber}`;
 
-    const ops = await pullContainersAuthed(wasm, device, auth.baseUrl, id, 0);
-    if (ops.length === 0) {
+    const replacedNote = accepted.replaced
+      ? ` It REPLACED the key sha256 ${accepted.replaced} this browser held — anything sealed ` +
+        `under that key and not re-sealed under this one is no longer readable here.`
+      : "";
+    // ⭐ No second pull. `acceptVault` already fetched the newest op to prove the
+    // key opens it, and hands those exact bytes back — so the vault is adopted
+    // from the container the check ran against, not from a later one.
+    if (!accepted.verifiedAgainstTip || !accepted.tipContainer) {
       say(
         `Accepted the vault key for "${id}" (sha256 ${accepted.fingerprint}) and sealed it locally, ` +
-          "but the server holds no vault yet — ask the owner to push.",
+          "but the server holds no vault yet — ask the owner to push." +
+          replacedNote,
       );
       return;
     }
-    const container = ops[ops.length - 1].container;
+    const container = accepted.tipContainer;
     const opened = openVault(wasm, accepted.vaultKey, container); // throws before storing
     await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(container) });
     vault = opened;
@@ -1202,9 +1376,13 @@ $("sharing-accept").addEventListener("click", async () => {
     render();
     say(
       `Accepted and opened the shared vault "${id}" — ${opened.entries.length} account(s). ` +
-        `Key sha256 ${accepted.fingerprint}: compare it with the sender out of band.`,
+        `Key sha256 ${accepted.fingerprint}: compare it with the sender out of band. ` +
+        `AUTHENTICATED as coming from ${accepted.senderDeviceId} (${accepted.senderTrust}).` +
+        replacedNote,
     );
   } catch (e) {
+    if (showEnvelopeRefusal(e)) return;
+    if (showPinMismatch(e)) return;
     say(`Accept failed: ${sharingErr(e)}`, "error");
   }
 });
@@ -1222,6 +1400,24 @@ $("sharing-accept").addEventListener("click", async () => {
 function recoveryErr(e) {
   const status = e && typeof e.status === "number" ? e.status : 0;
   if (status >= 400) return explainRecoveryStatus(status);
+  // ⭐ PHASE 60, said in its own words on the recovery path too: an envelope
+  // that proves nothing about who produced it is neither a 401 nor a 403 nor a
+  // changed key, and it must never be collapsed into a generic failure.
+  if (e instanceof UnauthenticatedEnvelopeError) {
+    return (
+      `That vault-key envelope is NOT AUTHENTICATED (SIGILhyb version ${e.foundVersion}; a vault ` +
+      `key must be version ${e.expectedVersion}). It carries no sender, so anyone who could read ` +
+      "this kit's published hybrid public key could have minted it — accepting it would install a " +
+      "vault key an attacker chose. Nothing was opened and nothing was stored. Ask the vault's " +
+      "owner to re-issue the kit's envelopes (sigil recovery cover, or Cover in the app)."
+    );
+  }
+  if (e instanceof UnknownSenderError) {
+    return (
+      "Nothing says which device deposited that vault key, so there is nothing to authenticate it " +
+      "against. Nothing was opened and nothing was stored."
+    );
+  }
   const text = err(e);
   if (/unsupported recovery kit version/i.test(text)) {
     return (
@@ -1282,7 +1478,8 @@ $("recovery-generate").addEventListener("click", async () => {
       vaultKey,
     }));
     const pins = device.pins ?? newPinStore();
-    const res = await generateRecoveryKit(wasm, auth, { vaultKeys, pins });
+    const hybrid = await ensurePublishedHybrid();
+    const res = await generateRecoveryKit(wasm, { ...auth, hybrid }, { vaultKeys, pins });
     // Persist the DERIVED pin (and nothing else) inside the sealed container.
     await persistDevice({ ...device, pins: res.pins });
 
@@ -1352,7 +1549,8 @@ $("recovery-cover").addEventListener("click", async () => {
     }
     $("recovery-unverified").hidden = true;
     say("Wrapping this vault's key to the kit…");
-    const res = await coverVault(wasm, auth, {
+    const hybrid = await ensurePublishedHybrid();
+    const res = await coverVault(wasm, { ...auth, hybrid }, {
       kitDeviceId: to,
       vaultId: id,
       vaultKey: key,
@@ -1522,7 +1720,11 @@ $("restore-form").addEventListener("submit", async (ev) => {
     // derived key and never asks the server for one.
     const vaultKeys = {};
     for (const v of res.vaults) vaultKeys[v.vaultId] = v.vaultKey;
-    const pins = newPinStore();
+    // ⭐ PHASE 60: start from the store the restore itself built. Every envelope
+    // it opened was AUTHENTICATED against its depositing device's key, and that
+    // key was pinned in the process — dropping it here would make each of those
+    // senders first-sight all over again on the next accept.
+    const pins = res.pins ?? newPinStore();
     await pinDerivedKey(pins, res.deviceId, hybridPublicIdentity(wasm, res.identity.hybrid));
 
     password = pw;

@@ -19,8 +19,8 @@ use sigil_cli::{
     new_totp_entry, open_container, open_vault, parse_otpauth_uri, publish_hybrid_key,
     pull_ops_auth, push_op_auth, put_key_envelope, read_cursor, revoke_device, save_hybrid_public,
     save_hybrid_secret, save_key, seal_to_container, seal_vault, share_vault_to_known_key,
-    totp_algorithm_from_str, unwrap_vault_key, vault_key_fingerprint, wrap_vault_key, write_cursor,
-    CliError, DeviceIdentity, ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE,
+    totp_algorithm_from_str, vault_key_fingerprint, wrap_vault_key, write_cursor, CliError,
+    DeviceIdentity, ImportedOtp, RequestAuth, TotpEntry, TotpVault, PULL_STATE_FILE,
     TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD, VAULT_KEYRING_FILE,
 };
 // Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
@@ -34,6 +34,10 @@ use sigil_cli::{
 // ownership key off, so a second device inherits both. Every call rides the
 // EXISTING contract v3 request path: no new signed message, no new header.
 use sigil_cli::{create_account_invite, get_account, list_account_invites, revoke_account_invite};
+// Phase 60 — the AUTHENTICATED vault-key envelope. A wrap now needs the SENDING
+// device's hybrid SECRET (it authenticates the envelope), and an unwrap needs
+// the sending device's PUBLIC key through the `VerifiedSender` gate.
+use sigil_cli::{accept_vault_key, SenderIdentity, VaultKeyWrapContext};
 use sigil_core::Argon2Params;
 // Phase 54 — THE RECOVERY KIT. All of it lives in the sigil-cli LIBRARY so the
 // desktop app gets the same semantics by calling the same functions (ADR 0037),
@@ -176,10 +180,14 @@ USAGE:
                                          DANGEROUS. Accept a CHANGED hybrid key for a device. Only
                                          after verifying the NEW safety number out of band — a
                                          changed key may be a KEY-SUBSTITUTION ATTACK
-  sigil vault accept --vault <id> [--keyring <f>] [--key <f>] [--hybrid-key <f>]
+  sigil vault accept --vault <id> [--from <deviceID>] [--safety-number <digits>] [--replace]
+                     [--keyring <f>] [--pins <f>] [--key <f>] [--hybrid-key <f>]
                      [--server <url>] [--envelope-out <f>]
-                                         Collect the envelope addressed to THIS device, unwrap it,
-                                         and store the recovered vault key locally (0600)
+                                         Collect the envelope addressed to THIS device, verify it
+                                         came from the SENDING device (--from, else this device's
+                                         own envelope index), unwrap it, prove the key opens the
+                                         vault's newest op, and store it locally (0600).
+                                         --replace is required to overwrite a DIFFERENT key
   sigil vault list [--keyring <file>]    List vaults this device holds a key for (fingerprints only)
   sigil hybrid-keygen --out <file>       Generate a hybrid identity: secret <file> (0600) + shareable <file>.pub
   sigil hybrid-seal --recipient-pub <pubfile> --in <file> --out <file>
@@ -2100,6 +2108,16 @@ struct VaultFlags {
     /// trusting the registry instead is not acceptable for the one credential
     /// that reconstructs the whole account.
     safety_number: Vec<String>,
+    /// `accept` only (Phase 60): the device that DEPOSITED the envelope, whose
+    /// hybrid public key authenticates it. Omitted, it is read from this
+    /// device's own (self-only) envelope index — a server-supplied hint that
+    /// cannot be abused, because naming the wrong device just makes the AEAD
+    /// refuse.
+    from: Option<String>,
+    /// `accept` only (Phase 60): permit REPLACING a different vault key this
+    /// client already holds. Off by default, because a silent replacement is
+    /// how a hostile deposit takes a vault away from a device that had it.
+    replace: bool,
 }
 
 fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
@@ -2141,7 +2159,9 @@ fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
                     .ok_or_else(|| "--safety-number requires a value".to_string())?;
                 f.safety_number.push(v);
             }
+            "--from" => set_once(&mut f.from, &mut it, "--from")?,
             "--publish" => f.publish = true,
+            "--replace" => f.replace = true,
             "--drop-all-others" => f.drop_all_others = true,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
@@ -2224,6 +2244,32 @@ fn sharing_identity(key: Option<String>) -> Result<(std::path::PathBuf, DeviceId
         ));
     }
     Ok((path, identity))
+}
+
+/// ⭐ Build the SENDER identity that every vault-key wrap now requires: this
+/// device's id plus its hybrid SECRET identity.
+///
+/// Since Phase 60 a vault-key envelope is AUTHENTICATED — the sender mixes its
+/// long-term X25519 secret into the KEM — so wrapping is no longer something a
+/// device can do with public material alone. A device that has never run
+/// `sigil device hybrid-publish` therefore cannot share, and is told so.
+fn sender_identity(
+    identity: &DeviceIdentity,
+    identity_path: &std::path::Path,
+    hybrid_key: Option<String>,
+) -> Result<SenderIdentity, String> {
+    let device_id = identity.device_id.clone().ok_or_else(|| {
+        "this identity has no device_id: run `sigil device enroll` first".to_string()
+    })?;
+    let secret_path = resolve_hybrid_path(hybrid_key, identity_path);
+    let secret = load_hybrid_secret(&secret_path).map_err(|e| {
+        format!(
+            "{e}\n  -> run `sigil device hybrid-publish` first: a vault-key envelope is \
+             AUTHENTICATED to the sending device, so this device must have a hybrid identity \
+             before it can wrap a key to anyone"
+        )
+    })?;
+    SenderIdentity::new(&device_id, secret).map_err(|e| e.to_string())
 }
 
 /// Write opaque envelope bytes to a 0600 file. They are ciphertext, but they are
@@ -2327,7 +2373,14 @@ fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
         // never asked, so there is no fetched answer to verify. Every wrap whose
         // recipient key came from the server goes through the gate (share,
         // rotate, cover, recovery generate); this one has no such input.
-        let envelope = wrap_vault_key(&public, &key).map_err(|e| e.to_string())?;
+        //
+        // It is still AUTHENTICATED and CONTEXT-BOUND: this device is both the
+        // sender and the recipient, so the envelope it deposits for itself is
+        // one only it could have produced.
+        let sender = sender_identity(&identity, &identity_path, f.hybrid_key.clone())?;
+        let ctx = VaultKeyWrapContext::new(&vault_id, &device_id, &device_id)
+            .map_err(|e| e.to_string())?;
+        let envelope = wrap_vault_key(&sender, &public, &ctx, &key).map_err(|e| e.to_string())?;
         let identity_opt = Some(identity);
         let auth = auth_for(&identity_opt);
         put_key_envelope(&server, &vault_id, &device_id, &envelope, &auth)
@@ -2377,7 +2430,12 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
     let server = resolve_server(f.server.clone());
     let keyring = resolve_keyring_path(f.keyring.clone());
 
-    let (_identity_path, identity) = sharing_identity(f.key.clone())?;
+    let (identity_path, identity) = sharing_identity(f.key.clone())?;
+    // ⭐ The SENDER identity. A vault-key envelope is authenticated to the device
+    // that deposits it, so this is resolved BEFORE any network call: a device
+    // without a hybrid identity must be told it cannot share, not discover it
+    // after a grant has already been made.
+    let sender = sender_identity(&identity, &identity_path, f.hybrid_key.clone())?;
     let identity_opt = Some(identity);
     let auth = auth_for(&identity_opt);
 
@@ -2426,9 +2484,16 @@ fn cmd_vault_share(f: &VaultFlags) -> Result<(), String> {
     // 2-4) ⭐ THE ONE wrap -> deposit -> grant path. It takes the VerifiedRecipient
     //      produced above, and `VerifiedRecipient` has no other constructor — so
     //      this call is unreachable with an unchecked key.
-    let envelope =
-        share_vault_to_known_key(&server, &vault_id, &recipient, &permission, &key, &auth)
-            .map_err(|e| explain_sharing_error(e, "sharing the vault (wrap, deposit, grant)"))?;
+    let envelope = share_vault_to_known_key(
+        &server,
+        &vault_id,
+        &recipient,
+        &permission,
+        &key,
+        &auth,
+        &sender,
+    )
+    .map_err(|e| explain_sharing_error(e, "sharing the vault (wrap, grant, deposit)"))?;
 
     if let Some(path) = &f.envelope_out {
         write_envelope_file(path, &envelope)?;
@@ -2463,9 +2528,12 @@ fn cmd_vault_accept(f: &VaultFlags) -> Result<(), String> {
         || f.drop_all_others
     {
         return Err(
-            "vault accept takes --vault/--keyring/--key/--hybrid-key/--server/--envelope-out/--for only"
+            "vault accept takes --vault/--keyring/--pins/--key/--hybrid-key/--server/--envelope-out/--for/--from/--safety-number/--replace only"
                 .to_string(),
         );
+    }
+    if f.safety_number.len() > 1 {
+        return Err("vault accept takes at most one --safety-number (the SENDER's)".to_string());
     }
     let vault_id = f
         .vault
@@ -2473,47 +2541,89 @@ fn cmd_vault_accept(f: &VaultFlags) -> Result<(), String> {
         .ok_or_else(|| "missing required --vault <id>".to_string())?;
     let server = resolve_server(f.server.clone());
     let keyring = resolve_keyring_path(f.keyring.clone());
+    let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
 
     let (identity_path, identity) = sharing_identity(f.key.clone())?;
     let device_id = identity.device_id.clone().expect("checked above");
     let identity_opt = Some(identity);
     let auth = auth_for(&identity_opt);
 
-    let addressee = f.addressee.clone().unwrap_or_else(|| device_id.clone());
-    let envelope = get_key_envelope(&server, &vault_id, &addressee, &auth)
-        .map_err(|e| explain_sharing_error(e, "collecting the key envelope"))?;
-
-    if let Some(path) = &f.envelope_out {
-        write_envelope_file(path, &envelope)?;
-    }
-
-    if addressee != device_id {
-        // Diagnostic path only: this device is not the addressee, so it holds no
-        // key that could open the envelope. Reaching here at all means the
-        // server failed to enforce the addressee rule.
-        return Err(format!(
-            "fetched {} bytes addressed to {addressee} — but this device is {device_id}, so the \
-             server should have refused with 403",
-            envelope.len()
-        ));
+    // The `--for` DIAGNOSTIC still short-circuits: it asks for someone else's
+    // envelope purely so the server's 403 is testable from outside, and it never
+    // unwraps anything.
+    if let Some(addressee) = f.addressee.clone() {
+        let envelope = get_key_envelope(&server, &vault_id, &addressee, &auth)
+            .map_err(|e| explain_sharing_error(e, "collecting the key envelope"))?;
+        if let Some(path) = &f.envelope_out {
+            write_envelope_file(path, &envelope)?;
+        }
+        if addressee != device_id {
+            return Err(format!(
+                "fetched {} bytes addressed to {addressee} — but this device is {device_id}, so \
+                 the server should have refused with 403",
+                envelope.len()
+            ));
+        }
     }
 
     let secret_path = resolve_hybrid_path(f.hybrid_key.clone(), &identity_path);
     let secret = load_hybrid_secret(&secret_path).map_err(|e| {
         format!("{e}\n  -> run `sigil device hybrid-publish` first so this device has a hybrid identity")
     })?;
-    let key = unwrap_vault_key(&secret, &envelope).map_err(|e| e.to_string())?;
-    keyring_put(&keyring, &vault_id, &key).map_err(|e| e.to_string())?;
+
+    // ⭐ THE UNWRAP GATE + OPEN-BEFORE-WRITING + the no-silent-replace rule, all
+    // inside one library call so the desktop app gets the identical semantics.
+    let report = accept_vault_key(
+        &server,
+        &vault_id,
+        &device_id,
+        &secret,
+        &keyring,
+        &pins,
+        &auth,
+        f.from.as_deref(),
+        f.safety_number.first().map(String::as_str),
+        f.replace,
+    )
+    .map_err(|e| explain_sharing_error(e, "accepting the vault key"))?;
+
+    if let Some(path) = &f.envelope_out {
+        write_envelope_file(path, &report.envelope)?;
+    }
 
     println!(
         "accepted vault {vault_id}\n  \
-         unwrapped the vault key with this device's hybrid secret identity\n  \
+         from device: {from}\n  \
+         key trust:   {trust}\n  \
+         safety no.:  {safety}\n  \
+         opened tip:  {tip}\n  \
          keyring:     {keyring} (mode 0600)\n  \
          key sha256:  {fp} (fingerprint only — the key is never printed)\n  \
          open it with: sigil totp list --vault <file> --vault-id {vault_id}",
+        from = report.sender_device_id,
+        trust = report.sender_trust.label(),
+        safety = report.sender_safety_number,
+        tip = if report.verified_against_tip {
+            "yes — the recovered key opens this vault's newest op"
+        } else {
+            "n/a — this vault has never been pushed, so there was nothing to open"
+        },
         keyring = keyring.display(),
-        fp = vault_key_fingerprint(&key),
+        fp = report.key_fingerprint,
     );
+    if let Some(old) = &report.replaced {
+        println!("  REPLACED a different key this client held (sha256 {old})");
+    }
+    if report.sender_trust.needs_out_of_band_check() {
+        eprintln!(
+            "warning: this is the FIRST time this client has seen {}'s hybrid key. The envelope\n  \
+             IS authenticated to that key — but on first contact a hostile server could have\n  \
+             served its own key AND forged the envelope under it. Confirm the safety number above\n  \
+             with that device's owner over a channel the server does NOT control, and re-run with\n  \
+             --safety-number \"<digits>\" to have it checked here.",
+            report.sender_device_id
+        );
+    }
     Ok(())
 }
 
@@ -2592,7 +2702,10 @@ fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
     let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
     let file = resolve_vault_path(f.file.clone());
 
-    let (_identity_path, identity) = sharing_identity(f.key.clone())?;
+    let (identity_path, identity) = sharing_identity(f.key.clone())?;
+    // Re-wrapping is a wrap: it needs this device's hybrid SECRET to authenticate
+    // every envelope it re-issues. Resolved before any state is touched.
+    let sender = sender_identity(&identity, &identity_path, f.hybrid_key.clone())?;
     let identity_opt = Some(identity);
     let auth = auth_for(&identity_opt);
 
@@ -2622,6 +2735,7 @@ fn cmd_vault_rotate(f: &VaultFlags) -> Result<(), String> {
         &safety_numbers,
         &auth,
         Argon2Params::RECOMMENDED,
+        &sender,
     )
     .map_err(|e| explain_sharing_error(e, "rotating the vault key"))?;
 
@@ -3598,7 +3712,10 @@ fn cmd_recovery_generate(f: &RecoveryFlags) -> Result<(), String> {
     let server = resolve_server(f.server.clone());
     let keyring = resolve_keyring_path(f.keyring.clone());
     let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
-    let (_identity_path, identity) = sharing_identity(f.key.clone())?;
+    let (identity_path, identity) = sharing_identity(f.key.clone())?;
+    // Covering a vault is a WRAP: the kit's envelopes are authenticated to this
+    // device, so its hybrid secret is required.
+    let sender = sender_identity(&identity, &identity_path, None)?;
     let identity_opt = Some(identity);
     let auth = auth_for(&identity_opt);
 
@@ -3616,7 +3733,7 @@ fn cmd_recovery_generate(f: &RecoveryFlags) -> Result<(), String> {
         f.vault.clone()
     };
 
-    let kit = recovery_generate(&server, &auth, &vaults, &keyring, &pins, None)
+    let kit = recovery_generate(&server, &auth, &vaults, &keyring, &pins, None, &sender)
         .map_err(|e| explain_recovery_error(e, "generating the recovery kit"))?;
 
     // The verification line comes FIRST, because it is the evidence that the
@@ -3848,7 +3965,9 @@ fn cmd_recovery_cover(f: &RecoveryFlags) -> Result<(), String> {
     let server = resolve_server(f.server.clone());
     let keyring = resolve_keyring_path(f.keyring.clone());
     let pins = resolve_pins_path(f.pins.clone(), f.keyring.clone());
-    let (_p, identity) = sharing_identity(f.key.clone())?;
+    let (identity_path, identity) = sharing_identity(f.key.clone())?;
+    // Covering is a WRAP, so it needs this device's hybrid secret.
+    let sender = sender_identity(&identity, &identity_path, None)?;
     let identity_opt = Some(identity);
     let auth = auth_for(&identity_opt);
 
@@ -3860,6 +3979,7 @@ fn cmd_recovery_cover(f: &RecoveryFlags) -> Result<(), String> {
         &keyring,
         &pins,
         f.safety_number.as_deref(),
+        &sender,
     )
     .map_err(|e| explain_recovery_error(e, "covering a vault with the recovery kit"))?;
 

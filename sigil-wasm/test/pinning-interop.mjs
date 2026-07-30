@@ -1,6 +1,6 @@
-// pinning-interop.mjs — THE PHASE 50 PROOF.
+// pinning-interop.mjs — THE PHASE 50 PROOF, plus PHASE 60's receiving half.
 //
-// Three claims, proven against a REAL sigild, the REAL `sigil` binary, and the
+// Four claims, proven against a REAL sigild, the REAL `sigil` binary, and the
 // REAL wasm. No mocks, no stubs, no hand-waving:
 //
 //   A. KEY PINNING DETECTS AND BLOCKS A KEY-SUBSTITUTION ATTACK. A MALICIOUS
@@ -24,6 +24,20 @@
 //      to [A, C], a NEW secret added to the vault is UNREADABLE with B's old key,
 //      B's envelope is gone from the server, and still-authorized C reads the new
 //      secret fine.
+//
+//   D. ⭐ PHASE 60 — THE UNWRAP GATE, i.e. the RECEIVING side, which had NO
+//      defence at all until that phase: `acceptVault` fetched no hybrid key, so
+//      the pin store was never consulted when a vault key ARRIVED. Section 7
+//      drives the REAL `acceptVault` against the SAME malicious proxy, now
+//      substituting the SENDER's key AND the deposited envelope, and shows that
+//      first sight pins-and-proceeds (ADR 0038 TOFU, stated as a limit and
+//      demonstrated), a wrong supplied safety number is refused while pinning
+//      nothing, and a CHANGED sender key is a hard KeyPinMismatchError.
+//      ⚠️ It exists because that gate had NO TEST IN EITHER LANGUAGE: deleting
+//      the safety-number comparison and the `checkAndPin` call from
+//      `verifySenderForUnwrap` left every suite in the repo green while a
+//      hostile key was installed in a victim's keyring. Both mutations were run
+//      against this section; both go RED.
 //
 // And the deliberate escape hatch: a LEGITIMATE re-enrolment also trips the alarm
 // (it is indistinguishable from an attack), a re-pin with the WRONG safety number
@@ -52,8 +66,12 @@ import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { resolveGo } from "./go-helper.mjs";
 
-import { generateDeviceSeed, enrollDevice } from "../device-auth.mjs";
+import { generateDeviceSeed, enrollDevice, pullContainersAuthed } from "../device-auth.mjs";
 import {
+  acceptVault,
+  wrapVaultKey,
+  SafetyNumberMismatchError,
+  TRUST_UNVERIFIED_FIRST_SIGHT,
   generateHybridIdentity,
   hybridPublicIdentity,
   publishHybridKey,
@@ -70,7 +88,14 @@ import {
   repinHybridKey,
   KeyPinMismatchError,
   generateVaultKey,
+  vaultKeyFingerprint,
   SAFETY_NUMBER_GROUPS,
+  // ⭐ PHASE 60 SYMMETRY — steps 4 and 5 of the CLI's five-step accept, which the
+  // browser clients did not have until this phase. Section 7 drives both.
+  verifySenderForUnwrap,
+  unwrapVaultKey,
+  VaultKeyDoesNotOpenError,
+  VaultKeyReplacementError,
 } from "../sharing.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -279,6 +304,24 @@ http
               headers["content-length"] = String(payload.length);
               delete headers["transfer-encoding"];
             }
+            // ⭐ PHASE 60. A key-substituting server that ONLY swaps the hybrid
+            // key achieves nothing now: the envelope still authenticates to the
+            // REAL sender, so the AEAD refuses it. The attack that actually
+            // works is to swap the key AND deposit an envelope minted under it —
+            // so the proxy must be able to rewrite the envelope body too, or the
+            // unwrap-gate test would "pass" for the wrong reason.
+            if (
+              a.on &&
+              a.envelopePath &&
+              req.method === "GET" &&
+              req.url === a.envelopePath &&
+              upRes.statusCode === 200
+            ) {
+              payload = Buffer.from(a.envelopeB64, "base64");
+              headers["content-type"] = "application/octet-stream";
+              headers["content-length"] = String(payload.length);
+              delete headers["transfer-encoding"];
+            }
             // No keep-alive through the proxy: this test blocks the Node event
             // loop for seconds at a time running the real CLI (execFileSync), so
             // a pooled idle socket would go stale and the next fetch would fail
@@ -370,6 +413,10 @@ http
     seed: seedJs,
     hybrid: hybridJs,
     pins: newPinStore(),
+    // ⭐ PHASE 60 SYMMETRY: `acceptVault`'s never-silently-replace check reads the
+    // keys this client already holds, and FAILS CLOSED like `pins`. Section 7
+    // overrides it per call.
+    vaultKeys: {},
   };
   await publishHybridKey(wasm, authJs, hybridJs);
   console.log(`  (1) OK: enrolled A=${ids.A} B=${ids.B} C=${ids.C} JS=${devJs.deviceId}`);
@@ -745,7 +792,11 @@ http
   sigil("A", ["push", "--vault", VAULT, "--in", vaultFile]);
 
   // C — still authorized — re-accepts the NEW key, pulls, and reads the new secret.
-  sigil("C", ["vault", "accept", "--vault", VAULT]);
+  // ⭐ `--replace` is REQUIRED from Phase 60 on: C already holds the PRE-rotation
+  // key, and accepting a DIFFERENT one for a vault you already hold is exactly
+  // how a hostile deposit would take a vault away from a device that had it. The
+  // refusal is the default; overwriting must be stated.
+  sigil("C", ["vault", "accept", "--vault", VAULT, "--replace"]);
   sigil("C", ["pull", "--vault", VAULT, "--out-dir", inboxC]);
   // The pull is INCREMENTAL, so take the highest op-N C has ever pulled rather
   // than assuming a sequence number.
@@ -883,6 +934,335 @@ http
       `        safety number; the pin store records the re-pin (Rust and JS agree)`,
   );
 
+  // =====================================================================
+  // 7. ⭐⭐ PHASE 60 — THE UNWRAP GATE, i.e. the RECEIVING side.
+  // =====================================================================
+  //
+  // Sections 1-6 prove the WRAP side: this client will not hand a vault key to
+  // a substituted recipient key. That is only half the problem, and until Phase
+  // 60 the other half was undefended — `acceptVault` fetched NO hybrid key at
+  // all, so the pin store was never consulted when a key ARRIVED. Anyone
+  // holding the recipient's PUBLISHED public key could mint an envelope and
+  // install a vault key of their choosing.
+  //
+  // ⚠️ AND THE FIX HAD NO TEST. Deleting the safety-number comparison and the
+  // `checkAndPin` call from `verifySenderForUnwrap` left every suite in this
+  // repository green, while a rewriting proxy installed a hostile key in the
+  // victim's keyring. So this section drives the REAL `acceptVault` — the
+  // function the webapp and the extension call — against the SAME malicious
+  // proxy, and it must go RED if either half of that gate is removed.
+  //
+  // The attack modelled here is the strong one: the server swaps the SENDER's
+  // published hybrid key AND replaces the deposited envelope with one minted
+  // under it. Swapping only the key achieves nothing (the AEAD refuses), which
+  // is why the proxy learned to rewrite envelope bodies above.
+  {
+    const jsRecipientPub = hybridPublicIdentity(wasm, hybridJs);
+    const authJsDirect = { ...authJs, baseUrl: direct };
+
+    // A shares the (post-rotation) vault to the JS device, so there is a real
+    // envelope, deposited by a real sender, sitting in a real mailbox.
+    sigil("A", [
+      "vault",
+      "share",
+      "--vault",
+      VAULT,
+      "--to",
+      devJs.deviceId,
+      "--permission",
+      "read",
+    ]);
+
+    // --- 7a. FIRST SIGHT: pinned, reported as unverified, and ACCEPTED. -----
+    // ⚠️ THE RESIDUAL LIMIT, ASSERTED SO IT CANNOT SILENTLY INVERT. ADR 0038's
+    // accepted trust-on-first-use applies to the unwrap side too: a sender this
+    // client has never seen is PINNED and the accept PROCEEDS, with the trust
+    // level saying plainly that nothing was verified out of band. A build that
+    // refused first contact and waved changes through would be worse than
+    // useless, and neither half alone would notice the swap.
+    const pinsAfterFirstSight = newPinStore();
+    const firstAccept = await acceptVault(
+      wasm,
+      { ...authJsDirect, pins: pinsAfterFirstSight },
+      { vaultId: VAULT, senderDeviceId: ids.A },
+    );
+    assert(
+      firstAccept.senderTrust === TRUST_UNVERIFIED_FIRST_SIGHT,
+      `first sight of a SENDER must be reported as unverified first sight, got ` +
+        `${firstAccept.senderTrust}`,
+    );
+    assert(
+      firstAccept.senderSafetyNumber === aNumberJs,
+      "the accept must report the SENDER's safety number so a human can compare it",
+    );
+    assert(firstAccept.vaultKey.length === 32, "the recovered vault key must be 32 bytes");
+    assert(
+      pinsAfterFirstSight.pins[ids.A]?.safety_number === aNumberJs,
+      "⚠️ FIRST SIGHT DID NOT PIN THE SENDER — every later key change would then be " +
+        "a first sight too, and the unwrap gate could never fire",
+    );
+
+    // POSITIVE CONTROL: the key an honest accept produced really opens the
+    // vault. Without this, "everything is refused" would read as a pass.
+    const pulled = await pullContainersAuthed(
+      wasm,
+      { deviceId: devJs.deviceId, seed: seedJs },
+      direct,
+      VAULT,
+      0,
+    );
+    assert(pulled.length > 0, "expected the shared vault to have at least one op");
+    const openedByJs = Buffer.from(
+      wasm.open_container(firstAccept.vaultKey, pulled[pulled.length - 1].container),
+    ).toString("utf8");
+    assert(
+      openedByJs.includes("post-rotation"),
+      "the accepted key must actually OPEN the vault — otherwise the refusals below " +
+        "prove nothing",
+    );
+
+    // --- 7b. A WRONG SUPPLIED SAFETY NUMBER IS A HARD STOP, pinning nothing. -
+    const pinsUnused = newPinStore();
+    let numberRefusal = null;
+    try {
+      await acceptVault(
+        wasm,
+        { ...authJsDirect, pins: pinsUnused },
+        {
+          vaultId: VAULT,
+          senderDeviceId: ids.A,
+          expectedSafetyNumber: "00000 00000 00000 00000 00000 00000",
+        },
+      );
+    } catch (e) {
+      numberRefusal = e;
+    }
+    assert(
+      numberRefusal instanceof SafetyNumberMismatchError,
+      `⚠️ THE SAFETY-NUMBER CHECK DID NOT FIRE on the unwrap side; got ` +
+        `${numberRefusal && numberRefusal.name}`,
+    );
+    assert(
+      Object.keys(pinsUnused.pins).length === 0,
+      "a REFUSED key must not be pinned — pinning it would let the retry report a " +
+        "Match and the alarm would never fire again",
+    );
+
+    // --- 7c. ⭐⭐ THE ATTACK. Substituted sender key + forged envelope. ------
+    const impostorHybrid = generateHybridIdentity();
+    const impostorPublic = hybridPublicIdentity(wasm, impostorHybrid);
+    const attackerChosenKey = generateVaultKey();
+    // The attacker mints an envelope AS device A, under ITS OWN keys, with the
+    // CORRECT context — so the only lie is the key the server serves.
+    const forgedEnvelope = wrapVaultKey(
+      wasm,
+      { deviceId: ids.A, hybrid: impostorHybrid },
+      jsRecipientPub,
+      { vaultId: VAULT, recipientDeviceId: devJs.deviceId, senderDeviceId: ids.A },
+      attackerChosenKey,
+    );
+    setAttack({
+      on: true,
+      victim: ids.A, // whose PUBLISHED key gets swapped
+      x25519: b64(impostorPublic.x25519PublicKey),
+      mlkem: b64(impostorPublic.mlkemEncapsKey),
+      envelopePath: `/v1/vaults/${VAULT}/keys/${devJs.deviceId}`,
+      envelopeB64: Buffer.from(forgedEnvelope).toString("base64"),
+    });
+
+    const authJsProxy = { ...authJs, baseUrl: base };
+    // Sanity: the substitution is actually happening.
+    const servedA = await fetchHybridKey(wasm, authJsProxy, ids.A);
+    assert(
+      (await safetyNumber(ids.A, servedA)) !== aNumberJs,
+      "the malicious proxy is NOT substituting the sender's key — the test would " +
+        "prove nothing",
+    );
+
+    // ⚠️ THE HONEST CONTROL, and the residual limit in one assertion: at the
+    // CRYPTOGRAPHIC layer, with an EMPTY pin store, the attack SUCCEEDS. First
+    // contact cannot be protected by pinning alone (ADR 0038), and stating it
+    // here proves the refusals below are the gates doing the work rather than
+    // some unrelated failure.
+    const virginPins = newPinStore();
+    const swappedSender = await verifySenderForUnwrap(wasm, authJsProxy, ids.A, {
+      pins: virginPins,
+    });
+    const tofuKey = unwrapVaultKey(
+      wasm,
+      hybridJs,
+      swappedSender,
+      { vaultId: VAULT, recipientDeviceId: devJs.deviceId, senderDeviceId: ids.A },
+      forgedEnvelope,
+    );
+    assert(
+      bytesEqual(tofuKey, attackerChosenKey),
+      "the attack is not actually live — an unwrap with NO pin should have yielded the " +
+        "attacker's key, so the refusals below would prove nothing",
+    );
+
+    // --- 7d. ⭐⭐ STEP 4: OPEN BEFORE RETURNING — DEFENCE IN DEPTH. -----------
+    // The attacker's key is a valid 32-byte key that AUTHENTICATES perfectly
+    // (the sender's key was swapped, so the AEAD is happy) and that a virgin pin
+    // store has no reason to doubt. What it cannot do is OPEN THE VAULT. Until
+    // Phase 60's symmetry fix, the browsers had no such check — `acceptVault`
+    // went straight from unwrap to return, and the webapp and the extension
+    // sealed the attacker's key into their device identity, DISPLACING the real
+    // one. This is the first-contact case pinning provably cannot catch, so the
+    // fact that step 4 catches it is the whole point of mirroring the CLI.
+    let openRefusal = null;
+    try {
+      await acceptVault(
+        wasm,
+        { ...authJsProxy, pins: newPinStore() },
+        { vaultId: VAULT, senderDeviceId: ids.A, heldKeys: {} },
+      );
+    } catch (e) {
+      openRefusal = e;
+    }
+    assert(
+      openRefusal instanceof VaultKeyDoesNotOpenError,
+      `⚠️ STEP 4 DID NOT FIRE — a key that opens NOTHING was returned to be persisted, ` +
+        `on the exact first-contact path pinning cannot protect. Got ` +
+        `${openRefusal && openRefusal.name}`,
+    );
+    assert(
+      openRefusal.vaultId === VAULT,
+      "VaultKeyDoesNotOpenError must name the vault so a UI can say which one",
+    );
+
+    // ⭐ AND WITH THE SENDER PINNED, IT IS A HARD STOP.
+    let unwrapRefusal = null;
+    try {
+      await acceptVault(
+        wasm,
+        { ...authJsProxy, pins: pinsAfterFirstSight },
+        { vaultId: VAULT, senderDeviceId: ids.A },
+      );
+    } catch (e) {
+      unwrapRefusal = e;
+    }
+    assert(
+      unwrapRefusal instanceof KeyPinMismatchError,
+      `⚠️ THE UNWRAP GATE DID NOT FIRE — a substituted sender key installed an ` +
+        `attacker-chosen vault key. Got ${unwrapRefusal && unwrapRefusal.name}`,
+    );
+    assert(
+      unwrapRefusal.deviceId === ids.A &&
+        unwrapRefusal.pinnedSafetyNumber === aNumberJs &&
+        unwrapRefusal.presentedSafetyNumber !== aNumberJs,
+      "KeyPinMismatchError must carry the device and BOTH safety numbers so the UI " +
+        "can show a human what changed",
+    );
+    assert(
+      pinsAfterFirstSight.pins[ids.A].safety_number === aNumberJs,
+      "a refused unwrap must NOT re-pin — a retry would then see a Match",
+    );
+
+    setAttack({ on: false });
+
+    // --- 7e. ⭐⭐ STEP 5: NEVER SILENTLY REPLACE. -----------------------------
+    // With the attack off, the genuine envelope unwraps to the genuine key. The
+    // question this step answers is what happens when the client ALREADY HOLDS a
+    // key for that vault. Until Phase 60's symmetry fix the browsers overwrote
+    // it unconditionally (`vaultKeys: { ...device.vaultKeys, [id]: accepted }`),
+    // so a deposit nobody asked for could take a vault away from the only device
+    // that could still open it — the old key is the only thing that opens
+    // everything sealed under it, and this client may hold the last copy.
+    const realKey = firstAccept.vaultKey;
+    const strandedKey = generateVaultKey();
+
+    // (i) A DIFFERENT held key is a HARD STOP, and it names both fingerprints.
+    let replaceRefusal = null;
+    try {
+      await acceptVault(
+        wasm,
+        { ...authJsDirect, pins: pinsAfterFirstSight },
+        { vaultId: VAULT, senderDeviceId: ids.A, heldKeys: { [VAULT]: strandedKey } },
+      );
+    } catch (e) {
+      replaceRefusal = e;
+    }
+    assert(
+      replaceRefusal instanceof VaultKeyReplacementError,
+      `⚠️ STEP 5 DID NOT FIRE — an accept silently REPLACED a different key this client ` +
+        `already held. Got ${replaceRefusal && replaceRefusal.name}`,
+    );
+    assert(
+      replaceRefusal.vaultId === VAULT &&
+        replaceRefusal.heldFingerprint === (await vaultKeyFingerprint(strandedKey)) &&
+        replaceRefusal.offeredFingerprint === (await vaultKeyFingerprint(realKey)),
+      "VaultKeyReplacementError must carry the vault and BOTH fingerprints so a human can " +
+        "see what would be swapped — without either key being printed",
+    );
+
+    // (ii) The SAME key is not a replacement at all — a re-accept is idempotent.
+    const reAccept = await acceptVault(
+      wasm,
+      { ...authJsDirect, pins: pinsAfterFirstSight },
+      { vaultId: VAULT, senderDeviceId: ids.A, heldKeys: { [VAULT]: realKey } },
+    );
+    assert(
+      reAccept.replaced === null && bytesEqual(reAccept.vaultKey, realKey),
+      "re-accepting the SAME key must not be reported as a replacement",
+    );
+
+    // (iii) The EXPLICIT opt-in is the only door, and it REPORTS what it did.
+    const replaced = await acceptVault(
+      wasm,
+      { ...authJsDirect, pins: pinsAfterFirstSight },
+      {
+        vaultId: VAULT,
+        senderDeviceId: ids.A,
+        heldKeys: { [VAULT]: strandedKey },
+        replace: true,
+      },
+    );
+    assert(
+      replaced.replaced === (await vaultKeyFingerprint(strandedKey)),
+      "an opted-in replacement must report the fingerprint of the key it displaced, so a " +
+        "user is told what they just lost access to",
+    );
+
+    // (iv) …and the keyring FAILS CLOSED, like the pin store. A caller that
+    //      forgets it must be a loud error, never "this client holds nothing" —
+    //      that silent default is precisely how a security check becomes a no-op.
+    let closedRefusal = null;
+    try {
+      await acceptVault(
+        wasm,
+        { baseUrl: direct, deviceId: devJs.deviceId, seed: seedJs, hybrid: hybridJs },
+        { vaultId: VAULT, senderDeviceId: ids.A, pins: pinsAfterFirstSight },
+      );
+    } catch (e) {
+      closedRefusal = e;
+    }
+    assert(
+      closedRefusal && /already holds/.test(closedRefusal.message),
+      `⚠️ heldKeys DID NOT FAIL CLOSED — an absent keyring silently disabled step 5. ` +
+        `Got ${closedRefusal && closedRefusal.message}`,
+    );
+
+    // (v) POSITIVE CONTROL: step 4 also PASSES on an honest accept, so "everything
+    //     is refused" cannot read as a pass.
+    assert(
+      firstAccept.verifiedAgainstTip === true && firstAccept.tipContainer !== null,
+      "an honest accept must report that the key was PROVED against the vault's newest op, " +
+        "and hand those exact bytes back so the caller does not pull again",
+    );
+
+    console.log(
+      "  (7) OK: ⭐ THE UNWRAP GATE — first sight of a SENDER pins, warns and proceeds\n" +
+        "        (ADR 0038 TOFU, and at the crypto layer the substituted key IS taken);\n" +
+        "        a wrong supplied safety number is refused and pins nothing; a CHANGED\n" +
+        `        sender key is KeyPinMismatchError — ${unwrapRefusal.presentedSafetyNumber}\n` +
+        `        served for ${ids.A}, ${aNumberJs} pinned — with the pin store unmutated;\n` +
+        "        ⭐ STEP 4 refuses a key that OPENS NOTHING (the first-contact case pinning\n" +
+        "        cannot catch) and STEP 5 refuses to REPLACE a different held key without an\n" +
+        "        explicit opt-in, with the keyring failing CLOSED when absent",
+    );
+  }
+
   // A last belt-and-braces check that the digest itself is stable.
   const digest = await hybridSafetyDigest("dev_KAT", {
     x25519PublicKey: katX,
@@ -891,13 +1271,21 @@ http
   assert(renderSafetyNumber(digest) === SAFETY_NUMBER_KAT, "digest -> render round trip");
 
   console.log(
-    "\nPASS — Phase 50:\n" +
+    "\nPASS — Phase 50 + Phase 60:\n" +
       "  * a MALICIOUS SERVER substituting a hybrid public key is DETECTED and BLOCKED in\n" +
       "    both the CLI and the browser client, and the vault key was never wrapped to it;\n" +
       "  * SAFETY NUMBERS are byte-identical in Rust and JS (single + order-independent\n" +
       "    pairwise), and different keys give different numbers;\n" +
       "  * ROTATION makes post-rotation content unreadable to a revoked device while a\n" +
-      "    still-authorized device reads it — FUTURE content only, by design.",
+      "    still-authorized device reads it — FUTURE content only, by design;\n" +
+      "  * ⭐ THE UNWRAP GATE holds on the RECEIVING side: the real acceptVault refuses a\n" +
+      "    CHANGED sender key and a wrong safety number without mutating the pin store,\n" +
+      "    while first sight is honestly reported as unverified TOFU;\n" +
+      "  * ⭐ AND THE JS ACCEPT IS SYMMETRIC WITH THE CLI'S FIVE STEPS: a recovered key that\n" +
+      "    OPENS NOTHING is refused (VaultKeyDoesNotOpenError) — which is what catches the\n" +
+      "    first-contact substitution pinning provably cannot — and one that would REPLACE a\n" +
+      "    different held key needs an explicit opt-in (VaultKeyReplacementError), with the\n" +
+      "    keyring failing CLOSED when a caller forgets to pass it.",
   );
 } catch (e) {
   console.error(e && e.stack ? e.stack : String(e));

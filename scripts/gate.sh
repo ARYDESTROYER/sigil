@@ -162,12 +162,34 @@ if ! command -v cargo-audit >/dev/null 2>&1; then
       Install it (this is the same check CI runs on all four lockfiles):
         cargo install cargo-audit --locked"
 else
+  # ⚠️ RUN THE SCAN ONCE, AND TELL "found something" APART FROM "could not run".
+  # The first version of this loop ran `cargo audit` a SECOND time just to build
+  # the failure message, doubling the number of advisory-database fetches and so
+  # doubling the chance of a transient. Worse, its message grepped only for
+  # `^(Crate|ID|Warning|Title|error):`, which a git fetch error does not match —
+  # so a network blip printed `✗ cargo audit sigil-wasm:` with an EMPTY reason,
+  # indistinguishable from a real advisory. Observed three times in one session;
+  # a full gate needed three attempts to go green. A gate that intermittently
+  # invents a security finding gets ignored exactly like the always-red
+  # cargo-audit job this block was written to replace.
   for m in libsigil cli sigil-wasm desktop; do
-    if (cd "$m" && cargo audit --deny warnings >/dev/null 2>&1); then
+    out=$(cd "$m" && cargo audit --deny warnings 2>&1)
+    if [ $? -eq 0 ]; then
       ok "cargo audit $m (0 vulns, 0 unacknowledged warnings)"
-    else
+    elif printf '%s' "$out" | grep -qE '^(Crate|ID):'; then
+      # Real finding rows are present — this is a genuine result.
       bad "cargo audit $m:
-$( (cd "$m" && cargo audit --deny warnings 2>&1) | grep -E '^(Crate|ID|Warning|Title|error):' | sed 's/^/      /')"
+$(printf '%s' "$out" | grep -E '^(Crate|ID|Warning|Title|error):' | sed 's/^/      /')"
+    else
+      # Non-zero with no finding rows means the scan never completed. Retry once
+      # against the CACHED database (-n skips the git fetch, the flaky part).
+      out=$(cd "$m" && cargo audit --deny warnings -n 2>&1)
+      if [ $? -eq 0 ]; then
+        ok "cargo audit $m (cached advisory DB — the fetch failed, the scan did not)"
+      else
+        bad "cargo audit $m COULD NOT RUN — this is not a finding, the scan failed to complete:
+$(printf '%s' "$out" | tail -4 | sed 's/^/      /')"
+      fi
     fi
   done
 fi
@@ -226,16 +248,28 @@ corepack pnpm --filter webapp build >/dev/null 2>&1 && ok "webapp build" || bad 
 # is silent on a healthy run. (`retries: 0` in playwright.config.ts means there is
 # no "flaky" line to worry about — a suite that needs a second attempt is a suite
 # whose failures get ignored.)
-pw() { # $1 = label, $2 = tail output
+pw() { # $1 = label, $2 = captured tail of the playwright run
   if printf '%s' "$2" | grep -qE "failed|did not run"; then bad "$1: $2"
   elif printf '%s' "$2" | grep -q "skipped"; then bad "$1 SKIPPED tests: $2"
-  else ok "$1: $(printf '%s' "$2" | grep -oE '[0-9]+ passed')"; fi
+  else
+    # ⚠️ REQUIRE A PARSEABLE COUNT. This used to print `ok` with whatever
+    # `grep -oE '[0-9]+ passed'` returned — including NOTHING, when the summary
+    # line fell outside the captured tail. That rendered as
+    # `✓ webapp playwright: ` / `undefined`: a PASS reported with no measurement
+    # behind it, which is the exact failure this whole script exists to catch.
+    # If the result cannot be read, that is a failure to measure, not a success.
+    n=$(printf '%s' "$2" | grep -oE '[0-9]+ passed' | tail -1)
+    if [ -n "$n" ]; then ok "$1: $n"
+    else bad "$1: could NOT read a pass count from the output — the run may not have
+      completed. Not treating an unreadable result as a pass. Tail was:
+$(printf '%s' "$2" | tail -6 | sed 's/^/      /')"; fi
+  fi
 }
-r=$(corepack pnpm --filter webapp exec playwright test 2>&1 | tail -3)
+r=$(corepack pnpm --filter webapp exec playwright test 2>&1 | tail -15)
 pw "webapp playwright" "$r"
 ./extension/build.sh >/dev/null 2>&1 && ok "extension vendor" || bad "extension build.sh"
 # `pnpm test` (not `exec playwright test`) — only it runs the pretest vendor hook.
-r=$(cd extension && corepack pnpm test 2>&1 | tail -3)
+r=$(cd extension && corepack pnpm test 2>&1 | tail -15)
 pw "extension" "$r"
 corepack pnpm -C web build >/dev/null 2>&1 && ok "marketing build" || bad "marketing build"
 

@@ -73,6 +73,7 @@ extern crate alloc;
 mod aead;
 mod envelope;
 mod hybrid;
+mod hybrid_auth;
 mod hybrid_seal;
 mod hybrid_sig;
 mod kdf;
@@ -88,6 +89,11 @@ pub use envelope::{Envelope, EnvelopeError};
 pub use hybrid::{
     hybrid_decapsulate, hybrid_encapsulate, HybridEncapsulation, HybridError,
     HYBRID_SHARED_SECRET_LEN,
+};
+pub use hybrid_auth::{
+    hybrid_auth_decapsulate, hybrid_auth_encapsulate, hybrid_auth_open, hybrid_auth_seal,
+    vault_key_wrap_aad, HybridAuthEncapsulation, HYBRID_AUTH_INFO, HYBRID_AUTH_SHARED_SECRET_LEN,
+    HYBRID_AUTH_TRANSCRIPT_PREFIX, VAULT_KEY_WRAP_AAD_PREFIX,
 };
 pub use hybrid_seal::{hybrid_open, hybrid_seal, HybridSealError, HybridSealed};
 pub use hybrid_sig::{hybrid_sign, hybrid_verify, HybridSigError, HYBRID_SIGNATURE_LEN};

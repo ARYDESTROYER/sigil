@@ -51,12 +51,21 @@ use std::path::{Path, PathBuf};
 
 use sigil_cli::{
     enroll_device, fetch_hybrid_key, fetch_subscription, generate_hybrid_identity, generate_key,
-    generate_vault_key, get_key_envelope, keyring_get, keyring_put, load_hybrid_public,
-    load_hybrid_secret, load_identity, load_key_file, load_keyring, publish_hybrid_key,
-    pull_ops_auth, push_op_auth, save_hybrid_public, save_hybrid_secret, save_key,
-    share_vault_to_known_key, unwrap_vault_key, vault_key_fingerprint, CliError, DeviceIdentity,
-    RequestAuth, VaultKeyring, VAULT_KEYRING_FILE, VAULT_KEY_LEN,
+    generate_vault_key, keyring_get, keyring_put, load_hybrid_public, load_hybrid_secret,
+    load_identity, load_key_file, load_keyring, publish_hybrid_key, pull_ops_auth, push_op_auth,
+    save_hybrid_public, save_hybrid_secret, save_key, share_vault_to_known_key,
+    vault_key_fingerprint, CliError, DeviceIdentity, RequestAuth, VaultKeyring, VAULT_KEYRING_FILE,
+    VAULT_KEY_LEN,
 };
+// Phase 60 — the AUTHENTICATED vault-key envelope. Same rule as everywhere in
+// this file: the desktop implements NOTHING of its own. `SenderIdentity` bundles
+// this device's id with the hybrid secret that authenticates its wraps, and
+// `accept_vault_key` is the CLI library's whole receiving path — resolve the
+// depositing device, pin-check its key, unwrap AUTHENTICATED + context-bound,
+// prove the key opens the vault, and refuse to silently replace a different one.
+// Putting that logic in the library rather than in `cli/src/main.rs` is exactly
+// what lets the desktop reuse it (ADR 0037).
+use sigil_cli::{accept_vault_key, SenderIdentity};
 // Phase 50 — key verification (safety numbers + pinning) and vault key rotation.
 // The desktop adds NO implementation of its own: it calls the same sigil-cli
 // library functions the CLI does, so the semantics and the safety-number digest
@@ -341,6 +350,17 @@ pub(crate) fn net_error(e: CliError, server: &str, what: &str) -> DesktopError {
                 _ => unreachable!("matched above"),
             }
         }
+        // ⭐ PHASE 60, and also not a generic failure. Neither of these is a 401
+        // (the request authenticated), a 403 (nothing was forbidden) or a changed
+        // key: the envelope's BYTES prove nothing about who produced them, or
+        // nothing says who deposited them. Both are refusals; nothing was opened.
+        e @ (CliError::WrongEnvelopeKind { .. } | CliError::UnknownSender(_)) => {
+            let wrong_kind = matches!(e, CliError::WrongEnvelopeKind { .. });
+            DesktopError::UnauthenticatedEnvelope {
+                wrong_kind,
+                detail: format!("{e} (while {what})"),
+            }
+        }
         other => DesktopError::Vault(format!("{other} (while {what})")),
     }
 }
@@ -458,6 +478,35 @@ impl DeviceConfig {
             return Err(DesktopError::NotEnrolled(path));
         }
         Ok(identity)
+    }
+
+    /// ⭐ PHASE 60 — this device AS A SENDER: its enrolled device id bundled with
+    /// the hybrid SECRET identity that authenticates every envelope it wraps.
+    ///
+    /// A vault-key envelope is now sealed under a KEM that mixes in the sender's
+    /// long-term X25519 secret, so a wrap needs the secret, not just the
+    /// recipient's public key. Bundling id + secret in one value is the CLI's own
+    /// rule: a call site cannot pass one device's id with another's secret.
+    ///
+    /// # Errors
+    /// - [`DesktopError::NotEnrolled`] when this device has no device id.
+    /// - [`DesktopError::Vault`] when it has no hybrid identity yet (publish one
+    ///   first — nothing can be wrapped without it).
+    pub(crate) fn sender_identity(&self) -> Result<SenderIdentity> {
+        let identity = self.enrolled_identity()?;
+        let device_id = identity.device_id.clone().expect("enrolled");
+        let secret_path = self.hybrid_secret_path();
+        if !secret_path.exists() {
+            return Err(DesktopError::Vault(format!(
+                "this device has no hybrid identity at {}; publish one first — a vault-key \
+                 envelope is AUTHENTICATED with this device's hybrid secret, so there is nothing \
+                 to sign the wrap with",
+                secret_path.display()
+            )));
+        }
+        let secret = load_hybrid_secret(&secret_path)?;
+        SenderIdentity::new(&device_id, secret)
+            .map_err(|e| net_error(e, &self.server, "building this device's sender identity"))
     }
 
     /// The auth to sign op-log requests with: contract v3 when enrolled, the
@@ -688,10 +737,22 @@ impl DeviceConfig {
         let safety_number = recipient.safety_number().to_string();
         let needs_check = recipient.trust().needs_out_of_band_check();
 
-        // 2-4) WRAP -> deposit -> grant, through the library's single path. It
+        // 2-4) WRAP -> grant -> deposit, through the library's single path. It
         //      takes the VerifiedRecipient produced above and has no other way in.
-        share_vault_to_known_key(&self.server, vault_id, &recipient, permission, &key, &auth)
-            .map_err(|e| net_error(e, &self.server, "sharing the vault (wrap, deposit, grant)"))?;
+        //      Phase 60: the wrap is AUTHENTICATED as this device (hence
+        //      `sender`) and BOUND to (vault, recipient, sender), and the grant
+        //      now runs BEFORE the deposit so a refused share leaves no envelope.
+        let sender = self.sender_identity()?;
+        share_vault_to_known_key(
+            &self.server,
+            vault_id,
+            &recipient,
+            permission,
+            &key,
+            &auth,
+            &sender,
+        )
+        .map_err(|e| net_error(e, &self.server, "sharing the vault (wrap, grant, deposit)"))?;
 
         Ok(ShareOutcome {
             fingerprint: vault_key_fingerprint(&key),
@@ -855,6 +916,8 @@ impl DeviceConfig {
     ) -> Result<(String, String, Vec<String>, Vec<String>)> {
         let identity = self.enrolled_identity()?;
         let auth = identity.auth();
+        // Phase 60: every re-wrap is AUTHENTICATED as this device.
+        let sender = self.sender_identity()?;
         let report = rotate_vault_key(
             &self.server,
             vault_id,
@@ -866,6 +929,7 @@ impl DeviceConfig {
             safety_numbers,
             &auth,
             Argon2Params::RECOMMENDED,
+            &sender,
         )
         .map_err(|e| net_error(e, &self.server, "rotating the vault key"))?;
         Ok((
@@ -880,9 +944,29 @@ impl DeviceConfig {
         ))
     }
 
-    /// ACCEPT a vault shared TO this device: collect the envelope addressed to
-    /// it, unwrap it with this device's hybrid SECRET identity, and record the
-    /// recovered key in the `0600` keyring.
+    /// ⭐ ACCEPT a vault shared TO this device, and **where the forgery used to
+    /// land** (Phase 60).
+    ///
+    /// This used to collect the envelope and unwrap ANYTHING that decrypted to 32
+    /// bytes, from anybody: it fetched no hybrid key, so ADR 0038's pin store was
+    /// never consulted on the receiving side, and an envelope minted from this
+    /// device's own PUBLISHED public key installed an attacker-chosen vault key.
+    ///
+    /// It now delegates the whole receiving path to the CLI library's
+    /// `accept_vault_key`, which (1) works out WHICH device deposited the
+    /// envelope — named here, else from this device's self-only envelope index,
+    /// and a REFUSAL if neither says — (2) pin-checks that device's hybrid key,
+    /// (3) unwraps AUTHENTICATED and bound to (vault, this device, that sender),
+    /// (4) proves the key actually opens the vault before writing it, and (5)
+    /// refuses to silently replace a DIFFERENT key already in the keyring.
+    ///
+    /// ⭐ There is no desktop implementation of any of that (ADR 0037) — the
+    /// reason the logic lives in the library rather than in `cli/src/main.rs`.
+    ///
+    /// `sender_device_id` names the depositing device explicitly;
+    /// `expected_safety_number` is the digits read out of band, which is what
+    /// closes the first-contact window pinning cannot. `replace` must be set to
+    /// overwrite a different existing key.
     ///
     /// Returns the key's fingerprint — never the key.
     ///
@@ -890,15 +974,20 @@ impl DeviceConfig {
     /// - [`DesktopError::NotEnrolled`] when this device has no device id.
     /// - [`DesktopError::MissingOnServer`] when nothing has been shared here.
     /// - [`DesktopError::Forbidden`] when this device may not read the vault.
-    /// - [`DesktopError::Vault`] when the envelope does not open (wrong device or
-    ///   tampered bytes); no plaintext is leaked.
-    pub fn accept_vault(&self, vault_id: &str) -> Result<String> {
+    /// - [`DesktopError::KeyPinMismatch`] when the sender's key CHANGED.
+    /// - [`DesktopError::Vault`] when the envelope is not an AUTHENTICATED one,
+    ///   does not open, or would replace a different key without `replace`; no
+    ///   plaintext is leaked in any of those cases.
+    pub fn accept_vault(
+        &self,
+        vault_id: &str,
+        sender_device_id: Option<&str>,
+        expected_safety_number: Option<&str>,
+        replace: bool,
+    ) -> Result<String> {
         let identity = self.enrolled_identity()?;
         let device_id = identity.device_id.clone().expect("enrolled");
         let auth = identity.auth();
-
-        let envelope = get_key_envelope(&self.server, vault_id, &device_id, &auth)
-            .map_err(|e| net_error(e, &self.server, "collecting the wrapped vault key"))?;
 
         let secret_path = self.hybrid_secret_path();
         if !secret_path.exists() {
@@ -909,9 +998,21 @@ impl DeviceConfig {
             )));
         }
         let secret = load_hybrid_secret(&secret_path)?;
-        let key = unwrap_vault_key(&secret, &envelope)?;
-        keyring_put(&self.keyring_path(), vault_id, &key)?;
-        Ok(vault_key_fingerprint(&key))
+
+        let report = accept_vault_key(
+            &self.server,
+            vault_id,
+            &device_id,
+            &secret,
+            &self.keyring_path(),
+            &self.pins_path(),
+            &auth,
+            sender_device_id,
+            expected_safety_number,
+            replace,
+        )
+        .map_err(|e| net_error(e, &self.server, "accepting the shared vault key"))?;
+        Ok(report.key_fingerprint)
     }
 
     // -- accounts (Phase 52) ----------------------------------------------
@@ -1363,7 +1464,7 @@ mod tests {
         for e in [
             c.publish_hybrid().unwrap_err(),
             c.share_vault("v", "dev_x", "read", None).unwrap_err(),
-            c.accept_vault("v").unwrap_err(),
+            c.accept_vault("v", None, None, false).unwrap_err(),
             c.check_server().unwrap_err(),
         ] {
             assert!(matches!(e, DesktopError::NotEnrolled(_)), "got {e:?}");

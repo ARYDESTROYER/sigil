@@ -1678,9 +1678,23 @@ The ones that change what this API *means*:
 > code path as the op-log, not a parallel one), but it is **gated off by default**
 > (`501`), **plain HTTP in dev**, and the cryptography it carries is **unaudited**.
 > The key hierarchy — a random per-vault key wrapped with the PQ-hybrid
-> `hybrid_seal` path, the human password never shared — is specified in
-> [`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use).
+> `hybrid_auth_seal` path, the human password never shared — is specified in
+> [`crypto-spec.md`](crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_auth_seal--hybrid_auth_open-in-use).
 > See [ADR 0035](decisions/0035-device-to-device-vault-sharing.md).
+>
+> ⚠️ **Phase 60 changed the ENVELOPE BYTES, and nothing else on this surface.**
+> The wrap was **anonymous** (`hybrid_seal`, HPKE `mode_base`), so anyone holding
+> a recipient's **published** hybrid public key — which `GET
+> /v1/devices/{deviceID}/hybrid-key` serves to every authenticated device — could
+> mint an envelope the recipient would accept and install a vault key **of their
+> own choosing**. The wrap is now **authenticated and context-bound**
+> (`SIGILhyb` **version 2**; a version-1 container is **refused** by clients
+> wherever a vault key is expected), and the envelope is **no longer a fixed
+> size**. ⭐ **`sigild` changed by ZERO lines** — no route, header, canonical
+> message, migration, table, metric or dependency; the blob was opaque before and
+> is opaque now. ⛔ **Every envelope deposited before Phase 60 must be
+> re-issued**, and there is no migration. See
+> [ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md).
 >
 > **Phase 50 added the last two** (`GET …/keys`, `DELETE …/keys/{deviceID}`) to
 > support **vault key rotation**, and added a purely **client-side** trust control
@@ -1759,10 +1773,33 @@ for that device**: those were sealed to the old key and must be re-shared.
 | ML-KEM-768 encapsulation key | exactly **1184** bytes after base64 decode | as above |
 | envelope may not be empty | ≥ 1 byte | → `400 empty_envelope` |
 
-A real wrapped vault key is a `SIGILhyb` container of about **1.2 KiB** (observed
-1226 bytes: 8-byte magic + version + 32-byte ephemeral X25519 public key +
-1088-byte ML-KEM ciphertext + a small AEAD envelope), so 16 KiB is generous
-headroom that still stops the relay being used as a blob store.
+A real wrapped vault key is a `SIGILhyb` container of about **1.3 KiB**:
+
+```
+  magic(8) ‖ version(1) ‖ eph_x25519_pub(32) ‖ mlkem_ct(1088) ‖ envelope
+```
+
+⚠️ **Its length is NOT fixed.** Since Phase 60 the envelope carries a
+**context-bound AAD** naming the purpose, the vault and both device ids
+([ADR 0048](decisions/0048-authenticated-vault-key-envelopes.md)), so:
+
+```
+  bytes = 1244 + len(vault_id) + len(recipient_device_id) + len(sender_device_id)
+```
+
+Measured **1310 bytes** for a 14-character vault id and two server-assigned
+device ids (26 characters each: `dev_` + 22 base64url chars). ⚠️ Do **not**
+hard-code a length: `size_bytes` in the responses below varies with the
+identifiers, and the examples show one plausible value, not a constant.
+
+⚠️ **`version` is `2`** for a vault-key envelope (**authenticated**); clients
+**refuse** a version-1 (anonymous) container here, because it carries no sender.
+Version 1 is still correct for the unrelated `sigil hybrid-seal` **file**
+container, which *is* a flat 1226 bytes — the two must not be conflated, since a
+forged file container being byte-shaped like a genuine wrap is exactly the defect
+ADR 0048 closed. `sigild` reads none of this: the envelope is opaque to it and
+only the **16 KiB** cap applies, which stays generous headroom while still
+stopping the relay being used as a blob store.
 
 ### `401` vs `403` on these routes
 
@@ -1841,7 +1878,7 @@ append — the server never decodes it.
 - **Success — `201 Created`:**
 
   ```json
-  { "vaultID": "<vaultID>", "device_id": "dev_<recipient>", "size_bytes": 1226, "created_at": "<RFC3339>" }
+  { "vaultID": "<vaultID>", "device_id": "dev_<recipient>", "size_bytes": 1310, "created_at": "<RFC3339>" }
   ```
 
 - **Errors:**
@@ -1916,7 +1953,7 @@ device's old envelope sitting in its mailbox.
   {
     "vaultID": "<vaultID>",
     "recipients": [
-      { "device_id": "dev_B", "sender_device_id": "dev_A", "size_bytes": 1226, "created_at": "<RFC3339>" }
+      { "device_id": "dev_B", "sender_device_id": "dev_A", "size_bytes": 1310, "created_at": "<RFC3339>" }
     ]
   }
   ```
@@ -1991,7 +2028,7 @@ hold a wrapped key addressed to me?"*
   {
     "device_id": "dev_B",
     "vaults": [
-      { "vaultID": "demo", "sender_device_id": "dev_A", "size_bytes": 1226, "created_at": "<RFC3339>" }
+      { "vaultID": "demo", "sender_device_id": "dev_A", "size_bytes": 1310, "created_at": "<RFC3339>" }
     ],
     "has_more": false
   }
@@ -2248,7 +2285,7 @@ and **never derivable from anything the server holds**.
 |-------------------|----------------------|------------------------|
 | joins the account | `POST /v1/devices/enroll` with an ordinary invite + proof of possession | one more device row, label `"recovery-kit"` |
 | publishes its key | `PUT /v1/devices/{kitID}/hybrid-key` | one more **public** hybrid key |
-| is covered for a vault | `PUT /v1/vaults/{vaultID}/keys/{kitID}` + `POST /v1/vaults/{vaultID}/grants` | one more **opaque** ~1226-byte `SIGILhyb` envelope, and a grant |
+| is covered for a vault | `PUT /v1/vaults/{vaultID}/keys/{kitID}` + `POST /v1/vaults/{vaultID}/grants` | one more **opaque** ~1.3 KiB `SIGILhyb` envelope (length varies with the ids), and a grant |
 | finds itself after a restore | `GET /v1/devices/{kitID}/keys` ([above](#get-v1devicesdeviceidkeys--which-vaults-hold-a-key-for-me-self-only-metadata-only)) | nothing — it is a read |
 | collects a key | `GET /v1/vaults/{vaultID}/keys/{kitID}` | nothing — it is a read |
 | is retired | `POST /v1/devices/{kitID}/revoke` | the ordinary revocation |

@@ -46,6 +46,9 @@ async function call(cmd, args = {}) {
     // A changed hybrid key gets the blocking alarm; a payment refusal gets the
     // entitlement banner (which says what still works). Everything else toasts.
     if (err && typeof err === "object" && err.entitlement) applyEntitlement(err.entitlement);
+    // ⭐ PHASE 60 first: an envelope that proves nothing about who produced it is
+    // neither a changed key nor a generic failure, and must not scroll past.
+    if (showEnvelopeRefusal(err)) throw err;
     if (!showKeyAlarm(err)) toast(errText(err), true);
     throw err;
   }
@@ -572,6 +575,39 @@ $("pins-btn").addEventListener("click", async () => {
 /** The device whose key changed, awaiting a DELIBERATE re-pin. */
 let pendingRepin = null;
 
+// ── THE PHASE 60 REFUSAL: an envelope that names no sender ──────────────────
+//
+// The native side tags it `kind: "envelope not authenticated"`. It is NOT a 401
+// (the request authenticated fine), NOT a 403 (nothing was forbidden) and NOT a
+// changed key — the BYTES prove nothing about who produced them. Accepting one
+// could install a vault key an attacker chose, so it gets its own visible block
+// rather than a toast that scrolls away.
+
+/**
+ * Show the refusal for an `envelope not authenticated` IPC error. Returns true
+ * when it handled the error, false for anything else.
+ */
+function showEnvelopeRefusal(err) {
+  if (!err || typeof err !== "object" || err.kind !== "envelope not authenticated") return false;
+  $("envelope-refusal-title").textContent =
+    "REFUSED — that vault-key envelope is NOT AUTHENTICATED.";
+  $("envelope-refusal-text").textContent =
+    "Nothing was opened and no key was stored. This is NOT a sign-in problem and NOT a " +
+    "permission problem, and no device's key changed. Either the envelope carries NO SENDER " +
+    "— anyone who can read this device's PUBLISHED hybrid public key could have minted it, so " +
+    "accepting it could install a vault key an attacker chose — or nothing says which device " +
+    "deposited it. Ask the owner to re-share the vault, or type the sharing device's id into " +
+    `"Accept from device id" and try again.\n\n${err.message ?? ""}`;
+  $("envelope-refusal").hidden = false;
+  $("envelope-refusal").scrollIntoView({ block: "nearest" });
+  toast("REFUSED: that envelope is not authenticated. Nothing was opened.", true);
+  return true;
+}
+
+function hideEnvelopeRefusal() {
+  $("envelope-refusal").hidden = true;
+}
+
 /** The actions the alarm BLOCKS while it is up. */
 function blockedButtons() {
   return [
@@ -668,11 +704,26 @@ $("rotate-form").addEventListener("submit", async (e) => {
   refresh();
 });
 
+$("envelope-refusal-dismiss").addEventListener("click", () => {
+  hideEnvelopeRefusal();
+});
+
 $("accept-btn").addEventListener("click", async () => {
   const id = vaultId();
   if (!id) return;
-  const fp = await call("accept", { vaultId: id });
-  toast(`accepted ${id} (key sha256 ${fp}) — now Pull to fetch the vault`);
+  hideEnvelopeRefusal();
+  // ⭐ PHASE 60. `from` names the depositing device (blank = ask the server's
+  // self-only index); `safetyNumber` is the digits read out of band, which is
+  // what closes the first-contact window pinning cannot.
+  const fp = await call("accept", {
+    vaultId: id,
+    from: $("accept-from").value.trim(),
+    safetyNumber: $("share-safety").value.trim(),
+  });
+  toast(
+    `accepted ${id} (key sha256 ${fp}), AUTHENTICATED to the device that deposited it — now ` +
+      "Pull to fetch the vault"
+  );
   await refreshSync();
 });
 

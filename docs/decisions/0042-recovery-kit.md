@@ -54,9 +54,19 @@ signs contract-v3 requests exactly like a phone does.
 ⭐ **`sigild` gained NO concept of "recovery".** No new table, **no migration**
 (`sigild_schema_version` stays **5**), no new auth path, no new signed message.
 The server sees only shapes it already relayed: one more device row, one more
-hybrid public key, and one more opaque ~1226-byte `SIGILhyb` envelope per covered
+hybrid public key, and one more opaque ~1.3 KiB `SIGILhyb` envelope per covered
 vault. There is nothing in the database an operator could recognise as a recovery
 mechanism, and nothing to attack that was not already there.
+
+> ⚠️ **Phase 60 ([ADR 0048](0048-authenticated-vault-key-envelopes.md)):** that
+> envelope is **not a fixed 1226 bytes** — it is
+> `1244 + len(vault_id) + len(recipient_device_id) + len(sender_device_id)`,
+> because the wrap is now **authenticated and context-bound**. ⛔ **A kit covered
+> before Phase 60 must be RE-COVERED**: its envelopes are version-1 (anonymous)
+> containers and are now refused, so **a printed sheet whose vaults are never
+> re-covered recovers nothing**. Nothing about the *kit* changed — the codec, the
+> derivation and the printed 56-character code are untouched, and `sigild` still
+> gained no concept of recovery.
 
 The one thing a kit does need that did not exist is a **self-only index**: on a
 fresh machine the kit knows its own device id and nothing else, so it must be

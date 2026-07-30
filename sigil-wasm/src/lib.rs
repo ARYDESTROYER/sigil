@@ -38,11 +38,12 @@ use sigil_core::{
     derive_recovery_keys as core_derive_recovery_keys,
     encode_recovery_kit as core_encode_recovery_kit, format_code as core_format_code,
     format_recovery_kit as core_format_recovery_kit, hotp as core_hotp,
+    hybrid_auth_open as core_hybrid_auth_open, hybrid_auth_seal as core_hybrid_auth_seal,
     hybrid_open as core_hybrid_open, hybrid_seal as core_hybrid_seal,
     ml_kem768_keygen as core_ml_kem768_keygen, open_record as core_open_record,
     public_key_from_seed as core_public_key_from_seed, seal_record as core_seal_record,
-    sign as core_sign, totp as core_totp, verify as core_verify,
-    x25519_public_key as core_x25519_public_key, Argon2Params, OtpAlgorithm,
+    sign as core_sign, totp as core_totp, vault_key_wrap_aad as core_vault_key_wrap_aad,
+    verify as core_verify, x25519_public_key as core_x25519_public_key, Argon2Params, OtpAlgorithm,
     ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
     ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, RECOVERY_SEED_LEN, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN,
     SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
@@ -116,6 +117,44 @@ const HYBRID_AAD: &[u8] = b"sigil-hybrid-cli/1";
 /// version(1) + eph_x25519_pub(32) + mlkem_ct(1088) = 1129. The seal envelope
 /// bytes follow this prefix. Mirrors `cli/src/lib.rs::HYBRID_FIXED_PREFIX_LEN`.
 const HYBRID_FIXED_PREFIX_LEN: usize = 8 + 1 + X25519_PUBLIC_KEY_LEN + ML_KEM768_CIPHERTEXT_LEN;
+
+// --- The AUTHENTICATED `SIGILhyb` container (version 2) ---------------------
+//
+// PHASE 60. The version-1 container above is ANONYMOUS: its only sender-side key
+// is a per-message EPHEMERAL X25519 secret, so anybody holding the recipient's
+// PUBLISHED hybrid public key can mint a container the recipient opens happily.
+// That is honest for file-to-a-pubkey encryption and CATASTROPHIC for delivering
+// a vault KEY — reproduced with the shipped binary:
+//
+//     sigil hybrid-seal --recipient-pub victim.pub --in attacker_key.bin --out forged.env
+//     -> 1226 bytes, magic SIGILhyb, byte-shaped IDENTICALLY to a genuine wrap
+//
+// Version 2 fixes it with `sigil_core::hybrid_auth_seal` (HPKE `mode_auth`'s
+// shape: a static-static X25519 DH from the SENDER's long-term secret is mixed
+// into the KDF) plus a CONTEXT-BOUND AAD. The FRAMING is byte-identical to v1 —
+// only the version byte and the sealing differ.
+//
+// ⚠️ BUT THE LENGTH IS NOT. This comment used to end "so a wrapped 32-byte vault
+// key is still exactly 1226 bytes", which is FALSE and was contradicted by this
+// file's own `authenticated_container_round_trips` test. The envelope carries
+// its AAD (in the clear, authenticated by the tag), and the AAD now names the
+// vault and BOTH device ids — so the size depends on those identifiers. Measured
+// against a live sigild with real server-assigned ids: 1304-1307 bytes. The
+// fixed part is `HYBRID_FIXED_PREFIX_LEN + 79`; add `aad.len()`. Nothing may
+// hard-code 1226 for a VAULT-KEY envelope from Phase 60 on — the ANONYMOUS v1
+// FILE container is the fixed-size one, and conflating the two is how a
+// forgery ended up byte-shaped like a genuine wrap in the first place.
+//
+// ⭐ The SENDER's static public key is deliberately NOT carried in the container.
+// It is an INPUT the caller supplies out of band (from the pin store, through
+// `verifySenderForUnwrap` in sharing.mjs). Carrying it would invite exactly the
+// mistake this fixes: reading the sender's identity out of attacker-controlled
+// bytes and then "verifying" against it.
+
+/// The AUTHENTICATED `SIGILhyb` container version — what every vault-key
+/// envelope is written as, and the only version an authenticated open accepts.
+/// MUST equal `cli/src/lib.rs::HYBRID_AUTH_FORMAT_VERSION` (`2`).
+const HYBRID_AUTH_FORMAT_VERSION: u8 = 2;
 
 /// The XChaCha20-Poly1305 nonce length, in bytes (24). JavaScript should
 /// generate exactly this many random bytes for the `nonce` argument to
@@ -393,6 +432,111 @@ pub fn hybrid_open_container(
 ) -> Result<Vec<u8>, JsError> {
     hybrid_open_container_inner(recipient_x25519_secret, recipient_mlkem_seed, container)
         .map_err(|e| JsError::new(&e))
+}
+
+// --- AUTHENTICATED hybrid encryption: the `SIGILhyb` v2 vault-key envelope ---
+//
+// Three thin shells over `sigil_core::hybrid_auth` + `vault_key_wrap_aad`. As
+// everywhere in this crate they add NO cryptography and NO codec of their own,
+// and ALL entropy stays caller-supplied from JS `crypto.getRandomValues`, so
+// `sigil-wasm/Cargo.lock` stays `getrandom`-free.
+
+/// Build the CONTEXT-BOUND additional-authenticated-data bytes for a vault-key
+/// wrap: `"sigil-vault-key-wrap-v1\n"` followed by the three identifiers, each
+/// `u32` big-endian length-prefixed.
+///
+/// ⭐ SINGLE-SOURCED, NOT MIRRORED. This is a one-line shell over
+/// `sigil_core::vault_key_wrap_aad`, which the `sigil` CLI calls too — so the JS
+/// clients and the Rust clients compute the same bytes by construction rather
+/// than by two hand-written implementations agreeing. Both sides still carry the
+/// same golden vector as a drift alarm.
+///
+/// Both parties MUST pass the identical `(vault_id, recipient_device_id,
+/// sender_device_id)` triple or the AEAD refuses to open — which is the point:
+/// it is what stops an envelope being re-filed under another vault, another
+/// recipient, another sender, or as an anonymous file container.
+#[wasm_bindgen]
+pub fn vault_key_wrap_aad(
+    vault_id: &str,
+    recipient_device_id: &str,
+    sender_device_id: &str,
+) -> Vec<u8> {
+    core_vault_key_wrap_aad(vault_id, recipient_device_id, sender_device_id)
+}
+
+/// AUTHENTICATED seal: encrypt `plaintext` TO a recipient's hybrid public
+/// identity **AS** the holder of `sender_x25519_secret`, under `aad`, producing
+/// a **CLI-compatible `SIGILhyb` VERSION 2 container**.
+///
+/// This is the wrap half of device-to-device vault sharing. Unlike
+/// [`hybrid_seal_to_container`], a party holding only the recipient's PUBLIC key
+/// cannot produce a container this authenticates: the sender's long-term X25519
+/// secret feeds a third Diffie–Hellman that goes into the KDF.
+///
+/// `sender_x25519_secret` (32) is the device's LONG-TERM hybrid secret scalar —
+/// the same one [`hybrid_x25519_public`] publishes the public half of. The
+/// remaining entropy is caller-supplied and MUST be fresh per call:
+/// `ephemeral_x25519_secret` (32), `mlkem_coin` (32), `aead_nonce` (24).
+///
+/// ⭐ Pass [`vault_key_wrap_aad`]'s output as `aad` for a vault-key wrap. A bad
+/// length or a KEM-input rejection surfaces to JS as a thrown `Error`.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_auth_seal_to_container(
+    sender_x25519_secret: &[u8],
+    recipient_x25519_pub: &[u8],
+    recipient_mlkem_encaps_key: &[u8],
+    ephemeral_x25519_secret: &[u8],
+    mlkem_coin: &[u8],
+    aead_nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    hybrid_auth_seal_to_container_inner(
+        sender_x25519_secret,
+        recipient_x25519_pub,
+        recipient_mlkem_encaps_key,
+        ephemeral_x25519_secret,
+        mlkem_coin,
+        aead_nonce,
+        aad,
+        plaintext,
+    )
+    .map_err(|e| JsError::new(&e))
+}
+
+/// AUTHENTICATED open: decrypt a `SIGILhyb` **version 2** container with this
+/// device's hybrid secret identity, **asserting it came from
+/// `sender_x25519_pub`** and was sealed under exactly `aad`.
+///
+/// ⛔ A **version 1** (anonymous) container is REFUSED before any cryptography
+/// runs, with an error naming the version found. That refusal is the whole
+/// point: a v1 container carries no sender at all, so accepting one would accept
+/// a key an attacker chose.
+///
+/// `sender_x25519_pub` is an INPUT, never read out of the container. Passing the
+/// wrong sender yields a different shared secret and therefore an AEAD
+/// authentication failure — no string comparison is trusted anywhere.
+///
+/// A wrong recipient, a WRONG SENDER, a tampered container or a mismatched `aad`
+/// all surface as a thrown `Error`, and no plaintext is returned in any of those
+/// cases.
+#[wasm_bindgen]
+pub fn hybrid_auth_open_container(
+    recipient_x25519_secret: &[u8],
+    recipient_mlkem_seed: &[u8],
+    sender_x25519_pub: &[u8],
+    aad: &[u8],
+    container: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    hybrid_auth_open_container_inner(
+        recipient_x25519_secret,
+        recipient_mlkem_seed,
+        sender_x25519_pub,
+        aad,
+        container,
+    )
+    .map_err(|e| JsError::new(&e))
 }
 
 // --- TOTP / HOTP one-time-password codes (RFC 4226 / RFC 6238) --------------
@@ -804,34 +948,22 @@ fn hybrid_open_container_inner(
     // stores only the 64-byte seed, not the expanded 2400-byte decaps key).
     let (_encaps_key, mlkem_decaps_key) = core_ml_kem768_keygen(&recipient_mlkem_seed);
 
-    if container.len() < HYBRID_FIXED_PREFIX_LEN {
-        return Err("container is too short to hold the SIGILhyb prefix".to_string());
+    let (version, eph_pub, mlkem_ct, envelope) = split_hybrid_container(container)?;
+    if version == HYBRID_AUTH_FORMAT_VERSION {
+        // The OTHER direction of the same rule (mirrors the CLI): opening an
+        // AUTHENTICATED vault-key envelope here would drop the sender check and
+        // the context binding on the floor.
+        return Err(format!(
+            "SIGILhyb container version {version} presented where version \
+             {HYBRID_FORMAT_VERSION} is required (version 2 is an AUTHENTICATED vault-key \
+             envelope — open it with hybrid_auth_open_container)"
+        ));
     }
-
-    let (magic, rest) = container.split_at(8);
-    if magic != HYBRID_MAGIC.as_slice() {
-        return Err("not a SIGILhyb container (bad magic: expected \"SIGILhyb\")".to_string());
-    }
-
-    let version = rest[0];
     if version != HYBRID_FORMAT_VERSION {
         return Err(format!(
             "unsupported SIGILhyb container version {version}: expected {HYBRID_FORMAT_VERSION}"
         ));
     }
-
-    // After magic(8) + version(1): eph_x25519_pub[32] | mlkem_ct[1088] |
-    // envelope[..]. The length gate above guarantees these splits are in bounds.
-    let after_version = &rest[1..];
-    let (eph_pub_bytes, rest2) = after_version.split_at(X25519_PUBLIC_KEY_LEN);
-    let (mlkem_ct_bytes, envelope) = rest2.split_at(ML_KEM768_CIPHERTEXT_LEN);
-
-    let eph_pub: [u8; X25519_PUBLIC_KEY_LEN] = eph_pub_bytes
-        .try_into()
-        .expect("eph_pub slice is exactly X25519_PUBLIC_KEY_LEN by construction");
-    let mlkem_ct: [u8; ML_KEM768_CIPHERTEXT_LEN] = mlkem_ct_bytes
-        .try_into()
-        .expect("mlkem_ct slice is exactly ML_KEM768_CIPHERTEXT_LEN by construction");
 
     core_hybrid_open(
         &recipient_x25519_secret,
@@ -841,6 +973,124 @@ fn hybrid_open_container_inner(
         envelope,
     )
     .map_err(|e| format!("hybrid_open failed: {e:?}"))
+}
+
+/// Split a `SIGILhyb` container into `(version, eph_x25519_pub, mlkem_ct,
+/// envelope)`, bounds-checking BEFORE slicing. Shared by the anonymous (v1) and
+/// authenticated (v2) readers, whose framing is identical. Mirrors
+/// `cli/src/lib.rs::split_hybrid_container`.
+#[allow(clippy::type_complexity)]
+fn split_hybrid_container(
+    container: &[u8],
+) -> Result<
+    (
+        u8,
+        [u8; X25519_PUBLIC_KEY_LEN],
+        [u8; ML_KEM768_CIPHERTEXT_LEN],
+        &[u8],
+    ),
+    String,
+> {
+    if container.len() < HYBRID_FIXED_PREFIX_LEN {
+        return Err("container is too short to hold the SIGILhyb prefix".to_string());
+    }
+    let (magic, rest) = container.split_at(8);
+    if magic != HYBRID_MAGIC.as_slice() {
+        return Err("not a SIGILhyb container (bad magic: expected \"SIGILhyb\")".to_string());
+    }
+    let version = rest[0];
+    let after_version = &rest[1..];
+    let (eph_pub_bytes, rest2) = after_version.split_at(X25519_PUBLIC_KEY_LEN);
+    let (mlkem_ct_bytes, envelope) = rest2.split_at(ML_KEM768_CIPHERTEXT_LEN);
+    let eph_pub: [u8; X25519_PUBLIC_KEY_LEN] = eph_pub_bytes
+        .try_into()
+        .expect("eph_pub slice is exactly X25519_PUBLIC_KEY_LEN by construction");
+    let mlkem_ct: [u8; ML_KEM768_CIPHERTEXT_LEN] = mlkem_ct_bytes
+        .try_into()
+        .expect("mlkem_ct slice is exactly ML_KEM768_CIPHERTEXT_LEN by construction");
+    Ok((version, eph_pub, mlkem_ct, envelope))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hybrid_auth_seal_to_container_inner(
+    sender_x25519_secret: &[u8],
+    recipient_x25519_pub: &[u8],
+    recipient_mlkem_encaps_key: &[u8],
+    ephemeral_x25519_secret: &[u8],
+    mlkem_coin: &[u8],
+    aead_nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let sender_x25519_secret: [u8; X25519_SECRET_KEY_LEN] =
+        fixed("sender x25519 secret", sender_x25519_secret)?;
+    let recipient_x25519_pub: [u8; X25519_PUBLIC_KEY_LEN] =
+        fixed("recipient x25519 public key", recipient_x25519_pub)?;
+    let recipient_mlkem_encaps_key: [u8; ML_KEM768_ENCAPS_KEY_LEN] =
+        fixed("recipient mlkem encaps key", recipient_mlkem_encaps_key)?;
+    let ephemeral_x25519_secret: [u8; X25519_SECRET_KEY_LEN] =
+        fixed("ephemeral x25519 secret", ephemeral_x25519_secret)?;
+    let mlkem_coin: [u8; ML_KEM768_ENCAPS_COIN_LEN] = fixed("mlkem coin", mlkem_coin)?;
+    let aead_nonce: [u8; NONCE_LEN] = fixed("aead nonce", aead_nonce)?;
+
+    let (eph_pub, mlkem_ct, envelope) = core_hybrid_auth_seal(
+        &sender_x25519_secret,
+        &recipient_x25519_pub,
+        &recipient_mlkem_encaps_key,
+        &ephemeral_x25519_secret,
+        &mlkem_coin,
+        &aead_nonce,
+        aad,
+        plaintext,
+    )
+    .map_err(|e| format!("hybrid_auth_seal failed: {e:?}"))?;
+
+    let mut out = Vec::with_capacity(HYBRID_FIXED_PREFIX_LEN + envelope.len());
+    out.extend_from_slice(HYBRID_MAGIC);
+    out.push(HYBRID_AUTH_FORMAT_VERSION);
+    out.extend_from_slice(&eph_pub);
+    out.extend_from_slice(&mlkem_ct);
+    out.extend_from_slice(&envelope);
+    Ok(out)
+}
+
+fn hybrid_auth_open_container_inner(
+    recipient_x25519_secret: &[u8],
+    recipient_mlkem_seed: &[u8],
+    sender_x25519_pub: &[u8],
+    aad: &[u8],
+    container: &[u8],
+) -> Result<Vec<u8>, String> {
+    let recipient_x25519_secret: [u8; X25519_SECRET_KEY_LEN] =
+        fixed("recipient x25519 secret", recipient_x25519_secret)?;
+    let recipient_mlkem_seed: [u8; ML_KEM768_KEYGEN_SEED_LEN] =
+        fixed("recipient mlkem seed", recipient_mlkem_seed)?;
+    let sender_x25519_pub: [u8; X25519_PUBLIC_KEY_LEN] =
+        fixed("sender x25519 public key", sender_x25519_pub)?;
+
+    let (version, eph_pub, mlkem_ct, envelope) = split_hybrid_container(container)?;
+    if version != HYBRID_AUTH_FORMAT_VERSION {
+        // ⛔ THE REFUSAL. A version-1 container proves nothing about who made it.
+        return Err(format!(
+            "SIGILhyb container version {version} presented where version \
+             {HYBRID_AUTH_FORMAT_VERSION} is required (version 1 = ANONYMOUS file container, \
+             version 2 = AUTHENTICATED vault-key envelope; they are not interchangeable)"
+        ));
+    }
+
+    // The CLI stores only the 64-byte seed; re-derive the decapsulation key.
+    let (_encaps_key, mlkem_decaps_key) = core_ml_kem768_keygen(&recipient_mlkem_seed);
+
+    core_hybrid_auth_open(
+        &recipient_x25519_secret,
+        &mlkem_decaps_key,
+        &sender_x25519_pub,
+        &eph_pub,
+        &mlkem_ct,
+        aad,
+        envelope,
+    )
+    .map_err(|e| format!("hybrid_auth_open failed: {e:?}"))
 }
 
 // --- TOTP / HOTP inner helpers (native-testable, no `JsError`) --------------
@@ -1386,6 +1636,176 @@ mod tests {
         // ephemeral secret we sealed with (offsets are correct).
         let eph_pub = core_x25519_public_key(&HYB_EPH_SECRET);
         assert_eq!(&c[9..9 + X25519_PUBLIC_KEY_LEN], eph_pub.as_slice());
+    }
+
+    // --- AUTHENTICATED `SIGILhyb` v2: the vault-key envelope ---------------
+    //
+    // These pin the Phase 60 fix at the wasm boundary. The construction itself
+    // lives in sigil-core (and is tested there); what is proven HERE is the
+    // container framing, the version refusals in BOTH directions, and that the
+    // shell passes the sender/AAD through unmangled.
+
+    /// The SENDER's long-term X25519 secret (distinct from every other constant).
+    const HYB_SENDER_SECRET: [u8; X25519_SECRET_KEY_LEN] = [0x66; X25519_SECRET_KEY_LEN];
+
+    fn auth_aad() -> Vec<u8> {
+        vault_key_wrap_aad("demo", "dev_bob", "dev_alice")
+    }
+
+    /// Wrap a plausible 32-byte vault key, exactly as sharing.mjs does.
+    fn hyb_auth_seal(aad: &[u8]) -> Vec<u8> {
+        let recipient_pub = hybrid_x25519_public_inner(&HYB_X25519_SECRET).unwrap();
+        let recipient_ek = hybrid_mlkem_encaps_key_inner(&HYB_MLKEM_SEED).unwrap();
+        hybrid_auth_seal_to_container_inner(
+            &HYB_SENDER_SECRET,
+            &recipient_pub,
+            &recipient_ek,
+            &HYB_EPH_SECRET,
+            &HYB_COIN,
+            &hyb_nonce(),
+            aad,
+            &[0x9Au8; 32],
+        )
+        .unwrap()
+    }
+
+    fn sender_pub() -> Vec<u8> {
+        hybrid_x25519_public_inner(&HYB_SENDER_SECRET).unwrap()
+    }
+
+    #[test]
+    fn authenticated_container_round_trips() {
+        let aad = auth_aad();
+        let c = hyb_auth_seal(&aad);
+        // ⚠️ THE SIZE IS NO LONGER FIXED. The envelope carries its AAD in the
+        // clear (authenticated by the tag), and the AAD now names the vault and
+        // both devices — so a wrapped 32-byte vault key is 1129 (prefix) + 79
+        // (nonce + framing + 48-byte ciphertext) + len(aad), not the flat 1226
+        // that the anonymous v1 form produced with its 18-byte fixed tag.
+        // Anything that hard-codes 1226 is wrong from Phase 60 on.
+        assert_eq!(c.len(), HYBRID_FIXED_PREFIX_LEN + 79 + aad.len());
+        assert_eq!(c.len(), 1226 - 18 + aad.len());
+        assert_eq!(&c[..8], b"SIGILhyb");
+        assert_eq!(c[8], HYBRID_AUTH_FORMAT_VERSION);
+        assert_eq!(c[8], 2);
+        let out = hybrid_auth_open_container_inner(
+            &HYB_X25519_SECRET,
+            &HYB_MLKEM_SEED,
+            &sender_pub(),
+            &aad,
+            &c,
+        )
+        .unwrap();
+        assert_eq!(out, vec![0x9Au8; 32]);
+    }
+
+    /// ⭐ THE VULNERABILITY, AT THE WASM BOUNDARY. A forger holding ONLY the
+    /// recipient's published public key mints the ANONYMOUS container — the
+    /// exact bytes `sigil hybrid-seal` produced — and the authenticated open
+    /// refuses it as the wrong KIND, before any cryptography runs.
+    #[test]
+    fn a_v1_container_is_refused_where_a_vault_key_is_expected() {
+        let forged = hyb_seal(); // anonymous: needs no secret of anyone's
+        assert_eq!(forged[8], 1);
+        let err = hybrid_auth_open_container_inner(
+            &HYB_X25519_SECRET,
+            &HYB_MLKEM_SEED,
+            &sender_pub(),
+            &auth_aad(),
+            &forged,
+        )
+        .unwrap_err();
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("ANONYMOUS"), "{err}");
+    }
+
+    /// And the reverse: an authenticated envelope is not an anonymous file.
+    #[test]
+    fn a_v2_container_is_refused_as_an_anonymous_file() {
+        let c = hyb_auth_seal(&auth_aad());
+        let err = hybrid_open_container_inner(&HYB_X25519_SECRET, &HYB_MLKEM_SEED, &c).unwrap_err();
+        assert!(err.contains("version 2"), "{err}");
+    }
+
+    #[test]
+    fn the_wrong_sender_or_the_wrong_context_is_refused() {
+        let aad = auth_aad();
+        let c = hyb_auth_seal(&aad);
+        // Wrong sender.
+        let other = hybrid_x25519_public_inner(&[0x77; X25519_SECRET_KEY_LEN]).unwrap();
+        assert!(hybrid_auth_open_container_inner(
+            &HYB_X25519_SECRET,
+            &HYB_MLKEM_SEED,
+            &other,
+            &aad,
+            &c
+        )
+        .is_err());
+        // Re-filed under another vault / recipient / sender / purpose.
+        for wrong in [
+            vault_key_wrap_aad("other", "dev_bob", "dev_alice"),
+            vault_key_wrap_aad("demo", "dev_eve", "dev_alice"),
+            vault_key_wrap_aad("demo", "dev_bob", "dev_eve"),
+            b"sigil-hybrid-cli/1".to_vec(),
+        ] {
+            assert!(
+                hybrid_auth_open_container_inner(
+                    &HYB_X25519_SECRET,
+                    &HYB_MLKEM_SEED,
+                    &sender_pub(),
+                    &wrong,
+                    &c
+                )
+                .is_err(),
+                "a re-filed envelope must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_bad_lengths_are_rejected() {
+        let aad = auth_aad();
+        let recipient_pub = hybrid_x25519_public_inner(&HYB_X25519_SECRET).unwrap();
+        let recipient_ek = hybrid_mlkem_encaps_key_inner(&HYB_MLKEM_SEED).unwrap();
+        assert!(hybrid_auth_seal_to_container_inner(
+            &[0u8; 31],
+            &recipient_pub,
+            &recipient_ek,
+            &HYB_EPH_SECRET,
+            &HYB_COIN,
+            &hyb_nonce(),
+            &aad,
+            b"x"
+        )
+        .is_err());
+        let c = hyb_auth_seal(&aad);
+        assert!(hybrid_auth_open_container_inner(
+            &HYB_X25519_SECRET,
+            &HYB_MLKEM_SEED,
+            &[0u8; 31],
+            &aad,
+            &c
+        )
+        .is_err());
+    }
+
+    /// ⭐ THE GOLDEN AAD VECTOR, byte for byte, so the JS mirror has exactly one
+    /// number to match. Duplicated in `libsigil/core/src/hybrid_auth.rs` and in
+    /// `sigil-wasm/test/sharing-interop.mjs`.
+    #[test]
+    fn vault_key_wrap_aad_is_golden() {
+        let aad = vault_key_wrap_aad("demo", "dev_bob", "dev_alice");
+        let hex: String = aad.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "736967696c2d7661756c742d6b65792d777261702d76310a0000000464656d6f\
+             000000076465765f626f62000000096465765f616c696365"
+        );
+        // Length-prefixing means no two distinct triples collide.
+        assert_ne!(
+            vault_key_wrap_aad("ab", "c", "d"),
+            vault_key_wrap_aad("a", "bc", "d")
+        );
     }
 
     // --- TOTP / HOTP: RFC vectors through the wasm wrappers ---------------

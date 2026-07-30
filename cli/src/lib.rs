@@ -54,12 +54,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sigil_core::{
-    decode_recovery_kit, derive_recovery_keys, encode_recovery_kit, hybrid_open, hybrid_seal,
-    ml_kem768_keygen, open_record, public_key_from_seed, seal_record, sign, x25519_public_key,
-    Argon2Params, HybridSealError, OtpAlgorithm, RecordError, RecoveryError,
-    ML_KEM768_CIPHERTEXT_LEN, ML_KEM768_DECAPS_KEY_LEN, ML_KEM768_ENCAPS_COIN_LEN,
-    ML_KEM768_ENCAPS_KEY_LEN, ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, RECOVERY_SEED_LEN,
-    SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN, X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
+    decode_recovery_kit, derive_recovery_keys, encode_recovery_kit, hybrid_auth_open,
+    hybrid_auth_seal, hybrid_open, hybrid_seal, ml_kem768_keygen, open_record,
+    public_key_from_seed, seal_record, sign, vault_key_wrap_aad, x25519_public_key, Argon2Params,
+    HybridSealError, OtpAlgorithm, RecordError, RecoveryError, ML_KEM768_CIPHERTEXT_LEN,
+    ML_KEM768_DECAPS_KEY_LEN, ML_KEM768_ENCAPS_COIN_LEN, ML_KEM768_ENCAPS_KEY_LEN,
+    ML_KEM768_KEYGEN_SEED_LEN, NONCE_LEN, RECOVERY_SEED_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
+    X25519_PUBLIC_KEY_LEN, X25519_SECRET_KEY_LEN,
 };
 
 /// The 8-byte magic that prefixes every container.
@@ -253,6 +254,41 @@ pub enum CliError {
         /// What the server is actually serving.
         presented_safety_number: String,
     },
+    /// ⛔ A `SIGILhyb` container was presented in the WRONG SLOT (Phase 60).
+    ///
+    /// There are two kinds of hybrid container and they are NOT
+    /// interchangeable:
+    ///
+    /// * **version 1** — the ANONYMOUS file container written by
+    ///   `sigil hybrid-seal`. Anyone holding the recipient's PUBLIC key can mint
+    ///   one; there is no sender in it at all.
+    /// * **version 2** — the AUTHENTICATED container a vault-key wrap uses. It
+    ///   can only be produced by a device holding a specific long-term X25519
+    ///   secret, and it is sealed under a context AAD naming the vault, the
+    ///   recipient and the sender.
+    ///
+    /// ⛔ **A version-1 container is REFUSED as a vault-key envelope, never
+    /// accepted.** Accepting it would be accepting the forgery this version
+    /// exists to stop: `sigil hybrid-seal --recipient-pub <victim>.pub --in
+    /// <attacker-chosen-key>` produced bytes that were byte-shaped identically
+    /// to a genuine wrap and opened cleanly. There is deliberately NO
+    /// compatibility flag. This repo is pre-audit and dev-gated with no real
+    /// users, so the break is clean: re-run `sigil vault share` / `sigil vault
+    /// rotate` / `sigil recovery cover` to re-issue every envelope.
+    WrongEnvelopeKind {
+        /// The container version actually found.
+        found_version: u8,
+        /// The container version this slot requires.
+        expected_version: u8,
+    },
+    /// ⛔ A vault-key envelope could not be attributed to an EXPECTED SENDER
+    /// (Phase 60): the caller could not work out which device deposited it, so
+    /// there was nothing to authenticate against and nothing was unwrapped.
+    ///
+    /// This is a REFUSAL, not a fallback: unwrapping "from whoever" is exactly
+    /// the anonymous behaviour that made a forged envelope indistinguishable
+    /// from a real one.
+    UnknownSender(String),
 }
 
 impl From<RecordError> for CliError {
@@ -389,6 +425,36 @@ impl core::fmt::Display for CliError {
                  from server:  {presented_safety_number}\n  \
                  Either it was mistyped, or the server substituted a key it can decrypt with. \
                  Nothing was wrapped, nothing was uploaded, and no key was pinned."
+            ),
+            CliError::WrongEnvelopeKind {
+                found_version: 1,
+                expected_version: 2,
+            } => write!(
+                f,
+                "REFUSING TO UNWRAP: this is a version 1 (UNAUTHENTICATED) SIGILhyb container, \
+                 and a vault-key envelope must be version 2 (AUTHENTICATED).\n  \
+                 A version 1 container carries NO SENDER: anyone who can read the recipient's \
+                 published hybrid PUBLIC key can mint one, so accepting it would let an \
+                 attacker install a vault key of their own choosing and read everything \
+                 written afterwards.\n  \
+                 There is deliberately no compatibility flag. Ask the sender to re-issue it \
+                 with `sigil vault share` (or `sigil vault rotate` / `sigil recovery cover`)."
+            ),
+            CliError::WrongEnvelopeKind {
+                found_version,
+                expected_version,
+            } => write!(
+                f,
+                "SIGILhyb container version {found_version} presented where version \
+                 {expected_version} is required (version 1 = anonymous file container, \
+                 version 2 = authenticated vault-key envelope; they are not interchangeable)"
+            ),
+            CliError::UnknownSender(m) => write!(
+                f,
+                "REFUSING TO UNWRAP: {m}\n  \
+                 A vault-key envelope is authenticated to the device that deposited it, so \
+                 there is nothing to check it against until that device is known. Name it \
+                 explicitly with --from <deviceID>."
             ),
         }
     }
@@ -856,39 +922,28 @@ pub fn hybrid_seal_to_container(
 /// - [`CliError::ShortContainer`] if the buffer can't hold the fixed prefix.
 /// - [`CliError::BadMagic`] / [`CliError::UnsupportedVersion`] on header
 ///   mismatch.
+/// - [`CliError::WrongEnvelopeKind`] if handed an AUTHENTICATED (version 2)
+///   vault-key envelope — that one must go through
+///   [`hybrid_auth_open_container`], which checks the sender and the context.
 /// - [`CliError::HybridSeal`] if the wrapped record fails to decode or
 ///   authenticate (wrong identity or tampered container).
 pub fn hybrid_open_container(
     identity: &HybridSecretKeys,
     container: &[u8],
 ) -> Result<Vec<u8>, CliError> {
-    if container.len() < HYBRID_FIXED_PREFIX_LEN {
-        return Err(CliError::ShortContainer);
+    let (version, eph_pub, mlkem_ct, envelope) = split_hybrid_container(container)?;
+    if version == HYBRID_AUTH_FORMAT_VERSION {
+        // The OTHER direction of the same rule: an AUTHENTICATED vault-key
+        // envelope is not an anonymous file, and opening it here would drop the
+        // sender check and the context binding on the floor.
+        return Err(CliError::WrongEnvelopeKind {
+            found_version: version,
+            expected_version: HYBRID_FORMAT_VERSION,
+        });
     }
-
-    let (magic, rest) = container.split_at(8);
-    if magic != HYBRID_MAGIC.as_slice() {
-        return Err(CliError::BadMagic);
-    }
-
-    let version = rest[0];
     if version != HYBRID_FORMAT_VERSION {
         return Err(CliError::UnsupportedVersion(version));
     }
-
-    // After magic(8) + version(1): eph_x25519_pub[32] | mlkem_ct[1088] |
-    // envelope[..]. The length gate above guarantees every split below is in
-    // bounds, so the fixed-length `try_into`s cannot fail.
-    let after_version = &rest[1..];
-    let (eph_pub_bytes, rest2) = after_version.split_at(X25519_PUBLIC_KEY_LEN);
-    let (mlkem_ct_bytes, envelope) = rest2.split_at(ML_KEM768_CIPHERTEXT_LEN);
-
-    let eph_pub: [u8; X25519_PUBLIC_KEY_LEN] = eph_pub_bytes
-        .try_into()
-        .expect("eph_pub slice is exactly X25519_PUBLIC_KEY_LEN by construction");
-    let mlkem_ct: [u8; ML_KEM768_CIPHERTEXT_LEN] = mlkem_ct_bytes
-        .try_into()
-        .expect("mlkem_ct slice is exactly ML_KEM768_CIPHERTEXT_LEN by construction");
 
     let plaintext = hybrid_open(
         &identity.x25519_secret,
@@ -898,6 +953,185 @@ pub fn hybrid_open_container(
         envelope,
     )?;
     Ok(plaintext)
+}
+
+// ---------------------------------------------------------------------------
+// ⭐ PHASE 60 — THE **AUTHENTICATED** HYBRID CONTAINER (`SIGILhyb` version 2)
+// ---------------------------------------------------------------------------
+//
+// THE HOLE THIS CLOSES, reproduced with the shipped binary and nothing else:
+//
+//     sigil hybrid-keygen --out b.hybrid          # victim; b.hybrid.pub is published
+//     head -c 32 /dev/urandom > attacker_key.bin
+//     sigil hybrid-seal --recipient-pub b.hybrid.pub --in attacker_key.bin --out forged.env
+//     -> 1226 bytes, magic SIGILhyb, byte-shaped IDENTICALLY to a genuine vault-key wrap
+//     sigil hybrid-open --key b.hybrid --in forged.env   # 32 bytes, the attacker's key
+//
+// Three separate defects lined up:
+//
+//   1. `hybrid_seal` is ANONYMOUS (ephemeral-static). Holding the recipient's
+//      PUBLIC key is enough to produce a container it will open. sigild serves
+//      every device's published hybrid public key to every authenticated device.
+//   2. `HYBRID_AAD` was FIXED (`b"sigil-hybrid-cli/1"`), so a container was bound
+//      to no vault, no recipient, no sender AND NO PURPOSE — which is exactly
+//      why the general-purpose FILE command's output was a valid VAULT-KEY
+//      envelope.
+//   3. `unwrap_vault_key`'s only check was `len == 32`.
+//
+// Consequence: a hostile/breached server, or any co-tenant with WRITE on the
+// vault, could install a vault key IT chose, and everything the victim wrote
+// afterwards was readable by the attacker. ADR 0038 pinning did not help — the
+// accept path fetched no hybrid key at all, so the pin store was never consulted.
+//
+// THE FIX, in three parts, all of which must hold:
+//
+//   * the KEM becomes AUTHENTICATED (`sigil_core::hybrid_auth_seal`): the sender
+//     mixes in a static-static X25519 DH, so a forger needs the SENDER's secret,
+//     not just the recipient's public key;
+//   * the AAD becomes CONTEXT-BOUND (`sigil_core::vault_key_wrap_aad`): purpose
+//     + vault id + recipient device id + sender device id;
+//   * the container VERSION becomes 2, and a version-1 container is REFUSED
+//     wherever a vault key is expected — accepting v1 would be accepting the
+//     vulnerability.
+//
+// The ANONYMOUS v1 form is KEPT for `sigil hybrid-seal` / `hybrid-open`, which
+// are honestly anonymous file encryption to a public key. The two are
+// domain-separated three ways over (version byte, KDF info label, AAD prefix),
+// so neither can be substituted for the other in either direction.
+
+/// The AUTHENTICATED hybrid container format version — what every vault-key
+/// envelope is written as and the only version an unwrap accepts.
+///
+/// MIRRORED in `sigil-wasm/src/lib.rs`; the two MUST stay byte-for-byte in sync.
+pub const HYBRID_AUTH_FORMAT_VERSION: u8 = 2;
+
+/// Encrypt `plaintext` TO a recipient's hybrid public identity **AS** the holder
+/// of `sender_x25519_secret`, under the caller-supplied context `aad`.
+///
+/// The wire layout is the v1 layout with a bumped version byte, so the two are
+/// distinguishable at offset 8 without parsing anything:
+///
+/// ```text
+///   offset  size    field
+///   ------  ------  -----------------------------------------------
+///   0       8       magic          = b"SIGILhyb"
+///   8       1       version        = 2   (1 = anonymous, 2 = AUTHENTICATED)
+///   9       32      eph_x25519_pub (sender's EPHEMERAL X25519 public key)
+///   41      1088    mlkem_ct       (ML-KEM-768 ciphertext)
+///   1129    ..      envelope       = the hybrid_auth_seal envelope (tail)
+/// ```
+///
+/// ⭐ The sender's STATIC public key is deliberately **NOT** carried in the
+/// container. It is an INPUT to the recipient's derivation, supplied out of band
+/// (from the pin store, through the [`VerifiedSender`] gate). Carrying it would
+/// invite exactly the mistake this fixes: reading the sender's identity out of
+/// the attacker-controlled bytes and then "verifying" against it.
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails.
+/// - [`CliError::HybridSeal`] if the KEM rejects an input.
+pub fn hybrid_auth_seal_to_container(
+    sender_x25519_secret: &[u8; X25519_SECRET_KEY_LEN],
+    recipient: &HybridPublicKeys,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CliError> {
+    let mut eph_secret = [0u8; X25519_SECRET_KEY_LEN];
+    fill_random(&mut eph_secret)?;
+    let mut coin = [0u8; ML_KEM768_ENCAPS_COIN_LEN];
+    fill_random(&mut coin)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    fill_random(&mut nonce)?;
+
+    let (eph_pub, mlkem_ct, envelope) = hybrid_auth_seal(
+        sender_x25519_secret,
+        &recipient.x25519_public_key,
+        &recipient.mlkem_encaps_key,
+        &eph_secret,
+        &coin,
+        &nonce,
+        aad,
+        plaintext,
+    )?;
+
+    let mut out = Vec::with_capacity(HYBRID_FIXED_PREFIX_LEN + envelope.len());
+    out.extend_from_slice(HYBRID_MAGIC);
+    out.push(HYBRID_AUTH_FORMAT_VERSION);
+    out.extend_from_slice(&eph_pub);
+    out.extend_from_slice(&mlkem_ct);
+    out.extend_from_slice(&envelope);
+    Ok(out)
+}
+
+/// The parsed parts of a `SIGILhyb` container: `(version, eph_x25519_pub,
+/// mlkem_ct, envelope)`. Shared by the anonymous (v1) and authenticated (v2)
+/// readers, which have identical framing and differ only in the version byte
+/// and how the envelope was sealed.
+type HybridContainerParts<'a> = (
+    u8,
+    [u8; X25519_PUBLIC_KEY_LEN],
+    [u8; ML_KEM768_CIPHERTEXT_LEN],
+    &'a [u8],
+);
+
+/// Split a `SIGILhyb` container into its parts, bounds-checking BEFORE slicing
+/// so short or garbage input yields a clear error rather than a panic.
+fn split_hybrid_container(container: &[u8]) -> Result<HybridContainerParts<'_>, CliError> {
+    if container.len() < HYBRID_FIXED_PREFIX_LEN {
+        return Err(CliError::ShortContainer);
+    }
+    let (magic, rest) = container.split_at(8);
+    if magic != HYBRID_MAGIC.as_slice() {
+        return Err(CliError::BadMagic);
+    }
+    let version = rest[0];
+    let after_version = &rest[1..];
+    let (eph_pub_bytes, rest2) = after_version.split_at(X25519_PUBLIC_KEY_LEN);
+    let (mlkem_ct_bytes, envelope) = rest2.split_at(ML_KEM768_CIPHERTEXT_LEN);
+    let eph_pub: [u8; X25519_PUBLIC_KEY_LEN] = eph_pub_bytes
+        .try_into()
+        .expect("slice is exactly X25519_PUBLIC_KEY_LEN by construction");
+    let mlkem_ct: [u8; ML_KEM768_CIPHERTEXT_LEN] = mlkem_ct_bytes
+        .try_into()
+        .expect("slice is exactly ML_KEM768_CIPHERTEXT_LEN by construction");
+    Ok((version, eph_pub, mlkem_ct, envelope))
+}
+
+/// Open an AUTHENTICATED container, asserting it came from
+/// `sender_x25519_pub` and was sealed under exactly `aad`.
+///
+/// ⛔ A **version 1** (anonymous) container is refused with
+/// [`CliError::WrongEnvelopeKind`] BEFORE any cryptography runs. That refusal is
+/// the whole point: a v1 container proves nothing about who made it.
+///
+/// # Errors
+/// - [`CliError::ShortContainer`] / [`CliError::BadMagic`].
+/// - [`CliError::WrongEnvelopeKind`] for a v1 (or any non-v2) container.
+/// - [`CliError::HybridSeal`] on ANY authentication failure — wrong recipient,
+///   **wrong sender**, tampered bytes, or a mismatched context AAD. No plaintext
+///   is ever returned in that case.
+pub fn hybrid_auth_open_container(
+    identity: &HybridSecretKeys,
+    sender_x25519_pub: &[u8; X25519_PUBLIC_KEY_LEN],
+    aad: &[u8],
+    container: &[u8],
+) -> Result<Vec<u8>, CliError> {
+    let (version, eph_pub, mlkem_ct, envelope) = split_hybrid_container(container)?;
+    if version != HYBRID_AUTH_FORMAT_VERSION {
+        return Err(CliError::WrongEnvelopeKind {
+            found_version: version,
+            expected_version: HYBRID_AUTH_FORMAT_VERSION,
+        });
+    }
+    Ok(hybrid_auth_open(
+        &identity.x25519_secret,
+        &identity.mlkem_decaps_key,
+        sender_x25519_pub,
+        &eph_pub,
+        &mlkem_ct,
+        aad,
+        envelope,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -3290,43 +3524,181 @@ pub fn get_key_envelope(
     finish_bytes(req.call())
 }
 
-/// WRAP a vault key to a recipient's hybrid public identity, producing the
-/// OPAQUE envelope the server relays.
+/// ⭐ The CONTEXT a vault-key envelope is bound to. Both sides MUST build the
+/// identical value or the AEAD refuses to open — which is the point.
 ///
-/// This is a thin, deliberately explicit wrapper over
-/// [`hybrid_seal_to_container`]: fresh ephemeral entropy (an X25519 secret, an
-/// ML-KEM-768 coin, and an AEAD nonce) is drawn from the OS CSPRNG on EVERY
-/// call, so no two shares of the same key reuse randomness.
+/// It answers the four questions a fixed AAD could not: *what is this for*
+/// (purpose), *which vault*, *addressed to whom*, and *from whom*. Byte layout
+/// is single-sourced in `sigil_core::vault_key_wrap_aad`.
 ///
-/// # Errors
-/// - [`CliError::Identity`] if the recipient's public identity does not decode.
-/// - [`CliError::Rng`] / [`CliError::HybridSeal`] from the underlying seal.
-pub fn wrap_vault_key(
-    recipient: &HybridPublicIdentity,
-    key: &[u8; VAULT_KEY_LEN],
-) -> Result<Vec<u8>, CliError> {
-    let decoded = recipient.decode()?;
-    hybrid_seal_to_container(&decoded, key)
+/// ⚠️ The three ids are positional. `new` validates their shapes, but it cannot
+/// tell a swapped recipient/sender pair from a legitimate one — the AEAD will,
+/// on the other side, by refusing to open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultKeyWrapContext {
+    vault_id: String,
+    recipient_device_id: String,
+    sender_device_id: String,
 }
 
-/// UNWRAP an envelope with this device's hybrid SECRET identity, recovering the
-/// 32-byte vault key.
+impl VaultKeyWrapContext {
+    /// Build a context, validating that each identifier is a shape this CLI is
+    /// willing to put in a URL (non-empty, no `/`, no whitespace).
+    ///
+    /// # Errors
+    /// - [`CliError::BadVault`] / [`CliError::Key`] for a malformed identifier.
+    pub fn new(
+        vault_id: &str,
+        recipient_device_id: &str,
+        sender_device_id: &str,
+    ) -> Result<Self, CliError> {
+        check_vault(vault_id)?;
+        check_device_id(recipient_device_id)?;
+        check_device_id(sender_device_id)?;
+        Ok(Self {
+            vault_id: vault_id.to_string(),
+            recipient_device_id: recipient_device_id.to_string(),
+            sender_device_id: sender_device_id.to_string(),
+        })
+    }
+
+    /// The vault this envelope belongs to.
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+    /// The device the envelope is addressed to.
+    pub fn recipient_device_id(&self) -> &str {
+        &self.recipient_device_id
+    }
+    /// The device that deposited (or will deposit) it.
+    pub fn sender_device_id(&self) -> &str {
+        &self.sender_device_id
+    }
+
+    /// The exact additional-authenticated-data bytes.
+    pub fn aad(&self) -> Vec<u8> {
+        vault_key_wrap_aad(
+            &self.vault_id,
+            &self.recipient_device_id,
+            &self.sender_device_id,
+        )
+    }
+}
+
+/// The SENDING half of a wrap: which device we are, and the hybrid SECRET
+/// identity that proves it.
 ///
-/// The recovered plaintext must be exactly [`VAULT_KEY_LEN`] bytes — anything
-/// else is rejected rather than silently used as a key.
+/// Bundled into one value so a call site cannot pass a device id belonging to
+/// one identity and the secret of another — the two must travel together.
+///
+/// ⚠️ Deliberately NOT `Debug`: [`HybridSecretIdentity`]'s own `Debug` prints its
+/// base64 secret, and nothing here should make that easier to reach.
+#[derive(Clone)]
+pub struct SenderIdentity {
+    /// This device's server-assigned id.
+    pub device_id: String,
+    /// This device's hybrid SECRET identity (X25519 secret + ML-KEM seed).
+    pub hybrid_secret: HybridSecretIdentity,
+}
+
+impl SenderIdentity {
+    /// Build a sender identity from a device id and its secret hybrid identity.
+    ///
+    /// # Errors
+    /// - [`CliError::Key`] if `device_id` is malformed.
+    pub fn new(device_id: &str, hybrid_secret: HybridSecretIdentity) -> Result<Self, CliError> {
+        check_device_id(device_id)?;
+        Ok(Self {
+            device_id: device_id.to_string(),
+            hybrid_secret,
+        })
+    }
+
+    /// This sender's X25519 SECRET scalar — the material that authenticates it.
+    fn x25519_secret(&self) -> Result<[u8; X25519_SECRET_KEY_LEN], CliError> {
+        Ok(self.hybrid_secret.decode()?.x25519_secret)
+    }
+
+    /// This sender's X25519 PUBLIC key, derived locally from the secret.
+    pub fn x25519_public_key(&self) -> Result<[u8; X25519_PUBLIC_KEY_LEN], CliError> {
+        Ok(x25519_public_key(&self.x25519_secret()?))
+    }
+}
+
+/// ⭐ WRAP a vault key to a recipient's hybrid public identity, AUTHENTICATED as
+/// `sender` and BOUND to `ctx`.
+///
+/// Fresh ephemeral entropy (an X25519 secret, an ML-KEM-768 coin, and an AEAD
+/// nonce) is drawn from the OS CSPRNG on EVERY call, so no two wraps of the same
+/// key reuse randomness.
+///
+/// ⚠️ `ctx.sender_device_id()` MUST be `sender.device_id` — the caller says who
+/// it is twice, once for the AAD (which the recipient checks) and once for the
+/// key material (which the AEAD checks). They are compared here so a mismatch is
+/// a local error rather than an envelope that nobody can open.
 ///
 /// # Errors
-/// - [`CliError::Identity`] if the secret identity does not decode.
-/// - [`CliError::HybridSeal`] on a wrong identity or tampered envelope (no
-///   plaintext is leaked).
+/// - [`CliError::Sharing`] if `ctx` names a different sender than `sender`.
+/// - [`CliError::Identity`] if either identity does not decode.
+/// - [`CliError::Rng`] / [`CliError::HybridSeal`] from the underlying seal.
+pub fn wrap_vault_key(
+    sender: &SenderIdentity,
+    recipient: &HybridPublicIdentity,
+    ctx: &VaultKeyWrapContext,
+    key: &[u8; VAULT_KEY_LEN],
+) -> Result<Vec<u8>, CliError> {
+    if ctx.sender_device_id() != sender.device_id {
+        return Err(CliError::Sharing(format!(
+            "wrap context names sender {:?} but the signing identity is {:?}",
+            ctx.sender_device_id(),
+            sender.device_id
+        )));
+    }
+    let decoded = recipient.decode()?;
+    hybrid_auth_seal_to_container(&sender.x25519_secret()?, &decoded, &ctx.aad(), key)
+}
+
+/// ⭐ UNWRAP an envelope with this device's hybrid SECRET identity — but ONLY as
+/// a record from `sender`, and ONLY under `ctx`.
+///
+/// Three checks, in this order, and every one of them is load-bearing:
+///
+///   1. the container must be AUTHENTICATED (version 2). A version-1 container
+///      is [`CliError::WrongEnvelopeKind`] — it carries no sender at all;
+///   2. the AEAD must authenticate under the shared secret derived with
+///      `sender`'s **static X25519 public key**. A forger who has only public
+///      material cannot produce one, so a wrong or forged sender fails HERE, at
+///      the AEAD, not at a string comparison that could be bypassed;
+///   3. the recovered plaintext must be exactly [`VAULT_KEY_LEN`] bytes.
+///
+/// ⭐ The sender arrives as a [`VerifiedSender`], which only
+/// [`verify_sender_for_unwrap`] and [`VerifiedSender::from_local`] can build —
+/// the same type-gate pattern as [`VerifiedRecipient`] on the wrap side. A
+/// caller cannot reach this function with a key it pulled straight off the wire.
+///
+/// # Errors
+/// - [`CliError::WrongEnvelopeKind`] for a legacy/anonymous envelope.
+/// - [`CliError::Identity`] if an identity does not decode.
+/// - [`CliError::HybridSeal`] on a wrong recipient, a WRONG SENDER, a tampered
+///   envelope, or a mismatched context (no plaintext is leaked).
 /// - [`CliError::Sharing`] if the envelope opened but did not hold a
 ///   [`VAULT_KEY_LEN`]-byte key.
 pub fn unwrap_vault_key(
     identity: &HybridSecretIdentity,
+    sender: &VerifiedSender,
+    ctx: &VaultKeyWrapContext,
     envelope: &[u8],
 ) -> Result<[u8; VAULT_KEY_LEN], CliError> {
+    if ctx.sender_device_id() != sender.device_id() {
+        return Err(CliError::Sharing(format!(
+            "unwrap context names sender {:?} but the verified sender is {:?}",
+            ctx.sender_device_id(),
+            sender.device_id()
+        )));
+    }
     let decoded = identity.decode()?;
-    let plaintext = hybrid_open_container(&decoded, envelope)?;
+    let plaintext =
+        hybrid_auth_open_container(&decoded, &sender.x25519_public_key()?, &ctx.aad(), envelope)?;
     plaintext.try_into().map_err(|v: Vec<u8>| {
         CliError::Sharing(format!(
             "envelope opened but held {} bytes, expected a {VAULT_KEY_LEN}-byte vault key",
@@ -4031,6 +4403,181 @@ pub fn verify_recipient_for_wrap(
     })
 }
 
+// ===========================================================================
+// ⭐⭐ THE UNWRAP GATE — the mirror image, on the receiving side
+// ===========================================================================
+//
+// The wrap side has had a type-enforced choke point since Phase 54. The UNWRAP
+// side had NOTHING: `vault accept` fetched an envelope and opened it, full stop.
+// It never fetched a hybrid key, so ADR 0038's pin store was not merely
+// bypassed — it was never CONSULTED. That is why key pinning did not mitigate
+// the forgery at all.
+//
+// Now an unwrap needs a `VerifiedSender`, and a `VerifiedSender` exists only in
+// two ways:
+//
+//   * `verify_sender_for_unwrap` — fetch the sender's published hybrid key and
+//     pin-check it, exactly as the wrap side does;
+//   * `VerifiedSender::from_local` — we HOLD the sender's secret half, so there
+//     was no fetch and nothing to substitute.
+//
+// ⚠️ THE HONEST LIMIT, stated plainly because it is the same one ADR 0038
+// accepted: on FIRST SIGHT of a sender, a hostile server can serve its own key
+// as "the sender's" AND forge an envelope under it. Pinning cannot protect first
+// contact in either direction. What authentication buys unconditionally is the
+// OTHER attacker in the threat model — a co-tenant with write access, or any
+// party that is not the server — who can no longer mint an acceptable envelope
+// at all. Against the server itself, the defence is the same as for a wrap: a
+// pinned sender is a hard stop on change, and `--safety-number` closes first
+// contact if a human uses it.
+
+/// A sender whose hybrid public key has passed [`verify_sender_for_unwrap`] (or
+/// is held locally in full).
+///
+/// ⭐ Fields are PRIVATE and there is NO public struct literal, so
+/// [`unwrap_vault_key`]'s signature is a proof rather than a convention.
+#[derive(Debug, Clone)]
+pub struct VerifiedSender {
+    device_id: String,
+    identity: HybridPublicIdentity,
+    trust: RecipientTrust,
+    safety_number: String,
+}
+
+impl VerifiedSender {
+    /// The device this key belongs to.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    /// The verified hybrid public identity.
+    pub fn identity(&self) -> &HybridPublicIdentity {
+        &self.identity
+    }
+    /// How trust was established.
+    pub fn trust(&self) -> RecipientTrust {
+        self.trust
+    }
+    /// The safety number of the key an envelope is about to be authenticated
+    /// against. Callers SHOULD show it when trust is first-sight.
+    pub fn safety_number(&self) -> &str {
+        &self.safety_number
+    }
+
+    /// The sender's static X25519 public key — the authentication input.
+    fn x25519_public_key(&self) -> Result<[u8; X25519_PUBLIC_KEY_LEN], CliError> {
+        Ok(self.identity.decode()?.x25519_public_key)
+    }
+
+    /// ⭐ The sender is an identity THIS PROCESS HOLDS THE SECRET HALF OF.
+    ///
+    /// Nothing is fetched, so there is nothing for a server to substitute — this
+    /// is the strongest of the trust outcomes, stronger than a pin. It is not a
+    /// bypass: constructing it requires the sender's SECRET identity, and anyone
+    /// holding that already *is* the sender. Used when a device unwraps an
+    /// envelope it wrapped itself (`vault rekey --publish`, the recovery kit's
+    /// mandatory pre-print round trip).
+    ///
+    /// # Errors
+    /// - [`CliError::Identity`] if the secret identity does not decode.
+    pub fn from_local(sender: &SenderIdentity) -> Result<Self, CliError> {
+        let keys = sender.hybrid_secret.decode()?;
+        let identity = HybridPublicIdentity {
+            version: HYBRID_IDENTITY_VERSION,
+            x25519_public_key: BASE64.encode(x25519_public_key(&keys.x25519_secret)),
+            mlkem_encaps_key: BASE64.encode(
+                ml_kem768_keygen(&decode_identity_field::<ML_KEM768_KEYGEN_SEED_LEN>(
+                    &sender.hybrid_secret.mlkem_seed,
+                    "mlkem_seed",
+                )?)
+                .0,
+            ),
+        };
+        let safety_number = hybrid_safety_number(&sender.device_id, &identity)?;
+        Ok(VerifiedSender {
+            device_id: sender.device_id.clone(),
+            identity,
+            trust: RecipientTrust::Derived,
+            safety_number,
+        })
+    }
+}
+
+/// ⭐⭐ THE UNWRAP GATE. Resolve the hybrid public key of the device that
+/// DEPOSITED an envelope, and establish trust in it, before anything is opened.
+///
+/// | situation | outcome | pin store |
+/// |---|---|---|
+/// | key DERIVED locally (pin `origin = "recovery-kit"`) | [`RecipientTrust::Derived`], **no fetch** | untouched |
+/// | pinned key, byte-identical | [`RecipientTrust::Pinned`] | untouched |
+/// | pinned key, **different** | ⛔ [`CliError::PinMismatch`] | **untouched** |
+/// | first sight + matching `expected_safety_number` | [`RecipientTrust::VerifiedFirstSight`] | pinned |
+/// | first sight + **wrong** `expected_safety_number` | ⛔ [`CliError::SafetyNumberMismatch`] | **untouched** |
+/// | first sight, no safety number | [`RecipientTrust::UnverifiedFirstSight`] (warn) | pinned |
+///
+/// Deliberately the SAME table as [`verify_recipient_for_wrap`] minus the
+/// recovery-kit row: a kit is a *recipient* of wraps, and the one place a kit
+/// acts as a sender (its own pre-print verification) holds the secret and uses
+/// [`VerifiedSender::from_local`].
+///
+/// As on the wrap side, every refusal happens BEFORE the key is pinned, so a
+/// retry cannot silence the alarm by pinning what was just refused.
+///
+/// # Errors
+/// - [`CliError::PinMismatch`] / [`CliError::SafetyNumberMismatch`] — hard
+///   stops; nothing was opened and the pin store is unchanged.
+/// - [`CliError::Server`] / [`CliError::Http`] from the fetch (fail-closed: an
+///   unreachable sender key means no unwrap, not an unauthenticated one).
+pub fn verify_sender_for_unwrap(
+    server: &str,
+    device_id: &str,
+    auth: &RequestAuth<'_>,
+    pins_path: &std::path::Path,
+    expected_safety_number: Option<&str>,
+) -> Result<VerifiedSender, CliError> {
+    check_device_id(device_id)?;
+
+    if let Some(identity) = derived_pin(pins_path, device_id)? {
+        let safety_number = hybrid_safety_number(device_id, &identity)?;
+        return Ok(VerifiedSender {
+            device_id: device_id.to_string(),
+            identity,
+            trust: RecipientTrust::Derived,
+            safety_number,
+        });
+    }
+
+    let identity = fetch_hybrid_key(server, device_id, auth)?;
+    let presented = hybrid_safety_number(device_id, &identity)?;
+
+    if let Some(expected) = expected_safety_number {
+        if normalize_safety_number(expected) != normalize_safety_number(&presented) {
+            return Err(CliError::SafetyNumberMismatch {
+                device_id: device_id.to_string(),
+                expected_safety_number: expected.to_string(),
+                presented_safety_number: presented,
+            });
+        }
+    }
+
+    let store = load_pins(pins_path)?;
+    let already_pinned = store.pins.contains_key(device_id);
+    // Pins (or, when already pinned, compares and refuses on change).
+    check_and_pin(pins_path, device_id, &identity)?;
+    let trust = if already_pinned {
+        RecipientTrust::Pinned
+    } else if expected_safety_number.is_some() {
+        RecipientTrust::VerifiedFirstSight
+    } else {
+        RecipientTrust::UnverifiedFirstSight
+    };
+    Ok(VerifiedSender {
+        device_id: device_id.to_string(),
+        identity,
+        trust,
+        safety_number: presented,
+    })
+}
+
 // --- billing / entitlement (READ ONLY) --------------------------------------
 
 /// The URL PATH of the subscription-status route.
@@ -4321,6 +4868,7 @@ pub fn rotate_vault_key(
     safety_numbers: &[(String, String)],
     auth: &RequestAuth<'_>,
     params: Argon2Params,
+    sender: &SenderIdentity,
 ) -> Result<RotationReport, CliError> {
     check_vault(vault_id)?;
     for r in recipients.iter().chain(drop.iter()) {
@@ -4416,7 +4964,8 @@ pub fn rotate_vault_key(
     //    replaced, not appended to).
     let mut rewrapped = Vec::with_capacity(resolved.len());
     for recipient in &resolved {
-        let envelope = wrap_vault_key(recipient.identity(), &new_key)?;
+        let ctx = VaultKeyWrapContext::new(vault_id, recipient.device_id(), &sender.device_id)?;
+        let envelope = wrap_vault_key(sender, recipient.identity(), &ctx, &new_key)?;
         put_key_envelope(server, vault_id, recipient.device_id(), &envelope, auth)?;
         rewrapped.push((recipient.device_id().to_string(), recipient.trust()));
     }
@@ -4455,8 +5004,11 @@ pub fn rotate_vault_key(
 //
 // WHAT THE SERVER SEES, AND IT IS ONLY WHAT IT ALREADY SAW: one more device row
 // (a label, an Ed25519 PUBLIC key, an account id), one more hybrid PUBLIC key
-// row (32 + 1184 bytes, length-checked only), and one more opaque ~1226-byte
-// `SIGILhyb` envelope per covered vault — byte-for-byte the shapes it already
+// row (32 + 1184 bytes, length-checked only), and one more opaque ~1.3 KiB
+// `SIGILhyb` envelope per covered vault (⚠️ NOT the flat 1226 bytes this comment
+// used to claim: from Phase 60 a vault-key envelope carries its context AAD, so
+// its length depends on the vault id and both device ids — 1304-1307 bytes
+// observed with real server-assigned ids) — byte-for-byte the shapes it already
 // relays for device-to-device sharing (ADR 0035). No table, column, route,
 // metric or audit field added by this phase can hold a kit secret, a vault key,
 // a password or a plaintext.
@@ -4684,10 +5236,19 @@ pub fn derived_pin(
 ///
 /// Returns the envelope bytes so a caller can write them out for inspection.
 ///
+/// ⭐ **THE ORDER IS AUTHORIZE-THEN-DEPOSIT, and it was the other way round.**
+/// The deposit used to run first, so a device with WRITE but no ownership got
+/// its envelope STORED and only then met the grant route's `403` — a caller who
+/// could not legitimately share still landed a key envelope of its choosing in
+/// the recipient's mailbox. A failed grant now means nothing was deposited. The
+/// reverse failure (grant succeeds, deposit fails) is the safe one: the
+/// recipient can read ciphertext it has no key for, which is exactly the state
+/// every recipient is in before a share anyway.
+///
 /// # Errors
 /// - [`CliError::Identity`] / [`CliError::Rng`] / [`CliError::HybridSeal`] from
 ///   the wrap.
-/// - [`CliError::Server`] / [`CliError::Http`] from the deposit or the grant.
+/// - [`CliError::Server`] / [`CliError::Http`] from the grant or the deposit.
 pub fn share_vault_to_known_key(
     server: &str,
     vault_id: &str,
@@ -4695,16 +5256,201 @@ pub fn share_vault_to_known_key(
     permission: &str,
     vault_key: &[u8; VAULT_KEY_LEN],
     auth: &RequestAuth<'_>,
+    sender: &SenderIdentity,
 ) -> Result<Vec<u8>, CliError> {
     check_vault(vault_id)?;
     let recipient_device_id = recipient.device_id();
-    // WRAP: fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
-    let envelope = wrap_vault_key(recipient.identity(), vault_key)?;
+    let ctx = VaultKeyWrapContext::new(vault_id, recipient_device_id, &sender.device_id)?;
+    // WRAP: AUTHENTICATED as this sender, BOUND to (vault, recipient, sender);
+    // fresh ephemeral X25519 secret + ML-KEM coin + AEAD nonce per call.
+    let envelope = wrap_vault_key(sender, recipient.identity(), &ctx, vault_key)?;
+    // AUTHORIZE FIRST through the EXISTING grant route, so a caller that may not
+    // share cannot leave an envelope behind.
+    //
+    // ⚠️ AND THE 403 HERE NEEDS EXPLAINING, because authorize-first has a cliff
+    // the old order hid: only a vault's OWNER may grant, ownership is
+    // trust-on-first-WRITE, and a vault that has never been written to this
+    // server therefore has NO owner — so the very first share of a never-pushed
+    // vault is refused. Under the old deposit-then-grant order the deposit
+    // silently claimed it. The bare server message ("only the vault owner ...")
+    // is true and useless; say what to do.
+    grant_vault_access(server, vault_id, recipient_device_id, permission, auth).map_err(
+        |e| match e {
+            CliError::Server { status: 403, .. } => CliError::Sharing(format!(
+                "REFUSED (HTTP 403 forbidden): this device may not grant access to vault \
+             {vault_id:?}, so nothing was wrapped and nothing was deposited.\n  \
+             Two causes, and only you can tell them apart:\n  \
+             (1) the vault has NEVER been written to this server, so NOBODY owns it yet \
+             \u{2014} ownership is trust-on-first-write. Push it first (`sigil push \
+             --vault {vault_id} --in <file>`, or Push in the app) and then share; a \
+             recipient holding a key with no ciphertext could not open anything anyway.\n  \
+             (2) the vault belongs to ANOTHER account. You may be able to write it, but \
+             administering it \u{2014} granting another device access \u{2014} belongs \
+             to its owner."
+            )),
+            other => other,
+        },
+    )?;
     // DEPOSIT the opaque envelope; the server cannot read it.
     put_key_envelope(server, vault_id, recipient_device_id, &envelope, auth)?;
-    // AUTHORIZE through the EXISTING grant route, so access and keys agree.
-    grant_vault_access(server, vault_id, recipient_device_id, permission, auth)?;
     Ok(envelope)
+}
+
+/// What an accept actually did. Fingerprints only — never a key.
+#[derive(Debug, Clone)]
+pub struct AcceptReport {
+    /// The vault accepted.
+    pub vault_id: String,
+    /// The device that deposited the envelope, as authenticated.
+    pub sender_device_id: String,
+    /// How trust in that sender was established.
+    pub sender_trust: RecipientTrust,
+    /// The sender's safety number, for a human to compare on first sight.
+    pub sender_safety_number: String,
+    /// SHA-256 fingerprint (16 hex) of the recovered key.
+    pub key_fingerprint: String,
+    /// Whether the recovered key was proved to OPEN this vault's newest op.
+    /// `false` only when the vault has never been pushed, so there was nothing
+    /// to open.
+    pub verified_against_tip: bool,
+    /// The fingerprint of the key this one REPLACED in the keyring, if any.
+    pub replaced: Option<String>,
+    /// The raw envelope, so a caller can write it out for inspection.
+    pub envelope: Vec<u8>,
+}
+
+/// ⭐ ACCEPT a vault key that another device wrapped to this one.
+///
+/// This is the receiving half of [`share_vault_to_known_key`] and it is where
+/// the forgery used to land. What it now does, in order, all of it load-bearing:
+///
+///   1. **work out WHO deposited the envelope.** Explicitly (`sender_device_id`)
+///      or from this device's OWN envelope index (`GET /v1/devices/{id}/keys`,
+///      self-only). No sender ⇒ [`CliError::UnknownSender`], a refusal. The id
+///      is server-supplied and therefore untrusted — naming the wrong device
+///      just makes step 3 fail, because the sender's static key is an input to
+///      the derivation, not a string that gets compared;
+///   2. **establish that sender's hybrid key** through
+///      [`verify_sender_for_unwrap`] — the pin store, at last, on the accept
+///      path;
+///   3. **unwrap AUTHENTICATED and CONTEXT-BOUND.** A v1 (anonymous) envelope is
+///      refused outright; a forged or re-filed one fails at the AEAD;
+///   4. ⭐ **OPEN BEFORE WRITING.** The recovered key must actually open this
+///      vault's newest op before it is written to the keyring — the same shape
+///      `recovery_restore` already used. A key that opens nothing never reaches
+///      local state;
+///   5. **never silently REPLACE.** An existing, different keyring entry needs
+///      `replace = true`. Overwriting is how a hostile deposit would take a
+///      vault away from a device that already had it.
+///
+/// # Errors
+/// - [`CliError::UnknownSender`] if the depositing device cannot be determined.
+/// - [`CliError::PinMismatch`] / [`CliError::SafetyNumberMismatch`] from step 2.
+/// - [`CliError::WrongEnvelopeKind`] / [`CliError::HybridSeal`] from step 3.
+/// - [`CliError::Sharing`] if the key does not open the vault, or if it would
+///   replace a different key without `replace`.
+/// - [`CliError::Server`] / [`CliError::Http`] from the transport.
+#[allow(clippy::too_many_arguments)]
+pub fn accept_vault_key(
+    server: &str,
+    vault_id: &str,
+    self_device_id: &str,
+    hybrid_secret: &HybridSecretIdentity,
+    keyring_path: &std::path::Path,
+    pins_path: &std::path::Path,
+    auth: &RequestAuth<'_>,
+    sender_device_id: Option<&str>,
+    expected_safety_number: Option<&str>,
+    replace: bool,
+) -> Result<AcceptReport, CliError> {
+    check_vault(vault_id)?;
+    check_device_id(self_device_id)?;
+
+    // 0) ⭐ COLLECT THE ENVELOPE FIRST — before anything else is asked of the
+    //    server. This ordering is deliberate and was the other way round: a
+    //    device that may NOT read this vault would otherwise be told "I cannot
+    //    work out who deposited the key" (its own index is empty) when the true
+    //    and far more useful answer is the mailbox's own `403 forbidden`. The
+    //    fetch grants nothing — the envelope is opaque ciphertext and is not
+    //    unwrapped until step 3 — so surfacing the authorization failure first
+    //    costs no security and stops a refusal being reported as a puzzle.
+    let envelope = get_key_envelope(server, vault_id, self_device_id, auth)?;
+
+    // 1) WHO SENT IT.
+    let sender_id = match sender_device_id {
+        Some(id) => {
+            check_device_id(id)?;
+            id.to_string()
+        }
+        None => {
+            let index = list_recoverable_vaults(server, self_device_id, auth)?;
+            let found = index
+                .iter()
+                .find(|v| v.vault_id == vault_id)
+                .map(|v| v.sender_device_id.clone())
+                .filter(|s| !s.is_empty());
+            found.ok_or_else(|| {
+                CliError::UnknownSender(format!(
+                    "this device's envelope index does not say which device deposited the key for \
+                     vault {vault_id:?}"
+                ))
+            })?
+        }
+    };
+
+    // 2) ESTABLISH THE SENDER'S KEY (pin store consulted — it never was before).
+    let sender =
+        verify_sender_for_unwrap(server, &sender_id, auth, pins_path, expected_safety_number)?;
+
+    // 3) UNWRAP, authenticated and context-bound.
+    let ctx = VaultKeyWrapContext::new(vault_id, self_device_id, &sender_id)?;
+    let key = unwrap_vault_key(hybrid_secret, &sender, &ctx, &envelope)?;
+
+    // 4) ⭐ OPEN BEFORE WRITING.
+    let ops = pull_ops_auth(server, vault_id, 0, auth)?;
+    let verified_against_tip = match ops.last() {
+        Some(last) => {
+            open_container(&key, &last.blob).map_err(|e| {
+                CliError::Sharing(format!(
+                    "the recovered key does NOT open vault {vault_id:?}'s newest op ({e}); \
+                     nothing was written to the keyring"
+                ))
+            })?;
+            true
+        }
+        None => false,
+    };
+
+    // 5) NEVER SILENTLY REPLACE.
+    let existing = keyring_get(keyring_path, vault_id)?;
+    let replaced = match existing {
+        Some(old) if old == key => None,
+        Some(old) => {
+            if !replace {
+                return Err(CliError::Sharing(format!(
+                    "this client already holds a DIFFERENT key for vault {vault_id:?} \
+                     (sha256 {}); accepting would replace it and lose access to everything \
+                     sealed under it. Re-run with --replace if that is what you mean.",
+                    vault_key_fingerprint(&old)
+                )));
+            }
+            Some(vault_key_fingerprint(&old))
+        }
+        None => None,
+    };
+
+    keyring_put(keyring_path, vault_id, &key)?;
+
+    Ok(AcceptReport {
+        vault_id: vault_id.to_string(),
+        sender_device_id: sender_id,
+        sender_trust: sender.trust(),
+        sender_safety_number: sender.safety_number().to_string(),
+        key_fingerprint: vault_key_fingerprint(&key),
+        verified_against_tip,
+        replaced,
+        envelope,
+    })
 }
 
 /// One vault a device holds a wrapped key for, as reported by
@@ -4848,6 +5594,7 @@ pub fn recovery_generate(
     keyring_path: &std::path::Path,
     pins_path: &std::path::Path,
     invite_ttl_seconds: Option<u64>,
+    sender: &SenderIdentity,
 ) -> Result<RecoveryKitOutcome, CliError> {
     // The generating device's own account, so step 7 has something to compare
     // against. Fetched FIRST: if this device cannot even read its own account,
@@ -4920,7 +5667,8 @@ pub fn recovery_generate(
     debug_assert_eq!(verified.trust(), RecipientTrust::Derived);
     let mut covered = Vec::with_capacity(keys.len());
     for (vault_id, key) in &keys {
-        share_vault_to_known_key(server, vault_id, &verified, "read", key, auth).map_err(abort)?;
+        share_vault_to_known_key(server, vault_id, &verified, "read", key, auth, sender)
+            .map_err(abort)?;
         covered.push((vault_id.clone(), vault_key_fingerprint(key)));
     }
 
@@ -4928,7 +5676,8 @@ pub fn recovery_generate(
     //    printed form and re-derives from THAT, so a codec bug cannot ship a
     //    sheet that decodes to a different identity.
     let verification =
-        verify_kit_round_trip(server, &code, &kit_id, &mine.account_id, &keys).map_err(abort)?;
+        verify_kit_round_trip(server, &code, &kit_id, &mine.account_id, &keys, sender)
+            .map_err(abort)?;
 
     let safety_number = hybrid_safety_number(&kit_id, &identity.hybrid_public)?;
     let after = get_account(server, auth)?;
@@ -4965,6 +5714,7 @@ fn verify_kit_round_trip(
     kit_id: &str,
     expected_account: &str,
     keys: &[(String, [u8; VAULT_KEY_LEN])],
+    sender: &SenderIdentity,
 ) -> Result<RecoveryVerification, CliError> {
     // Re-parse the EXACT text that will be printed.
     let parsed = decode_recovery_kit(code)?;
@@ -5006,7 +5756,12 @@ fn verify_kit_round_trip(
         )));
     }
     let envelope = get_key_envelope(server, vault_id, kit_id, &auth)?;
-    let recovered = unwrap_vault_key(&reborn.hybrid_secret, &envelope)?;
+    // ⭐ The envelope was wrapped moments ago BY THIS DEVICE, whose hybrid secret
+    // we hold — so the sender is established locally, with no fetch and nothing
+    // for the server to substitute.
+    let from_us = VerifiedSender::from_local(sender)?;
+    let ctx = VaultKeyWrapContext::new(vault_id, kit_id, &sender.device_id)?;
+    let recovered = unwrap_vault_key(&reborn.hybrid_secret, &from_us, &ctx, &envelope)?;
     let fingerprint = vault_key_fingerprint(&recovered);
     if fingerprint != vault_key_fingerprint(expected_key) {
         return Err(CliError::Recovery(format!(
@@ -5114,6 +5869,7 @@ pub fn recovery_cover(
     keyring_path: &std::path::Path,
     pins_path: &std::path::Path,
     expected_safety_number: Option<&str>,
+    sender: &SenderIdentity,
 ) -> Result<(String, bool), CliError> {
     check_device_id(kit_device_id)?;
     check_vault(vault_id)?;
@@ -5146,7 +5902,7 @@ pub fn recovery_cover(
         ))
     })?;
 
-    share_vault_to_known_key(server, vault_id, &verified, "read", &key, auth)?;
+    share_vault_to_known_key(server, vault_id, &verified, "read", &key, auth, sender)?;
     Ok((vault_key_fingerprint(&key), derived))
 }
 
@@ -5224,6 +5980,9 @@ pub fn recovery_restore(
 
     ensure_state_dir(out_dir)?;
     let keyring_path = out_dir.join(VAULT_KEYRING_FILE);
+    // The kit pins the senders it authenticates envelopes against, in the state
+    // dir it is already writing the keyring and the vault files into.
+    let pins_path = out_dir.join(HYBRID_PIN_FILE);
     let mut report = RestoreReport {
         device_id: device_id.to_string(),
         account_id: account.account_id,
@@ -5240,8 +5999,53 @@ pub fn recovery_restore(
                 continue;
             }
         };
-        // Rejects any recovered plaintext that is not exactly 32 bytes.
-        let key = unwrap_vault_key(&identity.hybrid_secret, &envelope)?;
+        // ⭐ WHO DEPOSITED THIS? A vault-key envelope is authenticated to its
+        // sender, so a restore must establish one. The kit knows nothing locally
+        // — it is a fresh machine — so the sender id comes from the kit's OWN
+        // envelope index. That id is server-supplied and therefore untrusted:
+        // naming the wrong device simply makes the AEAD refuse, because the
+        // sender's static key is an input to the derivation. A server can
+        // withhold recovery this way; it cannot forge one.
+        if entry.sender_device_id.is_empty() {
+            report.skipped.push((
+                entry.vault_id.clone(),
+                "the server did not say which device deposited this envelope, so there is no \
+                 sender to authenticate it against and it was NOT unwrapped"
+                    .to_string(),
+            ));
+            continue;
+        }
+        let sender = match verify_sender_for_unwrap(
+            server,
+            &entry.sender_device_id,
+            &auth,
+            &pins_path,
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                report.skipped.push((
+                    entry.vault_id.clone(),
+                    format!(
+                        "could not establish the sending device {}: {e}",
+                        entry.sender_device_id
+                    ),
+                ));
+                continue;
+            }
+        };
+        let ctx = VaultKeyWrapContext::new(&entry.vault_id, device_id, &entry.sender_device_id)?;
+        // Rejects a legacy/anonymous envelope, a forged one, and any recovered
+        // plaintext that is not exactly 32 bytes.
+        let key = match unwrap_vault_key(&identity.hybrid_secret, &sender, &ctx, &envelope) {
+            Ok(k) => k,
+            Err(e) => {
+                report
+                    .skipped
+                    .push((entry.vault_id.clone(), format!("envelope refused: {e}")));
+                continue;
+            }
+        };
 
         let ops = pull_ops_auth(server, &entry.vault_id, 0, &auth)?;
         let Some(last) = ops.last() else {
@@ -5313,11 +6117,7 @@ pub fn recovery_restore(
         // that key without ever asking a server — pin it as such. Without this,
         // an adopted machine would have to be handed the safety number to cover
         // a new vault with a key it holds the secret half of.
-        pin_derived_key(
-            &out_dir.join(HYBRID_PIN_FILE),
-            device_id,
-            &identity.hybrid_public,
-        )?;
+        pin_derived_key(&pins_path, device_id, &identity.hybrid_public)?;
     }
 
     Ok(report)
@@ -5461,15 +6261,20 @@ mod tests {
         let seed = [0x9du8; RECOVERY_SEED_LEN];
         let id = derive_recovery_identity(&seed);
         let key = [0x5au8; VAULT_KEY_LEN];
-        let envelope = wrap_vault_key(&id.hybrid_public, &key).expect("wrap");
-        // A recovery envelope is an ORDINARY SIGILhyb container — no new format.
+        let (sender, verified) = test_sender("dev_owner");
+        let ctx = VaultKeyWrapContext::new("demo", "dev_kit", "dev_owner").expect("ctx");
+        let envelope = wrap_vault_key(&sender, &id.hybrid_public, &ctx, &key).expect("wrap");
+        // A recovery envelope is an ORDINARY SIGILhyb container — no new format,
+        // just the AUTHENTICATED version byte.
         assert_eq!(&envelope[..8], HYBRID_MAGIC.as_slice());
-        let recovered = unwrap_vault_key(&id.hybrid_secret, &envelope).expect("unwrap");
+        assert_eq!(envelope[8], HYBRID_AUTH_FORMAT_VERSION);
+        let recovered =
+            unwrap_vault_key(&id.hybrid_secret, &verified, &ctx, &envelope).expect("unwrap");
         assert_eq!(recovered, key);
 
         // A DIFFERENT recovery secret recovers nothing.
         let other = derive_recovery_identity(&[0x9eu8; RECOVERY_SEED_LEN]);
-        assert!(unwrap_vault_key(&other.hybrid_secret, &envelope).is_err());
+        assert!(unwrap_vault_key(&other.hybrid_secret, &verified, &ctx, &envelope).is_err());
     }
 
     /// A code that round-trips through the printed form re-derives the SAME
@@ -7751,13 +8556,24 @@ mod tests {
         assert!(open_vault(&other, &sealed).is_err());
     }
 
+    /// A sender identity plus the locally-derived `VerifiedSender` for it —
+    /// the shape every wrap/unwrap test needs.
+    fn test_sender(device_id: &str) -> (SenderIdentity, VerifiedSender) {
+        let (secret, _public) = generate_hybrid_identity().expect("sender identity");
+        let sender = SenderIdentity::new(device_id, secret).expect("sender");
+        let verified = VerifiedSender::from_local(&sender).expect("verified sender");
+        (sender, verified)
+    }
+
     #[test]
     fn wrap_unwrap_vault_key_round_trips_and_rejects_the_wrong_device() {
         let (b_secret, b_public) = generate_hybrid_identity().expect("B identity");
         let (c_secret, _c_public) = generate_hybrid_identity().expect("C identity");
         let key = generate_vault_key().expect("key");
+        let (sender, verified) = test_sender("dev_a");
+        let ctx = VaultKeyWrapContext::new("demo", "dev_b", "dev_a").expect("ctx");
 
-        let envelope = wrap_vault_key(&b_public, &key).expect("wrap to B");
+        let envelope = wrap_vault_key(&sender, &b_public, &ctx, &key).expect("wrap to B");
         // The envelope is an opaque SIGILhyb container that does NOT contain the
         // key in the clear.
         assert_eq!(&envelope[..8], HYBRID_MAGIC.as_slice());
@@ -7766,20 +8582,20 @@ mod tests {
             "the wrapped envelope must not contain the vault key in the clear"
         );
 
-        let recovered = unwrap_vault_key(&b_secret, &envelope).expect("B unwraps");
+        let recovered = unwrap_vault_key(&b_secret, &verified, &ctx, &envelope).expect("B unwraps");
         assert_eq!(recovered, key);
 
         // A different device cannot open it.
-        assert!(unwrap_vault_key(&c_secret, &envelope).is_err());
+        assert!(unwrap_vault_key(&c_secret, &verified, &ctx, &envelope).is_err());
 
         // Two wraps of the SAME key differ (fresh ephemeral entropy per call).
-        let envelope2 = wrap_vault_key(&b_public, &key).expect("wrap again");
+        let envelope2 = wrap_vault_key(&sender, &b_public, &ctx, &key).expect("wrap again");
         assert_ne!(
             envelope, envelope2,
             "each wrap must use fresh ephemeral entropy"
         );
         assert_eq!(
-            unwrap_vault_key(&b_secret, &envelope2).expect("unwrap 2"),
+            unwrap_vault_key(&b_secret, &verified, &ctx, &envelope2).expect("unwrap 2"),
             key
         );
     }
@@ -7787,12 +8603,190 @@ mod tests {
     #[test]
     fn unwrap_rejects_a_payload_that_is_not_a_vault_key() {
         let (secret, public) = generate_hybrid_identity().expect("identity");
-        let decoded = public.decode().expect("decode");
-        let not_a_key = hybrid_seal_to_container(&decoded, b"only nine").expect("seal");
+        let (sender, verified) = test_sender("dev_a");
+        let ctx = VaultKeyWrapContext::new("demo", "dev_b", "dev_a").expect("ctx");
+        let not_a_key = hybrid_auth_seal_to_container(
+            &sender.x25519_secret().expect("secret"),
+            &public.decode().expect("decode"),
+            &ctx.aad(),
+            b"only nine",
+        )
+        .expect("seal");
         assert!(matches!(
-            unwrap_vault_key(&secret, &not_a_key),
+            unwrap_vault_key(&secret, &verified, &ctx, &not_a_key),
             Err(CliError::Sharing(_))
         ));
+    }
+
+    // =======================================================================
+    // ⭐ PHASE 60 — THE FORGERY, AND WHY IT NO LONGER WORKS
+    // =======================================================================
+
+    /// ⭐⭐ THE REPRODUCTION, AS A REGRESSION TEST.
+    ///
+    /// The shipped `sigil hybrid-seal --recipient-pub <victim>.pub` produced a
+    /// 1226-byte `SIGILhyb` container, byte-shaped IDENTICALLY to a genuine
+    /// vault-key wrap, from the victim's PUBLIC key alone — and
+    /// `unwrap_vault_key` accepted it. It must now be refused, and refused for
+    /// the RIGHT reason (it is unauthenticated), before any key material is
+    /// derived.
+    #[test]
+    fn a_forged_envelope_minted_from_the_public_key_alone_is_refused() {
+        let (victim_secret, victim_public) = generate_hybrid_identity().expect("victim identity");
+        let attacker_chosen_key = [0xABu8; VAULT_KEY_LEN];
+        let (_sender, verified) = test_sender("dev_peer");
+        let ctx = VaultKeyWrapContext::new("demo", "dev_victim", "dev_peer").expect("ctx");
+
+        // EXACTLY what `sigil hybrid-seal` does — no secret of anyone's needed.
+        let forged = hybrid_seal_to_container(
+            &victim_public.decode().expect("decode"),
+            &attacker_chosen_key,
+        )
+        .expect("the anonymous file path still works, by design");
+        assert_eq!(&forged[..8], HYBRID_MAGIC.as_slice());
+        assert_eq!(forged[8], HYBRID_FORMAT_VERSION, "a v1 file container");
+
+        assert_eq!(
+            unwrap_vault_key(&victim_secret, &verified, &ctx, &forged),
+            Err(CliError::WrongEnvelopeKind {
+                found_version: 1,
+                expected_version: 2,
+            }),
+            "a FILE envelope must NOT be accepted as a vault-key envelope"
+        );
+
+        // And the refusal says so in words a human can act on.
+        let msg = CliError::WrongEnvelopeKind {
+            found_version: 1,
+            expected_version: 2,
+        }
+        .to_string();
+        assert!(msg.contains("UNAUTHENTICATED"), "{msg}");
+        assert!(msg.contains("NO SENDER"), "{msg}");
+    }
+
+    /// The reverse direction of the same rule: an AUTHENTICATED vault-key
+    /// envelope is not an anonymous file, and `sigil hybrid-open` refuses it.
+    #[test]
+    fn a_vault_key_envelope_is_refused_as_a_file_envelope() {
+        let (secret, public) = generate_hybrid_identity().expect("identity");
+        let (sender, _verified) = test_sender("dev_a");
+        let key = generate_vault_key().expect("key");
+        let ctx = VaultKeyWrapContext::new("demo", "dev_b", "dev_a").expect("ctx");
+        let envelope = wrap_vault_key(&sender, &public, &ctx, &key).expect("wrap");
+
+        assert_eq!(
+            hybrid_open_container(&secret.decode().expect("decode"), &envelope),
+            Err(CliError::WrongEnvelopeKind {
+                found_version: 2,
+                expected_version: 1,
+            })
+        );
+    }
+
+    /// ⭐ A GENUINE envelope from the WRONG sender fails at the AEAD — never by
+    /// returning plaintext, and never by comparing a string the server chose.
+    #[test]
+    fn an_envelope_from_an_unexpected_sender_fails_at_the_aead() {
+        let (b_secret, b_public) = generate_hybrid_identity().expect("B identity");
+        let key = generate_vault_key().expect("key");
+        let (real_sender, real_verified) = test_sender("dev_a");
+        let (_other, other_verified) = test_sender("dev_a"); // same id, DIFFERENT key
+        let ctx = VaultKeyWrapContext::new("demo", "dev_b", "dev_a").expect("ctx");
+
+        let envelope = wrap_vault_key(&real_sender, &b_public, &ctx, &key).expect("wrap");
+
+        assert_eq!(
+            unwrap_vault_key(&b_secret, &real_verified, &ctx, &envelope).expect("real sender"),
+            key
+        );
+        assert!(
+            matches!(
+                unwrap_vault_key(&b_secret, &other_verified, &ctx, &envelope),
+                Err(CliError::HybridSeal(_))
+            ),
+            "an envelope attributed to the wrong sender key must fail AUTHENTICATION"
+        );
+    }
+
+    /// ⭐ CONTEXT BINDING at the CLI layer: the same envelope re-filed under a
+    /// different vault, recipient or sender is refused.
+    #[test]
+    fn an_envelope_cannot_be_re_filed_under_another_context() {
+        let (b_secret, b_public) = generate_hybrid_identity().expect("B identity");
+        let key = generate_vault_key().expect("key");
+        let (sender, verified) = test_sender("dev_a");
+        let ctx = VaultKeyWrapContext::new("vault-a", "dev_b", "dev_a").expect("ctx");
+        let envelope = wrap_vault_key(&sender, &b_public, &ctx, &key).expect("wrap");
+
+        for wrong in [
+            VaultKeyWrapContext::new("vault-b", "dev_b", "dev_a").expect("ctx"),
+            VaultKeyWrapContext::new("vault-a", "dev_c", "dev_a").expect("ctx"),
+        ] {
+            assert!(
+                matches!(
+                    unwrap_vault_key(&b_secret, &verified, &wrong, &envelope),
+                    Err(CliError::HybridSeal(_))
+                ),
+                "a re-filed envelope must be refused"
+            );
+        }
+    }
+
+    /// The two halves of a wrap must agree on who the sender is — a context
+    /// naming one device and an identity holding another's secret is a LOCAL
+    /// error, not an envelope nobody can open.
+    #[test]
+    fn wrap_refuses_a_context_that_names_a_different_sender() {
+        let (_bs, b_public) = generate_hybrid_identity().expect("B identity");
+        let key = generate_vault_key().expect("key");
+        let (sender, verified) = test_sender("dev_a");
+        let ctx = VaultKeyWrapContext::new("demo", "dev_b", "dev_z").expect("ctx");
+        assert!(matches!(
+            wrap_vault_key(&sender, &b_public, &ctx, &key),
+            Err(CliError::Sharing(_))
+        ));
+        // Symmetrically on the unwrap side.
+        let good = VaultKeyWrapContext::new("demo", "dev_b", "dev_a").expect("ctx");
+        let envelope = wrap_vault_key(&sender, &b_public, &good, &key).expect("wrap");
+        let (b_secret, _) = generate_hybrid_identity().expect("unused");
+        assert!(matches!(
+            unwrap_vault_key(&b_secret, &verified, &ctx, &envelope),
+            Err(CliError::Sharing(_))
+        ));
+    }
+
+    /// `VerifiedSender::from_local` must reconstruct EXACTLY the public identity
+    /// that `generate_hybrid_identity` published, or a device would fail to
+    /// authenticate envelopes it wrapped itself.
+    #[test]
+    fn from_local_reconstructs_the_published_public_identity() {
+        let (secret, public) = generate_hybrid_identity().expect("identity");
+        let sender = SenderIdentity::new("dev_a", secret).expect("sender");
+        let verified = VerifiedSender::from_local(&sender).expect("verified");
+        assert_eq!(
+            verified.identity().x25519_public_key,
+            public.x25519_public_key
+        );
+        assert_eq!(
+            verified.identity().mlkem_encaps_key,
+            public.mlkem_encaps_key
+        );
+        assert_eq!(verified.trust(), RecipientTrust::Derived);
+    }
+
+    /// ⭐ GOLDEN KAT for the wrap AAD, mirrored by `sigil-wasm/sharing.mjs`.
+    /// Rust and JS must build byte-identical context or a browser-wrapped key
+    /// will not open in the CLI.
+    #[test]
+    fn vault_key_wrap_aad_golden_vector() {
+        let ctx = VaultKeyWrapContext::new("demo", "dev_bob", "dev_alice").expect("ctx");
+        let hex: String = ctx.aad().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "736967696c2d7661756c742d6b65792d777261702d76310a0000000464656d6f\
+             000000076465765f626f62000000096465765f616c696365"
+        );
     }
 
     #[test]
@@ -8050,5 +9044,721 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+}
+
+#[cfg(test)]
+mod share_order_tests {
+    //! ⭐ PHASE 60 — the AUTHORIZE-BEFORE-DEPOSIT ordering, pinned by a
+    //! recording HTTP stub.
+    //!
+    //! `share_vault_to_known_key` used to PUT the envelope and only then ask for
+    //! the grant, so a device with WRITE but no ownership left a key envelope of
+    //! its choosing in the recipient's mailbox and met the `403` afterwards. The
+    //! deposit is the part that cannot be taken back, so it must go LAST.
+    //!
+    //! This needs no `sigild`: a bare `TcpListener` speaks just enough HTTP to
+    //! record which requests arrive, in order, and to answer the first one 403.
+
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::mpsc;
+
+    /// A one-shot recording HTTP server. Returns `(base_url, receiver)`; the
+    /// receiver yields `"METHOD PATH"` for each request it served.
+    fn recording_server(status_for_first: u16) -> (String, mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut served = 0usize;
+            // Two connections at most: the grant, then (if allowed) the deposit.
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    break;
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+
+                // Consume headers, noting Content-Length so the body is drained
+                // (otherwise the client can block writing it).
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body);
+                }
+
+                let _ = tx.send(format!("{method} {path}"));
+                served += 1;
+                let code = if served == 1 { status_for_first } else { 201 };
+                let body = b"{}";
+                let response = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    /// Build a `VerifiedRecipient` without a network round trip, by pinning a
+    /// locally generated identity as a "derived" key — the same short-circuit
+    /// `recovery generate` uses.
+    fn local_recipient(dir: &std::path::Path, device_id: &str) -> VerifiedRecipient {
+        let (_secret, public) = generate_hybrid_identity().expect("recipient identity");
+        let pins = dir.join("hybrid-pins.json");
+        pin_derived_key(&pins, device_id, &public).expect("pin derived");
+        verify_recipient_for_wrap(
+            "http://127.0.0.1:1", // never reached: a derived pin short-circuits
+            device_id,
+            &RequestAuth::None,
+            &pins,
+            None,
+            true,
+        )
+        .expect("derived recipient")
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("sigil-order-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    /// ⭐ A REFUSED GRANT MUST LEAVE NO ENVELOPE BEHIND.
+    #[test]
+    fn a_refused_grant_means_no_envelope_is_ever_deposited() {
+        let dir = temp_dir("deny");
+        let (server, rx) = recording_server(403);
+        let recipient = local_recipient(&dir, "dev_b");
+        let (sender_secret, _) = generate_hybrid_identity().expect("sender identity");
+        let sender = SenderIdentity::new("dev_a", sender_secret).expect("sender");
+        let key = generate_vault_key().expect("key");
+
+        let result = share_vault_to_known_key(
+            &server,
+            "demo",
+            &recipient,
+            "read",
+            &key,
+            &RequestAuth::None,
+            &sender,
+        );
+        // The 403 is REPHRASED, not swallowed: authorize-first has a cliff the old
+        // order hid (a never-written vault has no owner, so its first share is
+        // refused), and a bare "only the vault owner may do this" leaves the user
+        // stuck. What must not change is that it ABORTS.
+        let message = match &result {
+            Err(CliError::Sharing(m)) => m.clone(),
+            other => panic!("expected the grant's 403 to abort the share, got {other:?}"),
+        };
+        assert!(
+            message.contains("nothing was deposited") && message.contains("Push it first"),
+            "the refusal must say nothing was deposited AND how to fix it: {message}"
+        );
+
+        let requests: Vec<String> = rx.try_iter().collect();
+        assert_eq!(
+            requests,
+            vec!["POST /v1/vaults/demo/grants".to_string()],
+            "the GRANT must be the ONLY request a refused share makes — an envelope \
+             deposited before the authorization check cannot be taken back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And on the happy path the order is still grant, then deposit.
+    #[test]
+    fn a_successful_share_grants_before_it_deposits() {
+        let dir = temp_dir("allow");
+        let (server, rx) = recording_server(201);
+        let recipient = local_recipient(&dir, "dev_b");
+        let (sender_secret, _) = generate_hybrid_identity().expect("sender identity");
+        let sender = SenderIdentity::new("dev_a", sender_secret).expect("sender");
+        let key = generate_vault_key().expect("key");
+
+        share_vault_to_known_key(
+            &server,
+            "demo",
+            &recipient,
+            "read",
+            &key,
+            &RequestAuth::None,
+            &sender,
+        )
+        .expect("share succeeds against the stub");
+
+        let requests: Vec<String> = rx.try_iter().collect();
+        assert_eq!(
+            requests,
+            vec![
+                "POST /v1/vaults/demo/grants".to_string(),
+                "PUT /v1/vaults/demo/keys/dev_b".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod unwrap_gate_tests {
+    //! ⭐⭐ PHASE 60 — THE RECEIVING SIDE'S TWO CONTROLS, PINNED BY TESTS.
+    //!
+    //! `accept_vault_key` is where a forged or substituted vault key would land,
+    //! and it is defended by exactly two things:
+    //!
+    //!   * **the unwrap gate** — [`verify_sender_for_unwrap`] pin-checks the
+    //!     DEPOSITING device's hybrid public key (and honours a supplied safety
+    //!     number) before one byte is unwrapped;
+    //!   * **open-before-write** — the recovered key must actually OPEN the
+    //!     vault's newest op before it is written to the keyring.
+    //!
+    //! ⚠️ THEY ARE EACH OTHER'S ONLY BACKSTOP, and until this module existed
+    //! NEITHER was pinned: deleting the safety-number comparison and the
+    //! `check_and_pin` call from `verify_sender_for_unwrap`, or discarding the
+    //! result of the `open_container` in step 4, left every suite in the
+    //! repository green. A verifier then drove the neutered build against a
+    //! rewriting proxy and the hostile key WAS installed in the victim's
+    //! keyring. So each test below is written to go RED for exactly one deleted
+    //! control, and the mutations were run.
+    //!
+    //! No `sigild` is needed: a bare `TcpListener` answering canned responses IS
+    //! the hostile server, which is the honest shape — the whole point is that
+    //! the client must not believe what the server says.
+
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::{Path, PathBuf};
+
+    /// Fast Argon2id params: the tip container is sealed and opened for real, but
+    /// the KDF work factor is irrelevant to what is being proven.
+    const FAST: Argon2Params = Argon2Params {
+        m_cost: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+
+    const VAULT: &str = "demo";
+    const ME: &str = "dev_victim";
+    const SENDER: &str = "dev_sender";
+    const WRONG_NUMBER: &str = "00000 00000 00000 00000 00000 00000";
+
+    /// One canned response: (path WITHOUT query, status, content-type, body).
+    type Route = (String, u16, &'static str, Vec<u8>);
+
+    /// A hostile server: it answers whatever it is told to answer.
+    fn stub_server(routes: Vec<Route>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            // An accept makes at most four requests; take a few more so a
+            // retry cannot wedge the test on a silent hang.
+            for stream in listener.incoming().take(12) {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let path = target.split('?').next().unwrap_or_default().to_string();
+
+                // Drain headers, noting Content-Length so a body is consumed and
+                // the client is never left blocked writing it.
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body);
+                }
+
+                let (code, ctype, body) = match routes.iter().find(|r| r.0 == path) {
+                    Some((_, code, ctype, body)) => (*code, *ctype, body.clone()),
+                    None => (404, "application/json", br#"{"error":"no route"}"#.to_vec()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Every route an `accept_vault_key` can ask for, with the answers a hostile
+    /// server would give. `tip` is the vault's newest op, or `None` for a vault
+    /// that has never been pushed.
+    fn accept_routes(
+        envelope: &[u8],
+        served_sender_key: &HybridPublicIdentity,
+        tip: Option<&[u8]>,
+    ) -> Vec<Route> {
+        let key_json = serde_json::to_vec(&serde_json::json!({
+            "device_id": SENDER,
+            "x25519_public_key": served_sender_key.x25519_public_key,
+            "mlkem_encaps_key": served_sender_key.mlkem_encaps_key,
+        }))
+        .expect("hybrid key json");
+        let index_json = serde_json::to_vec(&serde_json::json!({
+            "device_id": ME,
+            "vaults": [{
+                "vaultID": VAULT,
+                "sender_device_id": SENDER,
+                "size_bytes": envelope.len(),
+                "created_at": "2026-01-01T00:00:00Z",
+            }],
+            "has_more": false,
+        }))
+        .expect("index json");
+        let ops_json = serde_json::to_vec(&serde_json::json!({
+            "vaultID": VAULT,
+            "ops": match tip {
+                Some(blob) => vec![serde_json::json!({ "seq": 1, "blob": BASE64.encode(blob) })],
+                None => vec![],
+            },
+            "next": 1,
+            "has_more": false,
+        }))
+        .expect("ops json");
+
+        vec![
+            (
+                format!("/v1/vaults/{VAULT}/keys/{ME}"),
+                200,
+                "application/octet-stream",
+                envelope.to_vec(),
+            ),
+            (
+                format!("/v1/devices/{SENDER}/hybrid-key"),
+                200,
+                "application/json",
+                key_json,
+            ),
+            (
+                format!("/v1/devices/{ME}/keys"),
+                200,
+                "application/json",
+                index_json,
+            ),
+            (
+                format!("/v1/vaults/{VAULT}/ops"),
+                200,
+                "application/json",
+                ops_json,
+            ),
+        ]
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!(
+            "sigil-unwrap-{tag}-{}-{nanos}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    /// A plausible sealed vault, so "does this key open the tip?" is a real
+    /// `open_container` over real ciphertext.
+    fn sealed_tip(key: &[u8; VAULT_KEY_LEN]) -> Vec<u8> {
+        seal_to_container(key, br#"{"version":1,"entries":[]}"#, FAST).expect("seal tip")
+    }
+
+    fn wrap_from(
+        sender_device_id: &str,
+        secret: HybridSecretIdentity,
+        recipient: &HybridPublicIdentity,
+        key: &[u8; VAULT_KEY_LEN],
+    ) -> Vec<u8> {
+        let sender = SenderIdentity::new(sender_device_id, secret).expect("sender identity");
+        let ctx = VaultKeyWrapContext::new(VAULT, ME, sender_device_id).expect("ctx");
+        wrap_vault_key(&sender, recipient, &ctx, key).expect("wrap")
+    }
+
+    /// A one-line rendering of an accept outcome. `AcceptReport`'s own `Debug`
+    /// prints the whole envelope, which buries the assertion message that
+    /// matters under 1300 bytes of ciphertext.
+    fn outcome(result: &Result<AcceptReport, CliError>) -> String {
+        match result {
+            Ok(r) => format!(
+                "Ok(accepted: sender={} trust={:?} key={} verified_against_tip={})",
+                r.sender_device_id, r.sender_trust, r.key_fingerprint, r.verified_against_tip
+            ),
+            Err(e) => format!("Err({e:?})"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept(
+        server: &str,
+        secret: &HybridSecretIdentity,
+        keyring: &Path,
+        pins: &Path,
+        sender_device_id: Option<&str>,
+        expected_safety_number: Option<&str>,
+    ) -> Result<AcceptReport, CliError> {
+        accept_vault_key(
+            server,
+            VAULT,
+            ME,
+            secret,
+            keyring,
+            pins,
+            &RequestAuth::None,
+            sender_device_id,
+            expected_safety_number,
+            false,
+        )
+    }
+
+    // =======================================================================
+    // ⭐ THE UNWRAP GATE
+    // =======================================================================
+
+    /// ⭐⭐ A SUBSTITUTED SENDER KEY IS A HARD STOP, AND NOTHING IS WRITTEN.
+    ///
+    /// This is the attack a verifier reproduced end to end against the neutered
+    /// build: a hostile server serves ITS OWN hybrid key as the sender's, mints
+    /// an envelope under it (which then authenticates perfectly, because the
+    /// authentication input is the key the server just handed over), and serves
+    /// a tip op that the attacker's chosen vault key opens — so open-before-write
+    /// cannot save us either. The ONLY thing standing between the victim and an
+    /// attacker-chosen vault key is the pin check inside
+    /// [`verify_sender_for_unwrap`].
+    ///
+    /// ⚠️ MUTATION: delete the `check_and_pin` call from
+    /// `verify_sender_for_unwrap` and this test fails — the accept succeeds and
+    /// the attacker's key lands in the keyring.
+    #[test]
+    fn a_substituted_sender_key_is_refused_and_no_key_is_written() {
+        let dir = temp_dir("substituted");
+        let pins = dir.join("hybrid-pins.json");
+        let keyring = dir.join("vault-keys.json");
+
+        let (victim_secret, victim_public) = generate_hybrid_identity().expect("victim");
+        let (_honest_secret, honest_public) = generate_hybrid_identity().expect("honest sender");
+        let (attacker_secret, attacker_public) = generate_hybrid_identity().expect("attacker");
+
+        // The victim has met the sender before — its real key is PINNED.
+        check_and_pin(&pins, SENDER, &honest_public).expect("pin the honest sender");
+        let honest_number = hybrid_safety_number(SENDER, &honest_public).expect("number");
+
+        // The attacker mints an envelope AS the sender, under its own keys, with
+        // the correct context — so only the served key is a lie.
+        let attacker_chosen = [0x5au8; VAULT_KEY_LEN];
+        let forged = wrap_from(SENDER, attacker_secret, &victim_public, &attacker_chosen);
+        // ...and a tip the attacker's key opens, so step 4 would wave it through.
+        let tip = sealed_tip(&attacker_chosen);
+        let server = stub_server(accept_routes(&forged, &attacker_public, Some(&tip)));
+
+        let result = accept(&server, &victim_secret, &keyring, &pins, Some(SENDER), None);
+        match &result {
+            Err(CliError::PinMismatch {
+                device_id,
+                pinned_safety_number,
+                presented_safety_number,
+            }) => {
+                assert_eq!(device_id, SENDER);
+                assert_eq!(pinned_safety_number, &honest_number);
+                assert_ne!(presented_safety_number, &honest_number);
+            }
+            _ => panic!(
+                "⚠️ THE UNWRAP GATE DID NOT FIRE — expected CliError::PinMismatch, got {}",
+                outcome(&result)
+            ),
+        }
+
+        assert!(
+            keyring_get(&keyring, VAULT).expect("keyring").is_none(),
+            "⚠️ AN ATTACKER-CHOSEN VAULT KEY WAS WRITTEN TO THE KEYRING"
+        );
+        let store = load_pins(&pins).expect("pins");
+        assert_eq!(
+            store.pins[SENDER].safety_number, honest_number,
+            "a refused check must NOT re-pin — a retry would then see a Match and \
+             silence its own alarm"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ A SUPPLIED SAFETY NUMBER THAT DOES NOT MATCH IS A HARD STOP, and the
+    /// key it refused is NOT pinned (so a retry cannot turn the refusal into a
+    /// `Match`).
+    ///
+    /// ⚠️ MUTATION: delete the `expected_safety_number` comparison from
+    /// `verify_sender_for_unwrap` and this test fails — the accept succeeds.
+    #[test]
+    fn a_wrong_supplied_safety_number_refuses_and_pins_nothing() {
+        let dir = temp_dir("safety");
+        let pins = dir.join("hybrid-pins.json");
+        let keyring = dir.join("vault-keys.json");
+
+        let (victim_secret, victim_public) = generate_hybrid_identity().expect("victim");
+        let (sender_secret, sender_public) = generate_hybrid_identity().expect("sender");
+
+        // Everything here is HONEST — the only thing wrong is the number the
+        // human typed, which is exactly the case the check exists for.
+        let key = generate_vault_key().expect("vault key");
+        let envelope = wrap_from(SENDER, sender_secret, &victim_public, &key);
+        let tip = sealed_tip(&key);
+        let server = stub_server(accept_routes(&envelope, &sender_public, Some(&tip)));
+
+        let result = accept(
+            &server,
+            &victim_secret,
+            &keyring,
+            &pins,
+            Some(SENDER),
+            Some(WRONG_NUMBER),
+        );
+        match &result {
+            Err(CliError::SafetyNumberMismatch {
+                device_id,
+                expected_safety_number,
+                presented_safety_number,
+            }) => {
+                assert_eq!(device_id, SENDER);
+                assert_eq!(expected_safety_number, WRONG_NUMBER);
+                assert_eq!(
+                    presented_safety_number,
+                    &hybrid_safety_number(SENDER, &sender_public).expect("number")
+                );
+            }
+            _ => panic!(
+                "⚠️ THE SAFETY-NUMBER CHECK DID NOT FIRE — expected \
+                 CliError::SafetyNumberMismatch, got {}",
+                outcome(&result)
+            ),
+        }
+        assert!(
+            keyring_get(&keyring, VAULT).expect("keyring").is_none(),
+            "nothing may be written when the safety number did not match"
+        );
+        assert!(
+            load_pins(&pins).expect("pins").pins.is_empty(),
+            "a REFUSED key must not be pinned — pinning it would let the retry \
+             report Match and the alarm would never fire again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ THE RESIDUAL LIMIT, PINNED SO IT CANNOT SILENTLY INVERT (ADR 0038).
+    ///
+    /// FIRST SIGHT of a sender is trust-on-first-use: the client pins and
+    /// PROCEEDS, reporting `UnverifiedFirstSight` so the caller can warn. A key
+    /// that CHANGES afterwards is a hard refusal. Both halves are asserted here
+    /// because the dangerous drift is the pair swapping over — a build that
+    /// refused first contact and accepted changes would be worse than useless,
+    /// and neither half alone would notice.
+    ///
+    /// It also exercises step 1 (the envelope INDEX) by passing no sender id.
+    ///
+    /// ⚠️ MUTATION: delete the `check_and_pin` call and this test fails — first
+    /// sight no longer pins, so the changed key in part B is accepted.
+    #[test]
+    fn first_sight_pins_and_proceeds_but_a_changed_key_is_refused() {
+        let dir = temp_dir("firstsight");
+        let pins = dir.join("hybrid-pins.json");
+        let keyring = dir.join("vault-keys.json");
+
+        let (victim_secret, victim_public) = generate_hybrid_identity().expect("victim");
+        let (sender_secret, sender_public) = generate_hybrid_identity().expect("sender");
+        let sender_number = hybrid_safety_number(SENDER, &sender_public).expect("number");
+
+        // --- A. FIRST SIGHT: pinned, warned about, and ACCEPTED. -------------
+        let key = generate_vault_key().expect("vault key");
+        let envelope = wrap_from(SENDER, sender_secret, &victim_public, &key);
+        let tip = sealed_tip(&key);
+        let server = stub_server(accept_routes(&envelope, &sender_public, Some(&tip)));
+
+        // No sender id: the index says who deposited it (step 1).
+        let report = accept(&server, &victim_secret, &keyring, &pins, None, None)
+            .expect("a first-sight accept must PROCEED — this is ADR 0038's accepted TOFU");
+        assert_eq!(report.sender_device_id, SENDER, "step 1 must use the index");
+        assert_eq!(
+            report.sender_trust,
+            RecipientTrust::UnverifiedFirstSight,
+            "first sight must be REPORTED as unverified so the caller can warn"
+        );
+        assert!(
+            report.sender_trust.needs_out_of_band_check(),
+            "this is the exact predicate `sigil vault accept` branches on to print its \
+             first-contact warning — if it stops being true the human stops being told"
+        );
+        assert_eq!(report.sender_safety_number, sender_number);
+        assert!(
+            report.verified_against_tip,
+            "the accept must have proved the key against the vault's newest op"
+        );
+        assert_eq!(keyring_get(&keyring, VAULT).expect("keyring"), Some(key));
+        let pinned_after_first_sight = load_pins(&pins)
+            .expect("pins")
+            .pins
+            .get(SENDER)
+            .map(|p| p.safety_number.clone());
+        assert_eq!(
+            pinned_after_first_sight.as_deref(),
+            Some(sender_number.as_str()),
+            "⚠️ FIRST SIGHT DID NOT PIN THE SENDER — every later key change would be \
+             a first sight too, and the gate would never fire"
+        );
+
+        // --- B. THE SAME SENDER, A DIFFERENT KEY: a hard refusal. ------------
+        let (attacker_secret, attacker_public) = generate_hybrid_identity().expect("attacker");
+        let attacker_chosen = [0x11u8; VAULT_KEY_LEN];
+        let forged = wrap_from(SENDER, attacker_secret, &victim_public, &attacker_chosen);
+        let forged_tip = sealed_tip(&attacker_chosen);
+        let hostile = stub_server(accept_routes(&forged, &attacker_public, Some(&forged_tip)));
+
+        let result = accept(
+            &hostile,
+            &victim_secret,
+            &keyring,
+            &pins,
+            Some(SENDER),
+            None,
+        );
+        assert!(
+            matches!(result, Err(CliError::PinMismatch { .. })),
+            "⚠️ A CHANGED SENDER KEY WAS ACCEPTED — got {}",
+            outcome(&result)
+        );
+        assert_eq!(
+            keyring_get(&keyring, VAULT).expect("keyring"),
+            Some(key),
+            "the vault key this device already held must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =======================================================================
+    // ⭐ OPEN BEFORE WRITE
+    // =======================================================================
+
+    /// ⭐⭐ A KEY THAT OPENS NOTHING NEVER REACHES LOCAL STATE.
+    ///
+    /// The sender here is honest and the envelope is genuinely authenticated —
+    /// the gate above passes cleanly. What is wrong is the KEY: it does not open
+    /// the vault it claims to be for. That is the shape of a hostile deposit
+    /// that got past first-sight TOFU, and step 4 is the only thing that catches
+    /// it. It is also the backstop the verifier watched stop the attack once the
+    /// gate was neutered, which is precisely why it needs its own test.
+    ///
+    /// ⚠️ MUTATION: discard the result of step 4's `open_container` and this test
+    /// fails — the useless key is written to the keyring and the accept reports
+    /// success.
+    #[test]
+    fn a_key_that_does_not_open_the_vault_is_never_written_to_the_keyring() {
+        let dir = temp_dir("openfirst");
+        let pins = dir.join("hybrid-pins.json");
+        let keyring = dir.join("vault-keys.json");
+
+        let (victim_secret, victim_public) = generate_hybrid_identity().expect("victim");
+        let (sender_secret, sender_public) = generate_hybrid_identity().expect("sender");
+
+        let real_key = generate_vault_key().expect("real key");
+        let wrong_key = generate_vault_key().expect("wrong key");
+        assert_ne!(real_key, wrong_key);
+
+        // A perfectly well-formed, authenticated, context-bound envelope — for
+        // the WRONG key. Everything before step 4 will pass.
+        let envelope = wrap_from(SENDER, sender_secret, &victim_public, &wrong_key);
+        let tip = sealed_tip(&real_key);
+        let server = stub_server(accept_routes(&envelope, &sender_public, Some(&tip)));
+
+        let result = accept(&server, &victim_secret, &keyring, &pins, Some(SENDER), None);
+        let message = match &result {
+            Err(CliError::Sharing(m)) => m.clone(),
+            _ => panic!(
+                "⚠️ OPEN-BEFORE-WRITE DID NOT FIRE — a key that opens nothing was \
+                 accepted: {}",
+                outcome(&result)
+            ),
+        };
+        assert!(
+            message.contains("does NOT open") && message.contains("nothing was written"),
+            "the refusal must say the key does not open the vault and that nothing \
+             was written: {message}"
+        );
+        assert!(
+            keyring_get(&keyring, VAULT).expect("keyring").is_none(),
+            "⚠️ A KEY THAT OPENS NOTHING WAS WRITTEN TO THE KEYRING"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The POSITIVE CONTROL for the test above: with the SAME shape and the
+    /// RIGHT key, the accept succeeds and records that it verified against the
+    /// tip. Without this, "everything is refused" would look like a pass.
+    #[test]
+    fn the_right_key_opens_the_tip_and_is_written() {
+        let dir = temp_dir("openctl");
+        let pins = dir.join("hybrid-pins.json");
+        let keyring = dir.join("vault-keys.json");
+
+        let (victim_secret, victim_public) = generate_hybrid_identity().expect("victim");
+        let (sender_secret, sender_public) = generate_hybrid_identity().expect("sender");
+
+        let key = generate_vault_key().expect("key");
+        let envelope = wrap_from(SENDER, sender_secret, &victim_public, &key);
+        let tip = sealed_tip(&key);
+        let server = stub_server(accept_routes(&envelope, &sender_public, Some(&tip)));
+
+        let report = accept(&server, &victim_secret, &keyring, &pins, Some(SENDER), None)
+            .expect("the correct key must be accepted");
+        assert!(report.verified_against_tip);
+        assert_eq!(report.key_fingerprint, vault_key_fingerprint(&key));
+        assert_eq!(keyring_get(&keyring, VAULT).expect("keyring"), Some(key));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

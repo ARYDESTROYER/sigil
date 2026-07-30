@@ -13,10 +13,14 @@ audited; see the status note below.)
 > tests that drive the real binaries. All of it is pre-audit.
 > `libsigil` now has **real but UNAUDITED** crypto building blocks — an
 > Argon2id KDF, an XChaCha20-Poly1305 + HKDF AEAD, a C-ABI `seal`/`open`
-> over them, and a hybrid (X25519 + ML-KEM-768) public-key seal. Most are still
-> **not wired into any product flow**; the exception is that hybrid seal, which
-> now wraps vault keys for the dev-gated device-to-device **vault sharing** below
-> — real, load-bearing, and **still unaudited**.
+> over them, and a hybrid (X25519 + ML-KEM-768) public-key seal in two forms —
+> **anonymous** (for file encryption) and, since Phase 60, **authenticated** (a
+> static-static X25519 DH folded into the KEM). Most are still
+> **not wired into any product flow**; the exception is that **authenticated**
+> hybrid seal, which wraps vault keys for the dev-gated device-to-device **vault
+> sharing** below — real, load-bearing, and **still unaudited**. ⛔ Note the
+> asymmetry: **confidentiality is hybrid, authenticity is classical X25519 only**
+> ([ADR 0048](docs/decisions/0048-authenticated-vault-key-envelopes.md)).
 > Everything is pre-audit; **do not store real secrets.** See
 > [`docs/sprint-72h.md`](docs/sprint-72h.md) for the
 > exact definition of done and the defer ledger.
@@ -73,16 +77,26 @@ audited; see the status note below.)
   — now exist as primitives, but both are UNAUDITED and standalone, NOT wired into
   any key-exchange / session / account / vault / auth flow; the system is NOT
   "post-quantum secure"**, and — **now composed into an encryption flow** — a real
-  (unaudited) **hybrid public-key authenticated encryption** layer
-  (`hybrid_seal`/`hybrid_open`) that encapsulates to a recipient's **hybrid public
-  key** with the hybrid KEM and then AEAD-`seal`s the record under the derived key
-  (**KEM-then-AEAD**), returning `(eph_pub, mlkem_ct, envelope)` — caller-supplied
+  (unaudited) **hybrid public-key encryption** layer in **two** forms. The
+  **ANONYMOUS** one (`hybrid_seal`/`hybrid_open`) encapsulates to a recipient's
+  **hybrid public key** with the hybrid KEM and then AEAD-`seal`s the record under
+  the derived key (**KEM-then-AEAD**), returning `(eph_pub, mlkem_ct, envelope)`.
+  ⚠️ It is HPKE `mode_base` — it has **no sender key** — so **anyone** holding the
+  recipient's public key can produce a container it will open; this repo described
+  it as "authenticated" until Phase 60, which was **wrong**, and using it to
+  deliver a **key** was a vulnerability. It is now used only for **file**
+  encryption. The **AUTHENTICATED** one (`hybrid_auth_seal`/`hybrid_auth_open`,
+  `hybrid_auth.rs`) folds in a **static-static X25519 DH between sender and
+  recipient** plus a **context-bound AAD** (purpose + vault + recipient + sender),
+  so a forger needs the *sender's* secret; it is what wraps a vault key, and it is
+  **load-bearing** ([ADR 0048](docs/decisions/0048-authenticated-vault-key-envelopes.md)).
+  Both are caller-supplied
   ephemeral X25519 secret + ML-KEM coin + AEAD nonce (no in-core randomness),
-  composing the hybrid KEM + AEAD + envelope codec with no new deps. **This is a
-  CUSTOM composition — NOT RFC 9180 HPKE — and the FIRST wiring of a hybrid primitive
-  into an encryption flow, but it is UNAUDITED and STANDALONE: a crypto-level flow
-  only, NOT the product's account / key-management / vault-storage model, and not
-  used by sigild or the CLI**, plus a
+  composing the hybrid KEM + AEAD + envelope codec with no new deps. **Both are a
+  CUSTOM composition — NOT RFC 9180 HPKE — and UNAUDITED. ⛔ The authenticated
+  form's sender authentication is CLASSICAL X25519 ONLY** (ML-KEM has no
+  static-static analogue), is **implicit and non-transferable** rather than a
+  signature, and does **not** make the system "post-quantum secure", plus a
   `sigil-ffi` C-ABI for the clients — `seal`/`open`/`buffer_free`, the classical
   Ed25519 sig exports `sigil_public_key_from_seed`/`sigil_sign`/`sigil_verify`
   (with a `SIGIL_ERR_VERIFY` code), and — **now assembled** — the **hybrid
@@ -281,10 +295,24 @@ audited; see the status note below.)
   byte-for-byte. Your **password is never shared and never wrapped**, and a vault
   key is never printed (only a short SHA-256 fingerprint, so two devices can check
   they match). Authorization reuses the existing per-vault grants, so a device that
-  is not the addressee gets a `403`, and a revoked device a `401`. Honest limits:
+  is not the addressee gets a `403`, and a revoked device a `401`.
+  ⭐ **The envelope also proves WHO sent it** (Phase 60): the wrap mixes in a
+  **static-static X25519 DH between sender and recipient** and is bound to an AAD
+  naming the **purpose, the vault, the recipient and the sender**, so an envelope
+  cannot be forged by someone who merely knows the recipient's published key, and
+  cannot be moved between vaults, recipients or senders. Before that it could —
+  anyone holding a device's **published** hybrid public key could install a vault
+  key of their choosing, and the receiving side never consulted the pin store at
+  all. Honest limits:
   it is **dev-gated (`501` by default), localhost/plain HTTP, and UNAUDITED**; the
   wrapping is a **custom KEM-then-AEAD composition, not RFC 9180 HPKE**, so the
-  **system is not "post-quantum secure"**. **Every client
+  **system is not "post-quantum secure"**; ⛔ the **sender authentication is
+  classical X25519 only** (ML-KEM has no static-static analogue, so
+  confidentiality is hybrid while authenticity is not), is **not a signature** and
+  cannot be shown to a third party; and ⛔ **every envelope shared before Phase 60
+  must be re-shared** — old ones are refused, including those covering a recovery
+  kit ([ADR 0048](docs/decisions/0048-authenticated-vault-key-envelopes.md)).
+  **Every client
   that talks to the server can now share** — the `sigil` CLI, the webapp, the
   browser extension and the desktop app — and a vault shared from one opens on the
   others; still dev-gated and unaudited.
@@ -295,16 +323,22 @@ audited; see the status note below.)
   see a key, each client can also show a **safety number**: six groups of five digits
   derived from that device's key and id, which two people read to each other over a
   phone call or in person to confirm they match. A vault key can also be **rotated**
-  and re-wrapped to the devices that keep access. Honest limits: **first contact is
+  and re-wrapped to the devices that keep access. ⭐ **Since Phase 60 the same pin
+  check runs when you ACCEPT a vault, not only when you share one** — it never did
+  before, which is why pinning did not stop the forgery above — and an accepted key
+  must actually **open the vault** before it is written down, and can never
+  silently replace a different key you already hold. Honest limits: **first contact
+  is
   trust-on-first-use unless someone actually compares the safety number**, accepting
   a changed key is a deliberate command that a user can still get wrong, **rotation
   protects only content written afterwards** (a device that already unwrapped a key
   keeps what it copied), and this is **new, unaudited code** like everything around
   it. See
   [`docs/api.md`](docs/api.md#device-to-device-vault-sharing-dev-gated-opt-in--phase-46),
-  [`docs/crypto-spec.md`](docs/crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_seal--hybrid_open-in-use),
-  [ADR 0035](docs/decisions/0035-device-to-device-vault-sharing.md)
-  and [ADR 0038](docs/decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md).
+  [`docs/crypto-spec.md`](docs/crypto-spec.md#key-hierarchy-and-vault-sharing-hybrid_auth_seal--hybrid_auth_open-in-use),
+  [ADR 0035](docs/decisions/0035-device-to-device-vault-sharing.md),
+  [ADR 0038](docs/decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)
+  and [ADR 0048](docs/decisions/0048-authenticated-vault-key-envelopes.md).
 - `cli/` — `sigil`, a **pre-audit demo CLI** that seals/opens one file via the
   libsigil core (`sigil seal`/`sigil open`), plus `sigil push`/`sigil pull` — a
   two-device **opaque sync demo** that ships the sealed container to/from

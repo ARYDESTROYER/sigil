@@ -679,7 +679,7 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
     );
 
     let desktop_fp = desktop
-        .accept_vault(VAULT_FROM_CLI)
+        .accept_vault(VAULT_FROM_CLI, None, None, false)
         .expect("desktop accept");
     assert_eq!(
         desktop_fp, cli_key_fp,
@@ -721,7 +721,7 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
         Err(DesktopError::Forbidden(msg)) => assert!(msg.contains("403"), "{msg}"),
         other => panic!("an unauthorized device must be refused, got {other:?}"),
     }
-    match third.accept_vault(VAULT_FROM_DESKTOP) {
+    match third.accept_vault(VAULT_FROM_DESKTOP, None, None, false) {
         Err(DesktopError::Forbidden(_)) | Err(DesktopError::MissingOnServer(_)) => {}
         other => panic!("a third device must not collect an envelope, got {other:?}"),
     }
@@ -731,7 +731,9 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
     let unenrolled = DeviceConfig::new(&h.server, &unenrolled_dir);
     for err in [
         unenrolled.publish_hybrid().unwrap_err(),
-        unenrolled.accept_vault(VAULT_FROM_DESKTOP).unwrap_err(),
+        unenrolled
+            .accept_vault(VAULT_FROM_DESKTOP, None, None, false)
+            .unwrap_err(),
         unenrolled
             .share_vault(VAULT_FROM_DESKTOP, &cli_id, "read", None)
             .unwrap_err(),
@@ -823,6 +825,16 @@ fn a_substituted_hybrid_key_raises_the_alarm_the_desktop_ui_renders() {
     session
         .convert_to_shared(&desktop, VAULT_FROM_DESKTOP)
         .expect("convert to shared");
+
+    // ⭐ PUSH BEFORE SHARING, and it is not incidental setup. Phase 60 made
+    // `share_vault` GRANT before it deposits, and only the vault's OWNER may
+    // grant — while ownership is trust-on-first-WRITE. A vault that has never
+    // been written to this server therefore has no owner, and the grant is a
+    // 403. Pushing is the write that claims it, which is also the only order
+    // that makes sense for the recipient: a key with no ciphertext opens nothing.
+    desktop
+        .push_vault_file(VAULT_FROM_DESKTOP, &vault_path)
+        .expect("push claims the vault for this account");
 
     // A real peer publishes its first hybrid key, K1.
     let cli_id = device_id_in(&h.cli(
@@ -1302,7 +1314,9 @@ fn a_sibling_device_cannot_cover_a_kit_without_the_printed_safety_number() {
         )
         .expect("share to the sibling");
     assert_eq!(
-        sibling.accept_vault(VAULT_FROM_DESKTOP).expect("accept"),
+        sibling
+            .accept_vault(VAULT_FROM_DESKTOP, None, None, false)
+            .expect("accept"),
         fp,
         "the sibling holds the same vault key"
     );

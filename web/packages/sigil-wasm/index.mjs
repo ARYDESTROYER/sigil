@@ -38,6 +38,15 @@ export const {
   hybrid_mlkem_encaps_key,
   hybrid_seal_to_container,
   hybrid_open_container,
+  // ⭐ THE AUTHENTICATED vault-key envelope (Phase 60). Without these three
+  // re-exported HERE, `sharing.mjs` — which is handed this module namespace as
+  // its `wasm` — would call undefined functions and EVERY browser share, rotate,
+  // accept, recovery-cover and restore would throw at runtime. That is exactly
+  // the trap Phase 56 fell into with `recovery_*`: typed in index.d.ts, absent
+  // here. The .d.ts declarations are a SEPARATE hole and are closed too.
+  vault_key_wrap_aad,
+  hybrid_auth_seal_to_container,
+  hybrid_auth_open_container,
   // THE RECOVERY KIT codec + HKDF derivation (Phase 54). These were declared in
   // index.d.ts but never re-exported here, so `recovery.mjs` — which is handed
   // this module namespace as its `wasm` — called an undefined function the first

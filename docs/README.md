@@ -33,7 +33,12 @@ the server cannot see, disable or weaken) and
 [0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
 (the container header is unauthenticated framing, so its KDF work factors are
 bounded **before any allocation** — a zero-knowledge relay cannot filter a
-hostile blob, which moves every content-validation duty to the client).
+hostile blob, which moves every content-validation duty to the client) and
+[0048](decisions/0048-authenticated-vault-key-envelopes.md) (delivering a **key**
+with an **anonymous** public-key seal let anyone holding the recipient's
+*published* key install a vault key of their choosing — and it explains why the
+fix authenticates with the **hybrid** key rather than a signature, and why
+confidentiality is hybrid while **authenticity is classical X25519 only**).
 
 **What is real, and what is not.** The cryptography is real and
 **unaudited**. `sigild` is a working dev server whose stateful surface is
@@ -63,8 +68,22 @@ server cannot know it is there
 and the no-downgrade ratchet that stops a browser weakening a vault's KDF **does
 not cover the CLI's and the desktop's own vault saves**, so *"strength only goes
 up"* is true of the browsers and of re-keys and **not globally true of this
-system**. Each ADR ends with its own limits, and they are meant to be read as
+system**. Since Phase 60, add one more that cuts across the post-quantum story:
+a shared vault key is now wrapped with an **authenticated** hybrid KEM, but that
+authentication is a **classical X25519 static-static DH** — ML-KEM has no
+static-static analogue — so **confidentiality is hybrid while authenticity is
+not**, and a wrap is **implicit, key-confirmed and non-transferable** rather than
+a signature ([0048](decisions/0048-authenticated-vault-key-envelopes.md)). Each
+ADR ends with its own limits, and they are meant to be read as
 findings-in-waiting rather than disclaimers.
+
+⚠️ **Two documents in this folder recently asserted a defense that did not
+exist** — `threat-model.md` row V and `crypto-spec.md`'s "cannot mint" paragraph,
+both describing the vault-key envelope. Neither was stale: both were written
+alongside the code and were wrong on the day they were written, because they
+described the *intent* of a flow rather than what the primitive underneath it
+does. The corrections are recorded **in place, as corrections**, rather than
+edited away. Treat that as the reading instruction for everything here.
 
 **Reproduce our claims.** `./scripts/gate.sh` runs every suite in the repo — Go
 with `-race` against a throwaway Postgres, four Rust crates, every

@@ -173,6 +173,25 @@ pub enum DesktopError {
         /// A human explanation. Never key material.
         detail: String,
     },
+    /// ⛔ PHASE 60. A vault-key envelope could not be accepted because the BYTES
+    /// prove nothing about who produced them, or because nothing says which
+    /// device deposited them.
+    ///
+    /// ⭐ Deliberately its own variant, and NOT collapsed into
+    /// [`DesktopError::Vault`], [`DesktopError::Unauthenticated`] (401) or
+    /// [`DesktopError::Forbidden`] (403): the request authenticated fine, nothing
+    /// was forbidden, and no device's key changed. An UNAUTHENTICATED (version 1)
+    /// `SIGILhyb` container carries NO SENDER — anyone who can read the
+    /// recipient's published hybrid public key can mint one — so accepting it
+    /// would install a vault key an attacker chose. Nothing is ever opened or
+    /// stored on this path.
+    UnauthenticatedEnvelope {
+        /// True when the envelope was an anonymous/wrong-kind container; false
+        /// when the depositing device simply could not be determined.
+        wrong_kind: bool,
+        /// A human explanation. Never key material and never a plaintext.
+        detail: String,
+    },
     /// ⚠️ A RECOVERY KIT operation failed at the client layer: an undecodable
     /// printed code (rejected OFFLINE, before anything was sent), a kit whose
     /// index holds nothing to recover, or a failed pre-print verification.
@@ -252,6 +271,7 @@ impl std::fmt::Display for DesktopError {
                  TRUSTED out-of-band channel, then re-pin deliberately."
             ),
             DesktopError::KeyUnverified { detail, .. } => write!(f, "{detail}"),
+            DesktopError::UnauthenticatedEnvelope { detail, .. } => write!(f, "{detail}"),
             DesktopError::Recovery(m) => write!(f, "recovery kit: {m}"),
             DesktopError::PaymentRequired { message, .. } => write!(f, "{message}"),
             DesktopError::Server { message, .. } => write!(f, "{message}"),

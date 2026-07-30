@@ -99,6 +99,22 @@ key)`, then seal the 32-byte vault key under it with XChaCha20-Poly1305. The res
 is a **`SIGILhyb` container** (~1.2 KiB, observed **1226 bytes**), and the
 recipient's `unwrap_vault_key` reverses it with its hybrid secret identity.
 
+> ⛔ **SUPERSEDED BY [ADR 0048](0048-authenticated-vault-key-envelopes.md)
+> (Phase 60) — the paragraph above describes a VULNERABLE construction.**
+> `hybrid_seal` is **anonymous** (HPKE `mode_base`), so holding the recipient's
+> **published** public key was enough to mint an envelope it would accept, and the
+> only check on the recovered plaintext was `len == 32` — which a forged key
+> passes. `wrap_vault_key` now calls `hybrid_auth_seal_to_container` (a
+> **static-static X25519 DH** folded into the KEM, so a forger needs the
+> **sender's** secret) under a **context-bound AAD** naming purpose + vault +
+> recipient + sender, writing **`SIGILhyb` version 2**; version 1 is **refused**
+> wherever a vault key is expected, and `unwrap_vault_key` now requires a
+> **`VerifiedSender`**. ⚠️ **The envelope is therefore NO LONGER 1226 bytes** — it
+> is `1244 + len(vault_id) + len(recipient_device_id) + len(sender_device_id)`
+> (measured **1310** for a 14-char vault id and two 26-char device ids). The flat
+> 1226 remains correct only for the **anonymous file** container. ⛔ Every
+> envelope wrapped under the old construction must be **re-issued**.
+
 Fresh ephemeral entropy — the ephemeral X25519 secret, the ML-KEM coin, and the
 AEAD nonce — is drawn per call, so two shares of the same key never reuse
 randomness (asserted by a unit test).

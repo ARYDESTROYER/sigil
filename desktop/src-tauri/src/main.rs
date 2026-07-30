@@ -210,6 +210,10 @@ fn ipc(e: DesktopError) -> IpcError {
         // server error. The UI must present it as the key-substitution alarm.
         DesktopError::KeyPinMismatch { .. } => "key changed",
         DesktopError::KeyUnverified { .. } => "key unverified",
+        // ⭐ Its own tag (Phase 60): an envelope that proves nothing about who
+        // produced it is neither an auth failure, nor a permission failure, nor a
+        // changed key. The UI must be able to say exactly that.
+        DesktopError::UnauthenticatedEnvelope { .. } => "envelope not authenticated",
         // ⭐ Its own tag: a lapsed subscription is a BILLING state, not a
         // security failure and not data loss. The UI must be able to say so, and
         // to say what still works.
@@ -732,12 +736,36 @@ struct ShareView {
     needs_out_of_band_check: bool,
 }
 
-/// Accept a vault shared TO this device: collect the envelope, unwrap it with
-/// this device's hybrid secret, and store the key in the `0600` keyring.
+/// ⭐ Accept a vault shared TO this device (Phase 60).
+///
+/// It no longer unwraps whatever decrypts to 32 bytes from whoever: the
+/// depositing device is resolved (named here, else from this device's self-only
+/// envelope index), its hybrid key is PIN-CHECKED, and the envelope must be an
+/// AUTHENTICATED (version 2) one bound to (this vault, this device, that
+/// sender). `from` names the sender explicitly; `safety_number` is the digits
+/// read out of band, which is what closes the first-contact window pinning
+/// cannot; `replace` is required to overwrite a DIFFERENT key already held.
+///
+/// A blank string means "not supplied" — the UI sends empty inputs as `""`.
 #[tauri::command]
-fn accept(vault_id: String, state: State<'_, AppState>) -> CmdResult<String> {
+fn accept(
+    vault_id: String,
+    from: Option<String>,
+    safety_number: Option<String>,
+    replace: Option<bool>,
+    state: State<'_, AppState>,
+) -> CmdResult<String> {
+    let from = from.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let expected = safety_number
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     sync_config(&state)?
-        .accept_vault(vault_id.trim())
+        .accept_vault(
+            vault_id.trim(),
+            from.as_deref(),
+            expected.as_deref(),
+            replace.unwrap_or(false),
+        )
         .map_err(ipc)
 }
 

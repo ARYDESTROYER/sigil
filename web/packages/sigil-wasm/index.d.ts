@@ -106,6 +106,53 @@ export function hybrid_open_container(
   container: Uint8Array,
 ): Uint8Array;
 
+/**
+ * The CONTEXT-BOUND AAD for a vault-key wrap (Phase 60):
+ * `"sigil-vault-key-wrap-v1\n"` then the three identifiers, each `u32`
+ * big-endian length-prefixed. Single-sourced in `sigil_core::vault_key_wrap_aad`,
+ * which the `sigil` CLI calls too, so Rust and JS agree by construction.
+ */
+export function vault_key_wrap_aad(
+  vault_id: string,
+  recipient_device_id: string,
+  sender_device_id: string,
+): Uint8Array;
+
+/**
+ * ⭐ AUTHENTICATED seal to a recipient hybrid identity, AS the holder of
+ * `sender_x25519_secret`, producing a `SIGILhyb` **version 2** container.
+ *
+ * Unlike {@link hybrid_seal_to_container}, a party holding only the recipient's
+ * PUBLIC key cannot produce a container this authenticates — the sender's
+ * long-term X25519 secret feeds a third Diffie–Hellman that goes into the KDF.
+ */
+export function hybrid_auth_seal_to_container(
+  sender_x25519_secret: Uint8Array,
+  recipient_x25519_pub: Uint8Array,
+  recipient_mlkem_encaps_key: Uint8Array,
+  ephemeral_x25519_secret: Uint8Array,
+  mlkem_coin: Uint8Array,
+  aead_nonce: Uint8Array,
+  aad: Uint8Array,
+  plaintext: Uint8Array,
+): Uint8Array;
+
+/**
+ * ⭐ AUTHENTICATED open of a `SIGILhyb` **version 2** container, asserting it
+ * came from `sender_x25519_pub` and was sealed under exactly `aad`.
+ *
+ * ⛔ A version-1 (anonymous) container is REFUSED before any cryptography runs.
+ * A wrong recipient, a WRONG SENDER, a tampered container or a mismatched AAD
+ * all throw, and no plaintext is returned in any of those cases.
+ */
+export function hybrid_auth_open_container(
+  recipient_x25519_secret: Uint8Array,
+  recipient_mlkem_seed: Uint8Array,
+  sender_x25519_pub: Uint8Array,
+  aad: Uint8Array,
+  container: Uint8Array,
+): Uint8Array;
+
 /** Derive the 32-byte Ed25519 public key from a 32-byte seed. */
 export function ed25519_public_key(seed: Uint8Array): Uint8Array;
 
@@ -174,6 +221,9 @@ export interface SigilWasm {
   hybrid_mlkem_encaps_key: typeof hybrid_mlkem_encaps_key;
   hybrid_seal_to_container: typeof hybrid_seal_to_container;
   hybrid_open_container: typeof hybrid_open_container;
+  vault_key_wrap_aad: typeof vault_key_wrap_aad;
+  hybrid_auth_seal_to_container: typeof hybrid_auth_seal_to_container;
+  hybrid_auth_open_container: typeof hybrid_auth_open_container;
   ed25519_public_key: typeof ed25519_public_key;
   ed25519_sign: typeof ed25519_sign;
   ed25519_verify: typeof ed25519_verify;
@@ -622,7 +672,140 @@ export const HYBRID_X25519_PUBLIC_LEN: number;
 export const HYBRID_MLKEM_SEED_LEN: number;
 export const HYBRID_MLKEM_ENCAPS_LEN: number;
 export const KEY_ENVELOPE_MAGIC: string;
-export const WRAPPED_VAULT_KEY_LEN: number;
+/** `SIGILhyb` version 1 — the ANONYMOUS form. NEVER a vault-key envelope. */
+export const KEY_ENVELOPE_VERSION_ANONYMOUS: number;
+/** `SIGILhyb` version 2 — AUTHENTICATED; the only version an unwrap accepts. */
+export const KEY_ENVELOPE_VERSION_AUTHENTICATED: number;
+/**
+ * Fixed byte overhead of a wrapped 32-byte vault key, EXCLUDING the AAD (1208).
+ * Replaces the old flat `WRAPPED_VAULT_KEY_LEN = 1226`, which was true only
+ * while every hybrid container shared ONE fixed AAD — the very defect Phase 60
+ * closed.
+ */
+export const WRAPPED_VAULT_KEY_OVERHEAD: number;
+/** Exact envelope length for a given wrap context. */
+export function wrappedVaultKeyLen(
+  vaultId: string,
+  recipientDeviceId: string,
+  senderDeviceId: string,
+): number;
+/**
+ * Byte length (24) of the vault-key-wrap AAD's domain-separation prefix.
+ * Deliberately a length, not a copy of the literal: the AAD is single-sourced in
+ * `sigil-core` and reached through `vaultKeyWrapAad`, so a JS copy of the domain
+ * string would be a drift surface for no benefit.
+ */
+export const VAULT_KEY_WRAP_AAD_PREFIX_LEN: number;
+
+/** The `SIGILhyb` container version byte, or `null` if the bytes are not one. */
+export function keyEnvelopeVersion(envelopeBytes: Uint8Array): number | null;
+
+/** The CONTEXT a vault-key envelope is bound to. Both sides MUST build it identically. */
+export interface VaultKeyWrapContext {
+  vaultId: string;
+  recipientDeviceId: string;
+  senderDeviceId: string;
+}
+
+/** The SENDING half of a wrap: which device we are, and the secret proving it. */
+export interface SenderIdentity {
+  deviceId: string;
+  hybrid: HybridSecretIdentity;
+}
+
+/** Build the context-bound AAD bytes (single-sourced through the wasm/core). */
+export function vaultKeyWrapAad(
+  wasm: Pick<SigilWasm, "vault_key_wrap_aad">,
+  vaultId: string,
+  recipientDeviceId: string,
+  senderDeviceId: string,
+): Uint8Array;
+
+/** Bundle a device id with the hybrid secret identity that authenticates it. */
+export function senderIdentity(
+  deviceId: string,
+  hybridSecret: HybridSecretIdentity,
+): SenderIdentity;
+
+/** The sender identity implied by an unlocked client's `auth`. */
+export function senderFromAuth(auth: SharingAuth): SenderIdentity;
+
+/**
+ * ⛔ Thrown when a vault-key slot is handed a container that is not an
+ * AUTHENTICATED (version 2) envelope — in practice a version-1 anonymous one.
+ *
+ * ⭐ Its OWN class on purpose: NOT a 401 (the request authenticated fine), NOT a
+ * 403 (nothing was forbidden), NOT a `KeyPinMismatchError` (no key changed). The
+ * BYTES prove nothing about who produced them.
+ */
+export class UnauthenticatedEnvelopeError extends Error {
+  readonly name: "UnauthenticatedEnvelopeError";
+  readonly foundVersion: number;
+  readonly expectedVersion: number;
+}
+
+/** ⛔ Thrown when an envelope cannot be attributed to an expected SENDER. */
+export class UnknownSenderError extends Error {
+  readonly name: "UnknownSenderError";
+}
+
+/**
+ * ⛔ Thrown when the key recovered from an envelope does NOT open the vault's
+ * newest op (step 4 of `acceptVault`, mirroring the CLI's `accept_vault_key`).
+ * A key that opens nothing never reaches local state.
+ */
+export class VaultKeyDoesNotOpenError extends Error {
+  readonly name: "VaultKeyDoesNotOpenError";
+  readonly vaultId: string;
+}
+
+/**
+ * ⛔ Thrown when accepting would REPLACE a DIFFERENT key already held for the
+ * vault (step 5 of `acceptVault`). Legitimate after a rotation — pass
+ * `replace: true`. Both fingerprints are SHA-256 prefixes, never key bytes.
+ */
+export class VaultKeyReplacementError extends Error {
+  readonly name: "VaultKeyReplacementError";
+  readonly vaultId: string;
+  readonly heldFingerprint: string;
+  readonly offeredFingerprint: string;
+}
+
+/**
+ * Normalize/validate the map of vault keys a client already holds. FAILS CLOSED
+ * on `null`/`undefined` for the same reason `requirePinStore` does.
+ */
+export function requireHeldVaultKeys(
+  keys: Record<string, Uint8Array> | null | undefined,
+): Record<string, Uint8Array>;
+
+/**
+ * A sender whose hybrid public key passed the unwrap gate. It CANNOT be
+ * constructed directly — only `verifySenderForUnwrap` / `verifiedSenderFromLocal`
+ * produce one, which is what makes `unwrapVaultKey`'s signature a proof.
+ */
+export class VerifiedSender {
+  private constructor();
+  readonly deviceId: string;
+  readonly identity: HybridPublicIdentity;
+  readonly trust: RecipientTrust;
+  readonly safetyNumber: string;
+  readonly x25519PublicKey: Uint8Array;
+}
+
+/** ⭐ THE UNWRAP GATE: resolve + pin-check the DEPOSITING device's key. */
+export function verifySenderForUnwrap(
+  wasm: SigilWasm,
+  auth: SharingAuth,
+  deviceId: string,
+  opts?: { pins?: HybridPinStore | null; expectedSafetyNumber?: string | null },
+): Promise<VerifiedSender>;
+
+/** The sender is an identity this process holds the SECRET half of — no fetch. */
+export function verifiedSenderFromLocal(
+  wasm: Pick<SigilWasm, "hybrid_x25519_public" | "hybrid_mlkem_encaps_key">,
+  sender: SenderIdentity,
+): Promise<VerifiedSender>;
 
 /** Plain-language explanation of a sharing-endpoint status (401/403/404/409/413). */
 export function explainSharingStatus(status: number): string;
@@ -656,17 +839,34 @@ export function generateVaultKey(): Uint8Array;
 /** First 16 hex chars of SHA-256(key) — a non-reversible fingerprint. */
 export function vaultKeyFingerprint(key: Uint8Array): Promise<string>;
 
-/** WRAP a vault key to a recipient's hybrid public key (fresh entropy per call). */
+/**
+ * ⭐ WRAP a vault key to a recipient's hybrid public key, AUTHENTICATED as
+ * `sender` and BOUND to `ctx` (fresh entropy per call).
+ *
+ * `ctx.senderDeviceId` MUST equal `sender.deviceId`.
+ */
 export function wrapVaultKey(
-  wasm: Pick<SigilWasm, "hybrid_seal_to_container" | "nonce_len">,
+  wasm: Pick<
+    SigilWasm,
+    "hybrid_auth_seal_to_container" | "vault_key_wrap_aad" | "nonce_len"
+  >,
+  sender: SenderIdentity,
   recipientPublic: HybridPublicIdentity,
+  ctx: VaultKeyWrapContext,
   vaultKey: Uint8Array,
 ): Uint8Array;
 
-/** UNWRAP an envelope with this device's hybrid SECRET identity. Throws. */
+/**
+ * ⭐ UNWRAP an envelope with this device's hybrid SECRET identity — but ONLY as a
+ * record from `sender`, and ONLY under `ctx`. Throws
+ * `UnauthenticatedEnvelopeError` for a version-1 container, and on any AEAD
+ * failure (wrong recipient, WRONG SENDER, tampered bytes, re-filed context).
+ */
 export function unwrapVaultKey(
-  wasm: Pick<SigilWasm, "hybrid_open_container">,
+  wasm: Pick<SigilWasm, "hybrid_auth_open_container" | "vault_key_wrap_aad">,
   mySecretIdentity: HybridSecretIdentity,
+  sender: VerifiedSender,
+  ctx: VaultKeyWrapContext,
   envelopeBytes: Uint8Array,
 ): Uint8Array;
 
@@ -687,7 +887,7 @@ export function getKeyEnvelope(
   deviceId?: string | null,
 ): Promise<Uint8Array>;
 
-/** SHARE a vault: fetch key, wrap, deposit, then grant — in one call. */
+/** SHARE a vault: gate + wrap (authenticated), then GRANT, then deposit. */
 export function shareVault(
   wasm: SigilWasm,
   auth: SharingAuth,
@@ -703,6 +903,8 @@ export function shareVault(
      * wrap gate throws `UnverifiedRecoveryKitError` otherwise).
      */
     expectedSafetyNumber?: string | null;
+    /** The AUTHENTICATING identity; defaults to this client's own (`auth`). */
+    sender?: SenderIdentity | null;
   },
 ): Promise<{
   recipientDeviceId: string;
@@ -722,12 +924,53 @@ export function shareVault(
 export function acceptVault(
   wasm: SigilWasm,
   auth: SharingAuth,
-  args: { vaultId: string; secretIdentity?: HybridSecretIdentity | null },
+  args: {
+    vaultId: string;
+    secretIdentity?: HybridSecretIdentity | null;
+    /**
+     * The device that DEPOSITED the envelope. Omitted, it is read from this
+     * device's own self-only envelope index; if that does not name one, the
+     * accept is REFUSED with `UnknownSenderError` rather than unwrapping
+     * anonymously.
+     */
+    senderDeviceId?: string | null;
+    /** The sender's safety number, read out of band (closes first contact). */
+    expectedSafetyNumber?: string | null;
+    pins?: HybridPinStore | null;
+    /**
+     * The vault keys this client ALREADY HOLDS, so an accept cannot silently
+     * REPLACE one. FAILS CLOSED like `pins`: pass `device.vaultKeys`, or `{}` if
+     * you deliberately hold none. Defaults to `auth.vaultKeys`.
+     */
+    heldKeys?: Record<string, Uint8Array> | null;
+    /**
+     * Explicit opt-in to replacing a DIFFERENT key already held for this vault
+     * (the CLI spells this `--replace`). Without it, that case is
+     * `VaultKeyReplacementError`.
+     */
+    replace?: boolean;
+  },
 ): Promise<{
   vaultId: string;
   vaultKey: Uint8Array;
   envelope: Uint8Array;
   fingerprint: string;
+  /** The device whose static key the envelope was AUTHENTICATED against. */
+  senderDeviceId: string;
+  senderTrust: RecipientTrust;
+  senderSafetyNumber: string;
+  /** Persist this — the sender is now pinned. */
+  pins: HybridPinStore;
+  /**
+   * Whether the recovered key was PROVED to open this vault's newest op. `false`
+   * only when the server holds no vault yet — never when an open was attempted
+   * and failed (that throws `VaultKeyDoesNotOpenError`).
+   */
+  verifiedAgainstTip: boolean;
+  /** The newest op, already pulled and already proven to open. `null` if none. */
+  tipContainer: Uint8Array | null;
+  /** Fingerprint of the key this one replaced (needs `replace`), else `null`. */
+  replaced: string | null;
 }>;
 
 // ── Phase 50: safety numbers, key pinning, rotation ─────────────────────────
@@ -890,6 +1133,8 @@ export function rotateVaultKey(
      * `UnverifiedRecoveryKitError` otherwise, before anything is mutated.
      */
     safetyNumbers?: Record<string, string>;
+    /** The AUTHENTICATING identity for every re-wrap; defaults to `auth`'s. */
+    sender?: SenderIdentity | null;
   },
 ): Promise<{
   vaultKey: Uint8Array;
@@ -1116,9 +1361,23 @@ export function restoreFromKit(
 ): Promise<{
   deviceId: string;
   accountId: string;
-  vaults: { vaultId: string; vaultKey: Uint8Array; fingerprint: string }[];
+  vaults: {
+    vaultId: string;
+    vaultKey: Uint8Array;
+    fingerprint: string;
+    /** The device that deposited the envelope, as AUTHENTICATED (Phase 60). */
+    senderDeviceId: string;
+    senderTrust: RecipientTrust;
+    senderSafetyNumber: string;
+  }[];
+  /**
+   * Vaults NOT restored, and why. A vault whose depositing device the server's
+   * index does not name is SKIPPED rather than unwrapped anonymously.
+   */
   skipped: { vaultId: string; reason: string }[];
   identity: RecoveryIdentity;
+  /** The pin store this restore built (every sender pinned on first sight). */
+  pins: HybridPinStore;
 }>;
 
 /** Revoke a kit and take back its envelopes. Does NOT auto-rotate. */

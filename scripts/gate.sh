@@ -54,7 +54,7 @@ for f in sorted(glob.glob('.github/workflows/*.yml')):
 print('  ✓ all workflows parse' if not bad else '')
 sys.exit(bad)" || fail=1
 
-note "=== SECURITY SCANNERS (the two checks CI ran and this gate did not) ==="
+note "=== SECURITY SCANNERS (all three of security.yml, plus the working tree) ==="
 # ⚠️ WHY THIS BLOCK EXISTS, and it is the same lesson as everything else here.
 # On 2026-07-30 the `security` workflow was RED on two jobs — govulncheck and
 # cargo-audit(desktop) — while this gate reported ALL GREEN on the very commit
@@ -99,6 +99,56 @@ else
   else
     bad "govulncheck ($("$SCANGO" version | awk '{print $3}')): $(printf '%s' "$gv" | grep -c '^Vulnerability #') vulnerability(ies)
 $(printf '%s' "$gv" | grep -E '^Vulnerability #|^    Found in:|^    Fixed in:' | sed 's/^/      /')"
+  fi
+fi
+
+# --- gitleaks ---------------------------------------------------------------
+# ⚠️ ADDED AFTER THE SECOND MISS. The first version of this block ran govulncheck
+# and cargo-audit — TWO of `security.yml`'s THREE jobs — and the very next push
+# went red on the third. Closing "the gate is a subset of CI" by adding *some* of
+# the missing checks is not closing it. Run the whole workflow's worth.
+#
+# Uses the same Docker image concept as CI's action, so no host install is
+# required; skipping when Docker is unavailable would recreate the exact blind
+# spot this block exists to remove, so it FAILS instead.
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  bad "docker unavailable — gitleaks did NOT run. This is the third CI check;
+      a gate missing it is a gate that can be green while \`security\` is red."
+else
+  glimg=zricethezav/gitleaks:latest
+  # (a) HISTORY — byte-for-byte what CI scans.
+  gl=$(docker run --rm -v "$PWD:/repo:ro" -w /repo "$glimg" \
+         detect --source=/repo --config=/repo/.gitleaks.toml --no-banner --redact 2>&1)
+  if printf '%s' "$gl" | grep -q 'no leaks found'; then
+    ok "gitleaks clean (full history)"
+  else
+    bad "gitleaks (history): $(printf '%s' "$gl" | grep -oE 'leaks found: [0-9]+' | tail -1)
+$(printf '%s' "$gl" | grep -E '^(File|Line|RuleID):' | head -12 | sed 's/^/      /')"
+  fi
+
+  # (b) ⭐ WHAT IS ABOUT TO BE COMMITTED — which the history scan CANNOT see.
+  # Verified: an uncommitted file holding a random 40-char credential beside
+  # `api_secret_key` is reported as "no leaks found" by the history scan. A
+  # pre-push gate that only inspects what is already committed cannot stop you
+  # committing a secret; it can only tell you afterwards.
+  #
+  # `--no-git` over the repo root is the wrong tool — it walked node_modules and
+  # build output and reported 39 findings here. So scan exactly the set git would
+  # take: tracked + untracked-but-not-ignored, copied into a scratch tree.
+  glsrc=$(mktemp -d)
+  git ls-files -co --exclude-standard -z | while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    mkdir -p "$glsrc/$(dirname "$f")" && cp "$f" "$glsrc/$f"
+  done
+  cp .gitleaks.toml .gitleaksignore "$glsrc/" 2>/dev/null
+  gw=$(docker run --rm -v "$glsrc:/scan:ro" -w /scan "$glimg" \
+         detect --source=. --config=.gitleaks.toml --no-git --no-banner --redact 2>&1)
+  rm -rf "$glsrc"
+  if printf '%s' "$gw" | grep -q 'no leaks found'; then
+    ok "gitleaks clean (working tree — everything git would commit)"
+  else
+    bad "gitleaks (working tree): $(printf '%s' "$gw" | grep -oE 'leaks found: [0-9]+' | tail -1)
+$(printf '%s' "$gw" | grep -E '^(File|Line|RuleID):' | head -12 | sed 's/^/      /')"
   fi
 fi
 

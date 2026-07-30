@@ -9779,3 +9779,84 @@ fixed in this commit:** find which exit path skips the cleanup (a signal, an ear
 `process.exit`, or a throw before the `try`), and give the shell proofs and node suites a
 cleanup that also fires on SIGINT/SIGTERM. Until then, `pkill -x sigild` between long
 sessions.
+
+---
+
+## 2026-07-30 — CI repair, round three: I fixed two of three scanners and the third went red on the next push
+
+**What happened.** `1e984f9` turned `interop` green and `security` **red** — on
+**gitleaks**, the one job of the three I had not added to the gate. The previous entry
+says the root cause was that the gate's coverage was *a strict subset of CI's*. I then
+closed that gap **partially**, which is the same defect wearing a smaller hat.
+`govulncheck` and `cargo-audit` were added; `gitleaks` was not; the very next push failed
+on it.
+
+### The finding: seven false positives on a published RFC test vector
+
+All seven were `generic-api-key` on `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ` in the three new
+Phase 59 test files. That base32 string decodes to the ASCII `12345678901234567890` — it
+is the **TOTP test seed printed in RFC 6238 Appendix B**, and it already appears in about
+a dozen suites here as the seed that must produce `94287082` at T=59.
+
+⭐ **Why it only fired now, which is the interesting part.** gitleaks' `generic-api-key`
+rule needs a trigger word — `secret`/`key`/`token` — near a high-entropy string. Every
+older suite names this constant **`RFC_SEED_B32`**, and "seed" is not a trigger word.
+Phase 59's new suites named it **`RFC_SECRET`** and passed it as `--secret`. Identical
+value, identical safety, different variable name.
+
+**Fixed by allowlisting the VALUE, not the paths.** Excluding the three files would blind
+the scanner to a real secret pasted into them later; excluding one published constant
+costs nothing. And renaming the variables to dodge the rule would have been worse than
+either — that hides the pattern instead of declaring it.
+
+### Then four more, and a file that tripped the scanner it configures
+
+A full-history scan (which CI does not do on a push) found four further false positives:
+two `key_fingerprint` test fixtures, the MV3 extension's **public** RSA manifest key
+(no private half in this repo, documented as such since Phase 43), and a `sigil.h` doc
+comment listing byte lengths. All four are pinned by **fingerprint** in a new
+`.gitleaksignore` — precise to `commit:path:rule:line`, so nothing else in those files is
+suppressed.
+
+⚠️ **Two mistakes while writing that file, both caught before pushing:**
+
+1. **The suppression file tripped the scanner.** My first draft *quoted* the flagged
+   values in its explanatory comments — the RSA key prefix and `"0123456789abcdef"` — so
+   `.gitleaksignore` itself became three findings. It now says what each value *is* and
+   never reproduces it, with the rule written at the bottom of the file.
+2. **I added an allowlist regex that suppressed nothing.** I theorised that fingerprint
+   lines were tripping the rule and added a pattern for them. Testing with and without
+   it gave `no leaks found` **both ways** — the quoted comments had been the only cause.
+   Removed: an unnecessary allowlist entry is a small permanent blind spot.
+
+⚠️ **And a worthless mutation test.** I first "proved" the allowlist still catches real
+secrets using `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` — **AWS's own documentation
+placeholder**, which gitleaks allowlists by default. It was not detected, and for a moment
+that looked like my allowlist being far too broad. A genuinely random 40-character
+credential beside `api_secret_key` **is** detected. *Choose a mutation the tool has no
+special knowledge of.*
+
+### The gate now runs all three — and one thing CI cannot
+
+⭐ **A history scan cannot see a secret you have not committed yet.** Verified: an
+uncommitted file holding a random credential is reported `no leaks found` by the history
+scan. A pre-push gate that only inspects what is already committed cannot stop you
+committing a secret; it can only tell you afterwards.
+
+So `gate.sh` runs **both**: the history scan (byte-for-byte what CI does) *and* a scan of
+exactly the files git would commit — `git ls-files -co --exclude-standard` copied to a
+scratch tree, because `--no-git` over the repo root walks `node_modules` and reported 39
+findings here. Both are mutation-proven: planting an uncommitted credential turns the
+working-tree check red (`leaks found: 1`) while history stays green.
+
+⚠️ **`.gitleaksignore` needs BOTH fingerprint spellings** — `commit:path:rule:line` for
+the history scan and `path:rule:line` for the working-tree scan — or the four accepted
+findings reappear as four permanent leaks. The no-git line numbers track the *current*
+file (extension/manifest.json has moved from line 12 to 14), so they will go stale when
+code moves; the gate then fails loudly, which is the right direction.
+
+### ➡️ The lesson, stated plainly
+
+**A partial fix to "the gate is a subset of CI" is still that bug.** When closing a
+coverage gap, enumerate the whole surface — every job in the workflow — rather than the
+instances that happened to fail. I had the list in front of me and used two thirds of it.

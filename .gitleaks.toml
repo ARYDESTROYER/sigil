@@ -19,4 +19,28 @@ regexes = [
   '''you@example\.com''',
   '''example\.invalid''',
   '''SIGILD_(POSTGRES|REDIS)_ADDR''',
+
+  # ── The PUBLIC RFC 6238 Appendix B test seed ──────────────────────────────
+  #
+  # `GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ` is base32 for the ASCII string
+  # "12345678901234567890" — the TOTP test vector printed in RFC 6238 itself.
+  # It is not a secret, it has never been a secret, and it appears in roughly a
+  # dozen suites across this repo as the seed that must produce 94287082 at
+  # T=59. The 16-character form is the same seed truncated for the SHA-1 case.
+  #
+  # ⚠️ WHY IT ONLY STARTED FIRING IN PHASE 59, because the reason matters more
+  # than the fix: gitleaks' `generic-api-key` rule needs a keyword like
+  # "secret"/"key"/"token" NEAR a high-entropy string. Every older suite names
+  # this constant `RFC_SEED_B32` — "seed" is not a trigger word. Phase 59's new
+  # suites named it `RFC_SECRET` / passed it as `--secret`, and that adjacency
+  # alone flipped the rule on. Identical value, identical safety, different
+  # variable name.
+  #
+  # ⭐ ALLOWLISTED BY VALUE, DELIBERATELY, RATHER THAN BY PATH. Excluding the
+  # three files would blind the scanner to a REAL secret pasted into them
+  # later; excluding this one published constant costs nothing. And the
+  # alternative — renaming the variables to dodge the rule — would be worse
+  # than either: it hides the pattern instead of declaring it.
+  '''GEZDGNBVGY3TQOJQ(GEZDGNBVGY3TQOJQ)?''',
+
 ]

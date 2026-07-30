@@ -1,0 +1,75 @@
+# gitleaks — findings reviewed and accepted, pinned by FINGERPRINT.
+#
+# ⚠️ READ THIS BEFORE ADDING A LINE.
+#
+# A fingerprint is `commit:path:rule:line`. Pinning one accepts EXACTLY that
+# finding at EXACTLY that point in history — it does NOT blind the scanner to the
+# file, the rule, or any future secret pasted into the same place. That precision
+# is the whole reason this file is used instead of a `paths` entry in
+# `.gitleaks.toml`: excluding a path would make the scanner permanently silent
+# about it, which is how a real secret eventually ships.
+#
+# The same reasoning as `desktop/.cargo/audit.toml`: an accepted finding belongs
+# in the repository with a justification, where it can be reviewed in a diff — not
+# hidden behind a CI flag, and not silenced by widening a rule.
+#
+# ⛔ NOTHING that is actually secret goes here. If a real credential is ever
+# committed, the answer is rotation and history rewriting — see the "gitleaks
+# fired" rotation runbook in docs/sprint-72h.md.
+#
+# Last reviewed: 2026-07-30. Every entry below was opened and read, not assumed.
+
+# ── Test fixtures in a unit test ─────────────────────────────────────────────
+# Two `key_fingerprint` literals inside a `#[test]` building a RecoveryKitView.
+# The value is a 16-character counting sequence of hex digits (again: NOT quoted
+# here — see the note at the bottom). It sits in a field that holds the first 16
+# hex chars of a SHA-256, so it is never a key, and never secret even when real.
+ab37e05759991158806702596b73fd2933b4c93d:desktop/core/src/recovery.rs:generic-api-key:616
+ab37e05759991158806702596b73fd2933b4c93d:desktop/core/src/recovery.rs:generic-api-key:624
+
+# ── The MV3 extension's pinned manifest key ──────────────────────────────────
+# The `"key"` field of extension/manifest.json: an RSA **PUBLIC** key in SPKI
+# form (its base64 opens with the standard SubjectPublicKeyInfo header for RSA —
+# deliberately NOT quoted here, see the note at the bottom of this file). Chrome
+# derives the unpacked extension ID from it, which is what lets the Playwright
+# suite address `chrome-extension://<fixed-id>/...`.
+# ⭐ THE PRIVATE HALF IS NOT IN THIS REPOSITORY and this is not a signing key —
+# CLAUDE.md has said so since Phase 43. Publishing a public key is what public
+# keys are for.
+132862645fab52cf1b50ba5efcced5fd4b55a689:extension/manifest.json:generic-api-key:12
+
+# ── A C header doc comment ───────────────────────────────────────────────────
+# Prose in `sigil.h` documenting the BYTE LENGTHS of `sigil_hybrid_seal`'s
+# parameters. The rule fired on the word "secret" sitting next to a run of digits.
+# There is no key material in a header file that only declares function signatures.
+c9db2b5175b8e1ae3c9e0d58295fd8e19ccbe5e8:libsigil/ffi/include/sigil.h:generic-api-key:313
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE SAME FOUR FINDINGS AGAIN, IN NO-GIT FORM.
+#
+# A fingerprint from a HISTORY scan is `commit:path:rule:line`. A fingerprint
+# from a `--no-git` scan of a working tree has no commit, so it is just
+# `path:rule:line` — and the entries above therefore DO NOT MATCH IT.
+# `scripts/gate.sh` runs both (history, matching CI; and the working tree,
+# because the history scan provably cannot see a secret you have not committed
+# yet), so both spellings are needed or the gate reports four permanent leaks.
+#
+# ⚠️ Line numbers here track the CURRENT file, not the commit that introduced
+# the finding — extension/manifest.json has moved from line 12 to line 14 — so
+# these will need updating when the surrounding code moves. If one goes stale
+# the gate fails LOUDLY, which is the right failure direction.
+# ─────────────────────────────────────────────────────────────────────────────
+desktop/core/src/recovery.rs:generic-api-key:616
+desktop/core/src/recovery.rs:generic-api-key:624
+extension/manifest.json:generic-api-key:14
+libsigil/ffi/include/sigil.h:generic-api-key:313
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ DO NOT QUOTE THE FLAGGED VALUE IN THESE COMMENTS. Describe it instead.
+#
+# The first draft of this file pasted the RSA public key's base64 prefix into a
+# comment to explain it — and gitleaks then flagged THIS FILE, three times. A
+# scanner-suppression file that itself trips the scanner is a self-inflicted
+# CI failure, and it was caught only by scanning a throwaway repo containing
+# nothing but this file. Say what the value IS; never reproduce it.
+# ─────────────────────────────────────────────────────────────────────────────

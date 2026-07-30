@@ -2093,7 +2093,20 @@ public, make no security claims, until the audit completes and trademark clears.
 ⭐ **`./scripts/gate.sh` is the documented way to run everything** (added Phase 56).
 It runs every command below, and does several things a hand-rolled sweep does not:
 
-- ⭐ it **RUNS BOTH SECURITY SCANNERS**, which for its first four phases it did NOT —
+- ⭐ it **RUNS ALL THREE SECURITY SCANNERS** — `govulncheck`, **`gitleaks`** and
+  `cargo audit` — plus a **working-tree gitleaks scan** that CI does not do. ⚠️ **The
+  first version of this block ran only TWO of `security.yml`'s THREE jobs, and the very
+  next push went red on the third** (gitleaks, on the PUBLIC RFC 6238 seed
+  `GEZDGNBVGY3TQOJQ…`, which trips `generic-api-key` only because Phase 59's new suites
+  named the constant `RFC_SECRET` where every older suite says `RFC_SEED` — "seed" is not
+  a trigger word). **A partial fix to "the gate is a subset of CI" is still that bug.**
+  Accepted findings live in **`.gitleaksignore`**, pinned by fingerprint, and ⚠️ **need
+  BOTH spellings** (`commit:path:rule:line` for the history scan, `path:rule:line` for the
+  working-tree scan) or they reappear as permanent leaks. ⭐ **The working-tree scan exists
+  because a history scan CANNOT see a secret you have not committed yet** — proven: an
+  uncommitted file holding a random credential reports `no leaks found` from the history
+  scan and `leaks found: 1` from the working-tree one.
+- ⭐ it **RUNS BOTH OTHER SECURITY SCANNERS**, which for its first four phases it did NOT —
   making its coverage a **strict subset of CI's**, so it could not answer the question it
   exists to answer. On 2026-07-30 the `security` workflow was red on two jobs while this
   script printed ALL GREEN about that same commit. It now runs **`govulncheck`** (against

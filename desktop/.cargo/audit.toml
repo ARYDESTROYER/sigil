@@ -1,0 +1,108 @@
+#                                                              -*- toml -*-
+# cargo-audit configuration for the `desktop/` workspace.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THIS FILE EXISTS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `desktop/` pulls the entire Tauri v2 tree — by far the largest dependency
+# surface in this repository (469 crates, versus 66 for the crypto core). That
+# tree carries 17 RustSec *warnings* and, as of this writing, **zero
+# vulnerabilities**.
+#
+# CI used to run `rustsec/audit-check@v2`, which fails the job on warnings and
+# offers no way to acknowledge one. The result was a permanently red check that
+# said the same thing on every commit. A security check that is always red is
+# not a security check — it is noise that trains a reviewer to skip the
+# `security` workflow, which is precisely where a real advisory would appear.
+#
+# So the job now runs `cargo audit --deny warnings` with the list below. That is
+# **strictly stronger** than what it replaced:
+#
+#   * a vulnerability in any workspace still fails, as it always did;
+#   * a *new* unmaintained/unsound advisory — one not named here — now fails
+#     too, instead of being lost among sixteen permanent failures;
+#   * every accepted advisory is written down in the repository, with who owns
+#     the fix and what would change our mind, rather than living in a CI flag
+#     nobody reads.
+#
+# ⚠️ RULES FOR EDITING THIS FILE
+#
+#   1. Nothing in the `vulnerabilities` class is ever ignored here. If a real
+#      advisory lands, the answer is to upgrade, vendor a patch, or drop the
+#      dependency — not to add a line below.
+#   2. Every ID gets a reason, an owner, and a condition that removes it.
+#   3. Re-review at the next dependency bump, and unconditionally before the
+#      external audit. An entry that has outlived its stated condition is a
+#      finding, not a formality.
+#
+# Last reviewed: 2026-07-30 (Phase 60), against advisory-db with 1173 entries.
+# Verified locally with: cd desktop && cargo audit --deny warnings
+
+[advisories]
+ignore = [
+    # ── GTK3 / gtk-rs 0.18.x — unmaintained, plus one unsoundness ────────────
+    #
+    # Owner: upstream. Tauri v2's Linux backend (tauri → wry → webkit2gtk)
+    # binds GTK3 through gtk-rs 0.18.x. The gtk-rs project retired its GTK3
+    # bindings in favour of GTK4; there is no newer 0.x to move to, and the
+    # version is not ours to choose — it is pinned by the webview stack.
+    #
+    # ⭐ SCOPE, and this is the load-bearing part: these crates are
+    #    **Linux-only and are not in this project's dependency graph on
+    #    macOS**. `cargo tree -i atk` / `-i gdk` / `-i glib` in `desktop/`
+    #    return NOTHING on darwin — they appear in `Cargo.lock` only because
+    #    Cargo locks every platform, and they are `cfg`-gated out of the build.
+    #    `desktop/` has never been built for Linux from this machine, and no
+    #    desktop binary has ever been signed, notarized or distributed.
+    #
+    # RUSTSEC-2024-0429 (glib) is `unsound`, not `unmaintained`: an unsound
+    # `Iterator`/`DoubleEndedIterator` impl for `VariantStrIter`. Sigil calls
+    # no GVariant API — it is reachable only through GTK internals, on a
+    # platform we do not build for.
+    #
+    # Removed when: Tauri's Linux backend moves to GTK4/gtk-rs 0.19+, or we
+    # decide not to ship a Linux desktop build at all. Re-evaluate the day a
+    # Linux target becomes real — at that point these stop being theoretical.
+    "RUSTSEC-2024-0411", # gdkwayland-sys 0.18.2  unmaintained
+    "RUSTSEC-2024-0412", # gdk            0.18.2  unmaintained
+    "RUSTSEC-2024-0413", # atk            0.18.2  unmaintained
+    "RUSTSEC-2024-0414", # gdkx11-sys     0.18.2  unmaintained
+    "RUSTSEC-2024-0415", # gtk            0.18.2  unmaintained
+    "RUSTSEC-2024-0416", # atk-sys        0.18.2  unmaintained
+    "RUSTSEC-2024-0417", # gdkx11         0.18.2  unmaintained
+    "RUSTSEC-2024-0418", # gdk-sys        0.18.2  unmaintained
+    "RUSTSEC-2024-0419", # gtk3-macros    0.18.2  unmaintained
+    "RUSTSEC-2024-0420", # gtk-sys        0.18.2  unmaintained
+    "RUSTSEC-2024-0429", # glib           0.18.5  UNSOUND (see note above)
+
+    # ── unic-* 0.9.0 — unmaintained Unicode tables ───────────────────────────
+    #
+    # Owner: upstream. Reached only as
+    #   unic-ucd-ident → urlpattern → tauri-utils → tauri
+    # i.e. Tauri's URL-pattern matcher, used to validate the capability
+    # allowlist. The `unic` project is dormant; `urlpattern` has not yet moved
+    # to `unicode-ident`. Not our dependency to choose.
+    #
+    # These are table-lookup crates with no I/O, no unsafe of consequence and
+    # no network parsing on our paths. Sigil's own capability set is
+    # `core:default` only (see desktop/src-tauri/capabilities/default.json), so
+    # the matcher runs over a constant we ship, not over attacker input.
+    #
+    # Removed when: `urlpattern` migrates off `unic-*`, or Tauri drops it.
+    "RUSTSEC-2025-0075", # unic-char-range    0.9.0
+    "RUSTSEC-2025-0080", # unic-common        0.9.0
+    "RUSTSEC-2025-0081", # unic-char-property 0.9.0
+    "RUSTSEC-2025-0098", # unic-ucd-version   0.9.0
+    "RUSTSEC-2025-0100", # unic-ucd-ident     0.9.0
+
+    # ── proc-macro-error 1.0.4 — unmaintained ────────────────────────────────
+    #
+    # Owner: upstream. A BUILD-TIME proc-macro helper; it contributes no code
+    # to the shipped binary and never sees runtime input. Reached transitively
+    # through the Tauri macro tree.
+    #
+    # Removed when: the dependents move to `proc-macro-error2` or `syn`'s own
+    # diagnostics.
+    "RUSTSEC-2024-0370", # proc-macro-error 1.0.4
+]

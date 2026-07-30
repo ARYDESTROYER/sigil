@@ -1009,7 +1009,23 @@ public, make no security claims, until the audit completes and trademark clears.
   set `SIGILD_TEST_POSTGRES`**, so ~30 tests skipped while it counted only PASS/FAIL. It
   now resolves the repo **from its own location** and **prints the tree + commit it is
   gating**, starts a throwaway `postgres:16` on a free port, and **FAILS if any test
-  skipped**. See *Build & test* below.
+  skipped**. ⚠️ **A THIRD blind spot was found on 2026-07-30, and it is the widest of
+  the three: the gate ran NEITHER SECURITY SCANNER.** Its coverage was a **strict subset
+  of CI's**, so it structurally could not answer the one question it exists to answer —
+  the `security` workflow was red on two jobs while the gate said ALL GREEN about that
+  same commit. It now runs **`govulncheck`** and **`cargo audit --deny warnings` across
+  all four lockfiles**, both mutation-proven THROUGH the gate (reverting `x/text` to
+  v0.29.0 → `✗ 1 vulnerability(ies)` naming GO-2026-5970; dropping `RUSTSEC-2024-0429`
+  from the ignore list → `✗ error: 1 denied warning found!`). ⭐ **`govulncheck` runs
+  against a `go1.25.x` toolchain — the line we SHIP — not `$GO`**, resolved as
+  `$SIGIL_SCAN_GO` → newest `~/go/bin/go1.25.*`; with none installed it **FAILS with
+  install instructions** rather than silently scanning the dev machine's Go 1.26.3 and
+  reporting three stdlib advisories that are not in the artifact. ⚠️ Two bugs in that new
+  block were caught by testing it in isolation before commit: **`$HOME/.cargo/bin` was
+  missing from `PATH`** so `cargo-audit` reported "not installed" where it was installed
+  (now **appended**, not prepended, so the rustup toolchain still wins for
+  `cargo`/`rustc`), and a **failed `cd sigild` printed `0 vulnerability(ies)`** — an empty
+  scanner result is now an explicit failure, never a count. See *Build & test* below.
 - `cli/` — `sigil`, a pre-audit demo CLI that seals/opens a file via the libsigil
   core, plus `push`/`pull` that sync the opaque container to/from sigild's
   **dev/localhost** op-log over **plain HTTP** (`SIGIL_SERVER`/`--server`;
@@ -1839,7 +1855,14 @@ public, make no security claims, until the audit completes and trademark clears.
 ## Toolchains (this machine — macOS arm64)
 
 - **Go** 1.26.3 at `/opt/homebrew/bin/go` (go.mod directive: **1.25.0** — raised for
-  the opt-in Postgres backend's `pgx`, which requires Go ≥ 1.25).
+  the opt-in Postgres backend's `pgx`, which requires Go ≥ 1.25). ⚠️ **The dev toolchain
+  is AHEAD of the shipped one and is itself vulnerable**: Go **1.26.3** carries
+  GO-2026-5856 / -5039 / -5037, while the artifact is built by `golang:1.25-alpine` and
+  CI pins setup-go **`1.25.x`**, where all three are fixed (1.25.11 / 1.25.12). That is
+  fine for running tests, but **`govulncheck` must NOT be run with it** — it would report
+  advisories that are not in the shipped binary. A **`go1.25.12`** is installed via
+  `golang.org/dl` at `~/go/bin/go1.25.12` for exactly that, and `scripts/gate.sh` insists
+  on it (`$SIGIL_SCAN_GO` overrides).
 - **Rust** stable (rustc 1.96) via Homebrew `rustup`. ⚠️ The `~/.cargo/bin`
   proxies were **not** created, and `rustup run stable cargo` did not resolve
   subcommands. The reliable invocation is to put the toolchain bin on PATH:
@@ -1851,8 +1874,18 @@ public, make no security claims, until the audit completes and trademark clears.
 ## Build & test (these commands are known-green)
 
 ⭐ **`./scripts/gate.sh` is the documented way to run everything** (added Phase 56).
-It runs every command below, and does three things a hand-rolled sweep does not:
+It runs every command below, and does several things a hand-rolled sweep does not:
 
+- ⭐ it **RUNS BOTH SECURITY SCANNERS**, which for its first four phases it did NOT —
+  making its coverage a **strict subset of CI's**, so it could not answer the question it
+  exists to answer. On 2026-07-30 the `security` workflow was red on two jobs while this
+  script printed ALL GREEN about that same commit. It now runs **`govulncheck`** (against
+  a **`go1.25.x`** toolchain — the line the Dockerfile and CI actually ship, resolved as
+  `$SIGIL_SCAN_GO` → newest `~/go/bin/go1.25.*`; **it FAILS rather than falling back** to
+  the dev machine's Go 1.26.3, whose three stdlib advisories are not in the artifact) and
+  **`cargo audit --deny warnings`** across all four lockfiles, where `desktop/` gets its
+  acknowledged advisories from the checked-in `desktop/.cargo/audit.toml` and the other
+  three must be warning-free outright;
 - it **ENUMERATES** the suites **dynamically** — every Rust crate, every Go package,
   every `sigil-wasm/test/*.mjs`, every `cli/tests/*.sh`, every Playwright spec — so a
   newly added suite cannot be silently missed;
@@ -1996,6 +2029,20 @@ $go -C sigild vet ./...
 $go -C sigild test -race ./...   # -race is the gate; CI (sigild.yml) runs -race too since Phase 51
 $go -C sigild build ./...
 
+# SECURITY SCANNERS — the two checks CI runs that the gate did not until 2026-07-30.
+# ⚠️ govulncheck MUST scan the toolchain we SHIP (go.mod `go 1.25.0`; Dockerfile
+# `golang:1.25-alpine`; CI setup-go `1.25.x`), NOT this machine's Go 1.26.3 — the dev
+# toolchain carries three stdlib advisories that are NOT in the artifact, and a scanner
+# that cries wolf gets muted. Install the shipped line once:
+$go install golang.org/dl/go1.25.12@latest && ~/go/bin/go1.25.12 download
+(cd sigild && GOTOOLCHAIN=local ~/go/bin/go1.25.12 run golang.org/x/vuln/cmd/govulncheck@latest ./...)
+# -> "No vulnerabilities found."
+cargo install cargo-audit --locked            # once; lands in ~/.cargo/bin
+for w in libsigil cli sigil-wasm desktop; do (cd $w && cargo audit --deny warnings); done
+# -> all four exit 0. `desktop/` passes only because desktop/.cargo/audit.toml
+#    acknowledges 17 upstream unmaintained/unsound advisories (0 vulnerabilities);
+#    the other three carry NO audit.toml and must stay warning-free outright.
+
 # sigild container (multi-stage → distroless, ~14 MB) — needs the Docker daemon
 docker build --build-arg VERSION=$(git rev-parse --short HEAD) -t sigild:dev sigild
 
@@ -2135,6 +2182,33 @@ list of `.github/workflows/` (ten files):
   matrix of ALL FOUR Rust workspaces** (`libsigil`, `cli`, `sigil-wasm`, `desktop`;
   Phase 51 — it audited `libsigil` only, which says nothing about the other three, and
   `desktop/` pulls the whole Tauri tree, by far the largest dependency surface here).
+  ⭐ **BOTH non-gitleaks jobs were RED on `565e377` and were repaired on 2026-07-30.**
+  (a) **govulncheck** flagged **GO-2026-5970** in `golang.org/x/text` **v0.29.0**,
+  reachable via `pgx` (`store.NewPostgresVaultLog` → `pgxpool.NewWithConfig` →
+  `norm.Form.Properties`); bumped to **v0.39.0** (and `x/sync` → 0.21.0) — both still
+  INDIRECT, so `sigild` keeps **exactly one direct dependency**. ⚠️ Three *other* findings
+  in a local run are an artifact of the SCANNING toolchain: this machine's Go is **1.26.3**
+  (advisories GO-2026-5856/-5039/-5037) while the artifact is built by
+  `golang:1.25-alpine` and CI pins setup-go **`1.25.x`**, where they are fixed in
+  1.25.11/1.25.12 — verified clean with an installed `go1.25.12`. **`1.25.x` FLOATS on
+  purpose**: pinning an exact patch would turn every stdlib backport into a red job.
+  (b) **cargo-audit(desktop)** had **never passed**: it used `rustsec/audit-check@v2`,
+  which fails on *warnings* with no acknowledgement mechanism, and the Tauri tree carries
+  **17 unmaintained/unsound advisories and ZERO vulnerabilities** — so the job said the
+  same thing on every commit, which is a reason to stop reading the one workflow where a
+  real advisory would appear. Replaced with a direct **`cargo audit --deny warnings`**
+  (using `dtolnay/rust-toolchain@stable` + `taiki-e/install-action@v2`, **both already
+  used in this repo** — no new third-party action) plus a checked-in
+  **`desktop/.cargo/audit.toml`** naming each accepted advisory with its owner and the
+  condition that removes it. **STRICTLY STRONGER:** a *new* advisory now fails instead of
+  hiding among sixteen permanent failures, and the acknowledgements are reviewable in a
+  diff rather than buried in a CI flag. ⚠️ `libsigil`/`cli`/`sigil-wasm` have **no**
+  `audit.toml` and must stay warning-free outright. ⭐ The GTK3/gtk-rs 0.18.x family
+  (11 of the 17, incl. the one **unsound** `glib` entry) is **Linux-only and NOT in the
+  macOS dependency graph at all** — `cargo tree -i atk`/`-i gdk`/`-i glib` return
+  **nothing** on darwin; they are in `Cargo.lock` only because Cargo locks every platform,
+  and `desktop/` has never been built for Linux from here. **That acknowledgement stops
+  being theoretical the day a Linux desktop build becomes real.**
 - **`release.yml`** — `workflow_dispatch`-only **and** deliberately **inert** (`if: false`
   on its job); cosign/SLSA signing deferred. It builds and publishes nothing.
 - **`publish-sigild.yml`** — the manual, human-gated GHCR publish (see above).

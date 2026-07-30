@@ -9189,3 +9189,90 @@ prints the path and sha).
   `docs/deployment.md` document the real behaviour and are the authority.
 - **Everything remains dev-gated, plain HTTP, pre-audit and UNAUDITED.** Billing has still
   never been run against a live provider account. Do not store real secrets.
+
+---
+
+## 2026-07-30 — CI repair: two red security jobs, and the gate that could not have known
+
+**Trigger:** the `security` workflow was failing on `565e377` — `govulncheck (sigild)`
+and `cargo-audit (desktop)` — while `scripts/gate.sh` reported **ALL GREEN** on that
+same commit. Both failures were reproduced locally before anything was changed.
+
+### 1. `govulncheck` — a real, reachable advisory
+
+`golang.org/x/text v0.29.0` carries **GO-2026-5970** (infinite loop on invalid input),
+reachable through `pgx`:
+
+```
+#1: internal/store/postgresvaultlog.go:109:36: store.NewPostgresVaultLog calls
+    pgxpool.NewWithConfig, which eventually calls norm.Form.Properties
+```
+
+Fixed by `go get golang.org/x/text@v0.39.0` (which also pulled `x/sync` 0.17.0 → 0.21.0).
+`sigild` still has **exactly one direct dependency**; both are indirect.
+
+⚠️ **The three *other* findings in the local run were an artifact of the scanning
+toolchain, not of the shipped one.** This machine's Go is **1.26.3**, which carries
+GO-2026-5856 / -5039 / -5037; the artifact is built by `golang:1.25-alpine` and CI pins
+setup-go `1.25.x`, and those advisories are fixed in **1.25.11 / 1.25.12**. Verified by
+installing `go1.25.12` and re-scanning: **clean**. Reporting a stdlib vulnerability that
+is not in the binary we ship would be the same cry-wolf failure as §2.
+
+### 2. `cargo-audit (desktop)` — a check that had never once passed
+
+Locally `cargo audit` on `desktop/` exits **0**: 17 warnings, **0 vulnerabilities**. CI
+used `rustsec/audit-check@v2`, which fails on warnings and offers no acknowledgement
+mechanism. So the job had been red on **every commit**, saying the same thing each time.
+
+The 17: eleven GTK3 / gtk-rs 0.18.x (`atk`, `gdk`, `gtk`, `glib`…), five `unic-*` via
+`urlpattern` ← `tauri-utils`, and `proc-macro-error`. ⭐ `cargo tree -i atk` / `-i gdk` /
+`-i glib` return **nothing** on darwin — the GTK family is `cfg`-gated Linux-only and is
+in `Cargo.lock` only because Cargo locks every platform. `desktop/` has never been built
+for Linux from this machine.
+
+**Fix, and it is deliberately not a silencer:** `desktop/.cargo/audit.toml` names each
+advisory with its owner and the condition that removes it, and CI now runs
+`cargo audit --deny warnings` directly. That is **strictly stronger** than before — a
+*new* advisory now fails, instead of being lost among sixteen permanent failures — and
+the acknowledgements are reviewable in a diff. `libsigil`, `cli` and `sigil-wasm` carry
+no `audit.toml` and must stay warning-free outright (verified: all three pass
+`--deny warnings`). No new third-party action: `taiki-e/install-action@v2` and
+`dtolnay/rust-toolchain@stable` were already used here.
+
+### 3. The actual root cause — `scripts/gate.sh` ran neither scanner
+
+The gate exists to answer "will CI pass?". Its coverage was a **strict subset** of CI's,
+so it could not. It now runs both, and both were **mutation-tested through the gate**:
+
+| mutation | gate result |
+|---|---|
+| `x/text` back to v0.29.0 | ✗ `govulncheck (go1.25.12): 1 vulnerability(ies)` naming GO-2026-5970 and its fix |
+| drop `RUSTSEC-2024-0429` from the ignore list | ✗ `error: 1 denied warning found!` naming `glib` |
+| both restored | ✓ all five checks green |
+
+`govulncheck` is run against a **go1.25.x** toolchain, not `$GO` — and when none is
+installed the gate **FAILS with install instructions** rather than quietly scanning the
+wrong toolchain.
+
+### ⚠️ Two bugs in that new block, found by testing it in isolation
+
+Both were mine, both were caught before commit, and both are the house failure mode:
+
+- **`cargo-audit` reported "not installed" on a machine where it was.** `gate.sh` set
+  `PATH` without `$HOME/.cargo/bin`. Now **appended** (not prepended — the rustup
+  toolchain must keep winning for `cargo`/`rustc` itself).
+- **A failed `cd sigild` printed `0 vulnerability(ies)`.** The scanner never ran and the
+  grep over an empty string produced a number. An empty result is now an explicit failure,
+  never a count.
+
+### Verification
+
+`gofmt`/`vet`/`build` clean; `go test -race -count=1 ./...` → **564 pass, 0 fail**;
+`go list -m` direct deps still **1**; `security.yml` parses and its three jobs resolve.
+
+### ➡️ Open
+
+- ⚠️ **Local Go 1.26.3 carries three stdlib advisories.** It is a test toolchain only —
+  nothing ships from it — but `gate.sh` deliberately refuses to scan with it.
+- The GTK acknowledgements become **real, not theoretical, the day a Linux desktop build
+  becomes real.** That is written into `desktop/.cargo/audit.toml`.

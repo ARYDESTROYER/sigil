@@ -70,6 +70,24 @@ were crypto call sites in fifteen non-test files. A threat-model row advertised
 recovery delegates with a seven-day veto window that has never existed. Both
 would have scoped real code out of a review.
 
+**A gate whose coverage was a strict subset of CI's.** `scripts/gate.sh` was
+built to be the answer to "will this pass?" — and it ran neither security
+scanner. The `security` workflow went red on two jobs (a `golang.org/x/text`
+advisory reachable through `pgx`, and a permanently-failing `cargo-audit`) while
+the gate reported ALL GREEN on the exact commit that broke them. It did not
+disagree with CI; it never asked the question. **A pre-push gate can only tell
+you CI will pass if it is a superset of CI.**
+
+**A check that was always red, and therefore was not a check.** The
+`cargo-audit` job used an action that fails on *warnings* with no way to
+acknowledge one. `desktop/` pulls the whole Tauri tree: seventeen
+unmaintained/unsound advisories on crates nobody here chose, and **zero
+vulnerabilities**. So the job failed identically on every commit for as long as
+it had existed. That is worse than not running it — a permanently red check
+trains a reviewer to skip the one workflow where a real advisory would appear.
+The fix was not to silence it but to make the accepted advisories *explicit and
+reviewable in the repo*, so that anything **new** fails loudly.
+
 ---
 
 ## What changed as a result
@@ -81,7 +99,16 @@ These are controls, not intentions:
   the repo from its own location and **prints which tree and commit it gated**;
   starts a throwaway Postgres and **fails if any test skipped**; and carries a
   **CI-drift check** asserting every suite on disk is named in some workflow.
-  That drift check is itself mutation-tested.
+  That drift check is itself mutation-tested. It also runs **both security
+  scanners** (`govulncheck` against the toolchain we *ship*, not the newer one
+  the dev machine happens to have; `cargo audit --deny warnings` across all four
+  lockfiles), so a green gate can no longer coexist with a red `security`
+  workflow.
+- **An accepted advisory is written down, with an owner and an expiry
+  condition.** `desktop/.cargo/audit.toml` lists each one, why it is tolerable,
+  who can actually fix it, and what would remove it — and `--deny warnings`
+  means anything *not* on that list fails. Suppression that lives in a diff can
+  be reviewed; suppression that lives in a CI flag cannot.
 - **Mutation testing is the default standard of proof** for anything
   security-relevant. A control whose mutation survives the suite is treated as
   broken, and several were.

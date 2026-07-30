@@ -23,7 +23,11 @@ set -uo pipefail
 # not looking at is worse than no gate.
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
 echo "gating: $(pwd)  ($(git rev-parse --short HEAD 2>/dev/null || echo 'no git'))"
-export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH"
+# ⚠️ `$HOME/.cargo/bin` is APPENDED, not prepended: cargo-installed helper
+# binaries (cargo-audit) live there, but the rustup toolchain bin must keep
+# winning for `cargo`/`rustc` itself. Leaving it off entirely made the new
+# cargo-audit check report "not installed" on a machine where it was.
+export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$PATH:$HOME/.cargo/bin"
 export NEXT_TELEMETRY_DISABLED=1
 GO=/opt/homebrew/bin/go
 QUICK=${1:-}
@@ -49,6 +53,74 @@ for f in sorted(glob.glob('.github/workflows/*.yml')):
     except Exception as e: print('  ✗',f,e); bad=1
 print('  ✓ all workflows parse' if not bad else '')
 sys.exit(bad)" || fail=1
+
+note "=== SECURITY SCANNERS (the two checks CI ran and this gate did not) ==="
+# ⚠️ WHY THIS BLOCK EXISTS, and it is the same lesson as everything else here.
+# On 2026-07-30 the `security` workflow was RED on two jobs — govulncheck and
+# cargo-audit(desktop) — while this gate reported ALL GREEN on the very commit
+# that broke them. It did not disagree with CI; it never asked the question.
+# A gate whose coverage is a strict subset of CI's cannot tell you CI will pass,
+# which is the one thing a pre-push gate exists to tell you.
+
+# --- govulncheck ------------------------------------------------------------
+# It must scan the toolchain we SHIP (go.mod says `go 1.25.0`; the Dockerfile
+# builds `FROM golang:1.25-alpine`; CI pins setup-go `1.25.x`) — NOT whatever
+# the dev machine happens to have. Those differ here: this machine's Go is
+# 1.26.3, which carries three stdlib advisories the shipped 1.25 line does not.
+# Scanning the dev toolchain would report vulnerabilities that are not in the
+# artifact, and a scanner that cries wolf gets muted — which is precisely how
+# the always-red cargo-audit job stopped being read.
+SCANGO=""
+if [ -n "${SIGIL_SCAN_GO:-}" ] && [ -x "${SIGIL_SCAN_GO}" ]; then
+  SCANGO="$SIGIL_SCAN_GO"
+else
+  # Newest locally-installed go1.25.x from `golang.org/dl` (version-sorted).
+  for c in $(ls "$HOME"/go/bin/go1.25.* 2>/dev/null | sort -V -r); do
+    [ -x "$c" ] && SCANGO="$c" && break
+  done
+fi
+if [ -z "$SCANGO" ]; then
+  bad "no go1.25.x toolchain to scan with — govulncheck NOT RUN.
+      Install the line we actually ship, then re-run:
+        $GO install golang.org/dl/go1.25.12@latest && \$HOME/go/bin/go1.25.12 download
+      (or set SIGIL_SCAN_GO=/path/to/go). Scanning with the dev toolchain
+      instead would report stdlib findings that are not in the shipped binary.)"
+else
+  gv=$(cd sigild 2>/dev/null && GOTOOLCHAIN=local "$SCANGO" run golang.org/x/vuln/cmd/govulncheck@latest ./... 2>&1)
+  if [ -z "$gv" ]; then
+    # The scanner produced NOTHING. That is never a pass — it means the `cd`
+    # failed or govulncheck could not start, and reporting a vulnerability count
+    # from an empty string would be a green-shaped signal for a check that did
+    # not run. (Observed while testing this block: a failed `cd` printed
+    # "0 vulnerability(ies)".)
+    bad "govulncheck produced NO OUTPUT — it did not run. Check that sigild/ exists and \"$SCANGO\" works."
+  elif printf '%s' "$gv" | grep -q 'No vulnerabilities found'; then
+    ok "govulncheck clean ($("$SCANGO" version | awk '{print $3}'), the shipped line)"
+  else
+    bad "govulncheck ($("$SCANGO" version | awk '{print $3}')): $(printf '%s' "$gv" | grep -c '^Vulnerability #') vulnerability(ies)
+$(printf '%s' "$gv" | grep -E '^Vulnerability #|^    Found in:|^    Fixed in:' | sed 's/^/      /')"
+  fi
+fi
+
+# --- cargo audit ------------------------------------------------------------
+# `--deny warnings` across EVERY lockfile. Vulnerabilities fail, and so does any
+# unmaintained/unsound advisory that is not written down in that workspace's
+# .cargo/audit.toml with a reason and a removal condition. Only desktop/ has
+# such a file; the other three must stay warning-free outright.
+if ! command -v cargo-audit >/dev/null 2>&1; then
+  bad "cargo-audit not installed — the Rust advisory scan did NOT run.
+      Install it (this is the same check CI runs on all four lockfiles):
+        cargo install cargo-audit --locked"
+else
+  for m in libsigil cli sigil-wasm desktop; do
+    if (cd "$m" && cargo audit --deny warnings >/dev/null 2>&1); then
+      ok "cargo audit $m (0 vulns, 0 unacknowledged warnings)"
+    else
+      bad "cargo audit $m:
+$( (cd "$m" && cargo audit --deny warnings 2>&1) | grep -E '^(Crate|ID|Warning|Title|error):' | sed 's/^/      /')"
+    fi
+  done
+fi
 
 note "=== GO (sigild) ==="
 [ -z "$(gofmt -l sigild)" ] && ok "gofmt clean" || bad "gofmt: $(gofmt -l sigild)"

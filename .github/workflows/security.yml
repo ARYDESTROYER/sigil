@@ -4,11 +4,16 @@ name: security
 # advisory auditing. Runs on every push/PR plus a weekly scheduled sweep so
 # advisories that land between commits still get surfaced.
 #
-# HONESTY NOTE: like the repo's other CI mirrors, this workflow is validated
-# locally (YAML-parsed, and each job mirrors a tool that has been run by hand)
-# but has NOT been run on real GitHub Actions from the build machine. The
-# cargo-audit matrix in particular has only been reasoned about, not observed:
-# each of the four workspaces has its own Cargo.lock at the path given.
+# HONESTY NOTE: this workflow HAS now been observed failing on real GitHub
+# Actions — govulncheck and cargo-audit(desktop) were both red — and both
+# failures were reproduced locally, fixed, and re-verified by hand before this
+# change. That is a change in status from the previous note here, which said the
+# cargo-audit matrix had "only been reasoned about, not observed". It has since
+# been observed doing the wrong thing. See each job's comment for what and why.
+#
+# `scripts/gate.sh` now runs both scanners, so a pre-push gate that says ALL
+# GREEN can no longer coexist with a red security workflow — which is precisely
+# what happened on 565e377.
 
 on:
   push:
@@ -44,6 +49,15 @@ jobs:
         with:
           # pgx (the Postgres op-log backend) requires go >= 1.25, which bumps
           # the module's go directive; pin the toolchain to match.
+          #
+          # ⚠️ `1.25.x` FLOATS to the newest 1.25 patch ON PURPOSE — govulncheck
+          # reports standard-library advisories against the toolchain that
+          # builds the binary, so pinning an exact patch here would make this
+          # job go red the moment a stdlib fix shipped and stay red until
+          # someone edited this line. Floating means we inherit the backports.
+          # This must stay in step with the Dockerfile's `golang:1.25-alpine`,
+          # which is what actually ships, and with the go1.25.x toolchain
+          # scripts/gate.sh insists on scanning with.
           go-version: "1.25.x"
           # sigild now has a go.sum (pgx for the Postgres op-log backend), so
           # cache the module downloads. govulncheck now also scans that dep.
@@ -63,6 +77,29 @@ jobs:
     # by far the largest dependency surface in the repository, and the one most
     # likely to be the subject of an advisory. Auditing only the smallest, most
     # conservative lockfile was the least useful choice available.
+    # ⚠️ THIS JOB USED TO BE PERMANENTLY RED, AND THAT WAS THE BUG.
+    #
+    # It ran `rustsec/audit-check@v2`, which fails on *warnings* and offers no
+    # way to acknowledge one. desktop/ pulls the whole Tauri tree, which carries
+    # 17 unmaintained/unsound advisories on crates we do not choose — and ZERO
+    # vulnerabilities. So the job failed identically on every commit and said
+    # nothing. A check that is always red is not a check: it is a reason to stop
+    # reading the security workflow, which is exactly where a real advisory
+    # would have shown up.
+    #
+    # Running cargo-audit directly with `--deny warnings` is STRICTLY STRONGER
+    # than what it replaced:
+    #   * a vulnerability in any workspace still fails, as before;
+    #   * a NEW unmaintained/unsound advisory now fails too, instead of being
+    #     lost among sixteen permanent failures;
+    #   * the accepted ones live in desktop/.cargo/audit.toml, in the repo, each
+    #     with an owner and the condition that removes it — reviewable in a diff
+    #     rather than buried in a CI flag.
+    # libsigil/, cli/ and sigil-wasm/ have no audit.toml and must stay
+    # warning-free outright; only desktop/ has acknowledgements.
+    #
+    # `scripts/gate.sh` runs this same command on all four lockfiles, so the
+    # pre-push gate can no longer be green while this job is red.
     name: cargo-audit (${{ matrix.workspace }})
     runs-on: ubuntu-latest
     strategy:
@@ -71,8 +108,12 @@ jobs:
         workspace: [libsigil, cli, sigil-wasm, desktop]
     steps:
       - uses: actions/checkout@v4
-      - name: cargo audit
-        uses: rustsec/audit-check@v2
+      - uses: dtolnay/rust-toolchain@stable
+      # Prebuilt binary — already this repo's convention for CLI tools, so this
+      # adds no third-party action that was not here already.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: ${{ matrix.workspace }}
+          tool: cargo-audit
+      - name: cargo audit
+        working-directory: ${{ matrix.workspace }}
+        run: cargo audit --deny warnings

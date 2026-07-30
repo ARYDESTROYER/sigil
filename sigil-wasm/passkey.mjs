@@ -338,11 +338,34 @@ export async function createPasskey({
 /**
  * Run ONE assertion and return its PRF output.
  *
- *   -> { prfOutput: Uint8Array(32), backupEligible, backupState, userVerified, credentialId }
+ *   -> { prfOutput: Uint8Array(32), backupEligible, backupState, userVerified,
+ *        credentialId, attachment }
  *
  * `allowCredentials: []` means "any discoverable credential for this origin",
  * which is how the LOCKED screen can run a ceremony before it has opened
  * anything — the credential id lives INSIDE the sealed slot it is trying to open.
+ *
+ * ⛔ **USER VERIFICATION IS ENFORCED HERE, AND THAT IS A CORRECTNESS REQUIREMENT,
+ * NOT A POLICY PREFERENCE (Phase 59).** CTAP 2.1's `hmac-secret` keys **TWO
+ * INDEPENDENT SECRETS** per credential — `CredRandomWithUV` and
+ * `CredRandomWithoutUV` — and which one the authenticator uses is decided by
+ * whether the ceremony verified a user. A ceremony that completes with `UV=false`
+ * therefore returns a *different, equally valid-looking* 32 bytes.
+ *
+ * We ask for `userVerification: "required"`, but that is a REQUEST; the flag is
+ * the only evidence, and nothing used to read it. The failure it caused is
+ * precisely the lockout ADR 0046 exists to prevent: at enable, the slot gets
+ * sealed under the wrong secret (and the two-assertion determinism probe does NOT
+ * catch it, because both probe assertions share one UV state and so agree with
+ * each other); at unlock, the slot then refuses, and a user holding a working
+ * passkey and the correct password is told "wrong password or a different
+ * passkey" and pushed onto the recovery sheet.
+ *
+ * So a UV-less assertion is refused with its OWN code (`uv_missing`) rather than
+ * being silently used. ⚠️ This remains a flag we are trusting: we cannot verify
+ * that a human was verified, and a lying authenticator is undetectable (ADR 0046,
+ * limitation 8). What it does guarantee is that we never seal under, or try to
+ * open with, a secret from the wrong hmac-secret slot.
  */
 export async function evaluatePrf({ allowCredentials = [], timeoutMs = PASSKEY_TIMEOUT_MS } = {}) {
   const salt = await prfSalt();
@@ -368,6 +391,21 @@ export async function evaluatePrf({ allowCredentials = [], timeoutMs = PASSKEY_T
     throw new PasskeyError("passkey: the ceremony returned no assertion", "ceremony_failed");
   }
 
+  // ⛔ UV FIRST, BEFORE THE PRF BYTES ARE EVEN LOOKED AT. See the doc comment:
+  // UV=false means the authenticator used its OTHER hmac-secret key, so the 32
+  // bytes below are the wrong secret — usable, plausible, and silently fatal.
+  // Checking here makes this the single choke point for enable AND unlock.
+  const flags = backupFlags(assertion.response?.authenticatorData);
+  if (!flags.userVerified) {
+    throw new PasskeyError(
+      "passkey: this ceremony completed WITHOUT user verification, and an authenticator derives " +
+        "a DIFFERENT key in that case (CTAP hmac-secret keys one secret with UV and another " +
+        "without). Refusing to use it rather than sealing — or trying to open — a vault with the " +
+        "wrong key",
+      "uv_missing",
+    );
+  }
+
   const ext = typeof assertion.getClientExtensionResults === "function"
     ? assertion.getClientExtensionResults()
     : {};
@@ -385,13 +423,20 @@ export async function evaluatePrf({ allowCredentials = [], timeoutMs = PASSKEY_T
       "prf_length",
     );
   }
-  const flags = backupFlags(assertion.response?.authenticatorData);
   return {
     prfOutput,
     credentialId: bytesToBase64(toBytes(assertion.rawId) ?? new Uint8Array(0)),
     backupEligible: flags.backupEligible,
     backupState: flags.backupState,
     userVerified: flags.userVerified,
+    // ⭐ THE REAL ATTACHMENT, reported by the ceremony that just ran — not
+    // inferred. `describeProtectionScope` turns this into the sentence a user
+    // reads about where their second factor lives, and inferring it from the
+    // backup-eligible flag (as a caller once did) says "on this device only"
+    // for every non-syncing SECURITY KEY, which is the opposite of true and the
+    // opposite of useful when the question is "what do I have to keep safe".
+    // "" when the browser does not report it — callers must not invent one.
+    attachment: assertion.authenticatorAttachment ?? "",
   };
 }
 
@@ -434,7 +479,9 @@ export async function probePrf(options = {}) {
   return {
     credentialId: second.credentialId || created.credentialId,
     rpId: created.rpId,
-    attachment: created.attachment,
+    // Prefer the attachment the ASSERTION reported; fall back to creation's.
+    // Both are the browser's own answer — neither is inferred.
+    attachment: second.attachment || created.attachment,
     prfOutput: second.prfOutput,
     backupEligible: second.backupEligible,
     backupState: second.backupState,
@@ -636,6 +683,21 @@ export function explainPasskeyStatus(err, { atUnlock = false } = {}) {
             "and no network."
         : "This authenticator's derived key is not stable, so a vault sealed with it could stop " +
             "opening at any moment. Refusing to use it. Nothing was changed.";
+    // ⛔ DISTINCT FROM "wrong password" AND FROM "PRF unsupported". The passkey
+    // is fine and the password may be fine; what happened is that the ceremony
+    // did not verify a user, and the authenticator therefore derives a different
+    // key. The fix is a real action the user can take (use the PIN/biometric
+    // prompt), which is why this must never be folded into slot_open_failed.
+    case "uv_missing":
+      return atUnlock
+        ? "Your passkey answered without verifying you (no PIN, biometric or device unlock), and " +
+            "authenticators derive a DIFFERENT key in that case — so it cannot open this vault. " +
+            "Try again and complete the PIN or biometric prompt. If your authenticator cannot " +
+            "verify you at all, unlock with your recovery sheet below."
+        : "Your passkey answered without verifying you (no PIN, biometric or device unlock). " +
+            "Authenticators derive a different key when they skip verification, so protecting " +
+            "the vault now would seal it with a key that later fails to open it. Nothing was " +
+            "changed — set up a PIN or biometric for this passkey and try again.";
     case "create_failed":
       return "Creating a passkey did not complete — it may have been dismissed or blocked.";
     case "ceremony_failed":

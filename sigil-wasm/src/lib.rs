@@ -245,6 +245,63 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, JsEr
     open_container_inner(password, container).map_err(|e| JsError::new(&e))
 }
 
+/// Read the Argon2id work factors declared by a `SIGILcli` container header,
+/// WITHOUT opening it — no password, no KDF, no allocation.
+///
+/// Returns `[m_cost, t_cost, p_cost]` as a `Uint32Array`. The JS wrapper
+/// `containerParams()` in `totp-vault.mjs` turns that into
+/// `{ m_cost, t_cost, p_cost }`.
+///
+/// Mirrors `sigil_cli::container_params`, and like it, range-checks the declared
+/// values against `sigil-core`'s ceilings so a hostile header is a thrown error
+/// rather than something a caller might feed back into a seal.
+#[wasm_bindgen]
+pub fn container_params(container: &[u8]) -> Result<Vec<u32>, JsError> {
+    let p = container_params_inner(container).map_err(|e| JsError::new(&e))?;
+    Ok(vec![p.m_cost, p.t_cost, p.p_cost])
+}
+
+/// ⭐ **THE NO-DOWNGRADE RATCHET FOR JAVASCRIPT — the choke point for every JS
+/// re-seal.** Given the container about to be REPLACED and the work factors this
+/// client would write today, return the factors it must actually write:
+/// `Argon2Params::no_downgrade(existing, requested)`, the componentwise maximum
+/// (with Argon2's `m_cost >= 8 * p_cost` floor honoured).
+///
+/// Returns `[m_cost, t_cost, p_cost]` as a `Uint32Array`.
+///
+/// ⛔ **Why this exists.** The Rust clients have had this ratchet since Phase 58
+/// (`sigil_cli::reseal_container`); the JS clients had NO equivalent, so every
+/// browser edit re-sealed at a hardcoded `19456 / 2 / 1`. A vault written by the
+/// CLI at `65536 / 4 / 2` came back from a single browser edit at a **3.4×
+/// weaker memory cost and half the passes**, silently, with no user action and
+/// no error — and because a re-seal is where new parameters are chosen, the
+/// weakening was permanent until something else raised it.
+///
+/// ⭐ The rule itself is NOT reimplemented here: it is `sigil-core`'s
+/// `Argon2Params::no_downgrade`, the same function `sigil_cli::no_downgrade`
+/// delegates to. There is one implementation, so the browser and the CLI cannot
+/// drift — which matters because a drift downward would be invisible.
+///
+/// Errors on a header that is not a valid `SIGILcli` header (see
+/// [`container_params`]); a caller with no existing container must not call this
+/// at all — it should seal at its own defaults, since there is nothing to ratchet
+/// from.
+#[wasm_bindgen]
+pub fn reseal_params(
+    container: &[u8],
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<Vec<u32>, JsError> {
+    let existing = container_params_inner(container).map_err(|e| JsError::new(&e))?;
+    let out = existing.no_downgrade(Argon2Params {
+        m_cost,
+        t_cost,
+        p_cost,
+    });
+    Ok(vec![out.m_cost, out.t_cost, out.p_cost])
+}
+
 // --- Hybrid PUBLIC-KEY (no-password) encryption: `SIGILhyb` interop ----------
 //
 // The public-key path, distinct from the password-based seal/open above. It
@@ -590,7 +647,19 @@ fn seal_to_container_inner(
     Ok(out)
 }
 
-fn open_container_inner(password: &[u8], container: &[u8]) -> Result<Vec<u8>, String> {
+/// Read the Argon2id work factors out of a `SIGILcli` header WITHOUT opening the
+/// container — no password, no KDF, no allocation.
+///
+/// ⭐ This is the JS clients' equivalent of `sigil_cli::container_params`, and it
+/// exists so the browser can apply the SAME no-downgrade ratchet the CLI applies
+/// (`Argon2Params::no_downgrade`) instead of re-sealing at whatever its own
+/// defaults happen to be. Without it, one browser edit of a CLI-written vault
+/// silently rewrote a 64 MiB / 4-pass header as 19 MiB / 2-pass.
+///
+/// The header is unauthenticated framing, so this reports what the writer
+/// *claims* — which is exactly what the ratchet needs, and exactly why the values
+/// are range-checked here as well.
+fn container_params_inner(container: &[u8]) -> Result<Argon2Params, String> {
     if container.len() < CLI_FIXED_HEADER_LEN {
         return Err("container is too short to hold the SIGILcli header".to_string());
     }
@@ -607,10 +676,49 @@ fn open_container_inner(password: &[u8], container: &[u8]) -> Result<Vec<u8>, St
         ));
     }
 
-    // Fixed-width fields after the version byte: m_cost, t_cost, p_cost, salt_len.
+    // Fixed-width fields after the version byte: m_cost, t_cost, p_cost.
     let m_cost = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]);
     let t_cost = u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]);
     let p_cost = u32::from_le_bytes([rest[9], rest[10], rest[11], rest[12]]);
+
+    // ⛔ RANGE-CHECK BEFORE ANY ALLOCATION — the mirror of the same check in
+    // `cli/src/lib.rs::open_container`. These three u32s are UNAUTHENTICATED
+    // header bytes written by whoever produced the container, and Argon2id
+    // allocates `m_cost` KiB in one block before doing any work; `m_cost =
+    // 0xFFFF_FFF0` asks for ~4 TiB and takes the tab (or the whole extension
+    // page) down. Browser clients pull containers from `sigild`'s ZERO-KNOWLEDGE
+    // op-log, which by design cannot inspect or filter what it relays, so the
+    // refusal has to happen here.
+    //
+    // ⭐ The ceilings themselves are NOT mirrored: they are `sigil-core`'s
+    // `Argon2Params::MAX_*` constants, read from the one crate both this binding
+    // and the CLI already depend on, so this bound cannot drift from the CLI's
+    // the way the format constants above could.
+    let params = Argon2Params {
+        m_cost,
+        t_cost,
+        p_cost,
+    };
+    if params.validate().is_err() {
+        return Err(format!(
+            "refusing this SIGILcli container: its header demands Argon2id work \
+             factors beyond what any Sigil client will honour (m_cost={m_cost} KiB, \
+             t_cost={t_cost}, p_cost={p_cost}; limits are {}/{}/{}). Nothing was \
+             allocated",
+            Argon2Params::MAX_M_COST,
+            Argon2Params::MAX_T_COST,
+            Argon2Params::MAX_P_COST
+        ));
+    }
+    Ok(params)
+}
+
+fn open_container_inner(password: &[u8], container: &[u8]) -> Result<Vec<u8>, String> {
+    // Parses + range-checks magic, version and the three work factors. Every
+    // failure here happens BEFORE a byte is allocated for the KDF.
+    let params = container_params_inner(container)?;
+    let (m_cost, t_cost, p_cost) = (params.m_cost, params.t_cost, params.p_cost);
+    let rest = &container[8..];
     let salt_len = rest[13] as usize;
 
     // `rest` starts at the version byte; the salt begins after the 14 fixed
@@ -1022,6 +1130,126 @@ mod tests {
         // Force salt_len (byte index 21) far past the buffer.
         c[21] = 0xff;
         assert!(open_container_inner(PASSWORD, &c).is_err());
+    }
+
+    // --- ⛔ Hostile Argon2 parameters in the container header (Phase 59) ------
+    //
+    // MIRRORS `cli/src/lib.rs`'s tests of the same name. A browser pulls
+    // containers from sigild's zero-knowledge op-log, which cannot filter what it
+    // relays, so an unbounded `m_cost` here is a remote way to kill the tab. The
+    // ceilings are read from `sigil-core` (`Argon2Params::MAX_*`), NOT mirrored,
+    // so this bound cannot drift from the CLI's.
+
+    fn set_header_params(c: &mut [u8], m: u32, t: u32, p: u32) {
+        c[9..13].copy_from_slice(&m.to_le_bytes());
+        c[13..17].copy_from_slice(&t.to_le_bytes());
+        c[17..21].copy_from_slice(&p.to_le_bytes());
+    }
+
+    #[test]
+    fn container_absurd_m_cost_refused_before_allocating() {
+        let mut c = seal_to_container_inner(PASSWORD, SALT, &nonce(), M, T, P, PLAINTEXT).unwrap();
+        set_header_params(&mut c, 0xFFFF_FFF0, 1, 1); // ~4 TiB
+        let err = open_container_inner(PASSWORD, &c).expect_err("refused");
+        assert!(err.contains("4294967280"), "{err}");
+        assert!(err.contains("Nothing was allocated"), "{err}");
+        // Must NOT read as an authentication failure — "hostile container" and
+        // "wrong password" are different things a user has to be able to tell
+        // apart.
+        assert!(!err.contains("open_record failed"), "{err}");
+    }
+
+    #[test]
+    fn container_each_work_factor_bounded_independently() {
+        for (m, t, p) in [
+            (Argon2Params::MAX_M_COST + 1, 1, 1),
+            (8, Argon2Params::MAX_T_COST + 1, 1),
+            (8, 1, Argon2Params::MAX_P_COST + 1),
+        ] {
+            let mut c =
+                seal_to_container_inner(PASSWORD, SALT, &nonce(), M, T, P, PLAINTEXT).unwrap();
+            set_header_params(&mut c, m, t, p);
+            assert!(
+                open_container_inner(PASSWORD, &c).is_err(),
+                "({m},{t},{p}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn container_normal_params_still_open() {
+        // Nothing that opens today may stop opening: the browser clients write
+        // 19456/2/1, the CLI writes 65536/4/2, tests write 8/1/1.
+        let c = seal_to_container_inner(PASSWORD, SALT, &nonce(), 19456, 2, 1, PLAINTEXT).unwrap();
+        assert_eq!(open_container_inner(PASSWORD, &c).unwrap(), PLAINTEXT);
+        assert!(Argon2Params::RECOMMENDED.validate().is_ok());
+    }
+
+    // --- ⭐ The JS no-downgrade ratchet (Phase 59 fix round) -----------------
+    //
+    // These back the `container_params` / `reseal_params` exports the browser
+    // clients now call on EVERY re-seal. Before them, JS had no equivalent of
+    // `sigil_cli::reseal_container`'s ratchet and one browser edit rewrote a
+    // CLI-written 65536/4/2 header as 19456/2/1.
+
+    #[test]
+    fn container_params_reads_the_header_without_a_password() {
+        let c = seal_to_container_inner(PASSWORD, SALT, &nonce(), 65536, 4, 2, PLAINTEXT).unwrap();
+        let p = container_params_inner(&c).expect("params");
+        assert_eq!((p.m_cost, p.t_cost, p.p_cost), (65536, 4, 2));
+        // Not a container at all -> an error, never a silent default.
+        assert!(container_params_inner(b"nope").is_err());
+        // A hostile header is refused here too, so a caller can never feed
+        // absurd factors BACK INTO a seal by way of the ratchet.
+        let mut hostile =
+            seal_to_container_inner(PASSWORD, SALT, &nonce(), M, T, P, PLAINTEXT).unwrap();
+        set_header_params(&mut hostile, 0xFFFF_FFF0, 1, 1);
+        assert!(container_params_inner(&hostile).is_err());
+    }
+
+    #[test]
+    fn reseal_params_never_writes_a_weaker_header() {
+        // ⛔ THE OBSERVED BUG: a CLI-written 65536/4/2 vault, re-sealed by a
+        // browser whose defaults are 19456/2/1, must come back at 65536/4/2.
+        let strong = seal_to_container_inner(PASSWORD, SALT, &nonce(), 65536, 4, 2, PLAINTEXT)
+            .expect("seal strong");
+        let existing = container_params_inner(&strong).unwrap();
+        let out = existing.no_downgrade(Argon2Params {
+            m_cost: 19456,
+            t_cost: 2,
+            p_cost: 1,
+        });
+        assert_eq!((out.m_cost, out.t_cost, out.p_cost), (65536, 4, 2));
+
+        // ...and the reverse: a deliberately WEAK container is RAISED to the
+        // client's defaults, not merely preserved.
+        let weak =
+            seal_to_container_inner(PASSWORD, SALT, &nonce(), 8, 1, 1, PLAINTEXT).expect("seal");
+        let raised = container_params_inner(&weak)
+            .unwrap()
+            .no_downgrade(Argon2Params {
+                m_cost: 19456,
+                t_cost: 2,
+                p_cost: 1,
+            });
+        assert_eq!((raised.m_cost, raised.t_cost, raised.p_cost), (19456, 2, 1));
+
+        // A ratcheted re-seal really opens, at the ratcheted strength.
+        let resealed = seal_to_container_inner(
+            PASSWORD,
+            SALT,
+            &nonce(),
+            raised.m_cost,
+            raised.t_cost,
+            raised.p_cost,
+            PLAINTEXT,
+        )
+        .unwrap();
+        assert_eq!(
+            open_container_inner(PASSWORD, &resealed).unwrap(),
+            PLAINTEXT
+        );
+        assert_eq!(container_params_inner(&resealed).unwrap(), raised);
     }
 
     #[test]

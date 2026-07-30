@@ -98,6 +98,30 @@ pub enum CliError {
     UnsupportedVersion(u8),
     /// The header parsed but the declared `salt_len` runs past the buffer.
     MalformedHeader,
+    /// ⛔ The container header's Argon2id work factors exceed
+    /// [`Argon2Params::MAX_M_COST`] / [`Argon2Params::MAX_T_COST`] /
+    /// [`Argon2Params::MAX_P_COST`] (Phase 59).
+    ///
+    /// The header is UNAUTHENTICATED plaintext framing, so `m_cost` is whatever
+    /// the writer of those bytes chose — and Argon2id allocates `m_cost` KiB in
+    /// one block before doing any work. `m_cost = 0xFFFF_FFF0` asks for ~4 TiB.
+    /// Containers reach a client through `sigild`'s **zero-knowledge** op-log,
+    /// which by design cannot inspect or filter them, so anyone able to write to
+    /// a vault's op-log (a revoked-but-not-yet-rotated device, a co-tenant of a
+    /// shared vault, a breached server) could otherwise make every client that
+    /// pulls die on allocation and keep the user away from their own 2FA codes.
+    ///
+    /// ⭐ Returned at PARSE time, before any allocation and before the KDF is
+    /// entered. Carries the three offending values (public framing metadata, no
+    /// secret) so an operator can see what was asked for.
+    ParamsOutOfRange {
+        /// The rejected memory cost, in KiB.
+        m_cost: u32,
+        /// The rejected time cost (passes).
+        t_cost: u32,
+        /// The rejected parallelism (lanes).
+        p_cost: u32,
+    },
     /// The underlying `sigil-core` record API failed: a malformed/truncated
     /// envelope, or — most importantly — an authentication failure (wrong
     /// password or tampered data). The plaintext is never returned in this case.
@@ -259,6 +283,21 @@ impl core::fmt::Display for CliError {
             CliError::MalformedHeader => f.write_str(
                 "malformed sigil-cli container header (declared salt overruns the file)",
             ),
+            CliError::ParamsOutOfRange {
+                m_cost,
+                t_cost,
+                p_cost,
+            } => write!(
+                f,
+                "refusing this container: its header demands Argon2id work factors \
+                 beyond what any Sigil client will honour (m_cost={m_cost} KiB, \
+                 t_cost={t_cost}, p_cost={p_cost}; limits are {}/{}/{}). Nothing was \
+                 allocated. A container that asks for more memory than a machine has \
+                 is a denial-of-service attempt, not a strong vault",
+                Argon2Params::MAX_M_COST,
+                Argon2Params::MAX_T_COST,
+                Argon2Params::MAX_P_COST
+            ),
             // `RecordError` derives Debug only; surface it via Debug so the user
             // sees Kdf / Aead / Envelope without us claiming more than we know.
             // Never includes plaintext.
@@ -416,6 +455,8 @@ pub fn seal_to_container(
 /// - [`CliError::ShortContainer`] if the buffer can't hold the fixed header.
 /// - [`CliError::BadMagic`] / [`CliError::UnsupportedVersion`] on header
 ///   mismatch.
+/// - [`CliError::ParamsOutOfRange`] if the header's Argon2id work factors exceed
+///   Sigil's ceilings — checked BEFORE any allocation (see the variant's docs).
 /// - [`CliError::MalformedHeader`] if the declared salt runs past the buffer.
 /// - [`CliError::Record`] if the wrapped record fails to decode or authenticate.
 pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliError> {
@@ -439,6 +480,26 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
     let p_cost = u32::from_le_bytes([rest[9], rest[10], rest[11], rest[12]]);
     let salt_len = rest[13] as usize;
 
+    let params = Argon2Params {
+        m_cost,
+        t_cost,
+        p_cost,
+    };
+    // ⛔ RANGE-CHECK BEFORE ANY ALLOCATION. These three u32s come straight out of
+    // an UNAUTHENTICATED header written by whoever produced the bytes, and Argon2
+    // allocates `m_cost` KiB up front. Refusing here — before the salt is even
+    // sliced, and long before the KDF is entered — is what turns a 4 TiB request
+    // from a crash into a typed error. `sigil-core` re-checks the same ceilings in
+    // `derive_master_key`; this earlier copy exists so the failure is reportable
+    // as "this container is hostile" rather than a generic KDF error.
+    if params.validate().is_err() {
+        return Err(CliError::ParamsOutOfRange {
+            m_cost,
+            t_cost,
+            p_cost,
+        });
+    }
+
     // `rest` starts at the version byte; the salt begins after the 14 fixed
     // bytes (version + 3 u32s + salt_len) consumed above.
     let after_fixed = &rest[14..];
@@ -446,12 +507,6 @@ pub fn open_container(password: &[u8], container: &[u8]) -> Result<Vec<u8>, CliE
         return Err(CliError::MalformedHeader);
     }
     let (salt, envelope) = after_fixed.split_at(salt_len);
-
-    let params = Argon2Params {
-        m_cost,
-        t_cost,
-        p_cost,
-    };
 
     let plaintext = open_record(password, salt, params, envelope)?;
     Ok(plaintext)
@@ -2228,9 +2283,36 @@ fn parse_state(text: &str) -> Result<std::collections::BTreeMap<String, u64>, Cl
 // Do NOT store real 2FA secrets in this pre-audit build.
 // ---------------------------------------------------------------------------
 
-/// The TOTP-vault JSON version this build writes and reads (the *inner* plaintext
-/// version; the outer container is a normal `SIGILcli` file).
+/// The TOTP-vault JSON version this build WRITES into `version` (the *inner*
+/// plaintext version; the outer container is a normal `SIGILcli` file).
 pub const TOTP_VAULT_VERSION: u8 = 1;
+
+/// ⭐ The highest [`TotpVault::min_reader_version`] this build can satisfy.
+///
+/// **This is the forward-compatibility contract, and it is deliberately not the
+/// same knob as [`TOTP_VAULT_VERSION`].** `version` says *what wrote this vault*;
+/// `min_reader_version` says *what a reader must understand to read it safely*.
+/// A reader refuses if and only if `min_reader_version > TOTP_VAULT_READER_VERSION`.
+///
+/// Why this exists: the vault schema is MIRRORED across four clients (CLI,
+/// webapp, MV3 extension, native desktop) plus a printed recovery kit, and the
+/// old rule was a blanket `version != 1 ⇒ refuse`. That made *any* schema
+/// addition a flag day — every client had to ship before any client could write
+/// the new field — with the alternative being an older client silently STRIPPING
+/// the field on its next write, on a sync path where the oldest writer wins.
+///
+/// With this field, a future purely-additive change writes `version: 2,
+/// min_reader_version: 1` and old clients keep reading (and, thanks to
+/// `TotpVault::extra` / `TotpEntry::extra`, keep the new data intact when they
+/// write back). A genuinely incompatible change writes `min_reader_version: 2`
+/// and is refused **precisely**, naming what is needed, instead of by a version
+/// equality check that cannot tell the two cases apart.
+///
+/// ⚠️ It FAILS CLOSED: a vault with no `min_reader_version` is treated as
+/// requiring a reader of its own `version`, so a version-2 writer that forgets to
+/// state the field gets the old conservative behaviour rather than a silent
+/// misread.
+pub const TOTP_VAULT_READER_VERSION: u8 = 1;
 
 /// Default number of digits for a TOTP code when none is specified.
 pub const TOTP_DEFAULT_DIGITS: u32 = 6;
@@ -2243,7 +2325,7 @@ pub const TOTP_DEFAULT_PERIOD: u32 = 30;
 /// The `secret` is the RAW key bytes stored as standard-base64 in the JSON (the
 /// on-the-wire provisioning form is base32, but we store the decoded bytes). The
 /// `algorithm` is one of `"sha1"`, `"sha256"`, `"sha512"` (lowercase).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TotpEntry {
     /// Human label for the account, e.g. `"alice@example.com"`. Unique within a
     /// vault (used to look an entry up).
@@ -2260,22 +2342,78 @@ pub struct TotpEntry {
     pub digits: u32,
     /// Time step in seconds (typically 30).
     pub period: u32,
+    /// ⭐ A STABLE, opaque per-entry identifier (Phase 59).
+    ///
+    /// Written as a lowercase RFC 4122 v4 UUID string, from 16 bytes of
+    /// CALLER-supplied entropy (`getrandom` natively, `crypto.getRandomValues` in
+    /// the browser — `sigil-core` draws none, ADR 0007). It carries **no
+    /// meaning**: it is not derived from the label, the issuer or the secret, and
+    /// it is not a secret itself.
+    ///
+    /// Why it exists: today an entry is identified by its `label`, which is user
+    /// text that the user can edit and that collides across issuers. A stable id
+    /// is what a future change would need to rename an entry without it looking
+    /// like a delete-plus-add on a sync path, and to make de-duplication mean
+    /// something. ⚠️ **Nothing keys off it yet** — every lookup is still by
+    /// `label`, deliberately (changing entry identity is a semantics decision for
+    /// the lead, not this phase). This only makes that change possible later.
+    ///
+    /// `None` on every entry written before this field existed; readers must not
+    /// require it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// ⭐ Every OTHER JSON field on this entry, preserved verbatim.
+    ///
+    /// Without this, serde silently DROPS fields it does not know on the next
+    /// re-serialize — so an older client that so much as opened and re-sealed a
+    /// vault would delete a newer client's data, on a sync path where the oldest
+    /// writer wins. See [`TotpVault::extra`].
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// The decrypted plaintext of a TOTP vault: a versioned list of [`TotpEntry`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TotpVault {
-    /// Inner vault format version. Always [`TOTP_VAULT_VERSION`].
+    /// Inner vault format version — what WROTE this vault. This build writes
+    /// [`TOTP_VAULT_VERSION`]; readers tolerate other values and consult
+    /// `min_reader_version` instead (see [`TOTP_VAULT_READER_VERSION`]).
     pub version: u8,
+    /// ⭐ The minimum reader version required to open this vault SAFELY.
+    ///
+    /// Omitted (`None`) by this build, which writes nothing a version-1 reader
+    /// cannot handle. A future writer that makes a genuinely incompatible change
+    /// sets this, and older clients then refuse **precisely** — naming the version
+    /// they would need — instead of refusing every future vault by a blanket
+    /// version equality check. See [`TOTP_VAULT_READER_VERSION`] for the rule and
+    /// why it fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_reader_version: Option<u8>,
     /// The stored TOTP entries.
     pub entries: Vec<TotpEntry>,
+    /// ⭐ Every OTHER top-level JSON field, preserved verbatim (Phase 59).
+    ///
+    /// `#[serde(flatten)]` collects fields this build does not know about and
+    /// writes them back unchanged, so an old client can open, edit and re-seal a
+    /// vault written by a newer client **losslessly**.
+    ///
+    /// ⚠️ This is the whole point of the field, and it is easy to defeat by
+    /// accident: any code that rebuilds a vault as `TotpVault { version, entries }`
+    /// — or, in JavaScript, as `{ version: v.version, entries: [...] }` — throws
+    /// the preserved data away again. The JS mirror
+    /// (`sigil-wasm/totp-vault.mjs`) does the same job with an explicit
+    /// rest-spread, and `test/schema-interop.mjs` proves both directions.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for TotpVault {
     fn default() -> Self {
         TotpVault {
             version: TOTP_VAULT_VERSION,
+            min_reader_version: None,
             entries: Vec::new(),
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -2380,13 +2518,55 @@ pub fn base32_encode(input: &[u8]) -> String {
     out
 }
 
-/// Build a [`TotpEntry`] from raw parts, base64-encoding the raw `secret` bytes.
+/// Format 16 bytes of CALLER-SUPPLIED entropy as a lowercase RFC 4122 version-4
+/// UUID string, for [`TotpEntry::uuid`].
+///
+/// Takes the randomness as an argument rather than drawing it, mirroring ADR
+/// 0007's discipline: the browser mirror does exactly the same over
+/// `crypto.getRandomValues`, and a pure function is testable with a fixed vector.
+/// The version (4) and variant (RFC 4122) bits are set, so the output is a
+/// well-formed UUID and not just hex.
+///
+/// ⚠️ The value is an identifier, NOT a secret and NOT a key.
+#[must_use]
+pub fn format_entry_uuid(random16: &[u8; 16]) -> String {
+    let mut b = *random16;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h = |r: &[u8]| -> String { r.iter().map(|x| format!("{x:02x}")).collect() };
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&b[0..4]),
+        h(&b[4..6]),
+        h(&b[6..8]),
+        h(&b[8..10]),
+        h(&b[10..16])
+    )
+}
+
+/// Draw a fresh [`TotpEntry::uuid`] from the OS RNG.
+///
+/// Native-only convenience over [`format_entry_uuid`]; this crate already links
+/// `getrandom` (ADR 0002 keeps that out of the wasm-pure core). Browser clients
+/// call `crypto.getRandomValues` and format it in JS instead.
+///
+/// # Errors
+/// - [`CliError::Rng`] if the OS RNG fails.
+pub fn random_entry_uuid() -> Result<String, CliError> {
+    let mut b = [0u8; 16];
+    fill_random(&mut b)?;
+    Ok(format_entry_uuid(&b))
+}
+
+/// Build a [`TotpEntry`] from raw parts, base64-encoding the raw `secret` bytes,
+/// and assign it a fresh random [`TotpEntry::uuid`].
 ///
 /// Validates `digits` against the core's supported range up front (a bad digit
 /// count would otherwise only surface later at code-generation time).
 ///
 /// # Errors
 /// - [`CliError::Totp`] if `digits`/`period` are out of range.
+/// - [`CliError::Rng`] if the OS RNG fails while drawing the uuid.
 pub fn new_totp_entry(
     label: &str,
     issuer: Option<String>,
@@ -2394,6 +2574,27 @@ pub fn new_totp_entry(
     algorithm: OtpAlgorithm,
     digits: u32,
     period: u32,
+) -> Result<TotpEntry, CliError> {
+    let uuid = random_entry_uuid()?;
+    new_totp_entry_with_uuid(label, issuer, secret, algorithm, digits, period, Some(uuid))
+}
+
+/// [`new_totp_entry`] with the entry id supplied by the caller.
+///
+/// Use this when the id must be deterministic (tests, a migration that carries
+/// ids forward) or must be omitted entirely (`None`, matching an entry written
+/// before the field existed).
+///
+/// # Errors
+/// - [`CliError::Totp`] if `label` is empty or `digits`/`period` are out of range.
+pub fn new_totp_entry_with_uuid(
+    label: &str,
+    issuer: Option<String>,
+    secret: &[u8],
+    algorithm: OtpAlgorithm,
+    digits: u32,
+    period: u32,
+    uuid: Option<String>,
 ) -> Result<TotpEntry, CliError> {
     if label.is_empty() {
         return Err(CliError::Totp("label must not be empty".to_string()));
@@ -2415,6 +2616,8 @@ pub fn new_totp_entry(
         algorithm: totp_algorithm_name(algorithm).to_string(),
         digits,
         period,
+        uuid,
+        extra: std::collections::BTreeMap::new(),
     })
 }
 
@@ -2683,13 +2886,35 @@ pub fn open_vault(password: &[u8], container: &[u8]) -> Result<TotpVault, CliErr
     let plaintext = open_container(password, container)?;
     let vault: TotpVault = serde_json::from_slice(&plaintext)
         .map_err(|e| CliError::Totp(format!("decrypted vault is not valid JSON: {e}")))?;
-    if vault.version != TOTP_VAULT_VERSION {
+    check_vault_readable(&vault)?;
+    Ok(vault)
+}
+
+/// ⭐ The forward-compatibility gate, replacing the old blanket
+/// `version != TOTP_VAULT_VERSION` refusal.
+///
+/// A vault is readable when the reader version it DEMANDS is one this build can
+/// satisfy. The demand is `min_reader_version` when stated, and otherwise the
+/// vault's own `version` — which makes an un-annotated future vault fail closed,
+/// exactly as it did before, while an explicitly-additive one (`version: 2,
+/// min_reader_version: 1`) opens.
+///
+/// See [`TOTP_VAULT_READER_VERSION`] for why the two knobs are separate.
+///
+/// # Errors
+/// - [`CliError::Totp`] naming the reader version required and the one we have.
+pub fn check_vault_readable(vault: &TotpVault) -> Result<(), CliError> {
+    let required = vault.min_reader_version.unwrap_or(vault.version);
+    if required > TOTP_VAULT_READER_VERSION {
         return Err(CliError::Totp(format!(
-            "unsupported vault version {}: expected {TOTP_VAULT_VERSION}",
+            "this vault needs a reader that understands schema version {required}, \
+             and this build understands {TOTP_VAULT_READER_VERSION} \
+             (the vault was written by version {}). Upgrade the client that reads it — \
+             opening it here could silently discard data it does not understand",
             vault.version
         )));
     }
-    Ok(vault)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3921,22 +4146,99 @@ pub fn delete_key_envelope(
     }
 }
 
+/// Read the Argon2id work factors out of a `SIGILcli` container header WITHOUT
+/// opening it (no password, no KDF, no allocation).
+///
+/// The header is unauthenticated framing metadata, so this tells you what the
+/// writer *claims* — which is exactly what [`reseal_container`]'s no-downgrade
+/// rule needs, and exactly why the values are range-checked here too.
+///
+/// # Errors
+/// - [`CliError::ShortContainer`] / [`CliError::BadMagic`] /
+///   [`CliError::UnsupportedVersion`] on a header that is not ours.
+/// - [`CliError::ParamsOutOfRange`] if the declared work factors exceed Sigil's
+///   ceilings.
+pub fn container_params(container: &[u8]) -> Result<Argon2Params, CliError> {
+    if container.len() < FIXED_HEADER_LEN {
+        return Err(CliError::ShortContainer);
+    }
+    let (magic, rest) = container.split_at(8);
+    if magic != MAGIC.as_slice() {
+        return Err(CliError::BadMagic);
+    }
+    if rest[0] != FORMAT_VERSION {
+        return Err(CliError::UnsupportedVersion(rest[0]));
+    }
+    let params = Argon2Params {
+        m_cost: u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]),
+        t_cost: u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]),
+        p_cost: u32::from_le_bytes([rest[9], rest[10], rest[11], rest[12]]),
+    };
+    if params.validate().is_err() {
+        return Err(CliError::ParamsOutOfRange {
+            m_cost: params.m_cost,
+            t_cost: params.t_cost,
+            p_cost: params.p_cost,
+        });
+    }
+    Ok(params)
+}
+
+/// ⭐ THE NO-DOWNGRADE RULE for re-sealing: never write a container weaker than
+/// the one you read.
+///
+/// Returns the componentwise **maximum** of `existing` (what the input container
+/// declared) and `requested` (what this build would write today).
+///
+/// The attack this closes: a container's header is unauthenticated, so an
+/// attacker who can get ONE weak container accepted — say `m_cost = 8` — would
+/// otherwise see that weakness *persist* through every subsequent re-seal, since
+/// a re-seal is the operation that decides the new parameters. Taking the max
+/// makes a work factor a ratchet: it can go up, never down, and a client with
+/// stronger defaults silently repairs a weak container the first time it re-seals
+/// it.
+///
+/// Argon2 requires `m_cost >= 8 * p_cost`; a componentwise max can in principle
+/// pair a small `m_cost` with a larger `p_cost`, so `m_cost` is raised to that
+/// floor if needed. Both inputs are already at or below the ceilings (an
+/// out-of-range container cannot be opened at all, and `8 * MAX_P_COST` = 128 KiB
+/// is far below [`Argon2Params::MAX_M_COST`]), so the result is always in range.
+/// ⚠️ **Delegates to [`Argon2Params::no_downgrade`] — there is exactly ONE
+/// implementation of this rule.** It lives in `sigil-core` so that the CLI, the
+/// desktop app and the wasm binding (and therefore the webapp and the extension)
+/// all ratchet identically; a mirrored copy would be free to drift, and a JS copy
+/// that drifted downward would silently weaken every CLI-written vault the
+/// browser touched.
+pub fn no_downgrade(existing: Argon2Params, requested: Argon2Params) -> Argon2Params {
+    existing.no_downgrade(requested)
+}
+
 /// Re-seal an existing `SIGILcli` container under a NEW secret: open it with
 /// `old_secret`, seal the exact same plaintext under `new_secret`.
 ///
 /// Container-agnostic on purpose — it re-keys a TOTP vault, a note, or anything
 /// else that is a `SIGILcli` container, because it never looks at the plaintext.
 ///
+/// ⭐ **The output is never weaker than the input.** `params` is a *floor*, not a
+/// verbatim instruction: the parameters actually written are
+/// [`no_downgrade(container's params, params)`](no_downgrade). See that
+/// function for why — a re-seal is where new work factors are chosen, so it is
+/// the one place a weak container could make its weakness permanent.
+///
 /// # Errors
-/// - Whatever [`open_container`] / [`seal_to_container`] return.
+/// - Whatever [`open_container`] / [`seal_to_container`] return (including
+///   [`CliError::ParamsOutOfRange`] for a hostile header).
 pub fn reseal_container(
     old_secret: &[u8],
     new_secret: &[u8],
     container: &[u8],
     params: Argon2Params,
 ) -> Result<Vec<u8>, CliError> {
+    // Read the incoming work factors BEFORE opening, so the ratchet applies even
+    // to a container this build would otherwise have re-sealed more weakly.
+    let existing = container_params(container)?;
     let plaintext = open_container(old_secret, container)?;
-    seal_to_container(new_secret, &plaintext, params)
+    seal_to_container(new_secret, &plaintext, no_downgrade(existing, params))
 }
 
 /// What a rotation actually did. Contains fingerprints only — never a key.
@@ -5373,6 +5675,209 @@ mod tests {
         assert_eq!(open_container(PASSWORD, &c), Err(CliError::MalformedHeader));
     }
 
+    // --- ⛔ Hostile Argon2 parameters in the container header (Phase 59) ------
+    //
+    // The header is unauthenticated framing, and Argon2id allocates `m_cost` KiB
+    // in ONE block before doing any work. These bytes reach a client through
+    // sigild's zero-knowledge op-log, which cannot filter them, so the refusal
+    // has to be here. Each test below completing at all is the evidence that
+    // nothing was allocated: an unbounded parse would have asked the allocator
+    // for terabytes.
+
+    /// Overwrite the three u32 LE work factors in a `SIGILcli` header in place.
+    fn set_header_params(c: &mut [u8], m: u32, t: u32, p: u32) {
+        c[9..13].copy_from_slice(&m.to_le_bytes());
+        c[13..17].copy_from_slice(&t.to_le_bytes());
+        c[17..21].copy_from_slice(&p.to_le_bytes());
+    }
+
+    #[test]
+    fn absurd_m_cost_in_the_header_is_refused_before_allocating() {
+        let mut c = seal_to_container(PASSWORD, b"payload", FAST).expect("seal");
+        // ~4 TiB of memory. Unbounded, this is the process dying on allocation
+        // every time the user pulls their vault.
+        set_header_params(&mut c, 0xFFFF_FFF0, 1, 1);
+        assert_eq!(
+            open_container(PASSWORD, &c),
+            Err(CliError::ParamsOutOfRange {
+                m_cost: 0xFFFF_FFF0,
+                t_cost: 1,
+                p_cost: 1
+            })
+        );
+    }
+
+    #[test]
+    fn each_work_factor_is_bounded_independently() {
+        for (m, t, p) in [
+            (Argon2Params::MAX_M_COST + 1, 1, 1),
+            (8, Argon2Params::MAX_T_COST + 1, 1),
+            (8, 1, Argon2Params::MAX_P_COST + 1),
+        ] {
+            let mut c = seal_to_container(PASSWORD, b"payload", FAST).expect("seal");
+            set_header_params(&mut c, m, t, p);
+            assert_eq!(
+                open_container(PASSWORD, &c),
+                Err(CliError::ParamsOutOfRange {
+                    m_cost: m,
+                    t_cost: t,
+                    p_cost: p
+                }),
+                "({m},{t},{p}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normal_container_still_opens_and_the_ceiling_is_above_what_we_write() {
+        // Nothing that opens today may stop opening. Prove it for the two
+        // parameter sets this repo actually writes plus the test-fast one.
+        for params in [
+            FAST,
+            Argon2Params {
+                m_cost: 19456,
+                t_cost: 2,
+                p_cost: 1,
+            },
+        ] {
+            let c = seal_to_container(PASSWORD, b"payload", params).expect("seal");
+            assert_eq!(
+                open_container(PASSWORD, &c).expect("open"),
+                b"payload".to_vec()
+            );
+        }
+        // RECOMMENDED is 64 MiB — assert the bound admits it without paying for
+        // a 64 MiB derivation in a unit test.
+        assert!(Argon2Params::RECOMMENDED.validate().is_ok());
+        // And the ceiling itself is accepted (inclusive bound), so raising the
+        // work factor later needs no format change.
+        let ceiling = Argon2Params {
+            m_cost: Argon2Params::MAX_M_COST,
+            t_cost: Argon2Params::MAX_T_COST,
+            p_cost: Argon2Params::MAX_P_COST,
+        };
+        assert!(ceiling.validate().is_ok());
+    }
+
+    #[test]
+    fn the_refusal_is_typed_and_names_no_secret() {
+        let mut c = seal_to_container(PASSWORD, b"payload", FAST).expect("seal");
+        set_header_params(&mut c, 0xFFFF_FFF0, 1, 1);
+        let msg = open_container(PASSWORD, &c).unwrap_err().to_string();
+        // It must NOT be reported as a wrong password / generic KDF failure —
+        // the user has to be able to tell "hostile container" from "typo".
+        assert!(msg.contains("4294967280"), "names what was demanded: {msg}");
+        assert!(msg.contains("Nothing was allocated"), "{msg}");
+        assert!(!msg.contains(core::str::from_utf8(PASSWORD).unwrap()));
+    }
+
+    #[test]
+    fn container_params_reads_the_header_without_a_password() {
+        let c = seal_to_container(PASSWORD, b"payload", FAST).expect("seal");
+        assert_eq!(container_params(&c).expect("params"), FAST);
+
+        let mut hostile = c.clone();
+        set_header_params(&mut hostile, 0xFFFF_FFF0, 1, 1);
+        assert!(matches!(
+            container_params(&hostile),
+            Err(CliError::ParamsOutOfRange { .. })
+        ));
+    }
+
+    // --- ⭐ The no-downgrade rule on re-seal ---------------------------------
+
+    #[test]
+    fn no_downgrade_is_a_componentwise_ratchet() {
+        let weak = Argon2Params {
+            m_cost: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let strong = Argon2Params {
+            m_cost: 19456,
+            t_cost: 2,
+            p_cost: 1,
+        };
+        // Up is allowed…
+        assert_eq!(no_downgrade(weak, strong), strong);
+        // …down is not: a weak input container cannot drag a strong re-seal down.
+        assert_eq!(no_downgrade(strong, weak), strong);
+        // Mixed: each factor rises independently.
+        assert_eq!(
+            no_downgrade(
+                Argon2Params {
+                    m_cost: 65536,
+                    t_cost: 1,
+                    p_cost: 1
+                },
+                Argon2Params {
+                    m_cost: 8,
+                    t_cost: 4,
+                    p_cost: 2
+                }
+            ),
+            Argon2Params {
+                m_cost: 65536,
+                t_cost: 4,
+                p_cost: 2
+            }
+        );
+        // Argon2 needs m_cost >= 8 * p_cost; a componentwise max could break
+        // that, so m_cost is floored to it and the result stays in range.
+        let repaired = no_downgrade(
+            Argon2Params {
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            Argon2Params {
+                m_cost: 8,
+                t_cost: 1,
+                p_cost: 4,
+            },
+        );
+        assert_eq!(repaired.m_cost, 32);
+        assert!(repaired.validate().is_ok());
+    }
+
+    #[test]
+    fn reseal_cannot_lower_the_parameters_it_read() {
+        let strong = Argon2Params {
+            m_cost: 128,
+            t_cost: 3,
+            p_cost: 2,
+        };
+        let c = seal_to_container(b"old", b"payload", strong).expect("seal");
+
+        // Ask for a WEAKER re-seal, as an attacker who got a weak container
+        // accepted would want. The output header must still carry `strong`.
+        let resealed = reseal_container(b"old", b"new", &c, FAST).expect("reseal");
+        assert_eq!(container_params(&resealed).expect("params"), strong);
+        assert_eq!(
+            open_container(b"new", &resealed).expect("open"),
+            b"payload".to_vec()
+        );
+
+        // And a re-seal that asks for MORE still gets more (the ratchet turns).
+        let up = Argon2Params {
+            m_cost: 19456,
+            t_cost: 3,
+            p_cost: 2,
+        };
+        let raised = reseal_container(b"new", b"newer", &resealed, up).expect("reseal up");
+        assert_eq!(container_params(&raised).expect("params"), up);
+    }
+
+    #[test]
+    fn reseal_refuses_a_hostile_input_header() {
+        let mut c = seal_to_container(b"old", b"payload", FAST).expect("seal");
+        set_header_params(&mut c, 0xFFFF_FFF0, 1, 1);
+        assert!(matches!(
+            reseal_container(b"old", b"new", &c, FAST),
+            Err(CliError::ParamsOutOfRange { .. })
+        ));
+    }
+
     #[test]
     fn truncated_envelope_is_rejected_without_panic() {
         let c = seal_to_container(PASSWORD, b"payload", FAST).expect("seal");
@@ -6218,14 +6723,21 @@ mod tests {
         // Export to an otpauth:// URI, then parse it back: the entry must survive.
         let uri = entry_to_otpauth_uri(&entry).expect("export uri");
         assert!(uri.starts_with("otpauth://totp/GitHub:alice%40example.com?"));
-        let parsed = parse_otpauth_uri(&uri).expect("re-parse");
+        let mut parsed = parse_otpauth_uri(&uri).expect("re-parse");
+        // `otpauth://` is an INTEROP format with no field for a Sigil-local entry
+        // id, so a re-parse yields a fresh one. Everything the URI carries must
+        // survive exactly.
+        assert!(parsed.uuid.is_some() && parsed.uuid != entry.uuid);
+        parsed.uuid = entry.uuid.clone();
         assert_eq!(parsed, entry);
 
         // An entry with no issuer round-trips too (no `Issuer:` path prefix).
         let no_issuer =
             new_totp_entry("solo", None, &secret, OtpAlgorithm::Sha1, 6, 30).expect("entry");
         let uri2 = entry_to_otpauth_uri(&no_issuer).expect("export uri");
-        assert_eq!(parse_otpauth_uri(&uri2).expect("re-parse"), no_issuer);
+        let mut parsed2 = parse_otpauth_uri(&uri2).expect("re-parse");
+        parsed2.uuid = no_issuer.uuid.clone();
+        assert_eq!(parsed2, no_issuer);
     }
 
     #[test]
@@ -6270,6 +6782,137 @@ mod tests {
         v2.remove("acct").expect("remove");
         assert!(v2.find("acct").is_none());
         assert!(matches!(v2.remove("acct"), Err(CliError::Totp(_))));
+    }
+
+    // --- ⭐ Schema forward-compatibility (Phase 59) --------------------------
+    //
+    // The vault schema is MIRRORED across four clients and a printed recovery
+    // kit. Before this, serde DROPPED any field it did not know, so an old client
+    // that merely opened and re-sealed a vault deleted a newer client's data — on
+    // a sync path where the oldest writer wins. `test/schema-interop.mjs` proves
+    // the same property across the Rust/JS boundary; these pin the Rust half.
+
+    #[test]
+    fn unknown_top_level_fields_survive_an_open_and_reseal() {
+        let future = br#"{
+            "version": 1,
+            "entries": [],
+            "vault_name": "work",
+            "future_object": {"nested": [1, 2, 3]}
+        }"#;
+        let vault: TotpVault = serde_json::from_slice(future).expect("parse");
+        assert_eq!(vault.extra.len(), 2);
+        assert_eq!(vault.extra["vault_name"], serde_json::json!("work"));
+
+        // Re-serialize: the unknown fields must still be there, verbatim.
+        let out: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&vault).unwrap()).unwrap();
+        assert_eq!(out["vault_name"], serde_json::json!("work"));
+        assert_eq!(out["future_object"]["nested"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn unknown_per_entry_fields_survive_an_open_and_reseal() {
+        let future = br#"{
+            "version": 1,
+            "entries": [{
+                "label": "acct",
+                "secret": "MTIzNDU2Nzg5MA==",
+                "algorithm": "sha1",
+                "digits": 6,
+                "period": 30,
+                "uuid": "11111111-2222-4333-8444-555555555555",
+                "icon": "github",
+                "tags": ["work", "critical"]
+            }]
+        }"#;
+        let mut vault: TotpVault = serde_json::from_slice(future).expect("parse");
+        let e = &vault.entries[0];
+        assert_eq!(
+            e.uuid.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(e.extra["icon"], serde_json::json!("github"));
+
+        // Edit the vault the way an old client would (append an entry) and
+        // re-serialize: the OTHER entry's unknown fields must be untouched.
+        vault
+            .add(new_totp_entry("second", None, b"0123456789", OtpAlgorithm::Sha1, 6, 30).unwrap())
+            .expect("add");
+        let out: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&vault).unwrap()).unwrap();
+        assert_eq!(out["entries"][0]["icon"], serde_json::json!("github"));
+        assert_eq!(
+            out["entries"][0]["tags"],
+            serde_json::json!(["work", "critical"])
+        );
+        assert_eq!(
+            out["entries"][0]["uuid"],
+            serde_json::json!("11111111-2222-4333-8444-555555555555")
+        );
+        // …and the newly added entry got an id of its own.
+        assert!(out["entries"][1]["uuid"].is_string());
+    }
+
+    #[test]
+    fn a_vault_this_build_writes_is_byte_shape_compatible_with_the_old_one() {
+        // Nothing that opens today may stop opening, and an untouched vault must
+        // not grow fields: `min_reader_version` and `extra` are OMITTED when
+        // empty, and `uuid` is omitted when absent.
+        let vault = TotpVault::default();
+        let json = String::from_utf8(serde_json::to_vec(&vault).unwrap()).unwrap();
+        assert_eq!(json, r#"{"version":1,"entries":[]}"#);
+
+        let bare = new_totp_entry_with_uuid("a", None, b"k", OtpAlgorithm::Sha1, 6, 30, None)
+            .expect("entry");
+        let json = String::from_utf8(serde_json::to_vec(&bare).unwrap()).unwrap();
+        assert!(!json.contains("uuid"), "{json}");
+    }
+
+    #[test]
+    fn min_reader_version_refuses_precisely_and_permits_additive_change() {
+        // Additive future vault: written by v2, readable by a v1 reader.
+        let additive: TotpVault =
+            serde_json::from_slice(br#"{"version":2,"min_reader_version":1,"entries":[]}"#)
+                .unwrap();
+        assert!(check_vault_readable(&additive).is_ok());
+
+        // Genuinely incompatible: refused, and the message NAMES the version.
+        let breaking: TotpVault =
+            serde_json::from_slice(br#"{"version":2,"min_reader_version":2,"entries":[]}"#)
+                .unwrap();
+        let err = check_vault_readable(&breaking).unwrap_err().to_string();
+        assert!(err.contains("version 2"), "{err}");
+
+        // FAILS CLOSED: a v2 vault that never states min_reader_version is
+        // treated as needing a v2 reader — the old conservative behaviour.
+        let silent: TotpVault = serde_json::from_slice(br#"{"version":2,"entries":[]}"#).unwrap();
+        assert!(check_vault_readable(&silent).is_err());
+
+        // And today's vaults still open.
+        assert!(check_vault_readable(&TotpVault::default()).is_ok());
+    }
+
+    #[test]
+    fn entry_uuid_is_a_well_formed_v4_from_caller_entropy() {
+        // Pure function over CALLER-supplied bytes (ADR 0007 discipline), so it
+        // has a fixed vector.
+        let u = format_entry_uuid(&[0xff; 16]);
+        assert_eq!(u, "ffffffff-ffff-4fff-bfff-ffffffffffff");
+        assert_eq!(
+            format_entry_uuid(&[0x00; 16]),
+            "00000000-0000-4000-8000-000000000000"
+        );
+        // Two random draws differ.
+        assert_ne!(random_entry_uuid().unwrap(), random_entry_uuid().unwrap());
+        // A vault round-trip keeps the id stable.
+        let mut v = TotpVault::default();
+        v.add(new_totp_entry("a", None, b"k", OtpAlgorithm::Sha1, 6, 30).unwrap())
+            .unwrap();
+        let id = v.entries[0].uuid.clone();
+        assert!(id.is_some());
+        let sealed = seal_vault(PASSWORD, &v, FAST).unwrap();
+        assert_eq!(open_vault(PASSWORD, &sealed).unwrap().entries[0].uuid, id);
     }
 
     // --- Contract v3 + device enrollment tests --------------------------------

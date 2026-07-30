@@ -22,6 +22,7 @@ defense, and the layer the defense lives at.
 | 10 | Browser malware | Reads extension state | Extension storage encrypted under master-password-derived key; user-initiated actions only; clipboard cleared after 3s; HTTPS enforced | Extension hardening |
 | 11 | Push-notification operator | Reads push payloads | Payloads carry only opaque vault ID + wake hint; approval blobs decryptable only by the user's other devices | Architecture |
 | 12 | Lost master password / lost every device | User locked out | ⚠️ **What ships is a printed 56-character recovery kit and NOTHING ELSE** ([ADR 0042](decisions/0042-recovery-kit.md), [Recovery kit](#recovery-kit-adversaries-dev-gated--see-adr-0042) below). It confers **IMMEDIATE, un-delayed, un-notified, full account takeover** to whoever holds the paper. There is **no recovery delegate**, **no delay window**, **no notification**, **no veto**, and **no passkey-bound recovery** — do not read this row as if there were. (⚠️ Phase 58 runs the dependency the OTHER way: the printed sheet is the break-glass **for** a passkey-protected profile, so a lost passkey costs nothing — but a lost sheet is still unrecoverable, and no passkey can substitute for it. See [ADR 0046](decisions/0046-passkey-protected-local-containers.md).) It does keep the property that **Sigil cannot decrypt unilaterally**, because the secret never reaches the server; and it must be **printed in advance** or it does not exist | Workflow + client |
+| 13 | **Writer of a hostile container** (added Phase 59) | Puts **one opaque blob** in a vault's op-log — available to a revoked-but-not-yet-rotated device, a co-tenant of a shared vault, or a breached server | ⚠️ **An availability attack, not a confidentiality one, and the server cannot defend against it by construction** — it stores opaque blobs and filtering would mean parsing what it is designed not to understand. The container header's Argon2id work factors are unauthenticated framing, and Argon2id allocates `m_cost` KiB in one block: measured, a 4 TiB request ran 12.57 s, peaked at ≈ 90 GB and was killed. Defense is a **client-side ceiling checked before any allocation** ([ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md), [section below](#writer-of-a-hostile-container-client-side-denial-of-service--see-adr-0047)) — which makes the refusal cheap but **does not remove the blob** | Client |
 
 **Server-stores-opaque-blobs property.** Even where `sigild` does hold data, it
 holds **only opaque client-encrypted blobs** — never plaintext and never keys.
@@ -719,6 +720,62 @@ would help someone forge or recover a kit.
   requirement.
 - ⚠️ **Dev-gated, plain HTTP in dev, UNAUDITED**, and the codec, derivation and
   gate are all new code.
+
+## Writer of a hostile container (client-side denial of service — see [ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md))
+
+**A new adversary class, added in Phase 59 because it was reachable and nothing
+addressed it.** It is not a confidentiality attack — it takes nothing — it is an
+**availability** attack on the client, and its delivery path is the property this
+architecture is built around.
+
+**Capability.** Write one opaque blob to a vault's op-log. That is available to
+anyone with write access: a **revoked-but-not-yet-rotated device** (revocation
+stops future access, but a blob already deposited stays), a **co-tenant of a
+shared vault** ([ADR 0035](decisions/0035-device-to-device-vault-sharing.md)), or
+a **breached or hostile server**, which can synthesise blobs freely because it
+never had to understand them.
+
+**The attack.** A `SIGILcli` header's Argon2id work factors are **unauthenticated
+framing** — they are inputs to the KDF, so they must be readable before any key
+exists. Argon2id allocates `m_cost` KiB **in one block before doing any work**.
+Measured: `m_cost = 0xFFFF_FFF0` ran **12.57 s**, peaked at a **≈ 90 GB memory
+footprint** on a 24 GB machine and was **killed**; `t_cost = 0xFFFF_FFF0`
+extrapolates to **≈ 282 days** of CPU for a single open attempt. Every client that
+pulls the vault dies, on every device, and the user cannot reach their own 2FA
+codes.
+
+⛔ **The server cannot defend against this, by construction.** `sigild` stores
+opaque blobs and returns them verbatim; filtering would require parsing a blob it
+is designed to be unable to interpret. **The property that makes the server safe
+is the property that stops it helping here** — and that is the honest general
+lesson: a zero-knowledge relay moves *every* content-validation duty to the
+client.
+
+**Defense.** A ceiling on the three work factors
+(`MAX_M_COST` = 256 MiB, `MAX_T_COST` = 16, `MAX_P_COST` = 16) enforced in
+`sigil-core` **at parse time, before any allocation**, and re-checked earlier
+still by both container parsers so the failure is typed
+(`CliError::ParamsOutOfRange`) and distinguishable from a wrong password. Measured
+after the fix: **0.00 s, 1.18 MB peak footprint**, on the same bytes. Construction
+in [`crypto-spec.md`](crypto-spec.md).
+
+**What is NOT defended, and must be read with the row above:**
+
+- ⛔ **The blob is not removed.** There is no delete-op route and no client-side
+  quarantine, so it stays in the log and every client re-parses and re-refuses it
+  **every time it syncs**. The refusal is cheap; the nuisance is permanent.
+- ⛔ **Op-log quota and storage are still consumed.** The per-vault rate limiter
+  ([ADR 0017](decisions/0017-oplog-scale-and-observability.md)) is **off by
+  default** and bounds append *rate*, not the existence of one bad blob.
+- ⚠️ **A container declaring the ceiling exactly (`256 MiB / 16 / 16`, legal, and
+  1.64 s per open) is preserved by the no-downgrade ratchet forever** — a small,
+  bounded, non-reversible cost an attacker can impose once.
+- ⚠️ **Nothing here addresses a client that is fed a *malformed* container by other
+  means** (a hostile file handed to `sigil open`, a tampered backup). The same
+  parse-time bound applies, but the bound is the whole defense.
+- ⚠️ This class was **not previously enumerated in this document**, which is worth
+  recording: the model was written around confidentiality, and an availability
+  attack delivered through the confidentiality mechanism had no row.
 
 ## Billing / payment surface (opt-in, dev-gated — see [ADR 0034](decisions/0034-billing-provider-seam.md))
 

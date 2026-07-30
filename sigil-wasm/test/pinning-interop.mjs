@@ -50,6 +50,7 @@ import {
 import { tmpdir } from "node:os";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
+import { resolveGo } from "./go-helper.mjs";
 
 import { generateDeviceSeed, enrollDevice } from "../device-auth.mjs";
 import {
@@ -99,7 +100,7 @@ const toolPath = [
   process.env.PATH ?? "",
 ].join(":");
 const toolEnv = { ...process.env, PATH: toolPath };
-const goBin = process.env.GO ?? "/opt/homebrew/bin/go";
+const goBin = resolveGo();
 
 function freePort() {
   return new Promise((resolve, reject) => {

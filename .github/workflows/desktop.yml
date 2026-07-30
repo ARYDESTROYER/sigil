@@ -22,6 +22,7 @@ on:
   push:
     paths:
       - "desktop/**"
+      - "sigild/**"
       - "cli/**"
       - "libsigil/**"
       - "rust-toolchain.toml"
@@ -29,6 +30,7 @@ on:
   pull_request:
     paths:
       - "desktop/**"
+      - "sigild/**"
       - "cli/**"
       - "libsigil/**"
       - "rust-toolchain.toml"

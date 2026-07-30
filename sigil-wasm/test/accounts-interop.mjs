@@ -49,6 +49,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
+import { resolveGo } from "./go-helper.mjs";
 
 import {
   generateDeviceSeed,
@@ -102,7 +103,7 @@ const toolPath = [
   process.env.PATH ?? "",
 ].join(":");
 const toolEnv = { ...process.env, PATH: toolPath };
-const goBin = existsSync("/opt/homebrew/bin/go") ? "/opt/homebrew/bin/go" : "go";
+const goBin = resolveGo();
 
 function freePort() {
   return new Promise((resolve, reject) => {

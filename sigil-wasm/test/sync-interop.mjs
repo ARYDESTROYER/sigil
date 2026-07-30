@@ -39,6 +39,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
 
 import { pushContainer, pullContainers } from "../sync.mjs";
+import { resolveGo } from "./go-helper.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..");
@@ -68,7 +69,7 @@ const toolPath = [
   process.env.PATH ?? "",
 ].join(":");
 const toolEnv = { ...process.env, PATH: toolPath };
-const goBin = "/opt/homebrew/bin/go";
+const goBin = resolveGo();
 
 // Grab a free localhost TCP port by binding :0 and reading it back.
 function freePort() {

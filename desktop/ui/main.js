@@ -198,9 +198,24 @@ $("import-form").addEventListener("submit", async (e) => {
   // migration-aware importer. Both paths live in the Rust core.
   const r = await call("import", { text });
   $("import-text").value = "";
-  toast(
+  const base =
     `imported ${r.imported} (skipped: ${r.skipped_duplicate} duplicate, ` +
-      `${r.skipped_hotp} HOTP, ${r.skipped_invalid} invalid)`
+    `${r.skipped_hotp} HOTP, ${r.skipped_invalid} invalid)`;
+  // ⛔ A multi-QR Google Authenticator export arrives one QR at a time. Saying
+  // "imported 12" and nothing else is how a user deletes the old app with two
+  // thirds of their accounts still only there.
+  const partial = r.partial_batches ?? [];
+  // ⭐ The alarm keys off batches_outstanding, not "was this multi-QR at all".
+  // Batch 2 of 2 still gets its note (this app keeps no record of earlier runs)
+  // but must not be called incomplete — a false alarm is how a real one gets
+  // ignored.
+  toast(
+    partial.length === 0
+      ? base
+      : r.batches_outstanding
+        ? `${base} — ⚠️ INCOMPLETE: ${partial.join(" ")} Import the remaining QR ` +
+            `code(s) before deleting anything from the old app.`
+        : `${base} — ${partial.join(" ")}`
   );
   refresh();
 });

@@ -98,6 +98,109 @@ pub struct MigrationOtp {
     pub counter: i64,
 }
 
+/// ⭐ A decoded `MigrationPayload`, INCLUDING the batch framing (Phase 59).
+///
+/// ⛔ **Why this type exists.** Google Authenticator splits a large export across
+/// several QR codes. Each QR is a complete, independently-decodable
+/// `MigrationPayload` carrying `batch_size` / `batch_index` / `batch_id`, and the
+/// accounts are divided between them. This codec used to consume those three
+/// fields and throw them away, so scanning the first QR of a three-QR export
+/// imported a THIRD of the accounts and reported plain success — silent data loss
+/// in the one feature whose entire purpose is not losing data, hitting exactly
+/// the users with the most accounts.
+///
+/// Now the framing is decoded and carried, and [`Self::is_complete`] /
+/// [`Self::batch_note`] make it impossible to describe a partial import as a
+/// whole one without ignoring them on purpose.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MigrationBatch {
+    /// The accounts carried by THIS payload — which may be a fraction of the
+    /// export (see [`Self::batch_size`]).
+    pub otps: Vec<MigrationOtp>,
+    /// The payload's `version` field (informational; decoding accepts any).
+    pub version: i32,
+    /// How many QR codes / payloads the whole export was split into. `0` or `1`
+    /// (the field is omitted at its proto3 default) means a single payload.
+    pub batch_size: i32,
+    /// Which payload this is, ZERO-BASED, as Google writes it. Omitted (`0`) for
+    /// the first, which is also the value a single-payload export carries.
+    pub batch_index: i32,
+    /// An id shared by every payload of one export, so a caller collecting
+    /// several can tell they belong together. `0` when absent.
+    pub batch_id: i32,
+}
+
+impl MigrationBatch {
+    /// Whether this payload is the WHOLE export.
+    ///
+    /// False as soon as `batch_size > 1` — i.e. there are other QR codes whose
+    /// accounts are not in `otps`. A caller must not report success as
+    /// "imported N accounts" when this is false; see [`Self::batch_note`].
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.batch_size <= 1
+    }
+
+    /// Whether this payload is the **LAST** QR of a multi-QR export.
+    ///
+    /// ⛔ Distinct from [`Self::is_complete`], and the distinction is the whole
+    /// point: batch 2 of 2 is NOT the whole export (there was a batch 1), but
+    /// nothing further needs scanning. Telling a user who has just finished that
+    /// "0 more QR code(s) must be imported — this import is PARTIAL" is a warning
+    /// that cries wolf, and a warning that cries wolf is one the next user
+    /// ignores when it is real.
+    ///
+    /// False for a single-payload export, which is [`Self::is_complete`] instead.
+    #[must_use]
+    pub fn is_final_batch(&self) -> bool {
+        !self.is_complete() && self.batch_index + 1 >= self.batch_size
+    }
+
+    /// A human-readable "batch i of N" note, or `None` for a single-payload
+    /// export.
+    ///
+    /// `batch_index` is zero-based on the wire; this renders it one-based,
+    /// because "batch 0 of 3" reads like nothing was imported.
+    ///
+    /// ⭐ TWO WORDINGS, because there are two situations. While QR codes remain
+    /// the note says the import is **PARTIAL** and how many are outstanding. On
+    /// the **final** batch nothing is outstanding, so it says so — while still
+    /// naming the earlier batches, since this client has no cross-invocation
+    /// state and genuinely cannot know whether they were imported. Callers pick
+    /// their framing from [`Self::is_final_batch`], not from the string.
+    #[must_use]
+    pub fn batch_note(&self) -> Option<String> {
+        if self.is_complete() {
+            return None;
+        }
+        if self.is_final_batch() {
+            let earlier = (self.batch_size - 1).max(0);
+            return Some(format!(
+                "this was batch {} of {} — the LAST QR code of a MULTI-QR Google \
+                 Authenticator export (batch id {}), carrying {} of the accounts. \
+                 Nothing further needs scanning from this export. Check that the \
+                 earlier {earlier} QR code(s) were imported too before deleting \
+                 anything from the old app",
+                self.batch_index + 1,
+                self.batch_size,
+                self.batch_id,
+                self.otps.len(),
+            ));
+        }
+        let remaining = (self.batch_size - self.batch_index - 1).max(0);
+        Some(format!(
+            "this is batch {} of {} from a MULTI-QR Google Authenticator export \
+             (batch id {}): it carries {} of the accounts, and {remaining} more QR \
+             code(s) must be imported before the transfer is complete. This import \
+             is PARTIAL",
+            self.batch_index + 1,
+            self.batch_size,
+            self.batch_id,
+            self.otps.len(),
+        ))
+    }
+}
+
 /// The result of mapping one [`MigrationOtp`] to the crate's TOTP model.
 pub enum ImportedOtp {
     /// A time-based entry ready to add to the vault.
@@ -264,17 +367,18 @@ fn decode_otp_parameters(buf: &[u8]) -> Result<MigrationOtp, CliError> {
     Ok(otp)
 }
 
-/// Decode a `MigrationPayload` into its list of [`MigrationOtp`] records.
+/// Decode a `MigrationPayload` into its accounts AND its batch framing.
 ///
-/// Only `otp_parameters` (field 1) is retained; `version`/`batch_*` and any
-/// unknown field are consumed and ignored. Truncated or malformed bytes yield a
-/// clear [`CliError::Totp`], never a panic.
+/// ⭐ `version` / `batch_size` / `batch_index` / `batch_id` are DECODED, not
+/// discarded — see [`MigrationBatch`] for why that matters. Unknown fields are
+/// still skipped. Truncated or malformed bytes yield a clear [`CliError::Totp`],
+/// never a panic.
 ///
 /// # Errors
 /// - [`CliError::Totp`] on a malformed varint, an overrunning length, or an
 ///   unknown wire type.
-pub fn decode_migration_payload(buf: &[u8]) -> Result<Vec<MigrationOtp>, CliError> {
-    let mut out = Vec::new();
+pub fn decode_migration_payload(buf: &[u8]) -> Result<MigrationBatch, CliError> {
+    let mut out = MigrationBatch::default();
     let mut pos = 0usize;
     while pos < buf.len() {
         let tag = read_varint(buf, &mut pos)?;
@@ -283,12 +387,12 @@ pub fn decode_migration_payload(buf: &[u8]) -> Result<Vec<MigrationOtp>, CliErro
         match (field, wire) {
             (1, WIRE_LEN) => {
                 let msg = read_len_delimited(buf, &mut pos)?;
-                out.push(decode_otp_parameters(msg)?);
+                out.otps.push(decode_otp_parameters(msg)?);
             }
-            // version / batch_size / batch_index / batch_id — consumed, ignored.
-            (2..=5, WIRE_VARINT) => {
-                read_varint(buf, &mut pos)?;
-            }
+            (2, WIRE_VARINT) => out.version = read_varint(buf, &mut pos)? as i32,
+            (3, WIRE_VARINT) => out.batch_size = read_varint(buf, &mut pos)? as i32,
+            (4, WIRE_VARINT) => out.batch_index = read_varint(buf, &mut pos)? as i32,
+            (5, WIRE_VARINT) => out.batch_id = read_varint(buf, &mut pos)? as i32,
             _ => skip_field(buf, &mut pos, wire)?,
         }
     }
@@ -351,16 +455,21 @@ pub fn encode_migration_payload(params: &[MigrationOtp]) -> Vec<u8> {
 /// The `otpauth-migration://` scheme prefix (case-insensitive on decode).
 const MIGRATION_SCHEME: &str = "otpauth-migration://";
 
-/// Decode an `otpauth-migration://offline?data=<BASE64>` URI into its accounts.
+/// Decode an `otpauth-migration://offline?data=<BASE64>` URI into a
+/// [`MigrationBatch`] — its accounts AND the batch framing.
 ///
 /// Extracts the `data` query parameter, percent-decodes it, then base64-decodes
 /// it tolerantly — accepting standard or URL-safe alphabets, with or without
 /// padding — and parses the resulting `MigrationPayload`.
 ///
+/// ⚠️ One URI is ONE QR code. A large Google Authenticator export spans several,
+/// and this returns only what THIS one carried: check
+/// [`MigrationBatch::is_complete`] before telling a user the transfer is done.
+///
 /// # Errors
 /// - [`CliError::Totp`] on a wrong scheme, a missing `data` parameter, a bad
 ///   base64 body, or a malformed payload.
-pub fn decode_migration_uri(uri: &str) -> Result<Vec<MigrationOtp>, CliError> {
+pub fn decode_migration_uri(uri: &str) -> Result<MigrationBatch, CliError> {
     let trimmed = uri.trim();
     if !trimmed.to_ascii_lowercase().starts_with(MIGRATION_SCHEME) {
         return Err(CliError::Totp(
@@ -494,15 +603,31 @@ pub fn migration_otp_to_entry(otp: &MigrationOtp) -> Result<ImportedOtp, CliErro
 /// Map a [`TotpEntry`] to a [`MigrationOtp`] for export.
 ///
 /// The migration format only expresses SHA1/256/512, 6/8 digits, a fixed 30 s
-/// period, and TOTP; an entry outside that (e.g. 7 digits) is rejected rather
-/// than silently corrupted. The entry's `period` is NOT representable in the
-/// format and is dropped (Google Authenticator TOTP is always 30 s); use the
-/// plain `otpauth://` export to preserve a non-standard period.
+/// period, and TOTP; an entry outside that is REJECTED rather than silently
+/// corrupted.
+///
+/// ⛔ **The period is part of that (Phase 59).** The wire format has no period
+/// field — Google Authenticator TOTP is always 30 s — so an entry with, say, a
+/// 60 s period used to be exported as if it were 30 s. The importing app would
+/// then compute a DIFFERENT CODE from the same secret, i.e. the export was a
+/// silent lie about an account that would simply stop working. It is now refused,
+/// and the error points at the plain `otpauth://` export, which carries `period`
+/// faithfully.
 ///
 /// # Errors
-/// - [`CliError::Totp`] on a bad stored secret, an unknown algorithm, or a digit
-///   count other than 6 or 8.
+/// - [`CliError::Totp`] on a bad stored secret, an unknown algorithm, a digit
+///   count other than 6 or 8, or a period other than
+///   [`TOTP_DEFAULT_PERIOD`] (30 s).
 pub fn entry_to_migration_otp(entry: &TotpEntry) -> Result<MigrationOtp, CliError> {
+    if entry.period != TOTP_DEFAULT_PERIOD {
+        return Err(CliError::Totp(format!(
+            "cannot export {:?} to the Google Authenticator migration format: its period is \
+             {} s and that format can only express {TOTP_DEFAULT_PERIOD} s, so the exported \
+             account would generate the WRONG codes. Use the plain `otpauth://` export \
+             instead — it carries the period",
+            entry.label, entry.period
+        )));
+    }
     let secret = entry.secret_bytes()?;
     let algorithm = match entry.otp_algorithm()? {
         OtpAlgorithm::Sha1 => ALG_SHA1,
@@ -554,9 +679,12 @@ mod tests {
 
     #[test]
     fn golden_google_authenticator_example_decodes_to_documented_values() {
-        let params = decode_migration_uri(GOLDEN_URI).expect("golden decodes");
-        assert_eq!(params.len(), 1, "one account in the golden example");
-        let p = &params[0];
+        let batch = decode_migration_uri(GOLDEN_URI).expect("golden decodes");
+        assert_eq!(batch.otps.len(), 1, "one account in the golden example");
+        // The real Google export is a SINGLE-batch one, so it is complete.
+        assert!(batch.is_complete());
+        assert!(batch.batch_note().is_none());
+        let p = &batch.otps[0];
 
         let mut expected_secret = b"Hello!".to_vec();
         expected_secret.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -621,12 +749,17 @@ mod tests {
 
         let encoded = encode_migration_payload(&originals);
         let decoded = decode_migration_payload(&encoded).expect("decode round-trip");
-        assert_eq!(decoded, originals, "encode->decode must be the identity");
+        assert_eq!(
+            decoded.otps, originals,
+            "encode->decode must be the identity"
+        );
+        assert_eq!(decoded.version, MIGRATION_PAYLOAD_VERSION as i32);
+        assert_eq!(decoded.batch_size, 1);
 
         // And it survives the full URI wrapper (base64 + scheme) too.
         let uri = encode_migration_uri(&originals);
         let via_uri = decode_migration_uri(&uri).expect("uri round-trip");
-        assert_eq!(via_uri, originals);
+        assert_eq!(via_uri.otps, originals);
     }
 
     #[test]
@@ -644,11 +777,171 @@ mod tests {
         let otp = entry_to_migration_otp(&entry).expect("to migration");
         let bytes = encode_migration_payload(std::slice::from_ref(&otp));
         let decoded = decode_migration_payload(&bytes).expect("decode");
-        assert_eq!(decoded.len(), 1);
-        match migration_otp_to_entry(&decoded[0]).expect("back to entry") {
-            ImportedOtp::Totp(back) => assert_eq!(*back, entry),
+        assert_eq!(decoded.otps.len(), 1);
+        match migration_otp_to_entry(&decoded.otps[0]).expect("back to entry") {
+            ImportedOtp::Totp(back) => {
+                // The migration wire format has no field for a Sigil-local entry
+                // id, so the imported entry gets a FRESH uuid — deliberately: it
+                // is a different entry in a different vault. Everything the
+                // format DOES carry must survive byte-identically.
+                assert!(back.uuid.is_some(), "an imported entry gets an id");
+                assert_ne!(back.uuid, entry.uuid);
+                let mut normalized = *back;
+                normalized.uuid = entry.uuid.clone();
+                assert_eq!(normalized, entry);
+            }
             ImportedOtp::SkippedHotp => panic!("should be TOTP"),
         }
+    }
+
+    /// Build a payload the way real Google Authenticator does for one QR of a
+    /// MULTI-QR export: the accounts for this slice plus the batch framing.
+    fn multi_qr_payload(otps: &[MigrationOtp], size: i32, index: i32, id: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for otp in otps {
+            let msg = encode_otp_parameters(otp);
+            write_len_field(&mut out, 1, &msg);
+        }
+        write_varint_field(&mut out, 2, MIGRATION_PAYLOAD_VERSION);
+        write_varint_field(&mut out, 3, size as u64);
+        write_varint_field(&mut out, 4, index as u64);
+        write_varint_field(&mut out, 5, id as u64);
+        out
+    }
+
+    fn sample_otp(name: &str) -> MigrationOtp {
+        MigrationOtp {
+            secret: b"secretbytes".to_vec(),
+            name: name.to_string(),
+            issuer: "Svc".to_string(),
+            algorithm: ALG_SHA1,
+            digits: DIGITS_SIX,
+            otp_type: OTP_TOTP,
+            counter: 0,
+        }
+    }
+
+    // --- ⛔ MULTI-QR EXPORTS ARE NO LONGER SILENTLY TRUNCATED (Phase 59) -----
+
+    #[test]
+    fn batch_framing_is_decoded_not_discarded() {
+        let payload = multi_qr_payload(&[sample_otp("a"), sample_otp("b")], 3, 1, 77);
+        let batch = decode_migration_payload(&payload).expect("decode");
+        assert_eq!(batch.otps.len(), 2);
+        assert_eq!(batch.batch_size, 3);
+        assert_eq!(batch.batch_index, 1);
+        assert_eq!(batch.batch_id, 77);
+        assert_eq!(batch.version, MIGRATION_PAYLOAD_VERSION as i32);
+    }
+
+    #[test]
+    fn a_partial_batch_can_never_read_as_a_whole_import() {
+        // Batch 1 of 3 — what a user scanning the FIRST QR of a 30-account
+        // export gets. Before Phase 59 this returned two entries and nothing
+        // else, and the CLI printed "imported 2" with no warning at all.
+        let batch = decode_migration_payload(&multi_qr_payload(
+            &[sample_otp("a"), sample_otp("b")],
+            3,
+            0,
+            77,
+        ))
+        .expect("decode");
+        assert!(!batch.is_complete(), "batch_size 3 is not the whole export");
+        let note = batch.batch_note().expect("a note is produced");
+        // One-based, names the total, and says what is still missing.
+        assert!(note.contains("batch 1 of 3"), "{note}");
+        assert!(note.contains("2 more QR"), "{note}");
+        assert!(note.contains("PARTIAL"), "{note}");
+
+        // The LAST batch of a multi-QR export is still not, on its own, the
+        // whole export — the other QRs' accounts are not here either.
+        let last =
+            decode_migration_payload(&multi_qr_payload(&[sample_otp("c")], 3, 2, 77)).expect("d");
+        assert!(!last.is_complete());
+        assert!(last.is_final_batch());
+        let note = last.batch_note().expect("note");
+        assert!(note.contains("batch 3 of 3"), "{note}");
+    }
+
+    #[test]
+    fn the_final_batch_does_not_cry_wolf() {
+        // ⛔ THE OBSERVED BUG: importing batch 2 of 2 printed "and 0 more QR
+        // code(s) must be imported … This import is PARTIAL", i.e. it told a
+        // user who had just finished that they had not. A warning that cries
+        // wolf is one the next user ignores when it is real.
+        let last =
+            decode_migration_payload(&multi_qr_payload(&[sample_otp("b")], 2, 1, 9)).expect("d");
+        assert!(last.is_final_batch(), "batch 2 of 2 is the final batch");
+        let note = last
+            .batch_note()
+            .expect("the final batch still says what it was");
+        assert!(note.contains("batch 2 of 2"), "{note}");
+        assert!(note.contains("LAST QR code"), "{note}");
+        // The three claims that were false must all be gone.
+        assert!(!note.contains("0 more QR"), "{note}");
+        assert!(!note.contains("must be imported"), "{note}");
+        assert!(!note.contains("PARTIAL"), "{note}");
+
+        // ...and a genuinely outstanding batch is STILL loud.
+        let first =
+            decode_migration_payload(&multi_qr_payload(&[sample_otp("a")], 2, 0, 9)).expect("d");
+        assert!(!first.is_final_batch());
+        let note = first.batch_note().expect("note");
+        assert!(note.contains("PARTIAL"), "{note}");
+        assert!(note.contains("1 more QR"), "{note}");
+
+        // A single-QR export is neither: it is COMPLETE, and silent.
+        let one =
+            decode_migration_payload(&multi_qr_payload(&[sample_otp("a")], 1, 0, 9)).expect("d");
+        assert!(one.is_complete());
+        assert!(!one.is_final_batch());
+        assert!(one.batch_note().is_none());
+    }
+
+    #[test]
+    fn a_single_batch_export_is_complete_and_silent() {
+        // The common case must not grow a scary warning.
+        let one = decode_migration_payload(&multi_qr_payload(&[sample_otp("a")], 1, 0, 5))
+            .expect("decode");
+        assert!(one.is_complete());
+        assert!(one.batch_note().is_none());
+
+        // …and so must a payload that omits the field entirely (proto3 default).
+        let mut bare = Vec::new();
+        write_len_field(&mut bare, 1, &encode_otp_parameters(&sample_otp("a")));
+        let d = decode_migration_payload(&bare).expect("decode");
+        assert_eq!(d.batch_size, 0);
+        assert!(d.is_complete());
+        assert!(d.batch_note().is_none());
+    }
+
+    // --- ⛔ EXPORT MUST NOT EMIT A LIE ABOUT THE PERIOD (Phase 59) -----------
+
+    #[test]
+    fn migration_export_refuses_a_non_30_second_period() {
+        // The migration wire format has no period field. Exporting a 60 s entry
+        // as if it were 30 s produces an account whose codes are WRONG in the
+        // receiving app — data loss dressed as success.
+        let e = crate::new_totp_entry("acct", None, b"0123456789", OtpAlgorithm::Sha1, 6, 60)
+            .expect("entry");
+        let err = entry_to_migration_otp(&e).expect_err("refused");
+        let msg = err.to_string();
+        assert!(msg.contains("60 s"), "{msg}");
+        assert!(msg.contains("WRONG codes"), "{msg}");
+        // …and it names the export that DOES carry the period.
+        assert!(msg.contains("otpauth://"), "{msg}");
+
+        // The standard 30 s period still exports.
+        let ok = crate::new_totp_entry(
+            "acct",
+            None,
+            b"0123456789",
+            OtpAlgorithm::Sha1,
+            6,
+            TOTP_DEFAULT_PERIOD,
+        )
+        .expect("entry");
+        assert!(entry_to_migration_otp(&ok).is_ok());
     }
 
     #[test]
@@ -746,9 +1039,9 @@ mod tests {
         write_varint_field(&mut payload, 7, 999); // unknown top-level field
 
         let decoded = decode_migration_payload(&payload).expect("skips unknowns");
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].secret, b"secretbytes");
-        assert_eq!(decoded[0].name, "acct");
-        assert_eq!(decoded[0].algorithm, ALG_SHA1);
+        assert_eq!(decoded.otps.len(), 1);
+        assert_eq!(decoded.otps[0].secret, b"secretbytes");
+        assert_eq!(decoded.otps[0].name, "acct");
+        assert_eq!(decoded.otps[0].algorithm, ALG_SHA1);
     }
 }

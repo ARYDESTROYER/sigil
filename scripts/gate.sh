@@ -191,8 +191,29 @@ corepack pnpm -C web build >/dev/null 2>&1 && ok "marketing build" || bad "marke
 
 if [ "$QUICK" != "--quick" ]; then
   note "=== SHELL E2E (dynamically enumerated) ==="
+  # `_*.sh` is a sourced library, not a suite — the shell twin of the node
+  # `*-helper.mjs` rule. This exclusion is repeated in the drift check and the
+  # inventory below and MUST stay identical in all three: an inventory that
+  # counts differently from the runner is the one number whose job is to make a
+  # missing suite visible, being wrong.
   for s in cli/tests/*.sh; do
-    if ./"$s" >/dev/null 2>&1; then ok "$(basename "$s")"; else bad "$(basename "$s")"; fi
+    case "$(basename "$s")" in _*) continue;; esac
+    ./"$s" >/dev/null 2>&1
+    rc=$?
+    case "$rc" in
+      0) ok "$(basename "$s")" ;;
+      # 137 = SIGKILL, 143 = SIGTERM. The script did not FAIL — it was KILLED, by
+      # an OOM killer, a sandbox, or a CI step timeout, usually with no output
+      # because stdout was still block-buffered. Reporting that as a test failure
+      # sends the next person hunting a bug in code that is fine: it happened here
+      # on 2026-07-30 and cost a real detour before `exit=0 in 21s` outside the
+      # sandbox settled it. ⚠️ It still FAILS the gate — "could not be run" is not
+      # "passed", and auto-retrying would just hide the flakiness.
+      137|143) bad "$(basename "$s") was KILLED (signal $((rc-128))), not failed — no result.
+      Nothing is proven either way. Usual causes: memory pressure, a sandbox, or a
+      step timeout. Re-run it alone before believing it is broken." ;;
+      *) bad "$(basename "$s") (exit $rc)" ;;
+    esac
   done
 fi
 
@@ -209,9 +230,67 @@ for t in sigil-wasm/test/*.mjs; do
 done
 for s in cli/tests/*.sh; do
   b=$(basename "$s")
+  case "$b" in _*) continue;; esac
   grep -qF "$b" .github/workflows/*.yml || { bad "no workflow runs $b"; missing=1; }
 done
 [ "$missing" -eq 0 ] && ok "every node interop suite and shell e2e script is named in a workflow"
+
+# ⚠️ NAMING A SUITE IS NOT ENOUGH — THE WORKFLOW MUST ALSO BE TRIGGERED.
+# Every workflow here has `paths:` filters, so a workflow can name a suite and
+# still never run it for the change that breaks it. Found on 2026-07-30:
+# `desktop.yml` and `web.yml` each boot a REAL sigild (server_interop.rs,
+# cors.spec.ts) while neither triggered on `sigild/**`, so a server change that
+# broke a client contract would have run neither suite.
+trigger_ok=1
+python3 - <<'PY' || trigger_ok=0
+import glob, os, re, sys, yaml
+
+def suite_files(wf_text):
+    """Test entry points a workflow runs, resolved to files on disk."""
+    out = set()
+    for m in re.finditer(r'(sigil-wasm/test/[\w.-]+\.mjs|cli/tests/[\w.-]+\.sh)', wf_text):
+        out.add(m.group(1))
+    # `cargo test --manifest-path X/Cargo.toml` exercises every integration test
+    # under that workspace, which is how desktop reaches server_interop.rs.
+    for m in re.finditer(r'--manifest-path\s+(\S+)/Cargo\.toml', wf_text):
+        out.update(glob.glob(os.path.join(m.group(1), '**', 'tests', '*.rs'), recursive=True))
+    # A bare `cargo test` in a workflow that checks out one workspace dir.
+    for m in re.finditer(r'working-directory:\s*(\S+)', wf_text):
+        out.update(glob.glob(os.path.join(m.group(1), '**', 'tests', '*.rs'), recursive=True))
+    # Playwright specs are named by their project dir, not individually.
+    for m in re.finditer(r'--filter\s+(webapp|@sigil/\S+)', wf_text):
+        out.update(glob.glob('web/apps/webapp/tests/*.ts'))
+    if 'extension/build.sh' in wf_text or '-C extension' in wf_text:
+        out.update(glob.glob('extension/tests/*.mjs'))
+    # normpath: the same file can arrive as both "x/y.rs" and "./x/y.rs" from
+    # different patterns, which would report every finding twice.
+    return {os.path.normpath(f) for f in out if os.path.isfile(f)}
+
+bad = 0
+for wf in sorted(glob.glob('.github/workflows/*.yml')):
+    text = open(wf).read()
+    doc = yaml.safe_load(text)
+    on = doc.get('on') or doc.get(True) or {}
+    if not isinstance(on, dict):
+        continue
+    push = on.get('push')
+    if not isinstance(push, dict) or 'paths' not in push:
+        continue  # triggers on everything; nothing to check
+    paths = set(push['paths'])
+    for f in suite_files(text):
+        # Which component does this suite actually need built?
+        src = open(f, encoding='utf-8', errors='replace').read()
+        if 'cmd/server' in src and 'sigild/**' not in paths:
+            print(f"  ✗ {wf} runs {f}, which builds a real sigild, "
+                  f"but does not trigger on sigild/**")
+            bad = 1
+sys.exit(bad)
+PY
+if [ "$trigger_ok" -eq 1 ]; then
+  ok "every workflow that boots a real sigild triggers on sigild/**"
+else
+  bad "a workflow runs a real-sigild suite it is not triggered for (see above)"
+fi
 
 note "=== INVENTORY (a suite missing from this list is a suite nobody runs) ==="
 printf '  rust crates:      %s\n' "$(ls -d libsigil cli sigil-wasm desktop | tr '\n' ' ')"
@@ -219,7 +298,7 @@ printf '  go test pkgs:     %s\n' "$(find sigild -name '*_test.go' | sed 's|/[^/
 # Must use the SAME exclusion as the runner loop and the drift check, or the one
 # number whose job is to make a MISSING suite visible is itself wrong.
 printf '  node interop:     %s\n' "$(ls sigil-wasm/test/*.mjs | grep -vE '/(fake-|[^/]*-helper\.mjs)' | grep -c .)"
-printf '  shell e2e:        %s\n' "$(ls cli/tests/*.sh | wc -l | tr -d ' ')"
+printf '  shell e2e:        %s\n' "$(ls cli/tests/*.sh | grep -vc '/_')"
 printf '  playwright specs: %s\n' "$(find web extension -name '*.spec.ts' -o -name '*.spec.mjs' | grep -vc node_modules)"
 
 [ "$fail" -eq 0 ] && note "

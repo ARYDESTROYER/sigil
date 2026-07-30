@@ -4,12 +4,14 @@ on:
   push:
     paths:
       - "web/**"
+      - "sigild/**"
       - "sigil-wasm/**"
       - "libsigil/**"
       - ".github/workflows/web.yml"
   pull_request:
     paths:
       - "web/**"
+      - "sigild/**"
       - "sigil-wasm/**"
       - "libsigil/**"
       - ".github/workflows/web.yml"
@@ -80,6 +82,12 @@ jobs:
           cache-dependency-path: sigild/go.sum
       - run: pnpm install --frozen-lockfile
       - run: corepack pnpm --filter @sigil/wasm build
+      # ⚠️ ALSO the NODE-target wasm package. tests/schema.spec.ts opens the app's
+      # SEALED container in the TEST process — the only way to prove that a real
+      # UI edit preserved fields the app does not understand — and `@sigil/wasm`
+      # is a BUNDLER-target package that Node cannot require. Without this step
+      # that spec fails to import and the product-level guard is gone.
+      - run: ../sigil-wasm/build-wasm.sh
       - run: corepack pnpm --filter webapp typecheck
       - run: corepack pnpm --filter webapp lint
       - run: corepack pnpm --filter webapp build

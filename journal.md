@@ -11,8 +11,31 @@ Conventions: ✅ done & verified · 🟡 in progress · ⛔ deferred (out of 72h
 
 ## ⭐ RESUME ANCHOR — state of play (keep current; read this first)
 
-**Where we are (through Phase 58; Phase 58 is complete and fully gated but UNCOMMITTED in
-the working tree — `main` is at `2f3ff93`, which is Phase 57).**
+**Where we are (through Phase 59). `main` is at `4f1f14e` — a CI repair. Phase 58 is
+COMMITTED at `d15030a`. Phase 59 and a CI-portability repair are complete, gated and
+UNCOMMITTED in the working tree.**
+
+⚠️ **This paragraph was stale for two phases** — it still claimed Phase 58 was uncommitted
+and `main` was at `2f3ff93` (Phase 57) long after Phase 58 landed, and a fact-checking pass
+on 2026-07-30 caught it. Its own heading says *keep current*, and it is the first thing any
+new session reads, so a wrong anchor mis-orients everything downstream. **Update it in the
+same commit as the work it describes.**
+
+**2026-07-30 — CI REPAIR (two rounds, both from red GitHub Actions rather than from a local
+signal).** Round one: `govulncheck` flagged **GO-2026-5970** in `golang.org/x/text` v0.29.0,
+reachable through `pgx` (bumped to v0.39.0), and `cargo-audit(desktop)` had **never once
+passed** because `rustsec/audit-check@v2` fails on *warnings* and the Tauri tree carries 17
+of them with **zero vulnerabilities** — replaced with `cargo audit --deny warnings` plus a
+checked-in `desktop/.cargo/audit.toml` naming each accepted advisory, its owner and the
+condition that removes it. Round two: the **`interop` workflow had been RED for several
+phases** — six node suites hardcoded `/opt/homebrew/bin/go` and two shell proofs used a
+`stat -f … || stat -c …` idiom that **GNU stat does not fail on**. ⭐ **The root cause of
+both rounds is the same:** `scripts/gate.sh`'s coverage was a **strict subset of CI's**, and
+every suite is written on macOS and run on Linux with nothing checking that the two agree.
+
+**PHASE 59 — see the dated entry near the end of this file.** A hostile container header was
+a remote DoS; a browser edit silently weakened the KDF of a CLI-written vault; and the vault
+schema could not change without an older client deleting a newer one's data.
 
 **PHASE 58 — PASSKEYS, PROTECTING THE BROWSER CLIENTS AT REST (ADR 0046).** Both browser
 clients sealed their two `SIGILcli` containers under a **human password alone** — the weak
@@ -9175,18 +9198,35 @@ prints the path and sha).
 - ⚠️ **Passkey protection exists on ONE of four clients.** The extension and the desktop are
   unprotected at rest by comparison, and the extension case is **scope, not a blocker**.
 - ⚠️ **Well-formed vault-id squatting is still unbounded** — no per-account claim budget.
-- **`sigild migrate adopt`'s transaction is real but untested.**
-- ⚠️ **`scripts/gate.sh --quick` still does not do what its usage line says** (it skips the
-  shell e2e but starts the throwaway Postgres regardless).
+- ~~**`sigild migrate adopt`'s transaction is real but untested.**~~ ⚠️ **STALE — CORRECTED
+  2026-07-30.** `sigild/internal/store/adopt_test.go` holds **three** tests:
+  `TestAdoptOrphanAccountsRepairsARolledBackWrite`,
+  `TestAdoptOrphanAccountsIsANoOpOnACleanDatabase` and
+  `TestUnresolvableOwnerGrantIsRefusedThenRepairable`.
+- ~~⚠️ **`scripts/gate.sh --quick` still does not do what its usage line says**~~ ⚠️ **STALE
+  — CORRECTED 2026-07-30.** The usage line reads *"--quick skips ONLY the shell e2e
+  scripts"*, and the seven lines directly beneath it explain why Postgres is deliberately
+  not skipped. The script and its documentation agree; it was this item, and the matching
+  paragraph in CLAUDE.md, that were wrong.
 - ⚠️ **The `isVisible` race is understood but not fully explained** — an independent verifier
   ran the offending spec verbatim and it passed, so a timing component cannot be ruled out.
   The hazard is removed from the suites either way.
-- **The stale code comments survive yet another documentation-only phase:**
-  `sigild/internal/api/audit.go` (and `metrics.go`, `ratelimit.go`) still describe a
-  **webhook** rate-limit surface that ADR 0041 **removed**; `cmd/server/main.go` and
-  `router.go` still say the enroll limiter "rejects before the body is read"; and
-  `abuse_test.go`'s header still contradicts its own assertions. `docs/api.md` and
-  `docs/deployment.md` document the real behaviour and are the authority.
+- ~~**The stale code comments survive yet another documentation-only phase**~~ ⚠️ **STALE —
+  CORRECTED 2026-07-30.** Every clause of that item was checked and **none of it is true
+  any more**: `ratelimit.go:163` opens with *"⛔ A THIRD LIMITER, ON POST
+  /v1/billing/webhook/{provider}, WAS REMOVED"*, which is the correct current statement;
+  `metrics.go:211` says *"There is deliberately NO 'rate_limited' value"* for the same
+  reason; `audit.go` describes only the two limiters that exist; no "rejects before the
+  body is read" text survives in `cmd/server/main.go` or `router.go`; and `abuse_test.go`'s
+  header does not contradict its assertions.
+
+⚠️ **THE POINT OF THOSE TWO STRIKETHROUGHS, because it is a failure mode and not a
+footnote.** Four claims in an **open-items list** were false, and a stale *open* item is
+worse than a stale status line: a status line misinforms a reader, while an open item
+**directs the next person's work at something already finished** — the most expensive kind
+of wrong. This is entry-6 territory in `docs/engineering-lessons.md`
+("documentation that was true when written"), now with a second habitat. ➡️ **Re-verify the
+"still open" list at the start of a phase, not only when writing one.**
 - **Everything remains dev-gated, plain HTTP, pre-audit and UNAUDITED.** Billing has still
   never been run against a live provider account. Do not store real secrets.
 
@@ -9276,3 +9316,466 @@ Both were mine, both were caught before commit, and both are the house failure m
   nothing ships from it — but `gate.sh` deliberately refuses to scan with it.
 - The GTK acknowledgements become **real, not theoretical, the day a Linux desktop build
   becomes real.** That is written into `desktop/.cargo/audit.toml`.
+
+## 2026-07-30 — Phase 59 (a hostile container header was a remote DoS; a browser edit silently weakened your KDF; and the vault schema could not change without losing data)
+
+**Where this started.** Not with a failing test. With a read of the container-parsing
+and re-sealing paths end to end, asking one question: *what do we believe just because
+the bytes said so?* Three answers came back, and they are one sentence — **a `SIGILcli`
+container is self-describing, and until now every client believed everything it
+described.**
+
+Everything below is client-side. ⭐ **`sigild` was not modified at all** — no route, no
+header, no canonical message, no migration, no table, no metric, no dependency, no
+`sigild_schema_version` bump. It still has exactly one direct Go dependency.
+
+---
+
+### 1. ⛔ The Argon2 parameters in the header were an unbounded instruction from a stranger
+
+A `SIGILcli` header (ADR 0020) carries `m_cost` / `t_cost` / `p_cost` as three raw
+`u32`s. They are **inputs to the KDF**, so they cannot live inside the AEAD — they are
+unauthenticated plaintext framing, written by whoever produced the bytes. Every client
+parsed them and handed them to Argon2id, which **allocates `m_cost` KiB in one block
+before doing any work.**
+
+**Measured here** (macOS arm64, 24 GB RAM, `argon2` 0.5.3 — the exact crate `sigil-core`
+links), driving the KDF directly:
+
+| header says | what happened |
+|---|---|
+| `m_cost = 0xFFFF_FFF0` (≈ 4 TiB), `t=1`, `p=1` | **12.57 s real**, **peak memory footprint 90,364,919,264 bytes (≈ 90 GB)** on a 24 GB machine, then the process was **killed**. No error, no return. |
+| `t_cost = 0xFFFF_FFF0`, `m = 19456` | allocates nothing, and does not return in any useful sense: **1 000 passes measured 5.68 s**, so 4 294 967 280 passes extrapolates to **≈ 282 days** for ONE open attempt |
+| after the fix, same 4 TiB container, through the **real `sigil` binary** | **0.00 s real, 1.18 MB peak footprint**, typed refusal naming the values and the limits |
+
+⛔ **The delivery path is the thing we are proudest of.** Containers reach a client
+through `sigild`'s op-log, which is **zero-knowledge by design**: it stores opaque
+blobs, returns them verbatim, and **cannot inspect or filter what it relays**. So the
+property that makes the server safe is exactly the property that stops it defending
+anyone here. Anyone who can write to a vault's op-log — a revoked-but-not-yet-rotated
+device, a co-tenant of a shared vault, a breached server — could park a container in it
+that kills every client that pulls, on every device at once, and keep a user away from
+their own 2FA codes.
+
+**The fix:** `Argon2Params::MAX_M_COST` = 262 144 KiB (256 MiB), `MAX_T_COST` = 16,
+`MAX_P_COST` = 16, a `validate()`, and a new `KdfError::ParamsTooLarge` — in
+`sigil-core`, checked in `derive_master_key` **first thing**, and checked **earlier
+still** by both container parsers so the failure is reportable as *"this container is
+hostile"* (`CliError::ParamsOutOfRange`) rather than as a generic KDF error. A user has
+to be able to tell that apart from a typo'd password.
+
+**Why 256 MiB, in order of what constrained it:** nothing that opens today may stop
+opening (it is **4×** `RECOMMENDED`'s 64 MiB and **≈13×** the browsers' 19 MiB); it must
+leave headroom to raise the work factor several times without a format break (the bound
+is **inclusive**); it must not cap us below OWASP's highest current Argon2id
+recommendation; and ⭐ **it must be survivable by the weakest client that has to open the
+vault, not by a developer laptop** — a mobile tab or an MV3 page that asks for a gigabyte
+is killed by the platform, and a user whose phone cannot open their vault is locked out
+just as surely as by a crash. The bounded worst case (256 MiB × 16 × 16) measured
+**1.64 s**.
+
+⭐ **A ceiling only, no floor.** A low work factor is a *weak* container, not a
+*dangerous* one, and refusing to open it would destroy data rather than protect it. The
+anti-downgrade rule belongs where new parameters are chosen — which is the next section.
+
+---
+
+### 2. ⭐ A single browser edit silently cut a CLI-written vault's KDF cost by 3.4×
+
+A re-seal is the operation that **chooses** new work factors. The Rust clients have
+ratcheted since Phase 58 (`sigil_cli::reseal_container`). The JavaScript clients had
+**no equivalent at all**: every browser re-seal wrote a hardcoded
+`{ m_cost: 19456, t_cost: 2, p_cost: 1 }` without ever reading the header it was
+replacing.
+
+Verified by dumping real bytes: `sigil seal` writes `Argon2Params::RECOMMENDED` —
+**65536 / 4 / 2**. So a vault written on the laptop and edited **once** in the browser
+came back at **19456 / 2 / 1**: a **3.4× cut in memory cost and half the passes**,
+silently, with no user action and no error. And because a re-seal is where parameters
+are chosen, the weakening was **permanent** until something else raised it.
+
+The same shape is an attack, not only an accident: get **one** weak container accepted —
+say `m_cost = 8` — and that weakness survives every subsequent re-seal, forever.
+
+**The fix, and the part that matters:** `Argon2Params::no_downgrade(existing, requested)`
+— the componentwise maximum, with Argon2's `m_cost >= 8 * p_cost` floor honoured —
+**lives in `sigil-core` and is not mirrored.** `sigil_cli::no_downgrade` delegates to it;
+two new wasm exports (`container_params`, `reseal_params`) reach it from JavaScript;
+`totp-vault.mjs` wraps them as `containerParams` / `ratchetParams`; and both browser
+clients route **every** re-seal through a `sealParams(storageKey)` helper.
+
+⚠️ **A mirrored copy would have been the wrong answer here specifically, because a drift
+downward is invisible** — it produces a container that still opens everywhere, just
+weaker. There is nothing to notice, ever.
+
+---
+
+### 3. The vault schema could not change without a flag day *or* data loss
+
+`TotpVault` / `TotpEntry` is mirrored across four clients plus a printed recovery kit,
+and vaults sync through an op-log where **the oldest writer wins**. Two rules made that a
+trap: `version != 1` was **refused outright**, so any addition was a four-client flag
+day; and **neither side preserved fields it did not know** — serde dropped them, the JS
+clients rebuilt `{ version, entries }` by hand. So an old client that merely **opened and
+re-sealed** a vault **deleted a newer client's data**, then pushed the stripped copy over
+it. There was no third option: either nothing could ever be added, or adding it meant
+silent loss for anyone not yet upgraded.
+
+**The fix, additively:**
+
+- `#[serde(flatten)] extra` on **both** structs; an explicit rest-spread plus a new
+  `cloneVault()` in JS. ⚠️ **Easy to defeat by accident, and both browsers were defeating
+  it** — their `withVault` helpers hand-rebuilt the object. Both now call `cloneVault`.
+- **`min_reader_version`, separate from `version`.** `version` says *what wrote this*;
+  `min_reader_version` says *what a reader must understand*. Refuse iff
+  `(min_reader_version ?? version) > TOTP_VAULT_READER_VERSION`. An additive future
+  vault (`version: 2, min_reader_version: 1`) opens **and round-trips losslessly**; a
+  genuinely incompatible one is refused **precisely**, naming the version needed. ⭐ It
+  **fails closed**: a v2 vault that forgets to state the field gets the old conservative
+  refusal.
+- A stable per-entry **`uuid`** (RFC 4122 v4 from caller-supplied entropy — ADR 0007
+  discipline on both sides). ⚠️ **Nothing keys off it yet**; every lookup is still by
+  `label`, deliberately. This only makes that change possible later.
+- Byte-shape compatibility is **asserted**: `TotpVault::default()` still serializes to
+  exactly `{"version":1,"entries":[]}`.
+
+ADR **0047** covers §1–§3.
+
+---
+
+### 4. ⛔ Passkey user verification was computed and never enforced (ADR 0046 addendum)
+
+CTAP 2.1's `hmac-secret` keys **two independent secrets per credential** —
+`CredRandomWithUV` and `CredRandomWithoutUV` — and the authenticator picks between them
+by whether the ceremony **verified a user**. `evaluatePrf` read the `userVerified` flag,
+returned it, and **used the PRF output regardless**. A `UV = false` ceremony therefore
+yields a *different, equally valid-looking* 32 bytes.
+
+The consequence is precisely the lockout ADR 0046 exists to prevent: at **enable** the
+hardware slot gets sealed under the wrong secret; at **unlock** the slot then refuses,
+and — because an AEAD tag cannot distinguish a wrong password from a different key — the
+user holding a **working passkey** and the **correct password** is told *"wrong password
+or a different passkey"* and pushed onto the recovery sheet.
+
+⛔ **The two-assertion determinism probe cannot catch it.** Both probe assertions share
+one UV state, so they agree with each other and the credential looks perfectly healthy.
+It is invisible to the exact control designed to catch unstable PRF output.
+
+Now refused with its own code (`uv_missing`), checked **before the PRF bytes are looked
+at**, at the one choke point both enable and unlock already go through — and
+`explainPasskeyStatus` gained an arm that says the passkey is fine, the password may be
+fine, and the fix is a **real action the user can take**. ⚠️ **ADR 0046's limitation 8
+still stands**: we cannot verify that a human was verified, and a lying authenticator is
+still undetectable. What is guaranteed is narrower — **we never seal under, or try to
+open with, a secret from the wrong hmac-secret slot.**
+
+A second, smaller correction in the same file: `evaluatePrf` now returns the **real
+`authenticatorAttachment`** from the ceremony. The webapp's unlock path had been
+*inferring* it as `backupEligible ? "" : "platform"`, which told every holder of a
+**non-syncing security key** that their second factor lived *"on this device only"* — the
+opposite of true, and the opposite of useful when the sentence answers *"what do I have to
+keep safe?"*. Same class of defect as the flag we were not enforcing: a value read from a
+**proxy** instead of the **source**.
+
+⚠️ **Why this is a Node test and not a Playwright one.** Chrome's CDP virtual
+authenticator **cannot produce the failure**: with `userVerification: "required"` it
+either verifies or the ceremony fails outright, so *"completed but unverified"* is
+unreachable through the real API. The Playwright passkey suite could not have covered
+this branch at any size, and did not. `sigil-wasm/test/passkey-uv-interop.mjs` drives the **shipped**
+`evaluatePrf` over a stubbed `navigator.credentials`. ⚠️ **That double is deliberately
+more permissive than any real authenticator** — the point — so a PASS there is evidence
+about **our check**, not about any browser.
+
+---
+
+### 5. Two things the import/export path was saying that were not true
+
+- **A multi-QR Google Authenticator import reported plain success.** Both codecs consumed
+  `batch_size` / `batch_index` / `batch_id` and threw them away, so scanning the **first
+  QR of a three-QR export imported a third of the accounts** and said so as if it were all
+  of them — hitting exactly the users with the most to lose, in the one feature whose
+  entire purpose is not losing accounts. The framing is now decoded (`MigrationBatch` in
+  Rust, a batch object in JS) and surfaced by **all four clients**.
+- **A `--migration` export of a non-30-second entry was a silent lie.** The wire format has
+  no period field, so a 60 s entry was exported as if it were 30 s and the receiving app
+  computes **different codes from the same secret** — an account that simply stops working.
+  Now refused, pointing at the plain `otpauth://` export that carries the period, with a
+  new CLI **`--skip-unsupported`** so one unrepresentable account no longer costs the user
+  the entire bulk-export path (refusal stays the **default**; the skip is loud, itemised
+  and on stderr).
+
+---
+
+### ⚠️ THE MISTAKE THIS PHASE MADE, and it is entry #9 again
+
+An independent verifier reverted the **product** half of two fixes and **the entire gate
+stayed green.**
+
+- `authenticator.tsx`'s `cloneVault(vault)` put back to
+  `{ version: vault.version, entries: [...vault.entries] }` — verbatim the pre-Phase-59
+  shape. Green: **webapp 50/50, extension 14/14**, and the Rust↔JS schema interop passed.
+- Five of the **six** sealing call sites put back to the bare `ARGON2` constant. Green
+  again.
+
+Mutating the **same** logic inside `totp-vault.mjs` and `passkey.mjs` went red every
+time. So the **module** was guarded and the **product** was not — and the fix in the
+shipping app was, at that moment, deletable without a single red light.
+
+That is [`docs/engineering-lessons.md`](docs/engineering-lessons.md) entry **#9**
+recurring **inside the commit that added the document**. It is now entry **#10**, in its
+own words.
+
+**Three new guards, at the level that can actually see it:**
+
+| file | what it pins |
+|---|---|
+| `web/apps/webapp/tests/schema.spec.ts` | seeds a vault whose stored JSON carries fields this build has never heard of, drives a **real edit through the real UI**, then **decrypts what the app actually wrote** |
+| `extension/tests/schema.spec.mjs` | the same property through the **real unpacked extension** |
+| `sigil-wasm/test/seal-params-guard.mjs` | a **source-structure** guard: enumerates every sealing call site in the two shipping browser sources and fails unless each is passed `sealParams(...)` — and fails if it finds **zero**, because a guard that checks nothing is worse than no guard |
+
+⚠️ **The seal guard is deliberately structural, and that is a limitation, not a boast.**
+Behavioural coverage for all six sites would mean driving an enrolled device and a passkey
+ceremony through two browsers for each one. This buys the regression guard for the failure
+that actually happens — a **new** call site written later that forgets — in the same shape
+as the AST guard already pinning `sigild`'s entitlement call sites. It proves each site
+*passes* `sealParams`; it does **not** prove `sealParams` is correct.
+
+Plus `sigil-wasm/test/schema-interop.mjs` — **10 proofs**, driving the **real `sigil`
+binary** as the Rust half, covering the vault schema, `min_reader_version`, entry ids, the
+batch framing both ways, the period refusal, `--skip-unsupported`, the hostile-header
+refusal on both sides, and the JS ratchet against the CLI's own rekey.
+
+---
+
+### Verification
+
+Re-run first-hand during the documentation pass, not taken on trust:
+
+| suite | result |
+|---|---|
+| `cargo test libsigil` | **141 pass, 0 fail** (122 + 19) |
+| `cargo test cli` | **112 pass, 0 fail** (107 + 2 + 3) |
+| `cargo test sigil-wasm` | **34 pass, 0 fail** (was 29) |
+| `cargo test desktop` | **32 pass, 0 fail** (25 unit + 1 `cli_interop` + 6 `server_interop`) |
+| `node sigil-wasm/test/schema-interop.mjs` | **PASS** — 10 proofs |
+| `node sigil-wasm/test/passkey-uv-interop.mjs` | **PASS** — 4 proofs |
+| `node sigil-wasm/test/seal-params-guard.mjs` | **PASS** — 6 sealing call sites across 2 product sources |
+| `playwright --list` (webapp) | **50 tests in 10 files** |
+| `playwright --list` (extension) | **14 tests in 6 files** |
+
+The DoS numbers in §1 were re-measured from scratch here with a standalone probe against
+`argon2` 0.5.3 and with the real `sigil` binary, rather than repeated from the build
+phase's notes. `sigild` is untouched (`git diff --stat sigild/` is empty), which is why
+[`docs/api.md`](docs/api.md) needed no change — **checked, not assumed.**
+
+---
+
+### ➡️ Still open — the honest list
+
+1. ⛔ **The ceiling removes nothing.** `sigild` still relays a hostile container; by design
+   it cannot know what it is relaying. There is no delete-op route and no client-side
+   quarantine, so the bad blob **stays in the op-log** and every client that pulls parses
+   and refuses it **again, every time**. What changed is the cost of the refusal, not the
+   fact of it.
+2. ⚠️ **The ratchet makes a bounded cost persistent.** A container accepted at exactly
+   `256 MiB / 16 / 16` — legal, and 1.64 s per open — has that cost preserved **forever**,
+   because the rule is a maximum and never a reset. Small, bounded, and not reversible
+   without a new flow. That is the accepted price of choosing "max".
+3. ⛔ **The ratchet does NOT cover every write.** `sigil totp <add|import|remove|…>` saves
+   through `save_vault(…, Argon2Params::RECOMMENDED)` and the desktop through
+   `seal_vault(…, self.params)`; **neither reads the existing container.** Today that
+   cannot downgrade anything, because `RECOMMENDED` (64 MiB) *is* the strongest thing
+   anything here writes. **But "strength only goes up" is therefore true of the browsers
+   and of re-keys, and not globally true of this system** — the day any client writes above
+   64 MiB, a `sigil totp add` will silently lower it.
+4. ⚠️ **`min_reader_version` is a promise a *writer* must keep**, and nothing enforces it.
+   A future client that makes a breaking change while leaving the field at 1 will be
+   misread by old clients, silently. The fail-closed default only covers the field being
+   **absent**.
+5. ⚠️ **`extra` preserves bytes, not semantics.** An old client can round-trip a field it
+   does not understand while behaving inconsistently with it — preserving
+   `"archived": true` and still showing the code.
+6. ⚠️ **The entry `uuid` is dead weight today** — written, mirrored, tested, used by
+   nothing. Uniqueness is unenforced, and an `otpauth://` or migration round-trip mints a
+   fresh one (those formats carry no id).
+7. ⚠️ **The period refusal has an escape hatch in exactly one client.** The CLI got
+   `--skip-unsupported`; the **webapp, extension and desktop call the encoder over the
+   whole vault**, so for them one 60 s entry now makes the migration export fail
+   **wholesale** where it previously produced a wrong one. Right direction, unanswered
+   usability regression.
+8. ⚠️ **ADR 0046 limitation 8 is narrowed, not retired.** We still cannot verify that a
+   human was verified.
+9. ⚠️ **`ratchetParams` fails open** on a container it cannot parse — deliberate, so a
+   corrupt stored value never blocks a save, but it means a damaged header silently loses
+   the ratchet for that write.
+10. ⚠️ Everything here is **UNAUDITED**, pre-audit and dev-only. A bound chosen by
+    measurement on one machine is a bound chosen by measurement on one machine.
+
+---
+
+## 2026-07-30 — CI repair, round two: the `interop` workflow had been red for phases, and the gate could not see it
+
+**Trigger.** Fixing the two `security` jobs put a green tick next to `security` — and made
+the *rest* of the run visible. `interop` had been **failing on every commit since at least
+`ab37e05` (Phase 56)**: three of its four jobs red, on work this repo describes as its
+proof of cross-client correctness. Nobody had looked, because the local gate said ALL GREEN
+and the red job was one line further down a page nobody scrolled.
+
+### What was actually broken — two idioms, both invisible on macOS
+
+**1. Six node suites hardcoded the Homebrew Go path.**
+
+```
+FAIL: could not build sigild: spawnSync /opt/homebrew/bin/go ENOENT
+```
+
+`sync-interop`, `sharing-interop`, `totp-interop`, `device-auth-interop`,
+`recovery-interop` had a bare `const goBin = "/opt/homebrew/bin/go"`;
+`entitlement-interop` and `pinning-interop` had `process.env.GO ?? "…"` with **no PATH
+lookup**. ⭐ `accounts-interop` was the only one with a fallback — **which is exactly why
+the accounts job was the one that passed while its neighbours failed.**
+
+⚠️ **This is the THIRD appearance of this defect.** `desktop/core/tests/server_interop.rs`
+solved it properly with `resolve_go()` and CLAUDE.md calls that "the pattern";
+`cors.spec.ts` was missing the PATH lookup and **`test.skip`ped itself** in CI — worse,
+because a skipped spec and a green job are indistinguishable. The pattern was written down
+and never made reusable, so every new suite re-derived it and some got it wrong. Now there
+is **one** implementation: `sigil-wasm/test/go-helper.mjs` (`$GO` → PATH →
+`/usr/local/go/bin/go` → Homebrew), and it **throws rather than skipping**.
+
+**2. Two shell proofs used a `stat` fallback that does not fall back.**
+
+```bash
+mode="$(stat -f '%Lp' "$p" 2>/dev/null || stat -c '%a' "$p")"
+```
+
+That reads as "try BSD, fall back to GNU". It is not. In GNU coreutils **`-f` means
+`--file-system` and does not fail** — the format string is consumed as a *file argument*
+and the real path is reported as filesystem status, on stdout, exit 0. Reproduced on
+`ubuntu:24.04`:
+
+```
+mode=[  File: "/tmp/x"
+    ID: 1e0af95adc552b5b Namelen: 255     Type: overlayfs
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 238733024  Free: 229665120  Available: 217519805
+Inodes: Total: 60710912   Free: 59225470
+700]
+```
+
+— the GNU dump **and** the fallback's answer, concatenated, so `[[ "$mode" == "700" ]]`
+failed and the proof reported a permissions violation that did not exist. ⭐ **The fix
+probes GNU FIRST**, because BSD `stat` has no `-c` and fails cleanly, making that direction
+unambiguous where the other is not. Now `filemode()` in a new `cli/tests/_e2e-lib.sh`,
+which also absorbs the Go resolution the three scripts each had their own copy of.
+
+### The controls added, all mutation-proven
+
+- **`sigil-wasm/test/portability-guard.mjs`** — asserts every Go-spawning suite imports
+  `resolveGo`, that no suite carries a literal Homebrew path, that no e2e script calls
+  `stat` directly, and that `cors.spec.ts` keeps its PATH lookup. Mutation: reinstating
+  either original idiom turns it red naming the file and the line. ⚠️ It flagged **itself**
+  on first run (a source guard necessarily quotes the patterns it hunts), so `*-guard.mjs`
+  is excluded from that one scan — narrowly, and it says so.
+- **`scripts/gate.sh` now checks workflow TRIGGERS, not just workflow mentions.** The old
+  drift check asserted every suite was *named* in some workflow. But every workflow has
+  `paths:` filters, so a workflow can name a suite and still never run it for the change
+  that breaks it. Found: **`desktop.yml` and `web.yml` each boot a REAL `sigild`**
+  (`server_interop.rs`, `cors.spec.ts`) **while neither triggered on `sigild/**`** — a
+  server change that broke a client contract would have run neither. Both fixed; the check
+  is mutation-proven.
+- `_*.sh` joins `fake-*` / `*-helper.mjs` as a non-suite, in **all three** places gate.sh
+  enumerates (runner, drift check, inventory) — a mismatch there was itself a past bug.
+
+### ⚠️ My own mistakes this round
+
+- **I read a stale file as CI output.** `curl -s` failed silently and left an earlier local
+  run in the scratchpad; I nearly concluded the sharing job "passed but the step failed"
+  from macOS paths (`/Users/ary/…`) in what I believed was an ubuntu log. Caught by looking
+  at the content instead of the filename. Re-fetched with `-w '%{http_code}'` to a fresh
+  directory.
+- **Two bugs in the security block I had just written**, found by running it in isolation:
+  `cargo-audit` reported "not installed" where it *was* installed (`$HOME/.cargo/bin`
+  missing from `PATH`), and a failed `cd sigild` printed `0 vulnerability(ies)` — a count
+  computed from an empty string. An empty scanner result is now an explicit failure.
+- **I reported three e2e scripts as failing when they had not.** Run back-to-back in one
+  background task, two were **SIGKILLed** (exit 137) under memory pressure from concurrent
+  Docker and cargo work, and because stdout was block-buffered to a file they produced
+  **zero lines** — a failure that looked like my change. Re-run individually: accounts 0
+  (14 s), recovery 0 (43 s), sharing 0.
+- **`grep -c '#[tauri::command]'` returned 41 against a documented 40.** The extra is a
+  mention inside a doc comment. This is the *same* inflated-grep mistake as a previous
+  32-vs-31 incident. The count is 40 attributed and 40 registered.
+
+### ✅ Verified on REAL Linux — the first time this repo has done so
+
+Every CI mirror in `.github/` has carried the disclaimer "validated by-eye / YAML-parse
+locally". This is what that cost. So the fixes were checked where they actually run:
+an arm64 `rust:1-bookworm` image + Go 1.25.12 + Node 22, repo copied in (never
+bind-mounted read-write — a Linux `cargo build` into `cli/target/debug` would clobber the
+macOS artifacts the gate is still using), CLI rebuilt from source as an
+`ELF 64-bit LSB pie executable, ARM aarch64`:
+
+```
+== SHELL E2E on Linux ==            == NODE INTEROP on Linux ==
+  ✓ e2e-sharing                       ✓ sync-interop        ✓ recovery-interop
+  ✓ e2e-accounts                      ✓ totp-interop        ✓ entitlement-interop
+  ✓ e2e-recovery                      ✓ device-auth-interop ✓ portability-guard
+                                      ✓ sharing-interop     ✓ seal-params-guard
+                                      ✓ pinning-interop     ✓ schema-interop
+                                      ✓ accounts-interop    ✓ passkey-uv-interop
+== LINUX RESULT: 15 passed, 0 failed ==
+```
+
+All three shell proofs — two of which were the red CI jobs — now pass on GNU coreutils.
+
+⚠️ **What this did NOT verify, stated plainly:** `pkg-node/` was copied from the macOS
+build rather than rebuilt (wasm is platform-independent, but that means **`build-wasm.sh`
+itself is still unverified on Linux** — CI does run it); the Playwright suites were not
+run in-container (no browser); and this is **arm64**, while GitHub runners are **x86_64**,
+so an ISA-specific defect would still slip through. The point was GNU-vs-BSD userland and
+Linux path assumptions, and on those it is now evidence rather than hope.
+
+**Reproduce it:**
+
+```bash
+docker build -f linux.Dockerfile -t sigil-linux:real .   # rust:1-bookworm + Go 1.25.12 + Node 22
+docker run --rm -v "$PWD:/src:ro" -v "$PWD/run-linux.sh:/run.sh:ro" sigil-linux:real bash /run.sh
+```
+
+➡️ **Worth doing properly later:** this was a one-off. A `linux` job — or simply trusting
+the existing CI now that it is green — is the durable version. The one-off is recorded
+here so the next person does not have to re-derive it.
+
+### ⚠️ Two things the gate run itself surfaced
+
+**1. `e2e-sharing.sh` reported as FAILED when it had been KILLED.** The gate printed
+`Killed: 9 … ✗ e2e-sharing.sh` with **zero output** (stdout was block-buffered to
+`/dev/null`-adjacent redirection and never flushed). It looked exactly like a regression in
+the very script that had just been changed. It was not: `exit=0 in 21 s` standalone outside
+the harness sandbox, and `✓ e2e-sharing` on Linux in the same session. The killer was the
+sandbox, not the code and not memory (system-wide free was 33 %).
+
+`gate.sh` now distinguishes **exit 137/143** from a genuine non-zero exit and says
+*"was KILLED (signal 9), not failed — no result. Nothing is proven either way."* ⭐ It still
+**FAILS the gate** — "could not be run" is not "passed", and auto-retrying would only hide
+the flakiness — but it no longer sends the next person hunting a bug in working code. This
+cost a real detour today.
+
+**2. ⚠️ THE SUITES LEAK `sigild` PROCESSES.** Twelve orphaned servers were found still
+running, the oldest **1 day 22 hours** old, from `recovery-*` and other harness temp dirs
+(~53 MB total, so not the cause of §1 — but a genuine leak):
+
+```
+pid=11647 up=01-20:49:29  /var/folders/…/T/sigil-recovery-rYvqJ6/sigild
+pid=30311 up=01-22:11:19  ./sigild
+…12 in total
+```
+
+The suites know about this hazard — `pinning-interop.mjs` carries *"THROW rather than
+process.exit: exiting here would skip the finally block and leave a sigild and a proxy
+running"* — so the pattern is understood and something still escapes it. ➡️ **Open, not
+fixed in this commit:** find which exit path skips the cleanup (a signal, an early
+`process.exit`, or a throw before the `try`), and give the shell proofs and node suites a
+cleanup that also fires on SIGINT/SIGTERM. Until then, `pkill -x sigild` between long
+sessions.

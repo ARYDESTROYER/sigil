@@ -95,6 +95,14 @@ struct Imported {
     skipped_duplicate: usize,
     skipped_hotp: usize,
     skipped_invalid: usize,
+    /// ⛔ Non-empty when this import came from a MULTI-QR Google Authenticator
+    /// export: one "batch i of N" note per payload. The UI must NOT report a
+    /// plain success while this has entries.
+    partial_batches: Vec<String>,
+    /// ⭐ True only while QR codes remain UNSCANNED. The UI keys its "INCOMPLETE"
+    /// alarm off THIS, not off `partial_batches` — the final batch of an export
+    /// still gets a note, and calling that incomplete is a false alarm.
+    batches_outstanding: bool,
 }
 
 /// An export, always paired with the mandatory secrets-in-the-clear warning.
@@ -422,6 +430,8 @@ fn import(text: String, state: State<'_, AppState>) -> CmdResult<Imported> {
             skipped_duplicate: r.skipped_duplicate,
             skipped_hotp: r.skipped_hotp,
             skipped_invalid: r.skipped_invalid,
+            partial_batches: r.partial_batches,
+            batches_outstanding: r.batches_outstanding,
         })
     })
 }

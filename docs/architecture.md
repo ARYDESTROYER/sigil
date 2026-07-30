@@ -46,7 +46,14 @@ cryptography of its own; see the status note above). The pieces in this repo:
   - the **crypto-agility envelope codec** (`Envelope::encode`/`decode`) — a
     self-describing wire frame, serialization only;
   - the **Argon2id KDF** (`derive_master_key`, `Argon2Params`) — password → 32-byte
-    master key;
+    master key. ⭐ Since Phase 59 it also owns the two rules that make a container's
+    **unauthenticated** work factors safe to act on
+    ([ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)):
+    a **ceiling** (`MAX_M_COST` 256 MiB / `MAX_T_COST` 16 / `MAX_P_COST` 16, validated
+    **before any allocation**, `KdfError::ParamsTooLarge`) and the **no-downgrade
+    ratchet** (`Argon2Params::no_downgrade`). Both live here so the CLI, the desktop and
+    the wasm binding **reach** them rather than copy them — a drift downward would be
+    invisible;
   - the **XChaCha20-Poly1305 + HKDF-SHA256 AEAD** (`seal`/`open`) — per-record key
     derivation plus authenticated encryption;
   - the **composed record API** (`seal_record`/`open_record`) — the single
@@ -268,7 +275,12 @@ cryptography of its own; see the status note above). The pieces in this repo:
   `cli/src/lib.rs` (each value carries a comment tying it to the other file — there
   is **no shared crate**), guarded by a native golden-header test plus a Node
   interop test (`test/interop.mjs`) that shells to the **real** built CLI binary in
-  both directions. It wraps **only** the symmetric `seal_record` / `open_record` /
+  both directions. ⚠️ **Those three `u32` cost params are the one part of the frame
+  a reader must act on before it can authenticate anything**, which since Phase 59
+  means both sides range-check them **before any allocation** and both re-seal
+  through the **no-downgrade ratchet** — reaching `sigil-core`'s `Argon2Params`
+  rather than mirroring it, unlike the format constants above
+  ([ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)). It wraps **only** the symmetric `seal_record` / `open_record` /
   container path — a **DEMONSTRATION** of the UNAUDITED building block, **NOT** the
   product's account / key-management model, and not for real secrets; the
   `SIGILcli` container is a **pre-audit CLI/demo container, not a frozen product
@@ -908,7 +920,7 @@ cryptography of its own; see the status note above). The pieces in this repo:
   through the enrollment UI over the real contract-v3 signed path, and asserts the
   **pre-fix** behaviour is reproduced when `SIGILD_CORS_ORIGINS` is absent). That
   closes the earlier honest gap that no Playwright test had ever driven the enroll
-  button. Phase 58 added **`tests/passkey.spec.ts` — 24 specs** driving the **real
+  button. Phase 58 added **`tests/passkey.spec.ts`** — now **26 specs** — driving the **real
   WebAuthn API** through the Chrome DevTools Protocol **virtual authenticator**
   ([ADR 0046](decisions/0046-passkey-protected-local-containers.md)): PRF present
   (`hasPrf: true`), PRF absent (omit it), the authenticator **removed**, a

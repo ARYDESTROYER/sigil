@@ -106,3 +106,55 @@ the existing sealed container and op-log sync.**
   left to callers). **Do not store real 2FA secrets in this build.** This is not
   the product's account / key-management / sync model. Public copy still obeys
   [`../../web/apps/marketing/MARKETING-CLAIMS.md`](../../web/apps/marketing/MARKETING-CLAIMS.md).
+
+## The mirrored schema is now forward-compatible: unknown fields survive, and `min_reader_version` is a separate knob (added Phase 59, 2026-07-30)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+**The mirror decision was right; its two rules were not.** This ADR mirrors
+`TotpVault` / `TotpEntry` between `cli/src/lib.rs` and
+`sigil-wasm/totp-vault.mjs`, and the schema is now read by **four** clients plus a
+printed recovery kit. Two rules made it impossible to evolve:
+
+- **`version != 1` was refused outright**, so *any* addition was a flag day —
+  every client had to ship before any client could write the new field; and
+- **neither side preserved fields it did not know.** `serde` dropped them on the
+  next serialize and the JS clients rebuilt `{ version, entries }` by hand. On a
+  sync path where **the oldest writer wins**, an old client that merely *opened and
+  re-sealed* a vault **deleted a newer client's data** and pushed the stripped copy
+  over it.
+
+There was no third option: either the schema could never change, or changing it
+meant silent data loss for anyone not yet upgraded.
+
+[ADR 0047](0047-container-parameter-ceiling-and-no-downgrade-ratchet.md) adds,
+additively:
+
+1. **`extra` on both structs** (`#[serde(flatten)]` in Rust, an explicit
+   rest-spread plus a new `cloneVault()` in JS), so unknown fields round-trip
+   verbatim at **vault and entry level**. ⚠️ **This is easy to defeat by
+   accident** — any code that rebuilds the object field-by-field throws it away
+   again, which is exactly what both browser clients' `withVault` helpers were
+   doing.
+2. **`min_reader_version`**, separate from `version`. `version` says *what wrote
+   this*; `min_reader_version` says *what a reader must understand*. Refuse iff
+   `(min_reader_version ?? version) > TOTP_VAULT_READER_VERSION`. An additive
+   future vault opens and round-trips losslessly; an incompatible one is refused
+   **precisely**, naming the version needed. ⭐ It **fails closed** when the field
+   is absent.
+3. A stable per-entry **`uuid`** (RFC 4122 v4 from caller-supplied entropy on both
+   sides, per [0007](0007-caller-supplied-entropy-in-core.md)). ⚠️ **Nothing keys
+   off it yet** — every lookup is still by `label`, deliberately.
+
+**What is unchanged:** the mirror itself (there is still no shared crate for this
+schema), the field names and casing, the base64-of-raw-bytes `secret`, the
+lowercase algorithm strings, and the rule that a drift between the two sides does
+not fail loudly. ⭐ **The guard is stronger, though:** the new
+`sigil-wasm/test/schema-interop.mjs` drives the **real `sigil` binary** as the Rust
+half, and a Playwright spec in each browser client now proves the property
+**through the real UI** — because a verifier reverted the app-level half of this
+fix and the whole gate stayed green.
+
+⚠️ **`extra` preserves bytes, not semantics.** An old client can round-trip a field
+it does not understand while behaving inconsistently with it.

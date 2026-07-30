@@ -58,12 +58,20 @@ type Cdp = Awaited<ReturnType<BrowserContext["newCDPSession"]>>;
  */
 async function addAuthenticator(
   cdp: Cdp,
-  { hasPrf = true, backupEligible = false }: { hasPrf?: boolean; backupEligible?: boolean } = {},
+  {
+    hasPrf = true,
+    backupEligible = false,
+    // ⭐ "internal" makes Chrome report `authenticatorAttachment: "platform"`;
+    // anything else (e.g. "usb", a removable security key) makes it report
+    // "cross-platform". That is the knob spec 24 uses to make the REAL
+    // attachment differ from an inferred one.
+    transport = "internal",
+  }: { hasPrf?: boolean; backupEligible?: boolean; transport?: string } = {},
 ): Promise<string> {
   const options: Record<string, unknown> = {
     protocol: "ctap2",
     ctap2Version: "ctap2_1",
-    transport: "internal",
+    transport,
     hasResidentKey: true,
     hasUserVerification: true,
     isUserVerified: true,
@@ -1137,4 +1145,90 @@ test("23. ⛔ clearing ONLY the vault must not silently destroy the device ident
   await expect(page.getByTestId("setup-submit")).toBeVisible({ timeout: T });
   await createVault(page, "twentythree-clean");
   await expect(page.getByTestId("global-notice")).toHaveCount(0);
+});
+
+test("24. ⭐⭐ THE ATTACHMENT IS REPORTED, NOT INFERRED: a SECURITY KEY must not be called 'this device only'", async ({
+  page,
+}) => {
+  /**
+   * ⛔ WHY THIS SPEC EXISTS, AND WHY IT IS SHAPED LIKE THIS.
+   *
+   * `authenticatorAttachment` answers the one question a user actually has about
+   * a second factor: *what do I have to keep safe?* The app used to INVENT it:
+   *
+   *     attachment: assertion.backupEligible ? "" : "platform"
+   *
+   * — so every holder of a non-syncing removable SECURITY KEY was told their
+   * passkey lived "on this device only", which is the exact opposite of true and
+   * the exact opposite of useful. Phase 59 replaced it with the value the
+   * ceremony actually reported (`assertion.authenticatorAttachment`).
+   *
+   * An independent verifier then reverted that one line in `authenticator.tsx`
+   * and the whole suite stayed green — because spec 12 uses a BACKUP-ELIGIBLE
+   * authenticator, and `describeProtectionScope` short-circuits on that flag
+   * before it ever looks at the attachment. The inference and the truth agreed
+   * everywhere the suite looked.
+   *
+   * ⭐ SO THIS SPEC MAKES THEM DISAGREE. A `usb` virtual authenticator with
+   * backup eligibility OFF gives:
+   *
+   *     REAL       -> "cross-platform"  -> "a removable security key"
+   *     FABRICATED -> "platform"        -> "on this device only"
+   *
+   * There is no way for a fabricated value to coincidentally match, so the
+   * mutation cannot survive.
+   */
+  const cdp = await enableWebAuthn(page);
+  await addAuthenticator(cdp, { transport: "usb", backupEligible: false });
+
+  await page.goto("/?t=59");
+  await createVault(page, "spec-twentyfour");
+  await addRfcAccount(page);
+  await protectProfile(page);
+
+  // ⭐ THE MUTATION-SENSITIVE PATH IS UNLOCK, not enable: the reverted line was
+  // in `unlock()`, where the assertion's own report becomes `protection`. So
+  // reload, unlock, and read the sentence the user is shown afterwards.
+  await page.reload();
+  await expect(page.getByTestId("unlock-submit")).toBeVisible({ timeout: T });
+  await page.getByTestId("unlock-password").fill("spec-twentyfour");
+  await page.getByTestId("unlock-submit").click();
+  await expect(page.getByTestId("vault-view")).toBeVisible({ timeout: T });
+
+  const scope = ((await page.getByTestId("passkey-scope").textContent()) ?? "").toLowerCase();
+  expect(scope).toContain("removable security key");
+  // ⛔ The sentence the fabrication produced. If this ever comes back, a user is
+  // being told to worry about the wrong object.
+  expect(scope).not.toContain("this device only");
+
+});
+
+test("24b. CONTROL: a genuine PLATFORM authenticator IS still described as 'this device only'", async ({
+  page,
+}) => {
+  // ⭐ Without this, spec 24's `not.toContain("this device only")` could pass for
+  // a boring reason — e.g. the app never says it at all. Same code path, same
+  // assertion target, OPPOSITE answer, driven only by the transport.
+  //
+  // ⚠️ It is a SEPARATE test rather than a second half of 24 on purpose: a
+  // ceremony with `allowCredentials: []` matches ANY discoverable credential for
+  // the origin, so two virtual authenticators attached to one page make the
+  // answer non-deterministic. One authenticator per profile.
+  const cdp = await enableWebAuthn(page);
+  await addAuthenticator(cdp, { transport: "internal", backupEligible: false });
+
+  await page.goto("/?t=59");
+  await createVault(page, "spec-twentyfour-platform");
+  await addRfcAccount(page);
+  await protectProfile(page);
+
+  await page.reload();
+  await expect(page.getByTestId("unlock-submit")).toBeVisible({ timeout: T });
+  await page.getByTestId("unlock-password").fill("spec-twentyfour-platform");
+  await page.getByTestId("unlock-submit").click();
+  await expect(page.getByTestId("vault-view")).toBeVisible({ timeout: T });
+
+  const scope = ((await page.getByTestId("passkey-scope").textContent()) ?? "").toLowerCase();
+  expect(scope).toContain("this device only");
+  expect(scope).not.toContain("removable security key");
 });

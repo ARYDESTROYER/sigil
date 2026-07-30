@@ -327,7 +327,8 @@ pub struct EntryView {
 }
 
 /// The outcome of an import run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// NOT `Copy`: `partial_batches` owns its notes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportSummary {
     /// Entries added to the vault.
     pub imported: usize,
@@ -338,6 +339,38 @@ pub struct ImportSummary {
     pub skipped_hotp: usize,
     /// Entries skipped because they were unparseable or invalid.
     pub skipped_invalid: usize,
+    /// ⛔ One note per MULTI-QR Google Authenticator batch seen during this
+    /// import (Phase 59).
+    ///
+    /// Google splits a large export across several QR codes; each one decodes
+    /// independently and carries only ITS share of the accounts. A UI MUST show
+    /// these rather than reporting a plain count. Empty for an ordinary
+    /// single-QR export.
+    ///
+    /// ⚠️ Non-empty does NOT mean "something is missing" — see
+    /// [`Self::batches_outstanding`]. The note for the LAST QR of an export says
+    /// so in its own words; this vec carries both kinds.
+    pub partial_batches: Vec<String>,
+    /// ⭐ True only while QR codes remain UNSCANNED.
+    ///
+    /// This is the field a UI keys its alarm off, not `partial_batches` being
+    /// non-empty. Importing batch 2 of 2 used to be reported as "THIS IMPORT IS
+    /// INCOMPLETE … 0 more QR code(s) must be imported", i.e. a user who had just
+    /// finished was told they had not — and a warning that cries wolf is one the
+    /// next user ignores when it is real.
+    pub batches_outstanding: bool,
+}
+
+impl ImportSummary {
+    /// Whether everything the user was importing actually arrived.
+    ///
+    /// False only while a decoded payload announced QR codes still to come; the
+    /// FINAL batch of a multi-QR export does not make an import incomplete (it
+    /// still gets a note, because this client keeps no record of earlier runs).
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.batches_outstanding
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -709,8 +742,15 @@ fn collect_from_uri(uri: &str, out: &mut Vec<TotpEntry>, summary: &mut ImportSum
     let lower = uri.to_ascii_lowercase();
     if lower.starts_with("otpauth-migration://") {
         match decode_migration_uri(uri) {
-            Ok(otps) => {
-                for otp in &otps {
+            Ok(batch) => {
+                // ⛔ Record a multi-QR batch BEFORE counting entries, so a
+                // partial import can never be reported as a whole one.
+                if let Some(note) = batch.batch_note() {
+                    // ⭐ Only a NON-final batch means something is still missing.
+                    summary.batches_outstanding |= !batch.is_final_batch();
+                    summary.partial_batches.push(note);
+                }
+                for otp in &batch.otps {
                     match migration_otp_to_entry(otp) {
                         Ok(ImportedOtp::Totp(e)) => out.push(*e),
                         Ok(ImportedOtp::SkippedHotp) => summary.skipped_hotp += 1,
@@ -967,6 +1007,90 @@ mod tests {
         assert_eq!(summary.imported, 1);
         assert_eq!(summary.skipped_hotp, 1);
         assert_eq!(summary.skipped_invalid, 1);
+    }
+
+    /// ⛔ THE FINAL BATCH OF A MULTI-QR EXPORT IS NOT AN INCOMPLETE IMPORT.
+    ///
+    /// Importing batch 2 of 2 used to report "0 more QR code(s) must be imported
+    /// … This import is PARTIAL", i.e. it told a user who had just finished that
+    /// they had not — and a warning that cries wolf is one the next user ignores
+    /// when it is real. The note must still NAME the batch (this app keeps no
+    /// record of earlier runs), but `batches_outstanding` — what the UI keys its
+    /// alarm off — must be false.
+    /// Standard base64, hand-rolled: this crate deliberately has no base64
+    /// dependency (it reuses the CLI's codecs), and one test fixture is not a
+    /// reason to add one.
+    fn b64(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn a_finished_multi_qr_import_is_not_reported_as_incomplete() {
+        use sigil_cli::migration::{encode_migration_payload, MigrationOtp};
+
+        // Build ONE QR of a two-QR export by hand: the encoder always writes a
+        // single self-contained batch, so the framing is appended here.
+        fn one_qr_of_two(index: u64) -> String {
+            let otp = MigrationOtp {
+                secret: b"12345678901234567890".to_vec(),
+                name: format!("acct-{index}"),
+                issuer: "Svc".to_string(),
+                algorithm: 1,
+                digits: 1,
+                otp_type: 2,
+                counter: 0,
+            };
+            // encode_migration_payload's tail is exactly
+            //   0x10 <version> 0x18 <batch_size=1>
+            // (batch_index / batch_id are omitted at their proto3 defaults), so
+            // raise batch_size and append the batch_index field.
+            let mut body = encode_migration_payload(std::slice::from_ref(&otp));
+            let n = body.len();
+            assert_eq!(&body[n - 2..], &[0x18, 0x01], "batch framing tail moved");
+            body[n - 1] = 2; // batch_size = 2
+            body.push(0x20); // field 4 (batch_index), varint
+            body.push(index as u8);
+            format!("otpauth-migration://offline?data={}", b64(&body))
+        }
+
+        // Batch 1 of 2: genuinely outstanding, and it must stay loud.
+        let mut first = new_session("batch-first");
+        let s1 = first.import_text(&one_qr_of_two(0)).expect("import");
+        assert_eq!(s1.imported, 1);
+        assert!(
+            !s1.is_complete(),
+            "batch 1 of 2 leaves QR codes outstanding"
+        );
+        assert!(s1.batches_outstanding);
+        assert!(s1.partial_batches[0].contains("PARTIAL"), "{s1:?}");
+
+        // Batch 2 of 2: still named, but NOT an incomplete import.
+        let mut last = new_session("batch-last");
+        let s2 = last.import_text(&one_qr_of_two(1)).expect("import");
+        assert_eq!(s2.imported, 1);
+        assert!(!s2.batches_outstanding, "nothing is outstanding: {s2:?}");
+        assert!(s2.is_complete(), "the user has finished: {s2:?}");
+        assert_eq!(s2.partial_batches.len(), 1, "it must still say which batch");
+        assert!(s2.partial_batches[0].contains("batch 2 of 2"), "{s2:?}");
+        assert!(!s2.partial_batches[0].contains("PARTIAL"), "{s2:?}");
     }
 
     #[test]

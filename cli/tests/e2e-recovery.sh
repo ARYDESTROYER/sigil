@@ -43,15 +43,11 @@ set -euo pipefail
 
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 
+# Portability helpers (filemode / resolve_go). NOT a test — see the file header.
+# shellcheck source=cli/tests/_e2e-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_e2e-lib.sh"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -n "${GO:-}" ]]; then
-	:
-elif [[ -x /opt/homebrew/bin/go ]]; then
-	GO=/opt/homebrew/bin/go
-else
-	GO=go
-fi
-command -v "$GO" >/dev/null || { echo "no Go toolchain found (set \$GO)" >&2; exit 1; }
+resolve_go
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sigil-recovery-e2e.XXXXXX")"
 SERVER_PID=""
@@ -230,10 +226,10 @@ grep -q "$KIT_ID" "$PINS" || fail "the kit is not pinned"
 ok "no code in A's HOME or the server log; the kit pin carries origin=recovery-kit"
 
 # Every file A holds is 0600 inside a 0700 directory.
-DIRMODE="$(stat -f '%Lp' "$HOME_A/.sigil" 2>/dev/null || stat -c '%a' "$HOME_A/.sigil")"
+DIRMODE="$(filemode "$HOME_A/.sigil")"
 [[ "$DIRMODE" == "700" ]] || fail "$HOME_A/.sigil is mode $DIRMODE, want 700"
 while IFS= read -r f; do
-	m="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+	m="$(filemode "$f")"
 	case "$f" in
 		*.hybrid.pub|*.sigil-pull-state.json) continue ;;  # public / non-secret
 	esac
@@ -285,7 +281,7 @@ ADOPT_OUT="$(HOME="$HOME_D" "$SIGIL" recovery restore --code "$CODE" --device-id
 [[ -f "$HOME_D/.sigil/device.hybrid" ]] || fail "--adopt did not persist the hybrid secret"
 grep -q 'SECOND COPY OF THE PAPER' <<<"$ADOPT_OUT" || fail "--adopt did not warn what it means"
 for f in "$HOME_D/.sigil/device.key" "$HOME_D/.sigil/device.hybrid"; do
-	m="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+	m="$(filemode "$f")"
 	[[ "$m" == "600" ]] || fail "$f is mode $m, want 600"
 done
 ok "--adopt persisted the kit 0600 and said this machine is now a copy of the paper"

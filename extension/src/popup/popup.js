@@ -28,10 +28,12 @@ import {
   openVault,
   sealVault,
   addEntry,
+  cloneVault,
   codeForEntry,
   base32Decode,
   base64ToBytes,
   bytesToBase64,
+  ratchetParams,
 } from "../../vendor/totp-vault.mjs";
 import {
   parseOtpauthUri,
@@ -184,8 +186,29 @@ async function readSealed() {
 async function persist(v, secret = null) {
   const salt = crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
   const nonce = crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
-  const container = sealVault(wasm, secret ?? sealSecret, v, salt, nonce, ARGON2);
+  const container = sealVault(wasm, secret ?? sealSecret, v, salt, nonce, await sealParams(STORAGE_KEY));
   await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(container) });
+}
+
+/**
+ * ⭐⭐ THE NO-DOWNGRADE RATCHET, applied at every re-seal this popup performs.
+ *
+ * ⛔ A `SIGILcli` container carries the Argon2id work factors it was sealed with,
+ * and a re-seal is where new factors get CHOSEN. This popup used to write
+ * `ARGON2` verbatim, so a vault the CLI wrote at 65536/4/2 came back from ONE
+ * edit here at 19456/2/1 — 3.4x less memory and half the passes, silently, on a
+ * vault the user shares with their laptop. The Rust clients have ratcheted since
+ * Phase 58 (`sigil_cli::reseal_container`); this is the JS half.
+ *
+ * `ARGON2` is a FLOOR, not an instruction: what gets written is the componentwise
+ * max of the stored container's factors and this build's. The rule lives in
+ * sigil-core (`Argon2Params::no_downgrade`, reached through the wasm), so it
+ * cannot drift from the CLI's.
+ */
+async function sealParams(storageKey) {
+  const got = await chrome.storage.local.get(storageKey);
+  const stored = got[storageKey];
+  return ratchetParams(wasm, stored ? base64ToBytes(stored) : null, ARGON2);
 }
 
 // ── device identity (sealed at rest, exactly like the vault) ─────────────────
@@ -203,7 +226,7 @@ async function persistDevice(d) {
   }
   const salt = crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
   const nonce = crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
-  const container = sealDeviceIdentity(wasm, password, d, salt, nonce, ARGON2);
+  const container = sealDeviceIdentity(wasm, password, d, salt, nonce, await sealParams(DEVICE_KEY));
   await chrome.storage.local.set({ [DEVICE_KEY]: bytesToBase64(container) });
   device = d;
   renderDevice();
@@ -372,7 +395,11 @@ function sharingErr(e) {
  */
 async function withVault(mutate) {
   if (!vault) throw new Error("vault is locked");
-  const draft = { version: vault.version, entries: [...vault.entries] };
+  // ⭐ `cloneVault`, NOT `{ version, entries }`. Rebuilding the object
+  // field-by-field silently deletes `min_reader_version` and every field a newer
+  // client wrote, and this popup would then push the stripped vault over the
+  // newer one — the oldest writer wins on the op-log.
+  const draft = cloneVault(vault);
   await mutate(draft);
   await persist(draft);
   vault = draft;
@@ -684,13 +711,32 @@ $("uri-form").addEventListener("submit", async (ev) => {
 $("migration-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   try {
-    const entries = decodeMigrationUri($("migration-input").value.trim());
+    // ⛔ ONE URI IS ONE QR CODE. A large Google Authenticator export spans
+    // several; `batchNote` is non-null when more remain, and must be shown or a
+    // user deletes the old app with most of their accounts still only there.
+    const batch = decodeMigrationUri($("migration-input").value.trim());
+    const entries = batch.entries;
     let added = 0;
     await withVault((d) => {
       added = mergeEntries(d, entries);
     });
     $("migration-form").reset();
-    say(`Imported ${added} of ${entries.length} account(s); duplicates skipped.`);
+    const base = `Imported ${added} of ${entries.length} account(s); duplicates skipped.`;
+    if (batch.batchNote && !batch.finalBatch) {
+      say(
+        `${base} ⚠️ THIS IMPORT IS INCOMPLETE — ${batch.batchNote}. Import the remaining ` +
+          `QR code(s) before deleting anything from the old app.`,
+        "error",
+      );
+    } else if (batch.batchNote) {
+      // ⭐ The FINAL QR of a multi-QR export. Still say which batch it was —
+      // this popup keeps no record of earlier runs — but do NOT call a finished
+      // import incomplete. A warning that cries wolf is one the next user
+      // ignores when it is real.
+      say(`${base} ${batch.batchNote}.`);
+    } else {
+      say(base);
+    }
   } catch (e) {
     say(err(e), "error");
   }

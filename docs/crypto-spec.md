@@ -593,6 +593,104 @@ key is ever printed, logged, or returned across a UI boundary.
   one and no client's container parser changes. Replacing it with a direct KDF is a
   future, format-breaking change.
 
+## Container KDF parameters — a ceiling, and a no-downgrade ratchet
+
+**Status (pre-audit, UNAUDITED).** A `SIGILcli` container
+([ADR 0020](decisions/0020-shared-client-container-format.md)) is
+**self-describing**: its header carries the Argon2id work factors it was sealed
+with, as three raw `u32`s.
+
+```
+"SIGILcli" | version(u8) | m_cost(u32 LE) | t_cost(u32 LE) | p_cost(u32 LE) | salt_len(u8) | salt | envelope
+                          └──────────────── UNAUTHENTICATED framing ────────────┘
+```
+
+⛔ **Those three fields cannot be authenticated.** They are *inputs* to the KDF,
+so they must be readable before the AEAD key exists — which means they are
+whatever the writer of the bytes chose.
+[ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
+adds the two rules that make that safe to read.
+
+### The ceiling: refuse before allocating
+
+```
+Argon2Params::MAX_M_COST = 262_144   KiB  = 256 MiB      (inclusive)
+Argon2Params::MAX_T_COST = 16        passes              (inclusive)
+Argon2Params::MAX_P_COST = 16        lanes               (inclusive)
+```
+
+Argon2id allocates `m_cost` KiB **in one block before it does any work**, so an
+unbounded `m_cost` parsed out of a container header is a **remote denial of
+service**. Measured on the dev machine (macOS arm64, 24 GB RAM, `argon2` 0.5.3 —
+the crate [`../libsigil/core/src/kdf.rs`](../libsigil/core/src/kdf.rs) links):
+`m_cost = 0xFFFF_FFF0` (≈ 4 TiB) ran **12.57 s**, peaked at a **≈ 90 GB memory
+footprint** and was **killed**; `t_cost = 0xFFFF_FFF0` allocates nothing and
+extrapolates to **≈ 282 days** for one open attempt. After the ceiling, the same
+container is refused by the real `sigil` binary in **0.00 s** with a **1.18 MB**
+peak footprint.
+
+⭐ **The refusal has to be client-side, and that is a direct consequence of the
+architecture.** Containers reach clients through `sigild`'s **zero-knowledge**
+op-log, which stores opaque blobs and **cannot inspect or filter what it relays**.
+The property that makes the server safe is the property that stops it helping
+here.
+
+`Argon2Params::validate()` returns `KdfError::ParamsTooLarge` — deliberately
+**distinct from `InvalidParams`**, because the values may be perfectly legal
+Argon2 parameters and are refused for what honouring them would cost. It is called
+by `derive_master_key` first thing, and **earlier still** by both container parsers
+(`sigil_cli::open_container`, the wasm binding's `open_container_inner`) so the
+error can say *"this container is hostile"* rather than *"the KDF failed"* — a
+distinction a user needs in order to tell it from a typo'd password.
+
+⭐ **A ceiling only. There is no floor.** A low work factor is a *weak* container,
+not a *dangerous* one, and refusing to open it would destroy data rather than
+protect it.
+
+### The ratchet: a re-seal may raise the work factor and may never lower it
+
+```
+no_downgrade(existing, requested) = componentwise max, then m_cost := max(m_cost, 8 * p_cost)
+```
+
+A re-seal is the operation that **chooses** new parameters, so it is the one place
+a weak container could make its weakness permanent. Taking the maximum makes each
+factor a ratchet — up, never down — and a client with stronger defaults silently
+*repairs* a weak container the first time it re-seals it. The `m_cost` floor is
+Argon2's own requirement (`m_cost >= 8 * p_cost`), which a componentwise max can
+otherwise violate.
+
+⭐ **One implementation, reached and never copied.** The rule is
+`Argon2Params::no_downgrade` in `sigil-core`; `sigil_cli::no_downgrade` delegates
+to it, `sigil_cli::reseal_container` applies it (so `params` there is a **floor**,
+not an instruction), and JavaScript reaches the same function through two wasm
+exports — `container_params` (read a header with no password, no KDF and no
+allocation) and `reseal_params` — wrapped as `containerParams` / `ratchetParams` in
+[`../sigil-wasm/totp-vault.mjs`](../sigil-wasm/totp-vault.mjs). ⚠️ **A mirrored
+copy would be the wrong answer here specifically, because a drift downward is
+invisible**: it yields a container that still opens everywhere, just weaker.
+
+### What this does and does not give you
+
+- ⛔ **The ceiling removes nothing.** A hostile container stays in the op-log; the
+  server cannot know it is there. Every client that pulls parses and refuses it
+  **again, every time**. What changed is the cost of that refusal.
+- ⚠️ **The ratchet makes a bounded cost persistent.** A container accepted at
+  exactly `256 MiB / 16 / 16` (legal; **1.64 s** per open, measured) keeps that
+  cost **forever**, because the rule is a maximum and never a reset.
+- ⛔ **The ratchet does not cover every write.** `sigil totp …` saves through
+  `save_vault(…, Argon2Params::RECOMMENDED)` and the desktop through
+  `seal_vault(…, self.params)`; **neither reads the existing container.** Today
+  that cannot downgrade anything, because `RECOMMENDED` (64 MiB) *is* the strongest
+  thing anything here writes — so **"strength only goes up" is true of the browsers
+  and of re-keys, and not globally true of this system.**
+- ⚠️ **`ratchetParams` fails open** on a container it cannot parse, so a corrupt
+  stored value never blocks a save — at the cost of losing the ratchet for that one
+  write. The dangerous direction still cannot happen: it falls back to the client's
+  own defaults, never to something weaker.
+- ⚠️ The numbers are **chosen by measurement on one machine**, and the whole of it
+  is **UNAUDITED**. Adversary treatment in [`threat-model.md`](threat-model.md).
+
 ## Recovery kit — a printable paper key
 
 **Status (pre-audit, UNAUDITED, dev-gated).** A **recovery kit** is the answer to

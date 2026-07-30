@@ -387,8 +387,97 @@ kit's *existence check*, which is advisory and fails closed.
   `disablePasskeyProtection` / `rekeyProtectionForNewKit` /
   `unlockWithRecoverySheet`, the `PasskeyPanel`, and the sync refusal).
 - Proof: [`../../web/apps/webapp/tests/passkey.spec.ts`](../../web/apps/webapp/tests/passkey.spec.ts)
-  — 24 specs driving the real WebAuthn API through the CDP virtual authenticator.
+  — 24 specs driving the real WebAuthn API through the CDP virtual authenticator
+  (**26** since the Phase 59 addendum below).
 - Format + derivation spec: [`../crypto-spec.md`](../crypto-spec.md).
 - Adversaries: [`../threat-model.md`](../threat-model.md) — the profile-copying
   attacker who does not hold the authenticator.
 - The recovery sheet this borrows: [0042](0042-recovery-kit.md).
+
+## User verification is now ENFORCED, because CTAP keys two secrets and we were reading the wrong one (added Phase 59, 2026-07-30)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+**Limitation 8 said the right thing and then stopped one step short.** It reads:
+*"User verification is a policy request, not a proof. We ask for
+`userVerification: "required"` and read a flag."* Both halves are still true. What
+was missing is that **nothing acted on the flag we read**.
+
+### The defect
+
+CTAP 2.1's `hmac-secret` extension keys **two independent secrets per
+credential** — `CredRandomWithUV` and `CredRandomWithoutUV` — and the
+authenticator chooses between them based on whether the ceremony **verified a
+user**. A ceremony that completes with `UV = false` therefore returns a
+*different, equally valid-looking* 32 bytes.
+
+`evaluatePrf` computed `userVerified` from the authenticator-data flags, returned
+it to callers, and **used the PRF output regardless**. The consequence is exactly
+the lockout this ADR exists to prevent:
+
+- **at enable**, the hardware slot is sealed under the wrong secret;
+- **at unlock**, that slot then refuses — and because an AEAD tag cannot
+  distinguish a wrong password from a different key, the user holding a **working
+  passkey** and the **correct password** is told *"wrong password or a different
+  passkey"* and pushed onto the recovery sheet.
+
+⛔ **The two-assertion determinism probe (§5) cannot catch it.** Both probe
+assertions share one UV state, so they agree with each other and the credential
+looks perfectly healthy. This is a failure mode that is invisible to the exact
+control designed to catch unstable PRF output.
+
+### The change
+
+`evaluatePrf` now reads the flags **before it looks at the PRF bytes at all** and
+throws `PasskeyError(…, "uv_missing")` when `userVerified` is false. That makes it
+the single choke point for **both** enable and unlock — the same shape as §4's
+write ordering: put the check where every path already goes.
+
+`explainPasskeyStatus` gained a `uv_missing` arm with distinct wording at enable
+and at unlock. ⭐ **It must never be folded into `slot_open_failed`**: the passkey
+is fine, the password may be fine, and the fix is a **real action the user can
+take** — complete the PIN or biometric prompt.
+
+⚠️ **This does not make limitation 8 go away, and it must not be read as doing
+so.** We still cannot verify that a human was verified, and a lying authenticator
+is still undetectable. What is now guaranteed is narrower and worth stating
+exactly: **we never seal under, or try to open with, a secret from the wrong
+hmac-secret slot.**
+
+### A second, smaller correction in the same file: the attachment was inferred
+
+`evaluatePrf` now also returns the **real `authenticatorAttachment`** reported by
+the ceremony that just ran, and `probePrf` prefers it. The webapp's unlock path
+had been *inferring* it as `backupEligible ? "" : "platform"` — which told every
+holder of a **non-syncing security key** that their second factor lived *"on this
+device only"*. That is the opposite of true, and it is the opposite of useful when
+the question the sentence answers is *"what do I have to keep safe?"*.
+
+This is the same class of defect as the flag we were not enforcing: a value
+derived from a *proxy* rather than read from the *source*. The *Good* bullet above
+— *"the honest status line is derived, not remembered"* — was true of the BE/BS
+flags and false of the attachment beside them.
+
+### Proof, and why it is not a Playwright spec
+
+⚠️ **Chrome's CDP virtual authenticator cannot produce this failure.** With
+`userVerification: "required"` it either verifies (UV = 1) or the ceremony fails
+outright, so *"completed but unverified"* — a nonconforming or lying
+authenticator, or a browser that silently downgrades — is **unreachable through
+the real API**. The Playwright suite therefore could not have covered this branch at
+any size, and did not.
+
+The guard is
+[`../../sigil-wasm/test/passkey-uv-interop.mjs`](../../sigil-wasm/test/passkey-uv-interop.mjs):
+it drives the **shipped `evaluatePrf`** over a stubbed `navigator.credentials`
+that returns whatever flags the test asks for. ⚠️ **That double is deliberately
+more permissive than any real authenticator** — that is the entire point, and it
+means a PASS there is evidence about **our check**, not about any browser's
+behaviour. Its four proofs: the refusal and its code; the wording at enable vs at
+unlock and that it is never rendered as a wrong password; that a verified ceremony
+returns the WITH-UV secret **and** the real attachment; and that the
+authenticator-data flag reader is correct bit by bit.
+
+**Everything else in this ADR is unchanged** — the CMK derivation, the slot
+construction, AND-never-OR, the write order, and every other limitation.

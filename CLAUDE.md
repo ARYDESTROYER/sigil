@@ -43,7 +43,54 @@ public, make no security claims, until the audit completes and trademark clears.
 
 ## Repository map
 
-- `libsigil/` — Rust crypto core (`core` = suite registry + envelope codec +
+- `libsigil/` — Rust crypto core.
+  ⭐ **Phase 59 (ADR 0047) added the two rules that make an UNAUTHENTICATED container
+  header safe to read, and both live HERE so nothing mirrors them.** A `SIGILcli`
+  header's Argon2id work factors are *inputs* to the KDF, so they cannot be inside the
+  AEAD — they are whatever the writer of the bytes chose, and Argon2id **allocates
+  `m_cost` KiB in ONE block before doing any work**. Measured (macOS arm64, 24 GB RAM,
+  `argon2` 0.5.3): `m_cost = 0xFFFF_FFF0` (≈4 TiB) ran **12.57 s**, peaked at a
+  **≈90 GB memory footprint** and the process was **KILLED**; `t_cost = 0xFFFF_FFF0`
+  allocates nothing and extrapolates to **≈282 days** for ONE open attempt (1 000
+  passes at m=19456 measured 5.68 s). ⛔ **The delivery path is the zero-knowledge
+  op-log, which BY DESIGN cannot inspect or filter what it relays** — so the property
+  that makes the server safe is the property that stops it defending anyone here, and
+  the refusal HAS to be client-side. **(1) A CEILING** in `kdf.rs`:
+  **`Argon2Params::MAX_M_COST` = 262_144 KiB (256 MiB)**, **`MAX_T_COST` = 16**,
+  **`MAX_P_COST` = 16** (all **INCLUSIVE**), a `const fn validate()`, and a new
+  **`KdfError::ParamsTooLarge`** — deliberately DISTINCT from `InvalidParams`, because
+  the values may be legal Argon2 parameters and are refused for what honouring them
+  would cost. `derive_master_key` validates FIRST THING; both container parsers
+  (`sigil_cli::open_container`, the wasm `open_container_inner`) validate EARLIER STILL
+  so the error reads *"this container is hostile"* (`CliError::ParamsOutOfRange`) and
+  not *"the KDF failed"*. Measured after: the real `sigil` binary refuses the same 4 TiB
+  container in **0.00 s / 1.18 MB peak footprint**. 256 MiB was chosen so that **nothing
+  that opens today stops opening** (4× `RECOMMENDED`'s 64 MiB, ≈13× the browsers'
+  19 MiB), there is headroom to raise the work factor without a format break, it is
+  above OWASP's highest current Argon2id recommendation, and ⭐ **a LOW-END PHONE can
+  still survive one such allocation** — the bound is chosen for the weakest client that
+  must open the vault, not a dev laptop. Bounded worst case (256 MiB × 16 × 16) measured
+  **1.64 s**. ⭐ **A ceiling ONLY — no floor**: a low work factor is a WEAK container,
+  not a DANGEROUS one, and refusing it would destroy data rather than protect it.
+  **(2) THE NO-DOWNGRADE RATCHET**, `Argon2Params::no_downgrade(self, requested)` — the
+  componentwise MAX with Argon2's `m_cost >= 8 * p_cost` floor honoured. ⚠️ **This is
+  the ONE implementation**: `sigil_cli::no_downgrade` delegates, `reseal_container`
+  applies it (so its `params` is a **FLOOR**, not an instruction), and JS reaches the
+  same function through the wasm exports `container_params` / `reseal_params`. **A
+  mirrored copy would be the wrong answer here specifically, because a drift downward is
+  INVISIBLE** — it yields a container that still opens everywhere, just weaker.
+  ⚠️ **HONEST LIMITS:** the ceiling **removes nothing** (a hostile blob stays in the
+  op-log; there is no delete-op route and no quarantine, so every client re-parses and
+  re-refuses it every sync — only the COST of the refusal changed); the ratchet makes a
+  bounded cost **PERSISTENT** (a container accepted at exactly 256 MiB/16/16 keeps that
+  1.64 s forever — the rule is a maximum, never a reset); and ⛔ **the ratchet does NOT
+  cover every write** — `sigil totp …` saves through
+  `save_vault(…, Argon2Params::RECOMMENDED)` and the desktop through
+  `seal_vault(…, self.params)`, **neither of which reads the existing container**, so
+  *"strength only goes up"* is true of the BROWSERS and of RE-KEYS and **not globally
+  true of this system** (harmless today only because `RECOMMENDED` 64 MiB IS the
+  strongest thing anything here writes).
+  (`core` = suite registry + envelope codec +
   real-but-unaudited Argon2id KDF, XChaCha20-Poly1305+HKDF AEAD, composed
   `seal_record`/`open_record`, and a classical **Ed25519** sign/verify primitive
   (`public_key_from_seed`/`sign`/`verify`, caller-supplied 32-byte seed, no
@@ -937,9 +984,44 @@ public, make no security claims, until the audit completes and trademark clears.
   `http://127.0.0.1`** (RP-ID rejects IP literals: `SecurityError: This is an invalid
   domain.`) — `playwright.config.ts` and the affected specs moved to **`http://localhost`**,
   and it also pins `workers: 2` (7-way contention produced ten unrelated failures) and
-  `reuseExistingServer: false`. Proven by **`tests/passkey.spec.ts` — 24 specs** over CDP's
+  `reuseExistingServer: false`. Proven by **`tests/passkey.spec.ts` — 26 specs** over CDP's
+  (24 in Phase 58; Phase 59 added two for the REAL `authenticatorAttachment`, replacing a
+  value the app had been INFERRING from the backup-eligible flag)
   **virtual authenticator** (`hasPrf: true` for the supported branch, omitting it for the
   unsupported one). Do NOT store real 2FA secrets.
+  ⭐ **PHASE 59 (ADR 0047) touched every place this app WRITES.** A new
+  **`sealParams(storageKey)`** helper reads the container about to be replaced and
+  ratchets, and it is now passed at **all four** of this file's sealing call sites
+  (`sealVault`, `sealDeviceIdentity`, and **both** `sealHwSlot` sites) — `ARGON2` is a
+  **FLOOR, not an instruction**. `withVault` now calls **`wasm.cloneVault(vault)`**
+  instead of rebuilding `{version, entries}` by hand, which used to silently delete
+  `min_reader_version` and every field a newer client wrote — and then push the stripped
+  vault over the newer one, because **the oldest writer wins** on the op-log. The
+  migration import renders the batch note, keying its "INCOMPLETE" framing off
+  `finalBatch` so a **finished** multi-QR import is not announced as incomplete. The
+  passkey unlock path stopped **inferring** the authenticator attachment and now uses
+  the real one from the ceremony.
+  ⛔ **THE MISTAKE THIS PHASE MADE, AND THE THREE GUARDS IT BOUGHT.** An independent
+  verifier reverted the **product** half of both fixes — `cloneVault(vault)` back to
+  `{ version: vault.version, entries: [...vault.entries] }`, and five of the six
+  `sealParams(...)` call sites back to the bare constant — and **the whole gate stayed
+  green: webapp 50/50, extension 14/14, and the Rust↔JS schema interop passed.**
+  Mutating the SAME logic inside `totp-vault.mjs` / `passkey.mjs` went red every time.
+  **The module was guarded and the PRODUCT was not** — entry **#9** of
+  `docs/engineering-lessons.md` recurring **inside the commit that added that
+  document**, now recorded as entry **#10**. New: **`tests/schema.spec.ts`** (seeds a
+  vault whose stored JSON carries fields this build has never heard of, drives a **REAL
+  edit through the REAL UI**, then **decrypts what the app actually wrote**),
+  **`extension/tests/schema.spec.mjs`** (the same through the real unpacked extension),
+  and **`sigil-wasm/test/seal-params-guard.mjs`** — a **SOURCE-STRUCTURE** guard that
+  enumerates every sealing call site in the two shipping browser sources (**6 across 2
+  files**) and fails unless each is passed `sealParams(...)`, **and fails if it finds
+  ZERO**, because a guard that checks nothing is worse than no guard. ⚠️ **It is
+  structural on purpose and that is a limitation**: it proves each site *passes* the
+  helper, **not** that the helper is correct. ⚠️ `tests/schema.spec.ts` needs the
+  **NODE-target** wasm (`sigil-wasm/pkg-node`) in the TEST process to open the app's
+  sealed container — `@sigil/wasm` is a **bundler-target** package Node cannot require —
+  so `.github/workflows/web.yml` now also runs the repo-root `build-wasm.sh`.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -970,7 +1052,10 @@ public, make no security claims, until the audit completes and trademark clears.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices; latest is
-  **0045**, the claim precondition). ⚠️ **Audit #4 found the STATUS BLOCKS an external
+  **0047**, the container parameter ceiling + the no-downgrade ratchet + the
+  forward-compatible vault schema — which also carries **dated addenda on 0020, 0024,
+  0025, 0026 and 0046**, per this repo's addendum rule: append, never rewrite).
+  ⚠️ **Audit #4 found the STATUS BLOCKS an external
   reviewer reads FIRST were false** and would have scoped sigild's cryptography out of
   review: `api.md`, `architecture.md` and `deployment.md` each opened with *"performs no
   cryptography / holds no keys / runs no auth"* while `grep -rE
@@ -1068,6 +1153,54 @@ public, make no security claims, until the audit completes and trademark clears.
   Authenticator export) + round-trip verified. The vault's `TotpVault` JSON schema is
   **UNCHANGED** (browser mirror intact); HOTP entries are warned-and-skipped since the
   vault is TOTP-only. Dev/UNAUDITED. ADR 0025.
+  ⭐ **Phase 59 (ADR 0047 + the 0025/0026 addenda) fixed TWO things this feature was
+  SAYING that were not true, in the one feature whose entire purpose is not losing
+  accounts.** (1) **A MULTI-QR IMPORT REPORTED PLAIN SUCCESS.** Google Authenticator
+  splits a large export across several QR codes, each an independently-decodable
+  `MigrationPayload` carrying `batch_size`/`batch_index`/`batch_id` with the accounts
+  DIVIDED between them — and both codecs **consumed those three fields and threw them
+  away**, so scanning the FIRST QR of a three-QR export imported a THIRD of the accounts
+  and printed `imported N` with no warning. `decode_migration_payload`/
+  `decode_migration_uri` now return a **`MigrationBatch`** (`otps` + the framing) with
+  `is_complete()` / `is_final_batch()` / `batch_note()`. ⭐ **`is_final_batch()` is NOT a
+  nicety:** the first cut told a user importing **batch 2 of 2** that *"0 more QR
+  code(s) must be imported — this import is PARTIAL"*, i.e. told someone who had just
+  finished that they had not — **a warning that cries wolf is one the next user ignores
+  when it is real.** The final batch is still NAMED (this client keeps no
+  cross-invocation state and genuinely cannot know whether the earlier QRs arrived) but
+  is not called incomplete. Surfaced by **all four clients** (`sigil totp import`, the
+  webapp, the extension, and the desktop via `ImportSummary { partial_batches,
+  batches_outstanding }` — the UI keys its alarm off `batches_outstanding`, NOT off
+  `partial_batches` being non-empty). (2) **A `--migration` EXPORT OF A NON-30 s ENTRY
+  WAS A SILENT LIE.** The wire format has **no period field**, so a 60 s entry was
+  exported as if it were 30 s and the receiving app computes **DIFFERENT CODES from the
+  same secret** — an account that simply stops working, delivered as a successful
+  export. `entry_to_migration_otp` now **REFUSES**, naming the label, the period and the
+  plain `otpauth://` export that carries it. ⭐ **Refusal stays the DEFAULT**, with a new
+  **`sigil totp export --migration --skip-unsupported`** so one unrepresentable account
+  no longer costs the user the whole bulk-export path — it exports the rest and names
+  each skipped entry **individually, with the reason, on stderr** (so it survives a pipe
+  to a file), and the summary line says `PARTIAL`. `--skip-unsupported` without
+  `--migration` is an error. ⚠️ **THAT ESCAPE HATCH EXISTS IN THE CLI ONLY** — the
+  webapp, the MV3 extension and the desktop call the encoder over the WHOLE vault, so
+  for them one 60 s entry now makes the migration export fail **WHOLESALE** where it
+  previously produced a wrong one (right direction, unanswered usability regression).
+  ⭐ **Phase 59 also made the VAULT SCHEMA changeable** (ADR 0047, the 0024 addendum):
+  `TotpVault` and `TotpEntry` each gained **`#[serde(flatten)] extra`**, so an old
+  client that merely opens and re-seals a vault no longer **DELETES** a newer client's
+  data (serde used to drop unknown fields, and the JS clients rebuilt
+  `{version, entries}` by hand — on a sync path where **the oldest writer wins**); a new
+  **`min_reader_version`** (`TOTP_VAULT_READER_VERSION` = 1, `check_vault_readable`)
+  separates *what wrote this* from *what a reader must understand*, refusing iff
+  `(min_reader_version ?? version) > READER_VERSION` and therefore **FAILING CLOSED**
+  when the field is absent — replacing the blanket `version != 1 ⇒ refuse` that made
+  every addition a four-client flag day; and a stable per-entry **`uuid`**
+  (`format_entry_uuid` / `random_entry_uuid` / `new_totp_entry_with_uuid`, RFC 4122 v4
+  from CALLER-supplied entropy per ADR 0007). ⚠️ **NOTHING KEYS OFF THE uuid YET** —
+  every lookup is still by `label`, deliberately. ⚠️ `extra` preserves **BYTES, NOT
+  SEMANTICS**, and any code that rebuilds a vault field-by-field throws it away again.
+  A test pins that `TotpVault::default()` still serializes to exactly
+  `{"version":1,"entries":[]}`.
   Also **`sigil device enroll|list|revoke|grant`** — the CLIENT half of sigild's
   multi-device auth model (**contract v3**, ADR 0031; Phase 42), so the CLI is the
   FIRST client that speaks v3: `device enroll --token <t> [--label <name>] [--key
@@ -1545,6 +1678,62 @@ public, make no security claims, until the audit completes and trademark clears.
   `crypto.subtle`), does **no cryptography of its own** (SHA-256/HKDF via `crypto.subtle`,
   AEAD + Argon2id in the wasm), touches **no wire format and no Rust**, and is used by the
   **webapp only** — `extension/build.sh` does **NOT** vendor it, deliberately.
+  ⛔ **Phase 59 fixed a LOCKOUT in that module: `userVerified` was computed and NEVER
+  ENFORCED (ADR 0046's Phase 59 addendum).** CTAP 2.1's `hmac-secret` keys **TWO
+  INDEPENDENT SECRETS per credential** (`CredRandomWithUV` / `CredRandomWithoutUV`) and
+  the authenticator chooses by whether the ceremony verified a user, so a `UV=false`
+  ceremony returns a *different, equally valid-looking* 32 bytes: at **enable** the slot
+  is sealed under the wrong secret, at **unlock** it refuses, and — since an AEAD tag
+  cannot tell a wrong password from a different key — a user holding a **WORKING passkey
+  and the CORRECT password** was told *"wrong password or a different passkey"* and
+  pushed onto the recovery sheet. ⛔ **The two-assertion determinism probe CANNOT catch
+  it** (both probe assertions share one UV state, so they agree with each other and look
+  healthy). `evaluatePrf` now checks the flag **BEFORE the PRF bytes are even looked at**
+  and throws code **`uv_missing`**, with its own `explainPasskeyStatus` arm at enable and
+  at unlock — ⚠️ **never folded into `slot_open_failed`**, because the passkey is fine,
+  the password may be fine, and the fix is a real action the user can take. ⚠️ **ADR 0046
+  limitation 8 is NARROWED, NOT RETIRED**: we still cannot verify that a human was
+  verified, and a lying authenticator is still undetectable. The guarantee is narrower —
+  **we never seal under, or try to open with, a secret from the wrong hmac-secret slot.**
+  Same file, second correction: `evaluatePrf` now returns the **REAL
+  `authenticatorAttachment`** from the ceremony (the webapp had been *inferring* it as
+  `backupEligible ? "" : "platform"`, telling every holder of a **non-syncing SECURITY
+  KEY** that their factor lived *"on this device only"* — the opposite of true, and the
+  opposite of useful when the question is *"what do I have to keep safe?"*).
+  ⚠️ **The guard is a NODE test, not Playwright, and that is forced:** Chrome's CDP
+  virtual authenticator **cannot produce a "completed but unverified" assertion** (with
+  `userVerification: "required"` it either verifies or the ceremony fails), so the
+  Playwright passkey suite could not have covered this branch, at any size.
+  **`sigil-wasm/test/passkey-uv-interop.mjs`** drives the SHIPPED `evaluatePrf` over a
+  stubbed `navigator.credentials` — ⚠️ **that double is deliberately MORE PERMISSIVE than
+  any real authenticator**, which is the point, so a PASS there is evidence about **our
+  check**, not about any browser.
+  ⭐ **Phase 59 also gave JS the NO-DOWNGRADE RATCHET and the FORWARD-COMPATIBLE SCHEMA**
+  (ADR 0047). Two new thin-shell wasm exports — **`container_params`** (read a
+  `SIGILcli` header with **no password, no KDF and no allocation**) and
+  **`reseal_params`** (call `sigil-core`'s `Argon2Params::no_downgrade`) — plus
+  `containerParams` / **`ratchetParams`** / **`cloneVault`** / `checkVaultReadable` /
+  `formatEntryUuid` / `randomEntryUuid` / `TOTP_VAULT_READER_VERSION` in
+  **`totp-vault.mjs`**, and `sharing.mjs`'s `rotateVaultKey` now ratchets instead of
+  re-sealing at its hardcoded default. ⛔ **THE BUG:** every browser re-seal wrote a
+  hardcoded `{m_cost:19456, t_cost:2, p_cost:1}` without reading the header it was
+  replacing, so a vault the CLI wrote at **65536/4/2** came back from **ONE** browser
+  edit at **19456/2/1** — a **3.4× cut in memory cost and half the passes**, silently,
+  with no user action and no error, and **permanent** (a re-seal is where parameters are
+  chosen). ⚠️ **`ratchetParams` FAILS OPEN** on a container it cannot parse (a corrupt
+  stored value must never block a save) — it falls back to the client's own defaults,
+  never to something weaker, so the dangerous direction still cannot happen.
+  **`totp-migration.mjs`** gained `migrationBatchIsComplete` / `migrationBatchIsFinal` /
+  `migrationBatchNote`, and ⚠️ **`decodeMigrationUri` NOW RETURNS A BATCH OBJECT, NOT AN
+  ARRAY** (`{entries, version, batchSize, batchIndex, batchId, complete, finalBatch,
+  batchNote}`) — a deliberate breaking change to this module's own API, chosen so that
+  ignoring the framing is **visible at the call site** rather than possible by omission;
+  every caller in the repo (webapp, extension, `demo/`) was updated in the same change.
+  ⚠️ **`web/packages/sigil-wasm/index.mjs` had to re-export `container_params` +
+  `reseal_params`** — without that, `ratchetParams` (which is handed the module namespace
+  as its `wasm`) would call an undefined function and every browser re-seal would fall
+  back to this build's own weaker defaults. **That is the two-hole trap from Phase 56
+  again** (`index.mjs` AND `index.d.ts`), and it is why the re-export exists.
   **Phase 56 also added the JS half of ENTITLEMENT (ADR 0043):** a NEW framework-free ESM
   module **`sigil-wasm/entitlement.mjs`** (`getSubscription`, `entitlementState`,
   `describeEntitlement`, `readEntitlementHeaders`, `explainSubscriptionStatus`, the three
@@ -1648,13 +1837,27 @@ public, make no security claims, until the audit completes and trademark clears.
   webapp — plus, since Phase 57, the **positive ADR 0036 assertion**: every value in
   `chrome.storage.local` must be a sealed `SIGILcli` container and
   `chrome.storage.session`/`sync`/`managed`, `sessionStorage`, cookies and IndexedDB must
-  all be EMPTY) and `entitlement.spec.mjs` — bring it to **12 tests in 5 spec files**, and
+  all be EMPTY) and `entitlement.spec.mjs` — brought it to **12 tests in 5 spec files** (now
+  **14 in 6** with Phase 59's `schema.spec.mjs`), and
   they DO drive the enrollment UI, closing the old "enrollment UI is not Playwright-covered"
   gap. ⚠️ They run against the **`fake-sigild.mjs` double**, not a real server.
   Phase 57 also gave `popup.js`'s `authErr` a **402 arm** — it rendered a lapsed-account
   cross-account share as an anonymous `HTTP 402`, because no JS explainer had a 402 case;
   `explainAuthStatus` / `explainRecoveryStatus` now spell out that a 402 is a **BILLING
   state**, not an authentication or permission failure, and that reading is never refused.
+  ⭐ **PHASE 59 (ADR 0047) applied the SAME three changes as the webapp**, through the
+  vendored helpers: an `async sealParams(storageKey)` reading `chrome.storage.local` and
+  ratcheting, passed at **both** of this popup's sealing sites (`sealVault`,
+  `sealDeviceIdentity`); **`cloneVault`** in `withVault` instead of hand-rebuilding
+  `{version, entries}` (which silently deleted a newer client's fields and then pushed
+  the stripped vault over them); and the multi-QR batch note, keyed off
+  `batch.finalBatch` so a **finished** import is not announced as incomplete. A new
+  **`schema.spec.mjs`** proves the preservation property **through the real unpacked
+  extension** — seeding a vault with fields no Sigil build has heard of, driving a real
+  popup edit, and decrypting what the extension actually wrote — bringing the suite to
+  **14 tests in 6 spec files**. ⚠️ It exists because a verifier reverted the PRODUCT half
+  of the fix and the whole gate stayed green (see the webapp bullet); the module was
+  covered and the popup was not.
   **Dev / UNAUDITED / loaded unpacked / published to NO store**; sync is **loopback
   plain-HTTP only, no TLS**; generate-only (no verification / constant-time compare /
   zeroization); the reserved-stub ambitions (phishing protection, passkey provider,
@@ -1849,6 +2052,20 @@ public, make no security claims, until the audit completes and trademark clears.
   nothing else under `cli/` was edited, and there is still no second HTTP client or signing
   path under `desktop/`.** Do NOT store real 2FA
   secrets. ADR 0032, ADR 0037, ADR 0038, ADR 0042, ADR 0043.
+  ⭐ **Phase 59 (ADR 0047) reached the desktop by the same REUSE rule, and added no
+  commands** (still **forty**): `ImportSummary` gained **`partial_batches`** (one note
+  per multi-QR Google Authenticator batch seen) and **`batches_outstanding`**, plus
+  `is_complete()`; the `import` command passes both across the IPC and `desktop/ui/main.js`
+  keys its **"⚠️ INCOMPLETE"** framing off **`batches_outstanding`**, NOT off
+  `partial_batches` being non-empty — importing **batch 2 of 2** used to be reported as
+  *"0 more QR code(s) must be imported"*, i.e. telling a user who had just finished that
+  they had not. ⚠️ `ImportSummary` is therefore **no longer `Copy`**. It inherits the
+  container ceiling and the `min_reader_version` / unknown-field preservation for free
+  (they are in `sigil-core` and the `sigil-cli` library). ⛔ **What it did NOT inherit:**
+  `--skip-unsupported` — `export_migration_uri` calls `entry_to_migration_otp` over the
+  whole vault, so a single non-30 s entry now makes the desktop's migration export fail
+  **wholesale**; and the **no-downgrade ratchet does not cover `VaultSession::save`**,
+  which seals at `self.params` without reading the existing container.
 - `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
   `extension/` and `desktop/` are now real — see above.)
 
@@ -1939,9 +2156,17 @@ It also encodes two traps that make a **planted mutation appear to PASS locally*
   the Go block: a spec that quietly stops running looks exactly like one that passes. The
   `pw()` helper fails on `skipped` / `did not run` as well as `failed`.
 
-`./scripts/gate.sh --quick` skips the shell e2e scripts. ⚠️ Its usage line also says it
-skips Postgres — it does **not**: the throwaway container is started regardless. Set
-`SIGILD_TEST_POSTGRES` yourself to point at an existing database instead.
+`./scripts/gate.sh --quick` skips the shell e2e scripts **and nothing else** — in
+particular it still starts the throwaway Postgres, deliberately, because a DSN-less run
+silently skips ~30 tests and two real regressions have been shown to survive one. Set
+`SIGILD_TEST_POSTGRES` yourself to point at an existing database instead. ⚠️ **This
+paragraph used to warn that the usage line "also says it skips Postgres". That warning was
+itself stale** (the line has read *"--quick skips ONLY the shell e2e scripts"* for some
+time, with the Postgres reasoning spelled out directly beneath it) and was corrected on
+2026-07-30 — one of **three** stale claims found in one sweep, alongside two entries in
+journal.md's *"still open"* list that had already been fixed. ⭐ **A stale OPEN item is
+worse than a stale status line: it points the next person's work at something already
+done.** Re-verify that list at the START of a phase, not only when writing one.
 
 ```bash
 # Rust core — fmt / clippy / test / wasm
@@ -1998,24 +2223,28 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 #   "expected 'recovery cover ...' to FAIL, but it succeeded".
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
-# clippy/test exercise the *_inner helpers (29 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the TWELVE Node tests below must all PASS.
+# clippy/test exercise the *_inner helpers (34 tests); build-wasm.sh emits
+# pkg-web/pkg-node (needs wasm-pack); then the SIXTEEN Node suites below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/12 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/12 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/12 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/12 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/12 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/12 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/12 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/12 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
-node sigil-wasm/test/pinning-interop.mjs            # 9/12 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
-node sigil-wasm/test/accounts-interop.mjs            # 10/12 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
-node sigil-wasm/test/recovery-interop.mjs           # 11/12 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
-node sigil-wasm/test/entitlement-interop.mjs         # 12/12 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/16 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/16 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/16 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/16 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/16 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/16 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/16 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/16 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/16 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/accounts-interop.mjs            # 10/16 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
+node sigil-wasm/test/recovery-interop.mjs           # 11/16 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
+node sigil-wasm/test/entitlement-interop.mjs         # 12/16 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
+node sigil-wasm/test/schema-interop.mjs             # 13/16 (Phase 59) the ONLY guard on TWO Rust<->JS mirrors that were silently LOSSY: the TotpVault/TotpEntry schema (serde DROPPED unknown fields; the JS clients rebuilt `{version, entries}` by hand, so an OLD client that merely opened and re-sealed a vault DELETED a newer client's data on a sync path where the OLDEST WRITER WINS) and the Google Authenticator BATCH FRAMING (both codecs discarded batch_size/batch_index/batch_id, so the first QR of a three-QR export imported a THIRD of the accounts and reported success). Drives the REAL `sigil` binary as the Rust half; 10 proofs, incl. min_reader_version failing closed, entry uuids, the period refusal + --skip-unsupported, the hostile-Argon2-header refusal on BOTH sides, and the JS ratchet vs the CLI's own rekey. Needs no server; PASS
+node sigil-wasm/test/passkey-uv-interop.mjs         # 14/16 (Phase 59) the ONLY exercise of the passkey USER-VERIFICATION check. Chrome's CDP virtual authenticator CANNOT produce a "completed but unverified" assertion, so the Playwright passkey suite cannot reach this branch at all, at any size — and an unenforced UV means sealing the hardware slot with CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to prevent. Drives the SHIPPED evaluatePrf over a stubbed navigator.credentials (⚠️ a double MORE PERMISSIVE than any real authenticator — the point); 4 proofs; PASS
+node sigil-wasm/test/seal-params-guard.mjs          # 15/16 (Phase 59) a SOURCE-STRUCTURE guard, not a behavioural one: every product re-seal site must ratchet its Argon2 parameters. A verifier proved mutating five of the six sites left webapp 50/50 and extension 14/14 GREEN, so this buys the regression guard for the failure that actually happens — a NEW call site that forgets. Checks 6 sealing sites across 2 product sources and FAILS if it finds ZERO; PASS
+node sigil-wasm/test/portability-guard.mjs          # 16/16 ⚠️ NOT Phase 59 feature work — it belongs to the 2026-07-30 CI-portability repair that shares this working tree. The suites are WRITTEN on macOS and RUN on ubuntu-latest, and nothing checked the two agreed: six suites hardcoded /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used `stat -f … || stat -c …`, which GNU stat does NOT fail on — so those jobs were RED for several phases while the macOS gate printed ALL GREEN. A SOURCE check, NOT a Linux run: it guards the two idioms that have actually bitten and CANNOT prove portability. PASS
 # ⚠️ sigil-wasm/test/fake-sigild.mjs is a SERVER DOUBLE for the BROWSER suites, NOT a
 # test — running it in a `test/*.mjs` loop HANGS. It sends NO CORS header unless a
 # caller passes an explicit allowlist, deliberately matching real sigild (an earlier
@@ -2061,7 +2290,7 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium: 46 tests in 9 spec files, PASS
+corepack pnpm --filter webapp exec playwright test   # headless chromium: 50 tests in 10 spec files, PASS
 # ⛔ It serves on http://localhost:3210, NOT 127.0.0.1 — Chrome refuses WebAuthn on an IP
 # literal, so every passkey spec (ADR 0046) fails there for a reason unrelated to the code.
 # `workers: 2` and `reuseExistingServer: false` are also deliberate (see the config's comments).
@@ -2079,7 +2308,7 @@ corepack pnpm --filter webapp exec playwright test   # headless chromium: 46 tes
 # the extension can be loaded unpacked or tested). NOT wired into CI.
 corepack pnpm -C extension install
 ./extension/build.sh                          # -> extension/vendor/ (gitignored)
-corepack pnpm -C extension test               # `pretest` re-runs build.sh; 12 tests in 5 spec files, PASS
+corepack pnpm -C extension test               # `pretest` re-runs build.sh; 14 tests in 6 spec files, PASS
 # ⚠️ Use `pnpm test`, NOT `pnpm -C extension exec playwright test`: only the former
 # runs the `pretest` vendor hook, so the latter can test a STALE extension/vendor/.
 # The suite loads the REAL unpacked extension in a full Chromium (channel:
@@ -2093,7 +2322,7 @@ corepack pnpm -C extension test               # `pretest` re-runs build.sh; 12 t
 # perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
 cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path desktop/Cargo.toml   # 24 unit + 7 integration (2 files) = 31
+cargo test  --manifest-path desktop/Cargo.toml   # 25 unit + 7 integration (2 files) = 32
 grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
 # Integration test 1 is THE VAULT INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
 # builds the real `sigil` binary itself and drives it against ONE shared vault file in
@@ -2163,11 +2392,18 @@ list of `.github/workflows/` (ten files):
   fmt/clippy/test** — which had no CI gate either, and which includes the golden
   `SIGILcli` / `SIGILhyb` header tests guarding the constants that MUST stay
   byte-identical with `cli/src/lib.rs` — builds the bindings and the real `sigil`
-  binary, runs **ALL TWELVE** Node interop tests (roundtrip, interop, hybrid-interop,
+  binary, runs **ALL SIXTEEN** Node interop suites (roundtrip, interop, hybrid-interop,
   sync-interop, totp-interop, migration-interop, device-auth-interop, sharing-interop,
-  pinning-interop, accounts-interop, recovery-interop, and **entitlement-interop** —
+  pinning-interop, accounts-interop, recovery-interop, **entitlement-interop** —
   the twelfth, added in Phase 56, and the **only** thing that parses a real `sigild`'s
-  entitlement bytes with the JS reader), and re-asserts `getrandom`==0 in both
+  entitlement bytes with the JS reader — plus, added in **Phase 59**,
+  **schema-interop** (the only guard on the vault schema and the migration batch
+  framing across Rust and JS), **passkey-uv-interop** (the only exercise of the passkey
+  user-verification check, which the Playwright suite structurally cannot reach) and
+  **seal-params-guard** (no product re-seal site can silently downgrade Argon2); and
+  **portability-guard**, which is ⚠️ **NOT Phase 59** but the 2026-07-30 CI-portability
+  repair sharing the same working tree — the suites are written on macOS and run on
+  ubuntu-latest, and nothing checked that the two agreed), and re-asserts `getrandom`==0 in both
   lockfiles. The other jobs run the **three** shell e2e scripts —
   **`cli/tests/e2e-sharing.sh`** (added Phase 51), plus **`e2e-accounts.sh`** and
   **`e2e-recovery.sh`**. They need Go + Rust + bash + curl + python3 and no wasm, so

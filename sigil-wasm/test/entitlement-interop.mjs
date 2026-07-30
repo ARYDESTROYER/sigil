@@ -57,13 +57,14 @@ import {
   base32Decode,
 } from "../totp-vault.mjs";
 import { webcrypto } from "node:crypto";
+import { resolveGo } from "./go-helper.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..");
 const pkgPath = join(__dirname, "..", "pkg-node", "sigil_wasm.js");
 const buildWasm = join(__dirname, "..", "build-wasm.sh");
 const sigildDir = join(repoRoot, "sigild");
-const goBin = process.env.GO ?? "/opt/homebrew/bin/go";
+const goBin = resolveGo();
 
 function fail(msg) {
   console.error(`FAIL: ${msg}`);

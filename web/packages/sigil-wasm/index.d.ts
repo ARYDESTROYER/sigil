@@ -63,6 +63,26 @@ export function seal_to_container(
 /** Open a CLI-compatible `SIGILcli` container. Throws on failure. */
 export function open_container(password: Uint8Array, container: Uint8Array): Uint8Array;
 
+/**
+ * Read `[m_cost, t_cost, p_cost]` out of a `SIGILcli` header — no password, no
+ * KDF, no allocation. Throws on a header that is not ours or whose declared work
+ * factors exceed sigil-core's ceilings.
+ */
+export function container_params(container: Uint8Array): Uint32Array;
+
+/**
+ * ⭐ THE NO-DOWNGRADE RATCHET (sigil-core's `Argon2Params::no_downgrade`, the
+ * same function `sigil_cli::no_downgrade` delegates to). Returns
+ * `[m_cost, t_cost, p_cost]`: the componentwise max of what `container` declares
+ * and what the caller asked for.
+ */
+export function reseal_params(
+  container: Uint8Array,
+  m_cost: number,
+  t_cost: number,
+  p_cost: number,
+): Uint32Array;
+
 /** Derive the 32-byte X25519 public key from a 32-byte X25519 secret. */
 export function hybrid_x25519_public(secret: Uint8Array): Uint8Array;
 
@@ -148,6 +168,8 @@ export interface SigilWasm {
   open_record: typeof open_record;
   seal_to_container: typeof seal_to_container;
   open_container: typeof open_container;
+  container_params: typeof container_params;
+  reseal_params: typeof reseal_params;
   hybrid_x25519_public: typeof hybrid_x25519_public;
   hybrid_mlkem_encaps_key: typeof hybrid_mlkem_encaps_key;
   hybrid_seal_to_container: typeof hybrid_seal_to_container;
@@ -172,6 +194,8 @@ export function initWasm(): Promise<SigilWasm>;
 // ── totp-vault helpers ──────────────────────────────────────────────────────
 
 export const TOTP_VAULT_VERSION: number;
+/** Highest `min_reader_version` this build can satisfy. */
+export const TOTP_VAULT_READER_VERSION: number;
 
 export interface TotpEntry {
   label: string;
@@ -182,11 +206,26 @@ export interface TotpEntry {
   algorithm: string;
   digits: number;
   period: number;
+  /** Stable RFC 4122 v4 entry id. Absent on entries written before Phase 59. */
+  uuid?: string;
+  /**
+   * ⭐ Fields written by a NEWER client that this build does not understand.
+   * They are preserved verbatim — do not rebuild an entry field-by-field.
+   */
+  [unknownField: string]: unknown;
 }
 
 export interface TotpVault {
+  /** What WROTE this vault. */
   version: number;
+  /**
+   * What a reader must UNDERSTAND. Refuse iff this exceeds
+   * `TOTP_VAULT_READER_VERSION`; absent means "the vault's own `version`".
+   */
+  min_reader_version?: number;
   entries: TotpEntry[];
+  /** ⭐ Unknown top-level fields, preserved verbatim. Use `cloneVault`. */
+  [unknownField: string]: unknown;
 }
 
 export interface AddEntryInput {
@@ -196,6 +235,8 @@ export interface AddEntryInput {
   algorithm: string;
   digits: number;
   period: number;
+  /** Omit to draw one; pass `null` to write no `uuid` field at all. */
+  uuid?: string | null;
 }
 
 export interface Argon2Params {
@@ -209,6 +250,34 @@ export function bytesToBase64(bytes: Uint8Array | ArrayLike<number>): string;
 export function base32Decode(input: string): Uint8Array;
 export function newVault(): TotpVault;
 export function addEntry(vault: TotpVault, input: AddEntryInput): TotpVault;
+/**
+ * ⭐ Clone a vault for editing WITHOUT dropping fields this build does not know.
+ * Use instead of `{ version: v.version, entries: [...v.entries] }`.
+ */
+export function cloneVault(vault: TotpVault): TotpVault;
+export function checkVaultReadable(vault: TotpVault): void;
+/**
+ * Read the Argon2id work factors a `SIGILcli` container declares, without a
+ * password and without opening it. Throws on a header that is not ours.
+ */
+export function containerParams(
+  wasm: Pick<SigilWasm, "container_params">,
+  containerBytes: Uint8Array,
+): Argon2Params;
+/**
+ * ⭐ THE NO-DOWNGRADE RATCHET — call at EVERY re-seal. Returns the componentwise
+ * max of what `existingContainer` declares and `requested`, so a browser edit can
+ * never write a weaker header than the one it read. `null` (a first seal) returns
+ * `requested` unchanged; an unparsable container also falls back to `requested`,
+ * never to something weaker.
+ */
+export function ratchetParams(
+  wasm: Pick<SigilWasm, "reseal_params">,
+  existingContainer: Uint8Array | null | undefined,
+  requested: Argon2Params,
+): Argon2Params;
+export function formatEntryUuid(random16: Uint8Array | ArrayLike<number>): string;
+export function randomEntryUuid(): string;
 export function openVault(
   wasm: Pick<SigilWasm, "open_container">,
   password: string | Uint8Array,
@@ -837,7 +906,57 @@ export function rotateVaultKey(
 export function base32Encode(bytes: Uint8Array): string;
 export function parseOtpauthUri(uri: string): TotpEntry;
 export function buildOtpauthUri(entry: TotpEntry): string;
-export function decodeMigrationUri(uri: string): TotpEntry[];
+/**
+ * ⭐ One decoded `otpauth-migration://` URI — i.e. ONE QR CODE. Google
+ * Authenticator splits a large export across several, each carrying a SLICE of
+ * the accounts, so `entries` is not necessarily the whole export.
+ */
+export interface MigrationBatch {
+  /** The accounts THIS payload carried. */
+  entries: TotpEntry[];
+  version: number;
+  /** How many QR codes the export was split into; 0/1 means a single one. */
+  batchSize: number;
+  /** Zero-based index of this QR within the export. */
+  batchIndex: number;
+  /** Shared id linking the QR codes of one export. */
+  batchId: number;
+  /** False when there are other QR codes still to import. */
+  complete: boolean;
+  /**
+   * ⭐ True when this was the LAST QR of a multi-QR export — i.e. `complete` is
+   * false, but nothing is OUTSTANDING. A UI keys its "INCOMPLETE" alarm off
+   * `!finalBatch`, not off `batchNote` being non-null: telling someone who has
+   * just scanned the last code that their import is partial is a false alarm,
+   * and false alarms are what teach users to click past the real one.
+   */
+  finalBatch: boolean;
+  /** A "batch i of N …" sentence when `complete` is false, else null. MUST be shown. */
+  batchNote: string | null;
+}
+
+/**
+ * ⚠️ Returns a batch, NOT an array. Check `complete` / `batchNote` before
+ * telling a user the transfer finished.
+ */
+export function decodeMigrationUri(uri: string): MigrationBatch;
+export function migrationBatchIsComplete(batch: { batchSize?: number }): boolean;
+/** ⭐ True only for the LAST QR of a multi-QR export. See `MigrationBatch.finalBatch`. */
+export function migrationBatchIsFinal(batch: {
+  batchSize?: number;
+  batchIndex?: number;
+}): boolean;
+export function migrationBatchNote(batch: {
+  batchSize?: number;
+  batchIndex?: number;
+  batchId?: number;
+  entries?: unknown[];
+  otps?: unknown[];
+}): string | null;
+/**
+ * ⛔ Throws for any entry the format cannot represent faithfully — including a
+ * `period` other than 30 s, which the wire format cannot carry at all.
+ */
 export function encodeMigrationUri(entries: TotpEntry[]): string;
 
 // ── recovery kit (Phase 54) ─────────────────────────────────────────────────
@@ -1167,10 +1286,22 @@ export interface PrfAssertion {
   credentialId: string;
   backupEligible: boolean;
   backupState: boolean;
+  /** Always true — a UV-less ceremony throws `uv_missing` instead of returning. */
   userVerified: boolean;
+  /**
+   * ⭐ The REAL `authenticatorAttachment` reported by the ceremony
+   * ("platform" | "cross-platform" | ""). Never infer this from other flags.
+   */
+  attachment: string;
 }
 
-/** Run ONE assertion (discoverable credential) and return its 32-byte PRF output. */
+/**
+ * Run ONE assertion (discoverable credential) and return its 32-byte PRF output.
+ *
+ * ⛔ Throws `PasskeyError` with code `uv_missing` if the ceremony completed
+ * WITHOUT user verification: CTAP hmac-secret keys one secret with UV and a
+ * different one without, so those bytes would be the wrong key.
+ */
 export function evaluatePrf(options?: {
   allowCredentials?: PublicKeyCredentialDescriptor[];
   timeoutMs?: number;

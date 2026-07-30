@@ -12,7 +12,7 @@ end are in the repository.
 
 ---
 
-## The one failure mode this project has, in nine disguises
+## The one failure mode this project has, in ten disguises
 
 > **Work that quietly does not run looks exactly like work that passes.**
 
@@ -30,9 +30,19 @@ algorithm — a *green signal that meant nothing*.
 | 7 | A test double (`fake-sigild.mjs`) sent `Access-Control-Allow-Origin`, which **real `sigild` does not**. Six webapp specs passed while the app could not reach a real server at all. | The mock was more permissive than the thing it stood in for. |
 | 8 | `cors.spec.ts` resolved Go via a hardcoded macOS path, so on CI it **`test.skip`ped itself** — leaving the only browser-level proof of a fix with zero coverage. Adding `actions/setup-go` did **not** fix it, because that sets `PATH` and never `$GO`. | A skipped file and a green job are indistinguishable. |
 | 9 | No test asserted the "browsers persist only sealed containers" invariant. A planted plaintext write of the device seed, hybrid secret and every vault key passed **19/19 and 12/12**. | The suites checked for one needle, not for the property. |
+| 10 | Two Phase 59 fixes were **guarded in the library and unguarded in the product**. A verifier reverted `cloneVault(vault)` in `authenticator.tsx` to the pre-fix `{ version, entries }` shape, and five of six `sealParams(...)` call sites to the bare constant — **webapp 50/50 and extension 14/14 stayed green** both times. Mutating the *same* logic inside `totp-vault.mjs` / `passkey.mjs` went red every time. | The module was covered, so the coverage *looked* real — while the fix in the shipping app was deletable without a single red light. |
 
 The common shape: **the measurement was broken, not the code.** In most of these
 the product was fine; what failed was the thing that was supposed to notice.
+
+⚠️ **Entry 10 happened inside the commit that added this document**, which is the
+most useful thing about it. Writing the pattern down did not prevent the pattern.
+The fix was three new guards at the level that can see it — a Playwright spec in
+each browser client that drives a **real UI edit** and then decrypts what the app
+actually wrote, plus a source-structure guard enumerating every sealing call site
+in the shipping sources and failing if it finds **zero**. ⚠️ That last one is
+explicitly a regression guard for *a new call site that forgets*, not proof that
+the helper it checks for is correct; it says so in its own header.
 
 ---
 
@@ -118,6 +128,12 @@ These are controls, not intentions:
   mock more permissive than the real thing are all *broken*.
 - **Test doubles must not be more permissive than the real thing**, and where they
   are, the file says so in its own header.
+- **A fix that lands in a shared library AND in a product must be guarded in the
+  product too.** Library-level coverage of a shared helper says nothing about
+  whether the shipping app still calls it. Where behavioural coverage of every
+  call site would be disproportionate, a **source-structure guard** that
+  enumerates the call sites is the accepted substitute — and it must fail when it
+  finds *none*, or a rename silently turns it into a no-op.
 - **Every terminal assertion waits.** `isVisible()` is banned as an outcome check
   in the browser suites; the suites were swept for it.
 - **Claims are grepped against the code** before they are written down — env vars,

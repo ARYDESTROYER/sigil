@@ -74,7 +74,7 @@ import {
   DeviceAuthError,
   explainAuthStatus,
 } from "./device-auth.mjs";
-import { bytesToBase64, base64ToBytes } from "./totp-vault.mjs";
+import { bytesToBase64, base64ToBytes, ratchetParams } from "./totp-vault.mjs";
 // ⭐ ONE recovery-kit label per language. This module used to redefine the string
 // locally; see the note above recipientIsRecoveryKit for why that was dangerous.
 // (recovery.mjs imports this module too — an ESM cycle that is safe because
@@ -1304,7 +1304,11 @@ export async function rotateVaultKey(
   const c = webcrypto();
   const vaultKey = generateVaultKey();
   const plaintext = wasm.open_container(oldVaultKey, container);
-  const p = params ?? { m_cost: 19456, t_cost: 2, p_cost: 1 };
+  // ⭐ NO-DOWNGRADE. This is the direct JS twin of `sigil_cli::reseal_container`,
+  // and it used to re-seal at a hardcoded 19456/2/1 no matter what the input
+  // declared — so rotating a vault the CLI had written at 65536/4/2 quietly cut
+  // its memory cost by 3.4x. `params` is a FLOOR, not a verbatim instruction.
+  const p = ratchetParams(wasm, container, params ?? { m_cost: 19456, t_cost: 2, p_cost: 1 });
   const resealed = new Uint8Array(
     wasm.seal_to_container(
       vaultKey,

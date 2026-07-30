@@ -93,3 +93,68 @@ hand-rolled, dependency-free codec — plus plain `otpauth://` — and add match
   unaudited building blocks; **do not import or export real 2FA secrets in this
   build.** Public copy still obeys
   [`../../web/apps/marketing/MARKETING-CLAIMS.md`](../../web/apps/marketing/MARKETING-CLAIMS.md).
+
+## Two things this feature was saying that were not true (added Phase 59, 2026-07-30)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+Both defects share one root cause — **a codec that discarded what it did not use**
+— and both landed in the one feature whose entire purpose is *not losing
+accounts*.
+
+### 1. ⛔ A multi-QR import reported plain success while carrying a fraction of the export
+
+Google Authenticator splits a large export across **several QR codes**. Each is a
+complete, independently-decodable `MigrationPayload` carrying `batch_size` /
+`batch_index` / `batch_id`, with the accounts **divided between them**. This codec
+consumed those three fields and threw them away, so scanning the first QR of a
+three-QR export imported **a third of the accounts** and printed `imported N`
+with no warning at all. The users it hits hardest are the ones with the most
+accounts — the only ones for whom the export is multi-QR in the first place.
+
+`decode_migration_payload` / `decode_migration_uri` now return a
+**`MigrationBatch`** carrying the framing, with `is_complete()`, `is_final_batch()`
+and a human-readable `batch_note()`. `sigil totp import` prints the note and a
+header chosen by whether anything is **actually outstanding**.
+
+⭐ **`is_final_batch()` is not a nicety.** The first cut told a user importing
+**batch 2 of 2** that *"0 more QR code(s) must be imported — this import is
+PARTIAL"* — i.e. it told someone who had just finished that they had not. **A
+warning that cries wolf is one the next user ignores when it is real.** The final
+batch is still *named* (this client keeps no cross-invocation state and genuinely
+cannot know whether the earlier QRs were imported) but it is not called
+incomplete.
+
+### 2. ⛔ A `--migration` export of a non-30-second entry was a silent lie
+
+The migration wire format has **no period field** — Google Authenticator TOTP is
+always 30 s. The original text recorded this as *"the entry's `period` is NOT
+representable in the format and is dropped"*. In practice that meant a 60 s entry
+was exported **as if it were 30 s**, and the receiving app then computed
+**different codes from the same secret**: an account that simply stops working,
+delivered as a successful export.
+
+`entry_to_migration_otp` now **refuses** such an entry, naming the label, the
+period, and the plain `otpauth://` export that carries the field faithfully.
+
+⭐ **Refusal is the default, and a new opt-in makes it survivable.** A silently
+partial export of your 2FA is worse than a failed one — but refusing outright made
+**one** unusual account cost the user the entire bulk-export path, which is the
+anti-lock-in feature. `sigil totp export --migration --skip-unsupported` exports
+the rest and names each entry it left out, **individually, with the reason, on
+stderr** so it survives a pipe to a file; the summary line then says `PARTIAL` and
+how many were skipped. Using it without `--migration` is an error, because the
+plain export can represent everything.
+
+### ⚠️ Honest limits
+
+- **`--skip-unsupported` exists only in the CLI.** The webapp, the MV3 extension
+  and the desktop call the encoder over the whole vault, so for them one 60 s entry
+  now makes the migration export fail **wholesale** where it previously produced a
+  wrong one. Right direction; unanswered usability regression.
+- **The import is still stateless.** Nothing correlates `batch_id` across
+  invocations, so the client cannot tell you that batches 1 and 3 arrived and 2 did
+  not. The note says so rather than implying otherwise.
+- **`export` still prints secrets in the clear** — unchanged, by design, behind the
+  same loud warning.

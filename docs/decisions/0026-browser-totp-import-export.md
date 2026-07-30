@@ -91,3 +91,65 @@ test.** This gives the browser client full TOTP import/export at parity with the
   unaudited building blocks; **do not import or export real 2FA secrets in this
   build.** Public copy still obeys
   [`../../web/apps/marketing/MARKETING-CLAIMS.md`](../../web/apps/marketing/MARKETING-CLAIMS.md).
+
+## The JS mirror carried the same two defects — and `decodeMigrationUri` now returns an object (added Phase 59, 2026-07-30)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+**The mirror worked exactly as designed, which is the point.** Both defects fixed
+in [ADR 0025's addendum](0025-totp-import-export.md) were present here too,
+byte-for-byte, because this module is a faithful mirror of `cli/src/migration.rs`.
+That is the cost side of the mirror decision: a defect in the original is a defect
+in the copy, and the cross-tool test proved they *agreed* — it could not tell that
+what they agreed on was wrong.
+
+- **The batch framing** (`batch_size` / `batch_index` / `batch_id`) was consumed
+  and discarded here too, so a browser import of the first QR of a three-QR export
+  added a third of the accounts and said `Imported N.`
+- **`entryToMigrationOtp` dropped the period**, so a 60 s entry was exported as if
+  it were 30 s and the receiving app computed different codes from the same secret.
+
+Both now match the Rust side exactly, including the wording of the batch note and
+the `is_final_batch` / `finalBatch` distinction that stops a *finished* multi-QR
+import being announced as incomplete.
+
+### ⚠️ A breaking change to this module's own API
+
+```js
+// before
+const entries = decodeMigrationUri(uri);          // Array<TotpEntry>
+
+// after
+const batch   = decodeMigrationUri(uri);          // { entries, version, batchSize,
+                                                  //   batchIndex, batchId, complete,
+                                                  //   finalBatch, batchNote }
+```
+
+⭐ **Deliberate, and chosen over an optional out-parameter or a second function.**
+A caller that ignores the framing is exactly the bug, so the shape makes ignoring
+it *visible* at the call site rather than possible by omission. Every caller in
+this repo was updated in the same change: the webapp, the MV3 extension (through
+its vendored copy) and the `sigil-wasm/demo/`. There is no published package here,
+so no external consumer exists — the change is recorded because the next person to
+read `totp-migration.mjs` will find its signature different from every other
+decoder in the file.
+
+`migrationBatchIsComplete`, `migrationBatchIsFinal` and `migrationBatchNote` are
+also exported for callers that decode a payload themselves.
+
+### ⚠️ Honest limits
+
+- **The mirror is still a mirror.** The batch note text, the one-based rendering of
+  the zero-based wire `batch_index`, and the period refusal now exist in **both**
+  Rust and JS and **must stay in step**.
+  `sigil-wasm/test/schema-interop.mjs` is the guard, and it drives the **real
+  `sigil` binary** — but a mirror that drifts still does not fail loudly on its
+  own.
+- **No `--skip-unsupported` equivalent.** The browser clients call
+  `encodeMigrationUri(vault.entries)` over the whole vault, so a single
+  unrepresentable entry now makes the migration export throw **wholesale**. Better
+  than emitting a wrong one; still a regression in usability that these clients
+  have not answered.
+- **The browser export still reveals secrets in the clear**, unchanged and by
+  design.

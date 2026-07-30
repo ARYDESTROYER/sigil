@@ -48,7 +48,7 @@
 // encrypted container). The demo export path warns loudly. Do NOT handle real
 // 2FA secrets in this build.
 
-import { base64ToBytes, bytesToBase64, base32Decode } from "./totp-vault.mjs";
+import { base64ToBytes, bytesToBase64, base32Decode, randomEntryUuid } from "./totp-vault.mjs";
 
 // ── Constants mirrored from cli/src/migration.rs ─────────────────────────────
 
@@ -323,24 +323,96 @@ function decodeOtpParameters(buf) {
   return otp;
 }
 
-/** Decode a MigrationPayload into its list of raw OtpParameters records. */
+/**
+ * Decode a MigrationPayload into its raw OtpParameters records AND its batch
+ * framing. MIRRORS cli/src/migration.rs::decode_migration_payload.
+ *
+ * ⛔ `batch_size` / `batch_index` / `batch_id` used to be consumed and DISCARDED
+ * on both sides. Google Authenticator splits a large export across several QR
+ * codes, each a complete payload carrying a SLICE of the accounts, so discarding
+ * the framing meant scanning the first QR of a three-QR export imported a third
+ * of the accounts and reported success. See `migrationBatchNote`.
+ */
 function decodeMigrationPayload(buf) {
-  const out = [];
+  const out = { otps: [], version: 0, batchSize: 0, batchIndex: 0, batchId: 0 };
   const cur = { buf, pos: 0 };
   while (cur.pos < buf.length) {
     const tag = Number(readVarint(cur));
     const field = tag >> 3;
     const wire = tag & 0x07;
     if (field === 1 && wire === WIRE_LEN) {
-      out.push(decodeOtpParameters(readLenDelimited(cur)));
-    } else if (field >= 2 && field <= 5 && wire === WIRE_VARINT) {
-      // version / batch_size / batch_index / batch_id — consumed, ignored.
-      readVarint(cur);
+      out.otps.push(decodeOtpParameters(readLenDelimited(cur)));
+    } else if (field === 2 && wire === WIRE_VARINT) {
+      out.version = Number(readVarint(cur));
+    } else if (field === 3 && wire === WIRE_VARINT) {
+      out.batchSize = Number(readVarint(cur));
+    } else if (field === 4 && wire === WIRE_VARINT) {
+      out.batchIndex = Number(readVarint(cur));
+    } else if (field === 5 && wire === WIRE_VARINT) {
+      out.batchId = Number(readVarint(cur));
     } else {
       skipField(cur, wire);
     }
   }
   return out;
+}
+
+/**
+ * ⭐ Whether a decoded payload is the WHOLE export.
+ * MIRRORS cli/src/migration.rs::MigrationBatch::is_complete.
+ */
+export function migrationBatchIsComplete(batch) {
+  return (batch.batchSize ?? 0) <= 1;
+}
+
+/**
+ * ⭐ A human-readable "batch i of N" note, or `null` for a single-QR export.
+ * MIRRORS cli/src/migration.rs::MigrationBatch::batch_note — including the
+ * one-based rendering of the zero-based wire `batch_index`, because "batch 0 of
+ * 3" reads like nothing was imported.
+ *
+ * A caller MUST surface this. An import that reports only a count is telling a
+ * user with 30 accounts that a transfer succeeded when two thirds of it did not.
+ */
+export function migrationBatchNote(batch) {
+  if (migrationBatchIsComplete(batch)) return null;
+  const size = batch.batchSize;
+  const index = batch.batchIndex ?? 0;
+  const count = (batch.entries ?? batch.otps ?? []).length;
+  if (migrationBatchIsFinal(batch)) {
+    return (
+      `this was batch ${index + 1} of ${size} — the LAST QR code of a MULTI-QR ` +
+      `Google Authenticator export (batch id ${batch.batchId ?? 0}), carrying ` +
+      `${count} of the accounts. Nothing further needs scanning from this export. ` +
+      `Check that the earlier ${Math.max(size - 1, 0)} QR code(s) were imported too ` +
+      `before deleting anything from the old app`
+    );
+  }
+  const remaining = Math.max(size - index - 1, 0);
+  return (
+    `this is batch ${index + 1} of ${size} from a MULTI-QR Google Authenticator ` +
+    `export (batch id ${batch.batchId ?? 0}): it carries ${count} of the accounts, ` +
+    `and ${remaining} more QR code(s) must be imported before the transfer is ` +
+    `complete. This import is PARTIAL`
+  );
+}
+
+/**
+ * ⭐ Whether this payload is the **LAST** QR of a multi-QR export.
+ * MIRRORS cli/src/migration.rs::MigrationBatch::is_final_batch.
+ *
+ * ⛔ Distinct from `migrationBatchIsComplete`, and the distinction is the whole
+ * point: batch 2 of 2 is not the whole export, but nothing further needs
+ * scanning. Telling a user who has just finished that "0 more QR code(s) must be
+ * imported — this import is PARTIAL" is a warning that cries wolf, and a warning
+ * that cries wolf is one the next user ignores when it is real.
+ *
+ * A caller uses this to pick its FRAMING ("incomplete!" vs "that was the last
+ * one"); the note text itself already differs.
+ */
+export function migrationBatchIsFinal(batch) {
+  if (migrationBatchIsComplete(batch)) return false;
+  return (batch.batchIndex ?? 0) + 1 >= batch.batchSize;
 }
 
 /** Encode one raw OtpParameters record; proto3 omits default (zero/empty). */
@@ -419,6 +491,9 @@ function migrationOtpToEntry(otp) {
     algorithm,
     digits,
     period: TOTP_DEFAULT_PERIOD,
+    // The migration wire format carries no Sigil entry id, so an imported entry
+    // gets a fresh one — the same thing the CLI's new_totp_entry does.
+    uuid: randomEntryUuid(),
   };
   if (otp.issuer.length > 0) entry.issuer = otp.issuer;
   return entry;
@@ -427,10 +502,23 @@ function migrationOtpToEntry(otp) {
 /**
  * Map a vault TotpEntry to a raw OtpParameters for export (mirrors
  * entry_to_migration_otp). The migration format expresses only SHA1/256/512,
- * 6/8 digits, TOTP, and a fixed 30 s period (the entry's `period` is dropped);
- * anything outside that throws rather than being silently corrupted.
+ * 6/8 digits, TOTP, and a fixed 30 s period; anything outside that throws rather
+ * than being silently corrupted.
+ *
+ * ⛔ THAT INCLUDES THE PERIOD (Phase 59). The wire format has no period field, so
+ * a 60 s entry used to be exported as if it were 30 s — the receiving app would
+ * then compute DIFFERENT codes from the same secret, i.e. the export was a
+ * silent lie about an account that would simply stop working.
  */
 function entryToMigrationOtp(entry) {
+  if (entry.period !== TOTP_DEFAULT_PERIOD) {
+    throw new Error(
+      `cannot export ${JSON.stringify(entry.label)} to the Google Authenticator migration ` +
+        `format: its period is ${entry.period} s and that format can only express ` +
+        `${TOTP_DEFAULT_PERIOD} s, so the exported account would generate the WRONG codes. ` +
+        `Use the plain otpauth:// export instead — it carries the period`,
+    );
+  }
   const secret = base64ToBytes(entry.secret);
   let algorithm;
   switch (entry.algorithm) {
@@ -468,9 +556,21 @@ function entryToMigrationOtp(entry) {
 // ── Public URI API ───────────────────────────────────────────────────────────
 
 /**
- * Decode an `otpauth-migration://offline?data=<BASE64>` URI into an array of
- * vault TotpEntry objects. HOTP accounts are skipped with a console.warn (the
- * vault is TOTP-only), matching the CLI. Mirrors decode_migration_uri.
+ * Decode an `otpauth-migration://offline?data=<BASE64>` URI.
+ *
+ * ⚠️ RETURNS A BATCH OBJECT, NOT AN ARRAY (Phase 59):
+ *
+ *   { entries, version, batchSize, batchIndex, batchId, complete, finalBatch,
+ *     batchNote }
+ *
+ * because ONE URI is ONE QR CODE, and a large Google Authenticator export spans
+ * several. `entries` holds only what THIS payload carried; `complete` is false
+ * and `batchNote` is a sentence when there are more QR codes to import. A caller
+ * that reports a count without checking `complete` is telling the user a partial
+ * transfer succeeded.
+ *
+ * HOTP accounts are skipped with a console.warn (the vault is TOTP-only),
+ * matching the CLI. Mirrors decode_migration_uri.
  *
  * Throws on a wrong scheme, a missing `data=` parameter, bad base64, a malformed
  * payload, or a per-account mapping error (e.g. MD5/unspecified algorithm).
@@ -493,9 +593,9 @@ export function decodeMigrationUri(uri) {
     throw new Error("otpauth-migration URI has no data= parameter");
   }
   const bytes = decodeMigrationData(data);
-  const params = decodeMigrationPayload(bytes);
+  const payload = decodeMigrationPayload(bytes);
   const entries = [];
-  for (const p of params) {
+  for (const p of payload.otps) {
     const entry = migrationOtpToEntry(p);
     if (entry === null) {
       console.warn(
@@ -505,7 +605,20 @@ export function decodeMigrationUri(uri) {
     }
     entries.push(entry);
   }
-  return entries;
+  const batch = {
+    entries,
+    version: payload.version,
+    batchSize: payload.batchSize,
+    batchIndex: payload.batchIndex,
+    batchId: payload.batchId,
+  };
+  batch.complete = migrationBatchIsComplete(batch);
+  // ⭐ `finalBatch` is what lets a UI say "that was the last one" instead of
+  // "THIS IMPORT IS INCOMPLETE" to someone who has just finished. `batchNote`
+  // already reads correctly for both cases; this is for the surrounding framing.
+  batch.finalBatch = migrationBatchIsFinal(batch);
+  batch.batchNote = migrationBatchNote(batch);
+  return batch;
 }
 
 /**
@@ -606,6 +719,10 @@ export function parseOtpauthUri(uri) {
     algorithm,
     digits,
     period,
+    // `otpauth://` is an INTEROP format with no Sigil entry id, so a parse
+    // produces a fresh one — mirroring the CLI's parse_otpauth_uri, which goes
+    // through new_totp_entry.
+    uuid: randomEntryUuid(),
   };
   if (issuer !== null) entry.issuer = issuer;
   return entry;

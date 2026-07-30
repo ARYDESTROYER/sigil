@@ -99,9 +99,12 @@ USAGE:
                                          Import 2FA secrets: <ARG> is an
                                          otpauth-migration:// URI (Google Authenticator bulk
                                          export), an otpauth:// URI, or a file with one URI per line
-  sigil totp export [<label>] [--vault <file>] [--migration] [--out <file>]
+  sigil totp export [<label>] [--vault <file>] [--migration] [--skip-unsupported] [--out <file>]
                                          Export entries as otpauth:// URIs (or ONE
                                          otpauth-migration:// URI with --migration). PRINTS SECRETS.
+                                         --migration REFUSES entries the Google format cannot
+                                         express (e.g. a 60 s period); --skip-unsupported exports
+                                         the rest and names each one it left out.
   sigil keygen --out <file>              Generate a DEV device key (0600) and print its public key
   sigil device enroll --token <t> [--label <name>] [--key <file>] [--server <url>] [--reuse-key]
                                          Enroll this device with sigild; writes the identity (0600)
@@ -231,6 +234,7 @@ TOTP IMPORT / EXPORT (totp import/export) — migrate 2FA in and out:
     sigil totp export work                # just the 'work' entry
     sigil totp export --migration         # ONE migration URI for all entries
     sigil totp export --migration --out backup.txt   # write to a 0600 file
+    sigil totp export --migration --skip-unsupported # skip what the format cannot express
 
   !! export prints your SECRETS IN THE CLEAR (that is what a 2FA export is). It
   warns on stderr; treat the output like a password. !!
@@ -3042,6 +3046,19 @@ fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// One decoded multi-QR batch note, plus whether anything is still OUTSTANDING.
+///
+/// ⛔ The bool is not cosmetic: it is what stops `sigil totp import` telling a
+/// user who has just scanned the last QR of an export that their import is
+/// incomplete. `batch_note()` alone cannot carry that, because a caller has to
+/// choose a HEADER for the whole run, across several URIs.
+struct BatchNote {
+    /// True while more QR codes remain; false on the final batch.
+    outstanding: bool,
+    /// The human-readable sentence from `MigrationBatch::batch_note`.
+    note: String,
+}
+
 /// Collect the TOTP entries carried by a single `otpauth-migration://` or
 /// `otpauth://` URI, appending to `entries` and bumping the skip counters.
 /// A malformed migration/otpauth URI is counted as invalid (not fatal), so a
@@ -3051,13 +3068,31 @@ fn collect_from_uri(
     entries: &mut Vec<TotpEntry>,
     skipped_hotp: &mut usize,
     skipped_invalid: &mut usize,
+    batch_notes: &mut Vec<BatchNote>,
 ) -> Result<(), String> {
     let lower = uri.to_ascii_lowercase();
     if lower.starts_with("otpauth-migration://") {
         // Bulk export: one URI, many accounts. A bad payload is fatal for THIS
         // URI (we cannot parse further), but per-account mapping errors are not.
-        let params = decode_migration_uri(uri).map_err(|e| e.to_string())?;
-        for p in &params {
+        let batch = decode_migration_uri(uri).map_err(|e| e.to_string())?;
+        // ⛔ MULTI-QR EXPORTS. Google Authenticator splits a large export across
+        // several QR codes; this URI is ONE of them. Say so and remember it, so
+        // the final line cannot claim a partial import was the whole transfer.
+        //
+        // ⭐ `outstanding` is the difference between "there is more to scan" and
+        // "that was the last one". Both are worth saying; only the first is a
+        // warning. Shouting INCOMPLETE at someone who has just finished is how a
+        // warning becomes noise the next user skips past when it is real.
+        if let Some(note) = batch.batch_note() {
+            let outstanding = !batch.is_final_batch();
+            if outstanding {
+                eprintln!("sigil: ⚠️  {note}");
+            } else {
+                eprintln!("sigil: {note}");
+            }
+            batch_notes.push(BatchNote { outstanding, note });
+        }
+        for p in &batch.otps {
             match migration_otp_to_entry(p) {
                 Ok(ImportedOtp::Totp(e)) => entries.push(*e),
                 Ok(ImportedOtp::SkippedHotp) => {
@@ -3134,8 +3169,15 @@ fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
     let mut entries: Vec<TotpEntry> = Vec::new();
     let mut skipped_hotp = 0usize;
     let mut skipped_invalid = 0usize;
+    let mut batch_notes: Vec<BatchNote> = Vec::new();
     for uri in &uris {
-        collect_from_uri(uri, &mut entries, &mut skipped_hotp, &mut skipped_invalid)?;
+        collect_from_uri(
+            uri,
+            &mut entries,
+            &mut skipped_hotp,
+            &mut skipped_invalid,
+            &mut batch_notes,
+        )?;
     }
 
     // De-dup by label against the existing vault (and within this batch): SKIP a
@@ -3162,27 +3204,73 @@ fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
         skipped_hotp,
         skipped_invalid
     );
+    // ⛔ NEVER let the line above be the last word on a multi-QR export. The
+    // count is true for what was scanned and false for the transfer, and the
+    // whole point of an import feature is not losing accounts.
+    if !batch_notes.is_empty() {
+        // ⭐ The header is chosen by whether anything is ACTUALLY outstanding,
+        // not by "was this a multi-QR export at all". Importing batch 2 of 2
+        // used to print "THIS IMPORT IS INCOMPLETE … 0 more QR code(s) must be
+        // imported", which is false, and a false alarm trains users to ignore
+        // the true one.
+        let outstanding = batch_notes.iter().any(|b| b.outstanding);
+        if outstanding {
+            println!("⚠️  THIS IMPORT IS INCOMPLETE — it is NOT the whole export:");
+        } else {
+            println!("That was the LAST QR code of a multi-QR export:");
+        }
+        for b in &batch_notes {
+            println!("      - {}", b.note);
+        }
+        if outstanding {
+            println!(
+                "    Scan/import the remaining Google Authenticator QR code(s) and run \
+                 `sigil totp import` again for each. Do NOT delete anything from the old \
+                 app until every batch is in and `sigil totp list` shows every account."
+            );
+        } else {
+            println!(
+                "    Nothing further needs scanning from this export. This client keeps no \
+                 record of earlier runs, so confirm `sigil totp list` shows every account \
+                 before deleting anything from the old app."
+            );
+        }
+    }
     Ok(())
 }
 
-/// `sigil totp export [<label>] [--vault <file>] [--migration] [--out <file>]`.
+/// `sigil totp export [<label>] [--vault <file>] [--migration]
+/// [--skip-unsupported] [--out <file>]`.
 ///
 /// Default: print each entry (or just `<label>`) as an `otpauth://totp/…` URI.
 /// With `--migration`: emit ALL selected entries as ONE
 /// `otpauth-migration://offline?data=…` URI. The output carries SECRETS in the
 /// clear, so a LOUD warning is printed to stderr first. Output goes to stdout
 /// unless `--out <file>` is given (written mode 0600).
+///
+/// ⭐ **`--skip-unsupported`** (migration export only). The Google Authenticator
+/// wire format cannot express everything Sigil stores — a 7-digit code, a 60 s
+/// period, SHA-512 with 8 digits, and so on — and exporting such an entry anyway
+/// would produce an account that generates the WRONG codes, so the encoder
+/// refuses it. Refusing is the right DEFAULT (nobody should silently receive a
+/// partial vault), but it made ONE unusual account cost the user the entire bulk
+/// export path — and bulk export is the anti-lock-in feature. With this flag the
+/// unsupported entries are skipped, named individually on stderr with the reason,
+/// and the rest export normally. The plain `otpauth://` export still carries
+/// everything and is pointed at in both messages.
 fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
     let (label, flags) = take_positional(&args);
     let (access, rest) = extract_vault_access(flags.to_vec())?;
     let vault_path = access.path.clone();
 
     let mut migration = false;
+    let mut skip_unsupported = false;
     let mut out: Option<String> = None;
     let mut it = rest.into_iter();
     while let Some(f) = it.next() {
         match f.as_str() {
             "--migration" => migration = true,
+            "--skip-unsupported" => skip_unsupported = true,
             "--out" => {
                 out = Some(
                     it.next()
@@ -3191,6 +3279,13 @@ fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
             }
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
+    }
+    if skip_unsupported && !migration {
+        return Err(
+            "--skip-unsupported only applies to `--migration` (the plain otpauth:// export \
+             can represent every entry, so it never skips anything)"
+                .to_string(),
+        );
     }
 
     let password = access.secret()?;
@@ -3213,11 +3308,73 @@ fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
          !! chats, or shared terminals. !!"
     );
 
+    // How many entries actually made it into the output (differs from
+    // `selected.len()` only when --skip-unsupported dropped some).
+    let mut exported = selected.len();
     let output = if migration {
         let mut otps = Vec::with_capacity(selected.len());
+        // ⛔ ONE UNREPRESENTABLE ACCOUNT MUST NOT COST THE WHOLE EXPORT. Refusing
+        // is still the DEFAULT — a silently partial export of your 2FA is worse
+        // than a failed one — but `--skip-unsupported` makes it the user's
+        // explicit, informed choice instead of a dead end.
+        let mut refused: Vec<(String, String)> = Vec::new();
         for e in &selected {
-            otps.push(entry_to_migration_otp(e).map_err(|err| err.to_string())?);
+            match entry_to_migration_otp(e) {
+                Ok(otp) => otps.push(otp),
+                Err(err) => refused.push((e.label.clone(), err.to_string())),
+            }
         }
+        if !refused.is_empty() {
+            if !skip_unsupported {
+                // NAME THEM. "one entry is unsupported" leaves the user grepping
+                // their own vault to find out which.
+                let mut msg = format!(
+                    "{} of {} entr{} cannot be represented in the Google Authenticator \
+                     migration format, so this export was REFUSED rather than silently \
+                     leaving {} out:",
+                    refused.len(),
+                    selected.len(),
+                    if refused.len() == 1 { "y" } else { "ies" },
+                    if refused.len() == 1 { "it" } else { "them" },
+                );
+                for (l, why) in &refused {
+                    msg.push_str(&format!("\n      - {l:?}: {why}"));
+                }
+                msg.push_str(
+                    "\n    Either use the plain `sigil totp export` (otpauth:// URIs carry \
+                     every field faithfully), or re-run with `--skip-unsupported` to export \
+                     the rest and leave these behind.",
+                );
+                return Err(msg);
+            }
+            // Opted in: LOUD, itemised, and on stderr so it survives a pipe to a
+            // file. The user asked for a partial export; they must still be able
+            // to see exactly what is missing from it.
+            eprintln!(
+                "!! SKIPPING {} of {} entr{} that the Google Authenticator migration format\n\
+                 !! cannot represent. THIS EXPORT IS PARTIAL — the following account(s) are\n\
+                 !! NOT in it and will NOT arrive in the other app:",
+                refused.len(),
+                selected.len(),
+                if refused.len() == 1 { "y" } else { "ies" },
+            );
+            for (l, why) in &refused {
+                eprintln!("!!   - {l:?}: {why}");
+            }
+            eprintln!(
+                "!! Export those with the plain `sigil totp export` (otpauth:// URIs carry\n\
+                 !! every field faithfully) so nothing is lost."
+            );
+        }
+        if otps.is_empty() {
+            return Err(
+                "nothing left to export: every selected entry is unrepresentable in the \
+                 Google Authenticator migration format. Use the plain `sigil totp export` \
+                 instead — otpauth:// URIs carry every field."
+                    .to_string(),
+            );
+        }
+        exported = otps.len();
         encode_migration_uri(&otps)
     } else {
         let mut lines = Vec::with_capacity(selected.len());
@@ -3246,9 +3403,21 @@ fn cmd_totp_export(args: Vec<String>) -> Result<(), String> {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| format!("could not set export permissions {path:?}: {e}"))?;
             println!(
-                "wrote {} entr{} to {path} (mode 0600)",
-                selected.len(),
-                if selected.len() == 1 { "y" } else { "ies" }
+                "wrote {exported} entr{} to {path} (mode 0600){}",
+                if exported == 1 { "y" } else { "ies" },
+                if exported == selected.len() {
+                    String::new()
+                } else {
+                    format!(
+                        " — PARTIAL: {} unsupported entr{} skipped (see the warning above)",
+                        selected.len() - exported,
+                        if selected.len() - exported == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    )
+                }
             );
         }
         None => println!("{output}"),

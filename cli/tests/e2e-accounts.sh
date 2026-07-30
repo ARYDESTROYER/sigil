@@ -39,15 +39,11 @@ set -euo pipefail
 
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 
+# Portability helpers (filemode / resolve_go). NOT a test — see the file header.
+# shellcheck source=cli/tests/_e2e-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_e2e-lib.sh"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-if [[ -n "${GO:-}" ]]; then
-	:
-elif [[ -x /opt/homebrew/bin/go ]]; then
-	GO=/opt/homebrew/bin/go
-else
-	GO=go
-fi
-command -v "$GO" >/dev/null || { echo "no Go toolchain found (set \$GO)" >&2; exit 1; }
+resolve_go
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sigil-acct-e2e.XXXXXX")"
 SERVER_PID=""

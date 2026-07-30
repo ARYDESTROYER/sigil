@@ -221,13 +221,38 @@ export default function Authenticator() {
     return vaultKeyRef.current ?? sealingSecret();
   }
 
+  // ⭐⭐ THE NO-DOWNGRADE RATCHET, at every re-seal this app performs.
+  //
+  // ⛔ A `SIGILcli` container carries the Argon2id work factors it was sealed
+  // with, and a re-seal is where new factors get CHOSEN. This app used to write
+  // `ARGON2` verbatim, so a vault the CLI wrote at 65536/4/2 came back from ONE
+  // edit here at 19456/2/1 — 3.4x less memory and half the passes, silently, on
+  // a vault the user shares with their laptop. The Rust clients have ratcheted
+  // since Phase 58 (`sigil_cli::reseal_container`); this is the JS half.
+  //
+  // `ARGON2` is therefore a FLOOR, not an instruction: the factors written are
+  // the componentwise max of what the stored container declares and what this
+  // build wants. The rule itself is sigil-core's `Argon2Params::no_downgrade`,
+  // reached through the wasm — not a JS reimplementation that could drift.
+  function sealParams(m: Wasm, storageKey: string): import("@sigil/wasm").Argon2Params {
+    const stored = window.localStorage.getItem(storageKey);
+    return m.ratchetParams(m, stored ? m.base64ToBytes(stored) : null, ARGON2);
+  }
+
   // Seal `v` with the CURRENT seal secret (fresh salt + nonce from the CSPRNG)
   // and write the sealed container (base64) to localStorage. Only the sealed
   // bytes are stored — never the vault, the password, a vault key or the CMK.
   function persist(m: Wasm, v: TotpVault, secret?: string | Uint8Array): void {
     const salt = crypto.getRandomValues(new Uint8Array(m.recommended_salt_len()));
     const nonce = crypto.getRandomValues(new Uint8Array(m.nonce_len()));
-    const container = m.sealVault(m, secret ?? vaultSealingSecret(), v, salt, nonce, ARGON2);
+    const container = m.sealVault(
+      m,
+      secret ?? vaultSealingSecret(),
+      v,
+      salt,
+      nonce,
+      sealParams(m, STORAGE_KEY),
+    );
     window.localStorage.setItem(STORAGE_KEY, m.bytesToBase64(container));
   }
 
@@ -236,7 +261,11 @@ export default function Authenticator() {
   // persist happens, so a rejected change never corrupts the stored vault.
   function withVault(fn: (draft: TotpVault) => void): TotpVault {
     if (!wasm || !vault) throw new Error("vault is locked");
-    const draft: TotpVault = { version: vault.version, entries: [...vault.entries] };
+    // ⭐ `cloneVault`, NOT `{ version, entries }`. Rebuilding the object
+    // field-by-field silently deletes `min_reader_version` and every field a
+    // newer client wrote, and this browser would then push the stripped vault
+    // over the newer one — the oldest writer wins on the op-log.
+    const draft: TotpVault = wasm.cloneVault(vault);
     fn(draft);
     persist(wasm, draft);
     setVault(draft);
@@ -253,7 +282,14 @@ export default function Authenticator() {
     }
     const salt = crypto.getRandomValues(new Uint8Array(m.recommended_salt_len()));
     const nonce = crypto.getRandomValues(new Uint8Array(m.nonce_len()));
-    const container = m.sealDeviceIdentity(m, sealingSecret(), d, salt, nonce, ARGON2);
+    const container = m.sealDeviceIdentity(
+      m,
+      sealingSecret(),
+      d,
+      salt,
+      nonce,
+      sealParams(m, DEVICE_KEY),
+    );
     window.localStorage.setItem(DEVICE_KEY, m.bytesToBase64(container));
     setDevice(d);
   }
@@ -331,12 +367,19 @@ export default function Authenticator() {
    * password" — that is the worst possible message for someone whose passkey
    * just died, and the recovery-sheet field is right there.
    *
-   * ⚠️ CMK-then-password, and that is NOT a residual OR slot. Enable is not
-   * atomic (a crash can leave a hwslot beside password-sealed containers), so the
-   * password is tried as a SECOND candidate — but only once the hwslot has
-   * ACTUALLY OPENED, which already required the passkey. After a *successful*
-   * enable the ciphertext has changed, so the password path stops working by
-   * construction rather than by policy.
+   * ⚠️ CMK-then-password, and that is NOT a residual OR slot. The password is
+   * tried as a SECOND candidate — but only once the hwslot has ACTUALLY OPENED,
+   * which already required the passkey. After a *successful* enable the
+   * ciphertext has changed, so the password path stops working by construction
+   * rather than by policy.
+   *
+   * It is kept because enable is not atomic. ⭐ THE SHIPPED WRITE ORDER IS
+   * CONTAINERS FIRST, SLOT LAST (ADR 0046 §4), so an interruption can never
+   * leave a slot beside password-sealed containers — a surviving slot means both
+   * containers are already CMK-sealed. What it CAN leave is a CMK-sealed vault
+   * beside a still-password-sealed device identity, with no slot at all; this
+   * list is what keeps that state readable rather than silently discarding the
+   * Ed25519 seed, the hybrid secret and every accepted vault key.
    */
   async function unlock(password: string): Promise<void> {
     if (!wasm) throw new Error("wasm not ready");
@@ -360,7 +403,12 @@ export default function Authenticator() {
         credentialId: slot.credentialId,
         backupEligible: assertion.backupEligible,
         backupState: assertion.backupState,
-        attachment: assertion.backupEligible ? "" : "platform",
+        // ⭐ The REAL `authenticatorAttachment` from the ceremony. This used to
+        // be inferred as `backupEligible ? "" : "platform"`, which told every
+        // holder of a non-syncing SECURITY KEY that their factor lived "on this
+        // device only" — the opposite of true, and exactly the wrong advice
+        // about what they need to keep safe.
+        attachment: assertion.attachment,
       };
     }
 
@@ -522,9 +570,11 @@ export default function Authenticator() {
    * checksummed OFFLINE (so a typo never reaches a server), and only then does
    * anything get re-sealed.
    *
-   * Write order is hwslot → vault → device. Enable is NOT atomic; a crash leaves
-   * a hwslot beside password-sealed containers, which unlock handles by trying
-   * CMK-then-password.
+   * ⭐ Write order is vault → device → hwslot: CONTAINERS FIRST, SLOT LAST.
+   * Enable is NOT atomic, and this ordering chooses which state a crash leaves
+   * behind — CMK-sealed containers with no slot, which the printed sheet alone
+   * recovers. See the block comment at the write itself for why the reverse
+   * order was rejected.
    */
   async function completePasskeyProtection(code: string): Promise<ProtectionInfo> {
     if (!wasm || !vault) throw new Error("vault is locked");
@@ -551,7 +601,7 @@ export default function Authenticator() {
       },
       salt(),
       nonce(),
-      ARGON2,
+      sealParams(wasm, HWSLOT_KEY),
     );
     // ⭐ WRITE ORDER IS THE SAFETY PROPERTY: containers FIRST, slot LAST.
     //
@@ -629,7 +679,7 @@ export default function Authenticator() {
       },
       crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
       crypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
-      ARGON2,
+      sealParams(wasm, HWSLOT_KEY),
     );
     window.localStorage.setItem(HWSLOT_KEY, wasm.bytesToBase64(slotBytes));
     cmkRef.current = cmk;
@@ -653,8 +703,9 @@ export default function Authenticator() {
    * stale slot behind would brick the browser on the next reload.
    *
    * ⚠️ MIXED STATE, handled exactly the way `unlock()` handles it. Enabling is
-   * NOT atomic (hwslot → vault → device), so an interruption leaves the device
-   * identity sealed under the OLD PASSWORD beside a CMK-sealed vault. Trying
+   * NOT atomic (vault → device → hwslot), so an interruption between the two
+   * container writes leaves the device identity sealed under the OLD PASSWORD
+   * beside a CMK-sealed vault, and no slot at all. Trying
    * only the CMK there left the Ed25519 seed, the hybrid secret and every
    * accepted vault key permanently unreadable, with no message. So the candidate
    * list is CMK → the optional current password → the new one, and when NONE of
@@ -688,12 +739,12 @@ export default function Authenticator() {
     let sharedAs: string | null = null;
     // ⭐ THE VAULT GETS THE SAME CANDIDATE LIST AS THE DEVICE, and this is a
     // LOCKOUT FIX, not a convenience. Enabling protection is NOT atomic: it
-    // writes the slot, then re-seals the vault, then the device. A crash BEFORE
-    // the vault re-seal leaves a slot beside a still-PASSWORD-sealed vault. In
-    // that state, once the passkey is gone, `unlock()` throws at the ceremony
-    // before it can try the password — so the sheet is the only door left. It
-    // previously tried ONLY the CMK here, so a user holding a correct sheet AND
-    // the correct old password was refused by both doors. Reproduced live.
+    // re-seals the vault, then the device identity, then writes the slot
+    // (containers first, slot last — ADR 0046 §4). A crash between the two
+    // container writes leaves a CMK-sealed vault beside a still-PASSWORD-sealed
+    // device identity. Trying ONLY the CMK there left the Ed25519 seed, the
+    // hybrid secret and every accepted vault key unreadable for a user holding a
+    // correct sheet AND the correct old password. Reproduced live.
     //
     // ⚠️ THIS DOES NOT BECOME AN "OR" DESIGN. The whole branch is already gated
     // behind a valid `verifyRecoveryKit(code)`, so the door is
@@ -1052,8 +1103,13 @@ function importMigration(
   wasm: Wasm,
   uri: string,
   withVault: (fn: (draft: TotpVault) => void) => TotpVault,
-): { imported: number; skipped: number } {
-  const entries: TotpEntry[] = wasm.decodeMigrationUri(uri);
+): { imported: number; skipped: number; batchNote: string | null; finalBatch: boolean } {
+  // ⛔ ONE URI IS ONE QR CODE. Google Authenticator splits a large export across
+  // several, each carrying a SLICE of the accounts, so a count on its own is a
+  // lie for exactly the users with the most to lose. `batchNote` is non-null
+  // when there are more QRs to import, and the caller must render it.
+  const batch = wasm.decodeMigrationUri(uri);
+  const entries: TotpEntry[] = batch.entries;
   let imported = 0;
   let skipped = 0;
   withVault((draft) => {
@@ -1073,7 +1129,7 @@ function importMigration(
       }
     }
   });
-  return { imported, skipped };
+  return { imported, skipped, batchNote: batch.batchNote, finalBatch: !!batch.finalBatch };
 }
 
 // ── Presentational shell ─────────────────────────────────────────────────────
@@ -1369,7 +1425,8 @@ function UnlockPanel({
             />
           </label>
           {/* ⚠️ OPTIONAL, and it exists for ONE state: turning protection on is
-              not atomic, so an interruption can leave this browser's device
+              not atomic (containers first, slot last), so an interruption
+              between the two container writes can leave this browser's device
               identity sealed under the password it had BEFORE, while the vault
               is already sealed under the sheet's key. Without this field that
               identity — the Ed25519 seed, the hybrid secret and every accepted
@@ -1389,8 +1446,8 @@ function UnlockPanel({
             <span className="mt-1 block text-xs text-neutral-500 dark:text-neutral-400">
               Only needed if turning passkey protection on was interrupted. If the
               sheet alone is refused, type this browser&rsquo;s PREVIOUS password
-              here — in one interruption window the containers are still sealed
-              under it, and the sheet cannot open them without it.
+              here — in one interruption window this browser&rsquo;s keys are
+              still sealed under it, and the sheet cannot open them without it.
             </span>
           </label>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -1722,7 +1779,14 @@ function VaultView({
   onAdoptSharedVault: (vaultId: string, vaultKey: Uint8Array, container: Uint8Array) => TotpVault;
   onAdd: (input: AddInput) => void;
   onImportOtpauth: (uri: string) => void;
-  onImportMigration: (uri: string) => { imported: number; skipped: number };
+  onImportMigration: (uri: string) => {
+    imported: number;
+    skipped: number;
+    /** Non-null when this was ONE QR of a multi-QR export; must be shown. */
+    batchNote: string | null;
+    /** True when it was the LAST QR — say so, but do NOT call it incomplete. */
+    finalBatch: boolean;
+  };
   onRemove: (label: string) => void;
   onLock: () => void;
 }) {
@@ -1935,7 +1999,14 @@ function AddAccountPanel({
 }: {
   onAdd: (input: AddInput) => void;
   onImportOtpauth: (uri: string) => void;
-  onImportMigration: (uri: string) => { imported: number; skipped: number };
+  onImportMigration: (uri: string) => {
+    imported: number;
+    skipped: number;
+    /** Non-null when this was ONE QR of a multi-QR export; must be shown. */
+    batchNote: string | null;
+    /** True when it was the LAST QR — say so, but do NOT call it incomplete. */
+    finalBatch: boolean;
+  };
 }) {
   const [label, setLabel] = useState("");
   const [issuer, setIssuer] = useState("");
@@ -1994,10 +2065,25 @@ function AddAccountPanel({
     setMigrationError("");
     setImportResult("");
     try {
-      const { imported, skipped } = onImportMigration(migration.trim());
-      setImportResult(`Imported ${imported} account${imported === 1 ? "" : "s"}${
+      const { imported, skipped, batchNote, finalBatch } = onImportMigration(migration.trim());
+      const base = `Imported ${imported} account${imported === 1 ? "" : "s"}${
         skipped ? `, skipped ${skipped} (duplicate or unsupported)` : ""
-      }.`);
+      }.`;
+      // ⛔ Never let the count be the last word on a multi-QR export: a user who
+      // reads "Imported 12." and deletes the old app loses the other batches.
+      // ⭐ But the LAST QR is not an incomplete import. Saying "0 more QR
+      // code(s) must be imported — this import is PARTIAL" to someone who has
+      // just finished is a false alarm, and false alarms are what teach users to
+      // click past the true one. The note still names the batch, because this
+      // browser keeps no record of earlier imports and genuinely cannot know.
+      setImportResult(
+        batchNote && !finalBatch
+          ? `${base} ⚠️ THIS IMPORT IS INCOMPLETE — ${batchNote}. Import the remaining QR ` +
+              `code(s) before deleting anything from the old app.`
+          : batchNote
+            ? `${base} ${batchNote}.`
+            : base,
+      );
       setMigration("");
     } catch (e) {
       setMigrationError(msg(e));

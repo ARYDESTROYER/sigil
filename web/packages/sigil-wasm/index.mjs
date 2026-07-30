@@ -25,6 +25,12 @@ export const {
   open_record,
   seal_to_container,
   open_container,
+  // ⭐ The NO-DOWNGRADE RATCHET for JS re-seals (Phase 59 fix round). Without
+  // these re-exported here, `ratchetParams` — which is handed this module
+  // namespace as its `wasm` — would call an undefined function and every browser
+  // re-seal would silently fall back to this build's own (weaker) defaults.
+  container_params,
+  reseal_params,
   ed25519_public_key,
   ed25519_sign,
   ed25519_verify,

@@ -522,7 +522,16 @@ async function main() {
       }
       let entries;
       if (uri.toLowerCase().startsWith("otpauth-migration://")) {
-        entries = decodeMigrationUri(uri); // may warn+skip HOTP entries
+        // ⛔ Returns a BATCH: one URI is one QR code, and a large Google
+        // Authenticator export spans several.
+        const batch = decodeMigrationUri(uri); // may warn+skip HOTP entries
+        entries = batch.entries;
+        if (batch.batchNote && !batch.finalBatch) {
+          console.warn(`sigil: INCOMPLETE IMPORT — ${batch.batchNote}`);
+        } else if (batch.batchNote) {
+          // The FINAL QR of a multi-QR export: worth stating, not a warning.
+          console.info(`sigil: ${batch.batchNote}`);
+        }
       } else if (uri.toLowerCase().startsWith("otpauth://")) {
         entries = [parseOtpauthUri(uri)];
       } else {

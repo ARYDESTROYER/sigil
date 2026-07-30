@@ -53,6 +53,7 @@ import {
   DeviceAuthError,
 } from "../device-auth.mjs";
 import { bytesToBase64 } from "../totp-vault.mjs";
+import { resolveGo } from "./go-helper.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..");
@@ -90,7 +91,7 @@ const toolPath = [
   process.env.PATH ?? "",
 ].join(":");
 const toolEnv = { ...process.env, PATH: toolPath };
-const goBin = "/opt/homebrew/bin/go";
+const goBin = resolveGo();
 
 function freePort() {
   return new Promise((resolve, reject) => {

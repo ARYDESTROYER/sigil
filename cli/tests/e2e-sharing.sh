@@ -37,18 +37,11 @@ set -euo pipefail
 
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 
+# Portability helpers (filemode / resolve_go). NOT a test — see the file header.
+# shellcheck source=cli/tests/_e2e-lib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_e2e-lib.sh"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# $GO wins; then the local machine's Homebrew Go; then whatever `go` is on PATH
-# (which is what a Linux CI runner has). Resolved here rather than hardcoded so
-# this script can run somewhere other than the build machine.
-if [[ -n "${GO:-}" ]]; then
-	:
-elif [[ -x /opt/homebrew/bin/go ]]; then
-	GO=/opt/homebrew/bin/go
-else
-	GO=go
-fi
-command -v "$GO" >/dev/null || { echo "no Go toolchain found (set \$GO)" >&2; exit 1; }
+resolve_go
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sigil-share-e2e.XXXXXX")"
 SERVER_PID=""
@@ -162,7 +155,7 @@ run_as "$HOME_B" device hybrid-publish >/dev/null
 run_as "$HOME_C" device hybrid-publish >/dev/null
 for h in "$HOME_A" "$HOME_B" "$HOME_C"; do
 	[[ -f "$h/.sigil/device.hybrid" ]] || fail "no hybrid secret identity in $h"
-	mode="$(stat -f '%Lp' "$h/.sigil/device.hybrid" 2>/dev/null || stat -c '%a' "$h/.sigil/device.hybrid")"
+	mode="$(filemode "$h/.sigil/device.hybrid")"
 	[[ "$mode" == "600" ]] || fail "hybrid secret in $h is mode $mode, want 600"
 done
 ok "three hybrid identities published; every secret half is mode 0600"

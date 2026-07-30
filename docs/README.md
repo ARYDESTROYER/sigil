@@ -29,7 +29,11 @@ giving the server anything),
 control) and
 [0046](decisions/0046-passkey-protected-local-containers.md) (a second at-rest
 factor whose break-glass is that same paper kit — **AND, never OR** — and which
-the server cannot see, disable or weaken).
+the server cannot see, disable or weaken) and
+[0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
+(the container header is unauthenticated framing, so its KDF work factors are
+bounded **before any allocation** — a zero-knowledge relay cannot filter a
+hostile blob, which moves every content-validation duty to the client).
 
 **What is real, and what is not.** The cryptography is real and
 **unaudited**. `sigild` is a working dev server whose stateful surface is
@@ -52,16 +56,37 @@ passkey-protected browser profile; passkey protection that exists on **one of
 four** clients, defends storage but never execution, and is **not retroactive**;
 entitlement that is reported and only
 optionally enforced; a per-process replay cache; and no key rotation for device
-identities. Each ADR ends with its own limits, and they are meant to be read as
+identities. Since Phase 59, add two more: a **hostile container** parked in an
+op-log is refused cheaply by every client but **is never removed**, because the
+server cannot know it is there
+([0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md));
+and the no-downgrade ratchet that stops a browser weakening a vault's KDF **does
+not cover the CLI's and the desktop's own vault saves**, so *"strength only goes
+up"* is true of the browsers and of re-keys and **not globally true of this
+system**. Each ADR ends with its own limits, and they are meant to be read as
 findings-in-waiting rather than disclaimers.
 
 **Reproduce our claims.** `./scripts/gate.sh` runs every suite in the repo — Go
-with `-race` against a throwaway Postgres, four Rust crates, twelve
-cross-component interop suites that drive real binaries against a live server,
-both browser suites, and three end-to-end shell proofs. It **fails if any test
-skipped**, prints which tree and commit it gated, and checks that every suite on
-disk is actually run by some workflow. If a claim in these documents is not
+with `-race` against a throwaway Postgres, four Rust crates, every
+cross-component interop suite in `sigil-wasm/test/` (most of which drive real
+binaries against a live server), both browser suites, and the end-to-end shell
+proofs. It **fails if any test skipped**, prints which tree and commit it gated,
+and checks that every suite on disk is actually run by some workflow — the suites
+are **enumerated dynamically**, which is why this paragraph no longer quotes a
+count. It also runs both **security scanners** (`govulncheck` against the Go
+toolchain we *ship*, and `cargo audit --deny warnings` across all four Rust
+lockfiles), and verifies that every workflow which boots a real `sigild` is
+actually **triggered** by changes to it. If a claim in these documents is not
 backed by something that command runs, treat the claim as unproven and tell us.
+
+⚠️ **And read that sentence sceptically, because it has already been wrong.** On
+2026-07-30 this gate printed ALL GREEN on a commit whose `security` workflow was
+red on two jobs and whose `interop` workflow had been red for several phases —
+its coverage was a strict subset of CI's, and every suite is written on macOS and
+run on Linux with nothing checking that the two agreed. Both gaps are closed and
+the fixes are mutation-proven, but the general lesson stands:
+[`engineering-lessons.md`](engineering-lessons.md) is the honest companion to this
+paragraph, and **a green signal from our own tooling is a claim like any other**.
 
 **We would rather hear it.** [`../SECURITY.md`](../SECURITY.md) states the scope;
 cryptographic findings are explicitly in scope and wanted. An earlier version of
@@ -111,9 +136,11 @@ client surfaces — webapp, MV3 extension, native desktop and the CLI — device
 **enrollment**, real per-vault **authorization**, an **account model**, and,
 since Phases 53–55, opt-in **abuse bounds**, a printable **recovery kit** and
 opt-in **entitlement enforcement** — with Phase 56 bringing the kit and the
-payment warnings to **all four** client surfaces, and Phase 58 adding an optional
-**passkey second factor to the webapp's at-rest seal** — which changed **nothing**
-on the server). But the system as a whole is
+payment warnings to **all four** client surfaces, Phase 58 adding an optional
+**passkey second factor to the webapp's at-rest seal**, and Phase 59 bounding the
+container header's KDF work factors, making a re-seal unable to weaken a vault,
+and making the vault schema changeable without data loss — the last two of which
+changed **nothing** on the server). But the system as a whole is
 **pre-audit and not production-ready**: nothing here is **audited**, every one of
 those server-side pieces is **dev-gated and `501` by default**, and the
 product-level layer is still missing — an **identity** system (no email, no

@@ -41,6 +41,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
+import { resolveGo } from "./go-helper.mjs";
 
 import {
   generateDeviceSeed,
@@ -72,7 +73,15 @@ import {
   restoreFromKit,
   verifyRecoveryKit,
 } from "../recovery.mjs";
-import { newVault, addEntry, openVault, sealVault, codeForEntry, base32Decode } from "../totp-vault.mjs";
+import {
+  newVault,
+  addEntry,
+  openVault,
+  sealVault,
+  codeForEntry,
+  base32Decode,
+  containerParams,
+} from "../totp-vault.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..");
@@ -100,7 +109,7 @@ const toolPath = [
   process.env.PATH ?? "",
 ].join(":");
 const toolEnv = { ...process.env, PATH: toolPath };
-const goBin = "/opt/homebrew/bin/go";
+const goBin = resolveGo();
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -867,15 +876,42 @@ try {
     // that marker, so the refusal names the device but does not label it. The
     // refusal itself is what protects access; the label is a nicety.
 
+    // ⭐ NO-DOWNGRADE, through the REAL rotation. `rotateVaultKey` is the direct
+    // JS twin of `sigil_cli::reseal_container`, and it used to re-seal at a
+    // hardcoded 19456/2/1 no matter what the input declared — so rotating a
+    // vault the CLI had written at 65536/4/2 quietly cut its memory cost by
+    // 3.4x. Feed it a STRONG container and a WEAK `params` floor: the output
+    // header must still be the strong one.
+    const STRONG = { m_cost: 65536, t_cost: 4, p_cost: 2 };
+    const strongInput = sealVault(
+      wasm,
+      sibKey,
+      openVault(wasm, sibKey, sealedNow),
+      webcrypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
+      webcrypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
+      STRONG,
+    );
+    assert(
+      containerParams(wasm, strongInput).m_cost === STRONG.m_cost,
+      "the test fixture itself must be the strong container",
+    );
+
     // Naming it — what the browser UIs now let a user do — succeeds.
     const rotated = await rotateVaultKey(wasm, authSib, {
       vaultId: sibVaultId,
       recipientDeviceIds: [sib.deviceId],
-      sealedVault: sealedNow,
+      sealedVault: strongInput,
       oldVaultKey: sibKey,
       params: ARGON2,
       drop: [kit.deviceId],
     });
+    const rotatedParams = containerParams(wasm, rotated.sealedVault);
+    assert(
+      rotatedParams.m_cost === STRONG.m_cost &&
+        rotatedParams.t_cost === STRONG.t_cost &&
+        rotatedParams.p_cost === STRONG.p_cost,
+      `rotateVaultKey WEAKENED the container: ${JSON.stringify(rotatedParams)}`,
+    );
     assert(
       rotated.removed.includes(kit.deviceId),
       "the rotation did not delete the dropped holder's envelope",
@@ -886,7 +922,8 @@ try {
     );
     console.log(
       "  (g) OK: rotateVaultKey from JS refuses to drop an unnamed holder (naming the kit), and " +
-        "succeeds once `drop` names it — the call shape both browsers now use",
+        "succeeds once `drop` names it — the call shape both browsers now use — and it does " +
+        "NOT weaken the container's Argon2 parameters while re-sealing",
     );
   }
 

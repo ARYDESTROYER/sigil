@@ -19,6 +19,7 @@ name: interop
 #                          account, and a revoked claimant no longer orphans a vault
 #   * recovery-interop   — the recovery-kit codec agrees Rust <-> JS
 #   * entitlement-interop— the JS entitlement reader agrees with a REAL sigild
+#   * seal-params-guard  — no product re-seal site can silently downgrade Argon2
 # A test nobody runs is a test that rots, and these guard the invariants that
 # three separate implementations (Go, Rust, JS) have to agree on.
 #
@@ -111,26 +112,26 @@ jobs:
       - name: Build the real sigil CLI
         run: cargo build --manifest-path cli/Cargo.toml --bin sigil
 
-      - name: 1/12 wasm seal/open round-trip
+      - name: 1/16 wasm seal/open round-trip
         run: node sigil-wasm/test/roundtrip.mjs
-      - name: 2/12 SIGILcli container interop with the real CLI
+      - name: 2/16 SIGILcli container interop with the real CLI
         run: node sigil-wasm/test/interop.mjs
-      - name: 3/12 SIGILhyb hybrid public-key interop
+      - name: 3/16 SIGILhyb hybrid public-key interop
         run: node sigil-wasm/test/hybrid-interop.mjs
-      - name: 4/12 E2EE sync loop against a live sigild
+      - name: 4/16 E2EE sync loop against a live sigild
         run: node sigil-wasm/test/sync-interop.mjs
-      - name: 5/12 cross-client TOTP through the opaque op-log
+      - name: 5/16 cross-client TOTP through the opaque op-log
         run: node sigil-wasm/test/totp-interop.mjs
-      - name: 6/12 TOTP migration codec agrees Rust and JS
+      - name: 6/16 TOTP migration codec agrees Rust and JS
         run: node sigil-wasm/test/migration-interop.mjs
-      - name: 7/12 device auth contract v3
+      - name: 7/16 device auth contract v3
         run: node sigil-wasm/test/device-auth-interop.mjs
-      - name: 8/12 vault sharing, browser and CLI, both directions
+      - name: 8/16 vault sharing, browser and CLI, both directions
         run: node sigil-wasm/test/sharing-interop.mjs
       # The most important one: proves a hostile server swapping a recipient's
       # hybrid public key is DETECTED and REFUSED, and that the Rust and JS
       # safety numbers agree.
-      - name: 9/12 key pinning blocks the substitution attack
+      - name: 9/16 key pinning blocks the substitution attack
         run: node sigil-wasm/test/pinning-interop.mjs
       # Phase 52. A browser-style JS client speaks the ACCOUNT model against a
       # live sigild, and it is the SAME account the real `sigil` CLI joins: the
@@ -138,21 +139,54 @@ jobs:
       # AND writes the vault (the orphaning defect this phase exists to fix), a
       # separate account is 403, and the invite negatives (reuse, foreign handle,
       # quota) all hold.
-      - name: 10/12 the account model, browser client and CLI in one account
+      - name: 10/16 the account model, browser client and CLI in one account
         run: node sigil-wasm/test/accounts-interop.mjs
       # Phase 54. The ONLY automated guard on the Rust <-> JS recovery codec: the
       # Crockford base32 encoding and the HKDF derivation are MIRRORED in
       # libsigil/core/src/recovery.rs and sigil-wasm, and a mirror that drifts
       # does not fail loudly — it silently produces a kit that cannot restore.
-      - name: 11/12 the recovery kit agrees across Rust and JS
+      - name: 11/16 the recovery kit agrees across Rust and JS
         run: node sigil-wasm/test/recovery-interop.mjs
       # Phase 56. The ONLY thing in the repo that parses sigild's real entitlement
       # bytes with the JS reader: the browser suites use a test double, so without
       # this a divergence between sigild's entitlementJSON / paymentRequiredResponse
       # and the JS parser would go red in NO job — and the failure mode is a client
       # telling a paying customer the wrong thing about their own subscription.
-      - name: 12/12 the entitlement reader agrees with a real sigild
+      - name: 12/16 the entitlement reader agrees with a real sigild
         run: node sigil-wasm/test/entitlement-interop.mjs
+      # Phase 59. The ONLY guard on two mirrors that were silently LOSSY: the
+      # TotpVault/TotpEntry schema (serde dropped unknown fields; the JS clients
+      # rebuilt `{version, entries}` by hand) and the Google Authenticator batch
+      # framing (both codecs discarded batch_size/batch_index/batch_id, so the
+      # first QR of a multi-QR export imported a fraction and reported success).
+      # Neither drift fails loudly — it just loses a user's accounts.
+      - name: 13/16 the vault schema and migration batching agree across Rust and JS
+        run: node sigil-wasm/test/schema-interop.mjs
+      # Phase 59. The ONLY exercise of the passkey user-verification check.
+      # Chrome's CDP virtual authenticator cannot produce a "completed but
+      # unverified" assertion, so the Playwright passkey suite cannot reach this
+      # branch at all — and an unenforced UV means sealing the hardware slot with
+      # CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to
+      # prevent.
+      - name: 14/16 a passkey ceremony without user verification is refused
+        run: node sigil-wasm/test/passkey-uv-interop.mjs
+      # Phase 59. A SOURCE-STRUCTURE guard, not a behavioural one: every product
+      # re-seal site must ratchet its Argon2 parameters. Behavioural coverage for
+      # all six would mean driving an enrolled device and a passkey ceremony
+      # through two browsers; a verifier proved that mutating five of the six left
+      # webapp 50/50 and extension 14/14 green, so this buys the regression guard
+      # for the failure that actually happens — a NEW call site that forgets.
+      - name: 15/16 every product re-seal ratchets its Argon2 parameters
+        run: node sigil-wasm/test/seal-params-guard.mjs
+      # The suites are written on macOS and run here on Linux, and until
+      # 2026-07-30 nothing checked that the two agreed: six suites hardcoded
+      # /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used a
+      # `stat -f ... || stat -c ...` idiom that GNU stat does not fail on. Those
+      # jobs were red for several phases while the macOS gate printed ALL GREEN.
+      # A source check, NOT a Linux run — it guards the two idioms that have
+      # actually bitten and cannot prove portability on its own.
+      - name: 16/16 no known macOS-only idiom in the suites
+        run: node sigil-wasm/test/portability-guard.mjs
 
       - name: Assert the libsigil core stays getrandom-free
         run: |

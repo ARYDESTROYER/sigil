@@ -99,3 +99,44 @@ Why mirror instead of share:
   future real, versioned container/wire format is a different decision and belongs
   in `sigil-core` or a purpose-built shared crate — at which point this ADR would
   be superseded.
+
+## The header's Argon2 parameters are now bounded, and a re-seal cannot lower them (added Phase 59, 2026-07-30)
+
+Per this repo's addendum rule the text above is left untouched; this section
+records only what changed.
+
+⭐ **The byte layout is unchanged.** Magic, format version, the three `u32` LE
+work factors, the `u8` salt length, the salt and the envelope are exactly where
+they were, and every container this repo has ever written still opens. What
+changed is what those fields are allowed to *say*, and what happens when a client
+re-seals.
+
+**The header cannot be authenticated, and that had a consequence nobody had
+priced.** `m_cost` / `t_cost` / `p_cost` are *inputs* to the KDF, so they must be
+readable before any key exists — they are whatever the writer of the bytes chose.
+Argon2id allocates `m_cost` KiB **in one block before doing any work**, so a
+header claiming `m_cost = 0xFFFF_FFF0` (≈ 4 TiB) was a **remote denial of
+service**: measured at **12.57 s**, a **≈ 90 GB peak memory footprint** on a 24 GB
+machine, and the process killed. The delivery path is `sigild`'s zero-knowledge
+op-log, which by design **cannot filter what it relays**.
+
+[ADR 0047](0047-container-parameter-ceiling-and-no-downgrade-ratchet.md) adds:
+
+- a **ceiling** (`MAX_M_COST` 256 MiB, `MAX_T_COST` 16, `MAX_P_COST` 16, all
+  inclusive) enforced in `sigil-core` and re-checked by both container parsers
+  **before any allocation** — refusal measured at **0.00 s / 1.18 MB**; and
+- a **no-downgrade ratchet** on re-seal (`reseal_container` writes the
+  componentwise max of what it read and what it was asked for), so
+  `SIGILcli` strength moves up and never down through a re-key.
+
+⚠️ **A consequence for anyone building on this format:** a container whose header
+declares work factors above those ceilings will be **refused by every Sigil
+client**, even though it is a structurally valid `SIGILcli` container. Nothing
+this repo writes is anywhere near them (the strongest is `RECOMMENDED`, 64 MiB),
+but the format is no longer "any `u32` you like".
+
+⚠️ The **format constants** (`MAGIC`, `FORMAT_VERSION`, `AAD`,
+`FIXED_HEADER_LEN`) are still **mirrored** between `cli/src/lib.rs` and
+`sigil-wasm/src/lib.rs` and still guarded by the golden-header test. The
+**ceilings are not mirrored** — both sides read `Argon2Params::MAX_*` from
+`sigil-core`, which they already depend on.

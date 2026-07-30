@@ -103,6 +103,19 @@ audited; see the status note below.)
   (staying wasm-pure/`getrandom`-free); the two new deps (`hmac`, `sha1`) are both
   `default-features = false`. It only generates codes (verification is left to
   callers) and is UNAUDITED. This is what the `sigil totp` vault (below) is built on.
+  **Since Phase 59 the core also owns two rules that make an *unauthenticated container
+  header* safe to read** ([ADR 0047](docs/decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)):
+  a **ceiling** on the Argon2id work factors a `SIGILcli` header may declare
+  (`MAX_M_COST` 256 MiB / `MAX_T_COST` 16 / `MAX_P_COST` 16, checked **before a byte is
+  allocated**, `KdfError::ParamsTooLarge`) — because those three fields are inputs to
+  the KDF and therefore cannot be authenticated, Argon2id allocates `m_cost` KiB in one
+  block, and a header claiming ~4 TiB was measured taking **12.57 s and a ≈90 GB memory
+  footprint** before the process was killed (0.00 s and 1.18 MB after the fix); and a
+  **no-downgrade ratchet** (`Argon2Params::no_downgrade`) so a re-seal can raise the
+  work factor and never lower it. ⚠️ The ceiling is a **client-side parse bound, not a
+  server filter** — the sync server stores opaque blobs and by design cannot inspect or
+  filter what it relays, so a hostile container is refused cheaply by every client but
+  is **never removed**.
 - `sigild/` — Go sync server. **Builds, vets, tests** (incl. real-socket
   `httptest` HTTP integration tests, race-clean). Serves `/healthz`, `/readyz`,
   `/version`, and a deliberate `501` on `/v1/vaults/{id}/ops` by default. Behind a
@@ -322,6 +335,20 @@ audited; see the status note below.)
   inverse — it prints each entry as an `otpauth://` URI, or (with `--migration`) one
   combined `otpauth-migration://` URI. **`export` prints your secrets IN THE CLEAR**
   (that is what a 2FA export is) — by design, guarded by a loud warning.
+  Phase 59 fixed two things this feature was **saying that were not true**: a
+  **multi-QR** Google Authenticator import (Google splits a large export across several
+  QR codes) used to report plain success while carrying only that QR's share of the
+  accounts, and now says which batch it was and whether anything is still outstanding —
+  on **all four** clients; and a `--migration` export of an entry whose period is not
+  30 s used to be emitted **as if it were**, producing an account that generates the
+  **wrong codes** in the receiving app, and is now refused, with a new
+  **`--skip-unsupported`** so one unrepresentable account no longer costs you the whole
+  bulk export. ⚠️ That opt-in exists **in the CLI only** — the browser and desktop
+  exports now fail wholesale on such an entry.
+  The sealed vault's JSON also became **forward-compatible**: unknown fields are
+  preserved through an edit (an older client used to silently delete a newer one's data
+  on a sync path where the oldest writer wins) and a `min_reader_version` refuses only
+  the vaults that genuinely need a newer reader, **failing closed** when it is absent.
   The CLI can also **enroll as a device** and sync under **per-vault authorization**
   against a `SIGILD_DEVICE_AUTH` dev server: `sigil device enroll --token <t>` proves
   possession of a fresh key and stores the server-assigned device ID in the 0600

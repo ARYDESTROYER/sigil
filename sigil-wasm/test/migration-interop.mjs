@@ -88,8 +88,12 @@ try {
   // =====================================================================
   const GOLDEN =
     "otpauth-migration://offline?data=CjUKCkhlbGxvId6tvu8SGEV4YW1wbGU6YWxpY2VAZ29vZ2xlLmNvbRoHRXhhbXBsZSABKAEwAhAB";
-  const golden = decodeMigrationUri(GOLDEN);
+  const goldenBatch = decodeMigrationUri(GOLDEN);
+  const golden = goldenBatch.entries;
   assert(golden.length === 1, `golden should decode to 1 account, got ${golden.length}`);
+  // The canonical example is a SINGLE-QR export, so it must read as complete.
+  assert(goldenBatch.complete === true, "golden batch should be complete");
+  assert(goldenBatch.batchNote === null, "a single-QR export must not warn");
   const g = golden[0];
   assert(
     base32Encode(base64ToBytes(g.secret)) === "JBSWY3DPEHPK3PXP",
@@ -124,8 +128,10 @@ try {
     migrationUri.startsWith("otpauth-migration://offline?data="),
     `CLI --migration export is not a migration URI: ${migrationUri.slice(0, 40)}`,
   );
-  const decoded = decodeMigrationUri(migrationUri);
+  const decodedBatch = decodeMigrationUri(migrationUri);
+  const decoded = decodedBatch.entries;
   assert(decoded.length === 2, `expected 2 decoded accounts, got ${decoded.length}`);
+  assert(decodedBatch.complete === true, "the CLI writes one self-contained batch");
 
   const byLabel = Object.fromEntries(decoded.map((e) => [e.label, e]));
   assert(byLabel["acc-one"], "decoded migration is missing acc-one");

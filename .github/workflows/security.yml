@@ -50,15 +50,25 @@ jobs:
           # pgx (the Postgres op-log backend) requires go >= 1.25, which bumps
           # the module's go directive; pin the toolchain to match.
           #
-          # ⚠️ `1.25.x` FLOATS to the newest 1.25 patch ON PURPOSE — govulncheck
-          # reports standard-library advisories against the toolchain that
-          # builds the binary, so pinning an exact patch here would make this
-          # job go red the moment a stdlib fix shipped and stay red until
-          # someone edited this line. Floating means we inherit the backports.
-          # This must stay in step with the Dockerfile's `golang:1.25-alpine`,
-          # which is what actually ships, and with the go1.25.x toolchain
-          # scripts/gate.sh insists on scanning with.
-          go-version: "1.25.x"
+          # ⚠️ PINNED, AND THE COMMENT ABOVE THIS ONE WAS WRONG.
+          #
+          # It used to read `1.25.x` with a note saying that floating "means we
+          # inherit the backports". It does not. On 2026-07-31 setup-go resolved
+          # `1.25.x` to **go1.25.11** while **1.25.12** was out, and go1.25.11
+          # carries GO-2026-5856 (an Encrypted Client Hello privacy leak in
+          # crypto/tls) which is fixed in 1.25.12. The job went red on a commit
+          # that touched no Go code.
+          #
+          # ⭐ WORSE, IT MADE THE LOCAL GATE OPTIMISTIC: scripts/gate.sh scanned
+          # with the newest go1.25.x it could find (1.25.12) and reported clean,
+          # so the gate was MORE LENIENT than CI — the exact failure the security
+          # block was added to prevent, arriving through a different door.
+          #
+          # So: pin an exact patch, and let gate.sh READ THIS VALUE rather than
+          # guessing a compatible one. A pin goes stale loudly (this job fails
+          # and names the fixed version); a float goes stale silently, in
+          # whichever direction setup-go's manifest happens to lag.
+          go-version: "1.25.12"
           # sigild now has a go.sum (pgx for the Postgres op-log backend), so
           # cache the module downloads. govulncheck now also scans that dep.
           cache: true

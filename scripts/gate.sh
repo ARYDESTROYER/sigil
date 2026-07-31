@@ -70,21 +70,31 @@ note "=== SECURITY SCANNERS (all three of security.yml, plus the working tree) =
 # Scanning the dev toolchain would report vulnerabilities that are not in the
 # artifact, and a scanner that cries wolf gets muted — which is precisely how
 # the always-red cargo-audit job stopped being read.
+# ⭐ READ THE PINNED VERSION OUT OF THE WORKFLOW — DO NOT GUESS A COMPATIBLE ONE.
+#
+# This used to take "the newest go1.25.x I can find". On 2026-07-31 that was
+# 1.25.12 while CI's `1.25.x` resolved to **1.25.11**, which carries GO-2026-5856
+# — so the gate scanned a PATCHED toolchain, reported clean, and CI went red on a
+# commit that touched no Go code. ⚠️ A gate that scans a DIFFERENT toolchain than
+# CI is optimistic by construction, which is the same defect as a gate whose
+# coverage is a subset: it cannot answer "will CI pass?".
+#
+# Now the pin lives in exactly one place (security.yml) and this reads it, so the
+# two cannot drift. Bumping the workflow automatically bumps what the gate needs.
+WANTGO=$(grep -oE 'go-version: "[0-9.]+"' .github/workflows/security.yml | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 SCANGO=""
 if [ -n "${SIGIL_SCAN_GO:-}" ] && [ -x "${SIGIL_SCAN_GO}" ]; then
   SCANGO="$SIGIL_SCAN_GO"
-else
-  # Newest locally-installed go1.25.x from `golang.org/dl` (version-sorted).
-  for c in $(ls "$HOME"/go/bin/go1.25.* 2>/dev/null | sort -V -r); do
-    [ -x "$c" ] && SCANGO="$c" && break
-  done
+elif [ -n "$WANTGO" ] && [ -x "$HOME/go/bin/go$WANTGO" ]; then
+  SCANGO="$HOME/go/bin/go$WANTGO"
 fi
 if [ -z "$SCANGO" ]; then
-  bad "no go1.25.x toolchain to scan with — govulncheck NOT RUN.
-      Install the line we actually ship, then re-run:
-        $GO install golang.org/dl/go1.25.12@latest && \$HOME/go/bin/go1.25.12 download
-      (or set SIGIL_SCAN_GO=/path/to/go). Scanning with the dev toolchain
-      instead would report stdlib findings that are not in the shipped binary.)"
+  bad "no go$WANTGO to scan with — govulncheck NOT RUN.
+      That is the EXACT version .github/workflows/security.yml pins, and the gate
+      will not substitute a different one: scanning a newer patch hides the very
+      stdlib advisory CI would report. Install it, then re-run:
+        $GO install golang.org/dl/go$WANTGO@latest && \$HOME/go/bin/go$WANTGO download
+      (or set SIGIL_SCAN_GO=/path/to/go if you know why you are overriding it)."
 else
   gv=$(cd sigild 2>/dev/null && GOTOOLCHAIN=local "$SCANGO" run golang.org/x/vuln/cmd/govulncheck@latest ./... 2>&1)
   if [ -z "$gv" ]; then

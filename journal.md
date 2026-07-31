@@ -10882,3 +10882,57 @@ RED is the rule.* ⭐ **A mutation test needs its mutation validated too.**
 `✗ govulncheck: 0 vulnerability(ies)` — zero findings presented as a failure, which reads as
 a contradiction and cost a verifier a debug cycle. Same family as the cargo-audit flake that
 printed an empty reason. It now says **"COULD NOT COMPLETE — this is NOT a finding"**.
+
+---
+
+## 2026-07-31 — the gate was OPTIMISTIC: it scanned a different toolchain than CI
+
+`security` went red on Phase 62 (`37403b7`), a commit that touched almost no Go, while
+`./scripts/gate.sh` had printed ALL GREEN including `✓ govulncheck clean`.
+
+**The cause, proven by running both:**
+
+```
+=== go1.25.11 — what CI's `1.25.x` actually resolved to ===
+Vulnerability #1: GO-2026-5856
+    Found in: crypto/tls@go1.25.11
+    Fixed in: crypto/tls@go1.25.12
+=== go1.25.12 — what my gate happened to pick ===
+No vulnerabilities found.
+```
+
+`setup-go`'s `1.25.x` resolved to **1.25.11** while **1.25.12** was released, and 1.25.11
+carries an Encrypted Client Hello privacy leak in `crypto/tls`. My gate resolved "the newest
+`go1.25.*` I can find locally" — 1.25.12 — and so **scanned a patched toolchain and reported
+clean**.
+
+⚠️ **AND THE COMMENT IN THE WORKFLOW ASSERTED THE OPPOSITE.** I had written that `1.25.x`
+floats "ON PURPOSE … floating means we inherit the backports". It does not: the resolution
+is whatever setup-go's manifest says, and it lagged. A confident comment explaining why the
+wrong thing was right — the same shape as `threat-model.md` row V.
+
+⭐ **THIS IS THE "GATE ⊇ CI" DEFECT AGAIN, THROUGH A THIRD DOOR.** Round one it was
+*coverage* (the gate ran no scanners). Round two it was *completeness* (it ran two of three
+jobs). This time the coverage was right and the **inputs differed**: same check, same
+command, **different toolchain**, opposite answer. A gate that scans a newer patch than CI
+is optimistic by construction.
+
+**Fixed so the two cannot drift:** `security.yml` now pins an exact patch (`1.25.12`), and
+`gate.sh` **READS THAT VALUE OUT OF THE WORKFLOW** rather than guessing a compatible one —
+one source of truth, and bumping the workflow automatically bumps what the gate demands. It
+**refuses to substitute** a different version:
+
+```
+✗ no go1.25.99 to scan with — govulncheck NOT RUN.
+      That is the EXACT version .github/workflows/security.yml pins, and the gate
+      will not substitute a different one: scanning a newer patch hides the very
+      stdlib advisory CI would report.
+```
+
+Mutation-proven: bump the pin to a version that is not installed and the gate fails loudly
+rather than quietly scanning something else.
+
+⚠️ **A pin has a real cost, stated rather than hidden:** it goes stale, and the next stdlib
+advisory will fail this job until someone edits the line. That is the *loud* direction. A
+float goes stale **silently**, in whichever direction a third-party manifest happens to lag
+— which is what just happened.

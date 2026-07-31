@@ -5319,6 +5319,192 @@ pub fn fetch_subscription(server: &str, auth: &RequestAuth<'_>) -> Result<String
     finish(req.call())
 }
 
+// --- clock skew: the diagnostic for the top real-world TOTP failure ---------
+//
+// ⛔ THE PROBLEM. A TOTP code is a function of a shared secret and THE CURRENT
+// TIME. When a device's clock drifts past half a time step, the codes it
+// produces start falling outside the window a verifier will accept — and to the
+// user a rejected code is INDISTINGUISHABLE from having the wrong secret.
+// (RFC 6238 §5.2 lets a verifier accept one step either side, so a drift just
+// over half a step often still validates; the further it drifts the more
+// certainly it does not. LIKELY, and increasingly certain — never "every code".) They re-scan the QR, re-import the export, delete and re-add
+// the account, and none of it helps, because nothing was ever wrong with the
+// secret. This is the single most common real-world authenticator failure, and
+// until now no Sigil client reported it anywhere.
+//
+// ⭐ THE SOURCE OF TRUTH IS ALREADY ON THE WIRE. Every HTTP response Go's
+// net/http produces carries a `Date` header (RFC 9110 §6.6.1), so any `sigild`
+// this client already talks to is a clock reference. NO new route, NO new
+// header, NO new dependency, and NO change to `sigild` for the native clients.
+//
+// ⛔⛔ IT IS A DIAGNOSTIC AND NEVER A CORRECTION. Nothing here feeds the clock
+// used to GENERATE codes. `sigil-core` reads no clock at all (ADR 0007) and the
+// instant is always supplied by the caller from the system clock — that stays
+// true. A client that silently generated codes against a server-supplied time
+// would produce codes the user cannot reproduce, cannot check against any other
+// authenticator, and cannot reason about when the server is wrong or hostile. A
+// wrong code the user can explain beats a right code they cannot trust.
+//
+// ⚠️ AND IT IS NOT A SECURITY CONTROL. The reading comes from an unauthenticated
+// plaintext header over plain HTTP, so anyone who can see the traffic can change
+// it. Its only job is to turn "my codes don't work" into "your clock is 4m12s
+// fast" — a hostile answer can at worst make that hint wrong, and no key,
+// signature or code depends on it.
+
+/// Warn when the local clock differs from the server's by more than this.
+///
+/// Half of the default 30-second TOTP step: at exactly half a period a code is
+/// on the edge of the window a verifier will accept, so this is the point at
+/// which drift starts to cost the user codes rather than merely being untidy.
+pub const CLOCK_SKEW_WARN_SECONDS: i64 = 15;
+
+/// One clock comparison between this machine and a server.
+///
+/// Carries both readings rather than only the difference, so a caller can show
+/// the user what was actually compared instead of asking them to trust a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockSkew {
+    /// Unix seconds parsed from the server's `Date` response header.
+    pub server_unix: i64,
+    /// Unix seconds read from this machine's clock at the same moment.
+    pub local_unix: i64,
+    /// `local_unix - server_unix`. POSITIVE means the LOCAL clock is AHEAD.
+    pub skew_seconds: i64,
+}
+
+impl ClockSkew {
+    /// True when the drift is large enough to start costing the user codes.
+    #[must_use]
+    pub fn significant(&self) -> bool {
+        self.skew_seconds.abs() > CLOCK_SKEW_WARN_SECONDS
+    }
+
+    /// A sentence for a human. Names the direction explicitly — "ahead" and
+    /// "behind" are what a person needs to act on; a signed integer is not.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let d = self.skew_seconds;
+        if !self.significant() {
+            return format!(
+                "clock OK: this machine is within {abs}s of the server \
+                 (local {local}, server {server}); TOTP codes will line up.",
+                abs = d.abs(),
+                local = self.local_unix,
+                server = self.server_unix,
+            );
+        }
+        let (dir, verb) = if d > 0 {
+            ("AHEAD OF", "back")
+        } else {
+            ("BEHIND", "forward")
+        };
+        format!(
+            "⚠️ CLOCK SKEW: this machine is {abs}s {dir} the server \
+             (local {local}, server {server}). That is more than half a 30s TOTP step, so codes \
+             generated here are likely to be REJECTED even though the secret is correct — the \
+             two failures look identical. Fix the system clock (turn automatic time sync on, or \
+             move it {verb} {abs}s). Nothing is wrong with your vault, and no code or key has \
+             been changed.",
+            abs = d.abs(),
+            local = self.local_unix,
+            server = self.server_unix,
+        )
+    }
+}
+
+/// Parse an HTTP `Date` header (RFC 9110 IMF-fixdate) into unix seconds.
+///
+/// Hand-rolled, because adding a date-parsing crate for one 29-character
+/// fixed-width field would be a new dependency in a repo whose entire
+/// dependency posture is "don't". Only IMF-fixdate is accepted — the two
+/// obsolete formats RFC 9110 lists are not produced by any server this talks to,
+/// and silently mis-parsing one would be worse than declining to read it.
+///
+/// `Sun, 06 Nov 1994 08:49:37 GMT`
+///
+/// Returns `None` for anything that is not exactly that shape.
+#[must_use]
+pub fn parse_http_date(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    // "Www, DD Mon YYYY HH:MM:SS GMT"
+    let rest = s.split_once(", ")?.1;
+    let mut parts = rest.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let mon_name = parts.next()?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let hms = parts.next()?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| *m == mon_name)? as i64
+        + 1;
+
+    let mut hp = hms.split(':');
+    let h: i64 = hp.next()?.parse().ok()?;
+    let mi: i64 = hp.next()?.parse().ok()?;
+    let sec: i64 = hp.next()?.parse().ok()?;
+    if hp.next().is_some() || !(0..=23).contains(&h) || !(0..=59).contains(&mi) || sec > 60 {
+        return None;
+    }
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+
+    Some(days_from_civil(year, month, day) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Pure integer arithmetic, no dependency, no leap seconds.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Compare this machine's clock against `server`'s.
+///
+/// Sends ONE unauthenticated `GET /healthz` — a route that exists on every
+/// `sigild`, is never dev-gated, never rate limited and returns no data — and
+/// reads the `Date` header off the response.
+///
+/// ⭐ Deliberately its OWN request rather than a value threaded out of push/pull:
+/// the reading must still be available when the sync itself FAILED, which is
+/// exactly the moment a user is trying to work out what is wrong.
+///
+/// `local_unix` is supplied by the caller (the same discipline the core uses,
+/// ADR 0007) so the comparison is testable without a clock.
+///
+/// # Errors
+/// - [`CliError::Http`] if the server is unreachable — an OFFLINE client gets no
+///   reading, and must say so rather than implying the clock is fine.
+/// - [`CliError::BadResponse`] if the response carried no parsable `Date`.
+pub fn server_clock_skew(server: &str, local_unix: i64) -> Result<ClockSkew, CliError> {
+    let resp = match ureq::get(&join_url(server, "/healthz")).call() {
+        Ok(r) => r,
+        // ⭐ A non-2xx response STILL carries a Date header, and a clock reading
+        // is useful precisely when the server is unhappy with us. Keep it.
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(ureq::Error::Transport(t)) => return Err(CliError::Http(t.to_string())),
+    };
+    let raw = resp
+        .header("Date")
+        .ok_or_else(|| CliError::BadResponse("server sent no Date header".to_string()))?;
+    let server_unix = parse_http_date(raw)
+        .ok_or_else(|| CliError::BadResponse(format!("unparsable Date header {raw:?}")))?;
+    Ok(ClockSkew {
+        server_unix,
+        local_unix,
+        skew_seconds: local_unix - server_unix,
+    })
+}
+
 // --- vault key rotation + re-wrap ------------------------------------------
 
 /// The URL PATH of a vault's envelope COLLECTION (list / rotate support).
@@ -6920,6 +7106,94 @@ pub fn recovery_revoke(
 mod tests {
     use super::*;
     use sigil_core::format_recovery_kit;
+
+    // --- clock skew ---------------------------------------------------------
+
+    /// The RFC 9110 §5.6.7 example, so the parser is anchored on the spec's own
+    /// value rather than on something we generated ourselves.
+    #[test]
+    fn http_date_parses_the_rfc_example() {
+        // "Sun, 06 Nov 1994 08:49:37 GMT" == 784111777 unix.
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        // The epoch itself, and a leap day, exercise days_from_civil's branches.
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date("Sat, 29 Feb 2020 12:00:00 GMT"),
+            Some(1_582_977_600)
+        );
+    }
+
+    /// ⭐ A MIS-PARSE MUST BE `None`, NEVER A WRONG NUMBER. A silently wrong
+    /// reading would tell a user with a perfectly good clock to change it, which
+    /// is worse than saying nothing — the whole point of this feature is to stop
+    /// people debugging the wrong thing.
+    #[test]
+    fn http_date_refuses_anything_that_is_not_imf_fixdate() {
+        for bad in [
+            "",
+            "not a date",
+            "Sun, 06 Nov 1994 08:49:37",           // no zone
+            "Sun, 06 Nov 1994 08:49:37 PST",       // wrong zone
+            "Sunday, 06-Nov-94 08:49:37 GMT",      // obsolete RFC 850
+            "Sun Nov  6 08:49:37 1994",            // obsolete asctime
+            "Sun, 06 Nov 1994 08:49:37 GMT extra", // trailing junk
+            "Sun, 06 Xxx 1994 08:49:37 GMT",       // bad month
+            "Sun, 06 Nov 1994 25:49:37 GMT",       // bad hour
+            "Sun, 06 Nov 1994 08:61:37 GMT",       // bad minute
+            "Sun, 32 Nov 1994 08:49:37 GMT",       // bad day
+        ] {
+            assert_eq!(parse_http_date(bad), None, "should not parse {bad:?}");
+        }
+    }
+
+    /// The threshold is half a 30-second step, and the message must name the
+    /// DIRECTION — "ahead"/"behind" is what a human can act on.
+    #[test]
+    fn clock_skew_reports_direction_and_only_warns_past_half_a_step() {
+        assert_eq!(CLOCK_SKEW_WARN_SECONDS, 15);
+
+        let ok = ClockSkew {
+            server_unix: 1_000_000,
+            local_unix: 1_000_010,
+            skew_seconds: 10,
+        };
+        assert!(!ok.significant());
+        assert!(ok.describe().contains("clock OK"));
+        assert!(!ok.describe().contains("CLOCK SKEW"));
+
+        let fast = ClockSkew {
+            server_unix: 1_000_000,
+            local_unix: 1_000_300,
+            skew_seconds: 300,
+        };
+        assert!(fast.significant());
+        assert!(fast.describe().contains("300s AHEAD OF"));
+
+        let slow = ClockSkew {
+            server_unix: 1_000_000,
+            local_unix: 999_700,
+            skew_seconds: -300,
+        };
+        assert!(slow.significant());
+        assert!(slow.describe().contains("300s BEHIND"));
+
+        // Exactly at the threshold is still fine; one second past is not.
+        let edge = ClockSkew {
+            server_unix: 0,
+            local_unix: 15,
+            skew_seconds: 15,
+        };
+        assert!(!edge.significant());
+        let over = ClockSkew {
+            server_unix: 0,
+            local_unix: 16,
+            skew_seconds: 16,
+        };
+        assert!(over.significant());
+    }
 
     // --- Phase 54: the recovery kit -----------------------------------------
 

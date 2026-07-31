@@ -918,6 +918,52 @@ timing, never by content.
   it today**; a future compaction that keys on it would be trusting a timestamp an
   adversary can lower, and must be designed with that in mind.
 
+## A server that lies about the time (the clock-skew diagnostic — see [ADR 0050](decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md))
+
+Every client can compare its own clock against a server's, reading the standard
+HTTP **`Date`** header off an unauthenticated `GET /healthz`. This section exists to
+bound what that hands an adversary, because the reading is **unauthenticated
+plaintext over plain HTTP** and anyone who can see or serve the traffic can change
+it.
+
+### What a hostile server (or an on-path attacker) CAN do
+
+- **Return a wrong `Date`.** It can invent skew where there is none, or report *clock
+  OK* on a device whose clock is badly wrong. The effect is that the hint is wrong:
+  the user is told to fix a clock that is fine, or is not told about one that is not.
+- **Withhold the reading**, by refusing the request or omitting the header. The
+  client then reports **NO CLOCK READING**, which is deliberately rendered as the
+  *absence* of a report and never as "your clock is fine".
+- **Correlate a poll.** `GET /healthz` is unauthenticated and carries no device id,
+  so it reveals only that some client at that address asked for the time.
+
+### What it CANNOT do
+
+- ⛔ **It cannot change a single generated code.** Every client computes codes from
+  its **own** system clock; `sigil-core` reads no clock at all
+  ([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)) and the instant is
+  supplied by the host. No path anywhere feeds a server-supplied time into
+  generation — a desktop test takes a reading a **billion seconds** out and the vault
+  still prints the RFC 6238 vector `94287082`. **This is the reason a lying server is
+  merely annoying rather than dangerous, and it is why "just sync to server time"
+  was rejected.**
+- ⛔ **No key, signature, envelope, grant or entitlement decision depends on it.** It
+  is not an input to the signed-request contract (whose own ±300 s window is a
+  separate, server-side mechanism), to the wrap gate, or to anything at rest.
+- ⛔ **It learns nothing about a vault.** The route returns no data, and the request
+  carries no vault id, device id or signature.
+
+### What is NOT defended
+
+- ⚠️ **The reading is not authenticated and is not meant to be.** Making it
+  trustworthy would need a signed time service, which is a new surface, a new
+  contract and a new key — for a hint whose worst outcome is being wrong.
+- ⚠️ **An offline client gets no reading at all**, which is exactly the situation (a
+  laptop with a dead clock battery) where the diagnostic would help most.
+- ⚠️ **`deleted_at` and any other client-written timestamp remain attacker-influenced
+  in the way described above.** This diagnostic does not, and is not intended to,
+  make client clocks trustworthy to anyone else.
+
 ## Billing / payment surface (opt-in, dev-gated — see [ADR 0034](decisions/0034-billing-provider-seam.md))
 
 The billing layer adds an endpoint that is, by necessity, **authenticated by

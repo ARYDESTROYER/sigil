@@ -181,6 +181,11 @@ test("a delete made on one device stays deleted after another device syncs", asy
       .filter({ hasText: "delete-me" })
       .getByTestId("account-remove")
       .click();
+    // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+    // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+    // button that sits inches from the code is permanent. Confirm it — this spec is
+    // about the merge/schema, not about the gate.
+    await a.getByTestId("remove-confirm-yes").click();
     await expect(a.getByTestId("account-count")).toHaveText("1", { timeout: T });
     await push(a);
 
@@ -234,6 +239,11 @@ test("the same label at two issuers is two accounts, and both keep their own cod
     .filter({ hasText: "GitHub" })
     .getByTestId("account-remove")
     .click();
+  // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+  // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+  // button that sits inches from the code is permanent. Confirm it — this spec is
+  // about the merge/schema, not about the gate.
+  await page.getByTestId("remove-confirm-yes").click();
   await expect(page.getByTestId("account-count")).toHaveText("1", { timeout: T });
   expect((await renderedLabels(page)).join(" | ")).toContain("GitLab");
 

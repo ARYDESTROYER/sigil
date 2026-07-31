@@ -112,6 +112,9 @@ import {
   formatInstant,
   NEVER_REFUSED,
 } from "../../vendor/entitlement.mjs";
+// ⛔ CLOCK SKEW — a DIAGNOSTIC, never a correction. Nothing here feeds the clock
+// `nowSeconds()` gives the wasm to generate codes.
+import { fetchClockSkew, describeClockSkew } from "../../vendor/clock-skew.mjs";
 
 /** chrome.storage.local key holding ONLY the sealed container, base64. */
 const STORAGE_KEY = "sigil.extension.vault.v1";
@@ -637,11 +640,19 @@ function row(entry) {
 
   const confirmText = document.createElement("p");
   confirmText.dataset.testid = "remove-confirm-warning";
+  // ⚠️ IT MUST NOT PROMISE A SYNC IT DOES NOT PERFORM. An earlier revision said
+  // "the deletion is synced to every other device holding it", which is FALSE
+  // here: sync in this product is MANUAL (explicit Push / Pull) and a vault with
+  // no server configured never propagates at all. This is the sentence a user
+  // reads while deciding whether to destroy a second factor, so it says exactly
+  // what happens and exactly what it is conditional on.
   confirmText.textContent =
     `Delete ${who_(entry)}? This permanently deletes the second-factor secret ` +
-    `from this vault, and the deletion is synced to every other device holding ` +
-    `it. It cannot be undone from here — if you no longer have this secret ` +
-    `anywhere else, you may lose access to the account it protects.`;
+    `from this vault. Sigil syncs only when you ask it to, so the deletion ` +
+    `reaches every other device holding this vault the next time you Push and ` +
+    `they Pull; until you do — and forever, if you never sync — it applies to ` +
+    `this device alone. It cannot be undone from here — if you no longer have ` +
+    `this secret anywhere else, you may lose access to the account it protects.`;
 
   const yes = document.createElement("button");
   yes.type = "button";
@@ -1136,6 +1147,10 @@ $("sync-push").addEventListener("click", async () => {
       `Pushed sealed container as op #${seq}${device ? " (signed)" : ""}.` +
         (sizeWarn ? ` ⚠️ ${sizeWarn}` : ""),
     );
+    // A successful sync means a reachable server, i.e. a free clock reference.
+    // Take the reading here so a broken clock is found while doing something
+    // else, long before the user is staring at a rejected login.
+    void refreshClock();
   } catch (e) {
     // ⭐ A 402 is a BILLING state, not an auth failure and not a bug: the server
     // authenticated AND authorized this device and then asked for payment.
@@ -1186,9 +1201,41 @@ $("sync-pull").addEventListener("click", async () => {
         `${res.removed} removed by a delete from another device. ` +
         `${res.vault.entries.length} account(s) now.${skipNote}`,
     );
+    void refreshClock();
   } catch (e) {
     say(`Pull failed: ${authErr(e)}`, "error");
   }
+});
+
+// ── clock skew (the DIAGNOSTIC) ─────────────────────────────────────────────
+//
+// ⛔ A TOTP code rejected because this device's clock drifted is
+// INDISTINGUISHABLE, to the user, from a wrong secret — so they re-scan the QR,
+// re-import the export, delete and re-add the account, and none of it helps.
+// Nothing in this product reported it until now.
+//
+// ⛔⛔ IT REPORTS. IT NEVER CORRECTS. `nowSeconds()` still drives every code from
+// this device's own system clock. A code generated against a server-supplied
+// time is one the user cannot reproduce, cannot compare against any other
+// authenticator, and cannot reason about when the server is wrong or hostile.
+//
+// ⭐ "unavailable" is rendered as NO READING, never as "your clock is fine".
+async function refreshClock() {
+  const el = $("clock-status");
+  if (!el) return;
+  let reading;
+  try {
+    reading = await fetchClockSkew({ baseUrl: $("sync-url").value.trim() }, nowSeconds());
+  } catch (e) {
+    reading = { state: "unavailable", reason: err(e) };
+  }
+  el.dataset.state = reading.state;
+  el.textContent = describeClockSkew(reading);
+  el.className = reading.state === "skewed" ? "warn" : "hint";
+}
+
+$("clock-check").addEventListener("click", () => {
+  void refreshClock();
 });
 
 // ── sharing (dev): device-to-device vault sharing ───────────────────────────

@@ -535,7 +535,8 @@ try {
       { SIGIL_PASSWORD: cliPassword },
     );
     // Re-key: the password vault becomes a SHARED vault under a random key.
-    sigil(["vault", "rekey", "--vault", VAULT_B], { SIGIL_PASSWORD: cliPassword });
+    // ⛔ `--yes`: rekey is a ONE-WAY DOOR (the password stops opening the vault).
+    sigil(["vault", "rekey", "--yes", "--vault", VAULT_B], { SIGIL_PASSWORD: cliPassword });
     sigil(["push", "--vault", VAULT_B, "--in", join(cliHome, ".sigil", "totp-vault.sigil")]);
 
     const cliUploaded = join(work, "cli-uploaded.env");

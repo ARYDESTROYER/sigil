@@ -256,6 +256,30 @@
         <!-- A refused write is a BILLING state: its own region, never rendered
              as "unauthorized" and never styled as a fault of this device. -->
         <p id="entitlement-402" class="warn" role="status" hidden data-testid="entitlement-402"></p>
+
+        <!-- ⛔ THE CLOCK DIAGNOSTIC. A TOTP code rejected because this device's
+             clock drifted is indistinguishable, to the user, from a wrong
+             secret: they re-scan the QR, re-import, delete and re-add, and none
+             of it helps. This is the only thing in the product that can tell
+             them apart.
+             ⛔⛔ It REPORTS. It never adjusts the clock codes are generated
+             from — a code computed against a server-supplied time is one the
+             user cannot reproduce or check anywhere else. -->
+        <p class="hint">
+          Codes are computed from <strong>this device&rsquo;s</strong> system
+          clock. Once it has drifted more than half a TOTP step, codes are likely
+          to be rejected even though the secret is perfectly correct, and the
+          further it drifts the more certain that becomes. Some verifiers accept a
+          code from one step either side, so a small drift may still get through,
+          but you cannot count on it. This compares against the server&rsquo;s
+          clock; it never changes the one codes come from.
+        </p>
+        <div class="row">
+          <button type="button" id="clock-check" data-testid="clock-check">Check clock</button>
+        </div>
+        <p id="clock-status" class="hint" role="status" data-state="unread" data-testid="clock-status">
+          Not checked yet.
+        </p>
       </details>
 
       <details class="panel">

@@ -1609,6 +1609,46 @@ export function describePaymentRequired(err: PaymentRequiredError): {
   detail: string;
 };
 
+// ── clock skew (sigil-wasm/clock-skew.mjs) ───────────────────────────────────
+//
+// ⛔ A DIAGNOSTIC, NEVER A CORRECTION. Nothing here feeds the clock used to
+// GENERATE codes: a client that silently generated codes against a
+// server-supplied time would produce codes the user cannot reproduce, cannot
+// compare against another authenticator, and cannot reason about when the server
+// is wrong. A wrong code the user can explain beats a right code they cannot
+// trust.
+//
+// ⚠️ Declared here AND re-exported at runtime in index.mjs — two separate holes.
+
+/** Half a 30s TOTP step. MIRRORED with cli/src/lib.rs. */
+export const CLOCK_SKEW_WARN_SECONDS: number;
+export const HEADER_DATE: string;
+
+/** A reading, or the explicit ABSENCE of one. "unavailable" is NOT "fine". */
+export type ClockSkewReading =
+  | { state: "ok" | "skewed"; serverUnix: number; localUnix: number; skewSeconds: number }
+  | { state: "unavailable"; reason: string };
+
+/** unix SECONDS from an RFC 9110 IMF-fixdate, or null. Never a wrong number. */
+export function parseHttpDate(raw: string | null | undefined): number | null;
+
+export function skewFromDateHeader(
+  dateHeader: string | null | undefined,
+  localUnix: number,
+): ClockSkewReading;
+
+/** Read the clock off a response the client ALREADY made — zero extra requests. */
+export function readClockSkew(response: Response, localUnix: number): ClockSkewReading;
+
+/** Ask explicitly: one unauthenticated GET /healthz. */
+export function fetchClockSkew(
+  opts: { baseUrl: string; fetch?: typeof fetch },
+  localUnix: number,
+): Promise<ClockSkewReading>;
+
+/** The sentence for a human; names the DIRECTION, and says NO READING plainly. */
+export function describeClockSkew(skew: ClockSkewReading): string;
+
 // ── passkey-protected local containers (sigil-wasm/passkey.mjs, ADR 0046) ─────
 //
 // ⚠️ These declarations and the `export *` in index.mjs are TWO SEPARATE HOLES.

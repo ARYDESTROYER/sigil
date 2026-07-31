@@ -173,8 +173,37 @@ A_CODE_PW="$(SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" totp code rfc --at "$
 [[ "$A_CODE_PW" == "$RFC_CODE" ]] || fail "A's password-vault code at T=$RFC_T is $A_CODE_PW, want $RFC_CODE"
 ok "A generates $A_CODE_PW at T=$RFC_T (matches the RFC 6238 vector)"
 
+# ---------------------------------------------------------------------------
+# ⛔ THE ONE-WAY DOOR IS GATED. `vault rekey` REPLACES password protection with
+# a 32-byte key stored in the clear in vault-keys.json — after it, SIGIL_PASSWORD
+# never opens this vault again, and losing that one file loses the vault while
+# the remembered password is worth nothing. It used to do all of that with no
+# warning and no acknowledgement, and the next ordinary `sigil totp list` then
+# failed with a bare `Aead(Authentication)` — indistinguishable from a typo.
+#
+# ⭐ This block is the regression guard for the GATE, not for the flag: deleting
+# the `if !f.yes` check in cmd_vault_rekey makes the first assertion fail, and
+# deleting the "nothing changed" assertion would let a gate that refused AFTER
+# re-sealing pass. Both are checked, in that order, before the real rekey below.
+# ---------------------------------------------------------------------------
+step "rekey REFUSES without --yes, and changes nothing when it refuses"
+if SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --vault "$VAULT" >/dev/null 2>&1; then
+	fail "vault rekey converted the vault with NO acknowledgement (--yes was not required)"
+fi
+REKEY_REFUSAL="$(SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --vault "$VAULT" 2>&1 || true)"
+grep -qi 'ONE-WAY DOOR' <<<"$REKEY_REFUSAL" || fail "the refusal does not call it a one-way door: $REKEY_REFUSAL"
+grep -qi 'NO LONGER OPENS THIS VAULT' <<<"$REKEY_REFUSAL" ||
+	fail "the refusal does not say the password stops working: $REKEY_REFUSAL"
+grep -qi 'vault-keys.json' <<<"$REKEY_REFUSAL" ||
+	fail "the refusal does not name the key file that replaces the password: $REKEY_REFUSAL"
+ok "refused, and the warning names the door, the password loss AND the key file"
+# ⭐ AND IT REALLY DID NOTHING: the password must still open the vault.
+SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" totp list >/dev/null ||
+	fail "a REFUSED rekey still changed how the vault is sealed"
+ok "the refused rekey left the vault password-sealed and readable"
+
 step "A re-keys the vault under a fresh random 32-byte VAULT KEY"
-SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --vault "$VAULT" --publish >/dev/null
+SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --yes --vault "$VAULT" --publish >/dev/null
 A_FP="$(run_as "$HOME_A" vault list | grep "$VAULT" | sed 's/.*key_sha256=//')"
 [[ -n "$A_FP" ]] || fail "A has no vault key after rekey"
 ok "vault key fingerprint (A) = $A_FP"
@@ -258,7 +287,7 @@ ok "C cannot read the vault op-log (403)"
 # C fabricates its OWN vault key for the SAME vault id and tries to inject an
 # envelope into A's vault — the closest thing to a real attack this model allows.
 SIGIL_PASSWORD='c-password-not-shared' run_as "$HOME_C" totp add junk --secret "$RFC_SEED" >/dev/null
-SIGIL_PASSWORD='c-password-not-shared' run_as "$HOME_C" vault rekey --vault "$VAULT" >/dev/null
+SIGIL_PASSWORD='c-password-not-shared' run_as "$HOME_C" vault rekey --yes --vault "$VAULT" >/dev/null
 expect_fail "$HOME_C" "403" vault share --vault "$VAULT" --to "$C_ID"
 ok "C cannot deposit an envelope on a vault it does not own (403)"
 

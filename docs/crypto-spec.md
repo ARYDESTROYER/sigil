@@ -1231,6 +1231,23 @@ binary (or the browser) supplies it, exactly as callers supply salts, nonces, an
 seeds. There is no in-core time source and no randomness here, so the
 `wasm32-unknown-unknown` / `no_std` / `getrandom`-free build is preserved.
 
+⚠️ **The consequence, and what Phase 62 did and did NOT change about it.** Because
+the caller supplies the instant, the correctness of every code depends on the
+*host's* clock, which the core cannot see or check. A device drifted past half a
+step starts having codes rejected, and to a user that is indistinguishable from a
+wrong secret. Since Phase 62 every client can **diagnose** that by comparing its
+clock against a server's HTTP `Date` header
+([ADR 0050](decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md);
+the warn threshold is **15 s**, half the default 30 s step, mirrored between
+`cli/src/lib.rs` and `sigil-wasm/clock-skew.mjs`). ⛔⛔ **That is a reading and never
+a correction: nothing anywhere feeds a server-supplied time into `totp`.** The
+argument is always the host's own clock, this rule is unchanged, and a client that
+broke it would produce codes the user could not reproduce or check against any
+other authenticator. ⚠️ Note also that RFC 6238 §5.2 permits a verifier to accept a
+code from one step either side, and real verifiers commonly do — so drift just past
+the threshold is **likely**, not certain, to cost the user a code. Never state it
+as "every code is rejected".
+
 **Dependencies (both `getrandom`-free).** The HMAC uses RustCrypto
 [`hmac`](https://docs.rs/hmac) (already in the tree transitively via `hkdf`, now a
 direct dependency) with `sha1` for HMAC-SHA-1 and the existing `sha2` for

@@ -187,6 +187,11 @@ test("otpauth:// and Google Authenticator migration imports work in the popup", 
 
   // Remove one; the vault re-seals and the row disappears.
   await page.locator('[data-label="alice@example.com"] [data-testid="remove"]').click();
+  // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+  // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+  // button inches from the code is permanent. Confirm it — this spec is about the
+  // merge/schema/import, not about the gate.
+  await page.locator('[data-label="alice@example.com"] [data-testid="remove-confirm-yes"]').click();
   await expect(page.getByTestId("account")).toHaveCount(1);
 
   expect(failures).toEqual([]);

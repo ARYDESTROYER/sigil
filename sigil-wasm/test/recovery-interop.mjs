@@ -472,7 +472,8 @@ try {
   sigil(["totp", "add", "cli", "--secret", RFC_SEED_B32, "--digits", "8", "--period", "30"], cliHome, {
     SIGIL_PASSWORD: "cli password cli",
   });
-  sigil(["vault", "rekey", "--vault", VAULT_CLI, "--publish"], cliHome, {
+  // ⛔ `--yes`: rekey is a ONE-WAY DOOR (the password stops opening the vault).
+  sigil(["vault", "rekey", "--yes", "--vault", VAULT_CLI, "--publish"], cliHome, {
     SIGIL_PASSWORD: "cli password cli",
   });
   sigil(["push", "--vault", VAULT_CLI, "--in", join(cliHome, ".sigil", "totp-vault.sigil")]);
@@ -545,7 +546,8 @@ try {
     sigil(["totp", "add", "x", "--secret", RFC_SEED_B32], kitHome, {
       SIGIL_PASSWORD: "label probe password",
     });
-    sigil(["vault", "rekey", "--vault", "labelvault", "--publish"], kitHome, {
+    // ⛔ `--yes`: rekey is a ONE-WAY DOOR (the password stops opening the vault).
+    sigil(["vault", "rekey", "--yes", "--vault", "labelvault", "--publish"], kitHome, {
       SIGIL_PASSWORD: "label probe password",
     });
 

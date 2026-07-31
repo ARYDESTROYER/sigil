@@ -10576,3 +10576,309 @@ subject matter**: the portability guard was not portable-safe against itself, th
 made false claims about the docs, and the merge guard's comment stripper hid a merge bypass.
 **A guard is code, and it gets no exemption from the failure mode it was built to catch.**
 Write the mutation test for the guard before trusting the guard.
+
+### ⚠️ A PROCESS ERROR OF MINE: `git add -A` while an agent held the tree
+
+`27f0da6` is described in its message as a CI fix. It is not only that. Nine files
+changed; **four were mine** (`interop.yml`, `journal.md`, and the two guards). The other
+five — `cli/src/main.rs` (+128), `desktop/ui/main.js`, `extension/src/popup/{js,css}`,
+`web/apps/webapp/app/authenticator.tsx` (+119) — are **Phase 62 work in progress**, swept
+in because I ran `git add -A` while a background agent was editing the same tree.
+
+**The commit message is therefore false about its own contents**, which is the same class
+of defect this project keeps finding in its documentation, committed by me into git history
+rather than into a doc.
+
+⛔ **I am NOT rewriting it.** It is pushed to `main`; rewriting shared history to tidy a
+message is a worse risk than an inaccurate message that is corrected in the open. The
+Phase 62 commit will say plainly which of its files already landed in `27f0da6` and why.
+
+⭐ **THE RULE, now that I have broken it once: never `git add -A` while a background agent
+has the working tree.** Stage explicit paths, or wait for the agent to finish. A concurrent
+agent makes `-A` mean "everything anyone is doing right now", which is never what a commit
+message claims.
+
+## 2026-07-31 — Phase 62: the product stops harming and lying to its user
+
+Everything before this phase fixed things the **system** did wrong: an
+unauthenticated container header (0047), an anonymous key wrap (0048), a vault
+that overwrote itself (0049). This one fixes things the **product** did to the
+person using it. None of the four defects is cryptographic. All four lose the
+user their accounts.
+
+Recorded as **[ADR 0050](docs/decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)**,
+with dated addenda on **0042**, **0044** and **0049**.
+
+### The four defects
+
+**1. A one-click delete of a second factor.** Every client's account row had a
+bare **Remove** wired straight to the removal, inches from the code the user came
+to read, on a row that repaints once a second. Mis-clicks are the expected case.
+
+⭐ **And Phase 61 had just RAISED the stakes.** Before the 2P-Set, a stale
+snapshot might resurrect a deleted entry by accident. ADR 0049 §3 deliberately
+closed that: the tombstone propagates and *wins*. The accidental safety net was
+removed on purpose, and no UI had been adjusted to match. **An accidental delete
+is now more permanent than it used to be.** That belonged in 0049 as an addendum,
+and it is now there.
+
+**2. Two clients denied, in the product, that they could print a recovery kit.**
+The webapp's and the extension's account panels both said *"this app cannot print
+one"* — true until Phase 56, false ever since, with the **Generate a kit** button
+on the same screen in the webapp.
+
+⛔ This is the worst class of stale claim this repo produces. A stale line in a
+`.md` misleads a maintainer. A stale **capability** claim inside the product,
+about the one control that prevents the permanent loss ADR 0040 limitation 1
+describes, **routes the user past the fix.**
+
+⚠️ The finding named only the extension. The webapp carried the identical
+sentence and was found by **grepping for the claim** rather than by trusting the
+report. *A false sentence is a class, not an instance.*
+
+**3. `vault rekey` dropped the password silently.** A one-way door on a bare
+invocation: afterwards `SIGIL_PASSWORD` does not open the vault (not "also" —
+instead), and the key lives in `vault-keys.json` in the clear. Worse, the
+aftermath is **misdiagnosed**: the next `sigil totp list` fails with
+`Aead(Authentication)`, **byte-identical to a wrong password**, so the obvious
+reaction is the wrong one. Now `--yes`, as a **refusal rather than a prompt** so
+it behaves the same in a script as at a terminal.
+
+**4. The most common real-world authenticator failure was reported nowhere.** A
+code rejected because the device clock drifted is indistinguishable, to the user,
+from a wrong secret. All four clients now diagnose it off the `Date` header every
+response already carries — no new route, no new dependency.
+
+### ⚠️ `sigild` WAS modified, and I am not going to write "sigild gained nothing"
+
+One additive `"Date",` in `corsExposedResponseHeaders`, plus its test.
+
+`Date` is **not** one of the seven CORS-safelisted response headers, so a browser
+reads **null** for it cross-origin. That was **probed, not assumed** — a real
+Chromium against a real `sigild` could read `content-length`, `content-type` and
+`x-request-id`, and nothing else. Without the line the **browser half of the
+diagnostic is dead**: it reports *no reading*, forever, on the two clients that
+need it most. It discloses nothing (`curl`, the CLI and the desktop could always
+read it), and the middleware is not installed unless `SIGILD_CORS_ORIGINS` is set.
+
+The "sigild changed by zero lines" sentence in 0048 and 0049 is worth something
+**because** it is checked. Checking it means being willing to write the opposite.
+
+### ⭐ Why a confirmation and not an undo — the decision, not the shortcut
+
+An undo has exactly two implementations here and both are worse:
+
+1. **Write the tombstone, then retract it.** That is the resurrection ADR 0049
+   exists to prevent, and it is **unretractable the moment another device has
+   merged it** — the tombstone has already won there, permanently, by design. An
+   undo that works only until someone else syncs is a promise we cannot keep.
+2. **Hold the delete pending in memory.** Closing a tab or a popup then silently
+   discards the user's intent.
+
+So the gate goes **before** the irreversible act. The tombstone is still written
+at commit and never before; nothing in 0049's semantics changed.
+
+### What the verifier found — including two mutations that SURVIVED this phase's own guard
+
+The delete gates were guarded structurally in `sigil-wasm/test/merge-guard.mjs`
+§3b. A verifier planted two mutations and **both went green**:
+
+- **(a) The desktop confirmation deleted outright.** The check required
+  `/window\.confirm\(/` **anywhere** in `desktop/ui/main.js` — a file holding
+  **SIX** such calls (re-pin, rekey, forget vault…). It was matching the wrong
+  five.
+- **(b) The extension handler refactored to non-async.** The check banned exactly
+  **one spelling** of the bypass; `rm.addEventListener("click", () => { void
+  withVault(...) })` walked past it.
+
+⭐ **And a third hole was found while fixing those two**: the webapp check banned
+the literal `onClick={onRemove}`, which `onClick={() => onRemove()}` walks past.
+It was live-mutated with the confirmation UI **fully intact**, so it could only
+fail on the rule that matters — and it did.
+
+The fix was **structural, not another banned spelling**. §3b became three pure
+`src -> {ok, why}` predicates (`desktopDeleteGate`, `extensionDeleteGate`,
+`webappDeleteGate`) that **locate the destructive call and walk outward**, on top
+of a length-preserving `blank()` (two index-compatible views), `matchBrace()` and
+`enclosingClickListener()`. `stripComments` could not be reused — it replaces
+comment lines with `""` and destroys the offsets this needs. The three mutations
+are now **encoded as self-test specimens**, alongside good shapes so a predicate
+that returns `false` forever is caught. **107 → 108 checks.**
+
+*(This is the fourth time a guard in this repo has failed on its own subject
+matter. The rule from `27f0da6` holds: write the mutation test for the guard
+before trusting the guard.)*
+
+The verifier also found the copy wrong twice:
+
+- *"every code will be rejected"* — **overstated**. RFC 6238 §5.2 lets a verifier
+  accept a code one step either side and real verifiers commonly do. Corrected in
+  **eight** places to *likely, and increasingly certain*, with the tolerance named.
+- *"the deletion is synced to every other device holding it"* — **false**. Sigil
+  syncs only when asked. Now: *the next time you Push and they Pull; until you do
+  — and forever, if you never sync — it applies to this device alone.* The browser
+  specs assert the honest wording **and** assert the false sentence is absent.
+
+⚠️ A real bug the rewording caused: my first draft ended *"it stays on this device
+alone"*, and Playwright's `hasText` matches an element's **full** text including
+the hidden confirmation paragraph on every row — so a fixture label
+`filter({hasText:"stays"})` resolved to two rows and failed inside `addAccount`,
+naming neither the copy nor the row. Reworded, with a comment at `addAccount` so
+the next person is not sent to the wrong layer. **Caught by the gate, not by
+reading the diff.**
+
+### The clock diagnostic, and the two properties that matter more than the feature
+
+⛔⛔ **It reports; it never corrects.** Nothing feeds the clock codes are
+generated from. `sigil-core` reads no clock (ADR 0007) and the instant is always
+the caller's. A desktop test takes a reading a **billion seconds** out and the
+vault still prints `94287082`. *A wrong code the user can explain beats a right
+code they cannot trust.*
+
+⭐ **"No reading" is not "your clock is fine."** Offline, a dead port, or a server
+that answers without a usable `Date` all produce an explicit *unavailable* state,
+rendered as **NO CLOCK READING — this is not a report that your clock is fine.**
+The CLI's push/pull warning stays silent there rather than reassuring.
+
+The threshold (15 s = half a step) is a Rust↔JS **mirror**, guarded two ways in
+`clock-skew-interop.mjs`: the **literal** (both pinned to the golden `15`, because
+a *coordinated* retune passes a cross-language equality check — the
+`"recovery-kit"` lesson), and the **behaviour** (the real `sigil clock` binary and
+the JS reader judging one identical `Date` reading at 0, ±14, ±15, ±16, ±17, ±60;
+verdict, exit status and direction word must all agree). Mutation-proven on the
+**Rust constant alone**: `15 → 45` and `15 → 16` both red.
+
+⚠️ One trap recorded: the first cut used `spawnSync` for the CLI, which blocks
+Node's event loop — so the in-process `Date` server could never answer and the
+suite **hung** with 3a green and 3b silent. Async `spawn` now, with a comment
+saying why other sections may keep `spawnSync`.
+
+⛔ Also worth knowing: `Date.parse("12345")` returns a **finite** number (the year
+12345). The first JS version turned a nonsensical header into a confident reading
+~10,000 years out — a screaming skew warning aimed at a user whose clock was
+**perfect**. The shape is now checked against RFC 9110 IMF-fixdate before
+`Date.parse` is trusted. The Rust half hand-rolls the parse and never had it.
+
+### Desktop coverage — improved, still the weakest
+
+`DeviceConfig::clock()` gained a real test against real HTTP (all three states,
+both skew directions, a dead port, a server sending **no** `Date`, and the
+never-corrects property), mutation-proven twice. It also exposed a wording bug:
+the error detail said *"could not reach {server}"* on a branch that **also**
+covers a server that answered without a usable `Date` — telling the reader we
+could not reach a server we did reach.
+
+⚠️ **Still by-eye:** the desktop's clock panel and its delete-confirm dialog are
+rendered by **no test**. `desktopDeleteGate` proves the confirmation is on the
+**path**; it proves nothing about whether the window shows it.
+
+### Gate
+
+`./scripts/gate.sh` on `27f0da6`, three runs. Go **640 pass / 0 fail / 0 skip**
+(Postgres-gated suite ran), Rust libsigil 160 / cli 144 / sigil-wasm 41 / desktop
+**34**, node interop **20/20**, webapp Playwright **66** in 13 spec files,
+extension **30** in 9, all three shell e2e green, both scanners clean, CI-drift
+check green.
+
+⚠️ **One flake, disclosed rather than buried:** `recovery-interop.mjs` failed in
+run 2. It was self-inflicted — a concurrent `go vet` contending on the Go build
+cache with the `go build` that suite performs. Green in runs 1 and 3 and 3/3
+standalone. Not caused by any change here, but not *proven* independent of load
+either.
+
+### Still open after this phase
+
+- ⛔ **A confirmed delete is still permanent.** By design, per §2 of ADR 0050.
+- ⛔ **Tombstones still grow without bound** (ADR 0049 limit 1). Untouched.
+- ⚠️ **The desktop clock UI and delete dialog remain unrendered by any test.**
+- ⚠️ **The browser clock/delete specs run against `fake-sigild.mjs`, a double.**
+- ⚠️ **The threshold mirror is guarded in two languages, not three** —
+  `web/packages/sigil-wasm/index.d.ts` re-declares the surface by hand and `tsc`
+  cannot see drift. Same third-literal problem Phase 57 recorded for
+  `"recovery-kit"`. Not closed.
+- ⚠️ **The delete gates false-alarm a legitimate refactor** (hoisting the confirm
+  into a helper). Deliberate — fail closed, loudly — but a maintainer under time
+  pressure could "fix" it by weakening the gate rather than updating it. That is
+  the shape of `docs/engineering-lessons.md` entry **3** (a control relaxed until
+  it degraded into a no-op while still reporting success), and why that document's
+  "what changed as a result" list requires a source-structure guard to fail when
+  it matches **nothing**.
+  ⚠️ **This bullet originally read "that is how guard #8 in
+  `docs/engineering-lessons.md` died" — a claim inherited verbatim from the fix
+  agent's hand-off and written into the ADR without being checked.** It is false:
+  that document has no numbered guard list at all, and entry **8** of its table is
+  `cors.spec.ts` skipping itself on a hardcoded Go path — a self-skipping spec,
+  not a guard a maintainer weakened. Caught by grepping the reference instead of
+  trusting it, and corrected in both places. ⭐ It is worth recording as itself an
+  instance of this phase's theme: **a confident, plausible, unverified sentence
+  propagating into documentation is exactly the defect ADR 0050 §Defect 2 is
+  about** — and it reached an ADR *in the phase whose subject is not lying to the
+  user*. Cross-references are claims; grep them like counts.
+- ⚠️ **The guard machinery is a hand-rolled scanner, not a parser.** `blank()`
+  treats `//` outside a string as a comment, so a bare URL in JSX *text* would be
+  blanked. None exists today; every failure mode is red, not green. A parser would
+  mean a new dependency.
+- ⚠️ **Nobody has read this phase's new copy end to end** hunting for further
+  overstatements. Two were found and swept; others may remain.
+
+### Documentation shipped with the change, not after it
+
+ADR 0050 + addenda on 0042 / 0044 / 0049; `docs/decisions/README.md`;
+`docs/api.md` (the `Date` exposure and a new subsection saying plainly that the
+diagnostic is client-side and **not** a security control); `docs/architecture.md`
+(§2d, the clock data flow, and the Tauri count 41 → 42); `docs/threat-model.md`
+(a new adversary section: what a server that lies about the time can and cannot
+do — the answer to *cannot* being **it cannot change a single generated code**);
+`docs/crypto-spec.md` (the consequence of ADR 0007's no-clock rule, stated where
+the TOTP primitive is specified); `README.md`; `docs/README.md`; and CLAUDE.md,
+whose **12 stale counts** this phase introduced are what
+`sigil-wasm/test/docs-claims-guard.mjs` was built to catch — it caught them, and
+they are fixed rather than argued with.
+
+### Phase 62 round 2 — the sixth guard that failed on its own subject matter
+
+A verifier defeated the freshly-rewritten delete gate with the one shape that matters most:
+**keep the whole confirmation text and discard its answer.**
+
+```js
+window.confirm(`Delete ${who}? …`);   // <- the user clicks Cancel
+await call("remove_by_id", { uuid }); // <- and it deletes anyway
+```
+
+`merge-guard.mjs` passed it cleanly, while its own failure message promised
+*"(and acts on its answer)"*. ⭐ **It promised a property it did not check** — the predicate
+accepted any enclosing block containing both `window.confirm(` and a `return`.
+
+Fixed structurally: a call whose value is **used** is never at statement position — it is
+preceded by `if (`, `!`, `=`, `return`, `&&`, `||`. A call whose value is thrown away sits
+directly after `;`, `{`, `}` or the block start. That distinction is the whole check.
+
+⚠️ **It took me three attempts to plant the mutation faithfully, and the first two would
+have let me declare victory.** Attempt 1 turned `if (` into `void (` and left the `return;`
+— which makes the delete *never* run, the opposite of the bug. Attempt 2 was off by one
+line (there are TWO closing parens, one for `confirm(` and one for `if (`) and produced a
+file with a syntax error, so the guard's RED could have been the broken braces rather than
+the rule. Only attempt 3 was faithful, and I proved it by running `node --check` on the
+mutated file **before** reading the guard's verdict: *the mutated file parses, therefore the
+RED is the rule.* ⭐ **A mutation test needs its mutation validated too.**
+
+**Three text defects the verifier found, all fixed:**
+
+1. **ADR 0050 over-claimed.** It said *"All four clients — webapp, MV3 extension, native
+   desktop, and the CLI's interactive path — gate a single-entry delete"*. **The CLI does
+   not**, deliberately: `sigil totp remove <label>` is already a typed statement of intent,
+   a prompt would break every script and e2e suite, and a tool that asks "are you sure?" at
+   a shell is one people learn to pipe `yes` into. It prints the consequence instead, and
+   `merge-guard` makes that exemption conditional on the sentence existing — **exempt from
+   the confirmation rule, not from the honesty rule.** ⚠️ An ADR written to record a phase
+   about false claims, containing a false claim.
+2. **The CLI's post-delete message** was the last in-product text still saying a tombstone
+   *"propagates to every other device holding it"* with no manual-sync qualifier. Every GUI
+   client had been corrected; the CLI had not.
+3. **`cors_test.go`** kept the *"every code is being rejected"* overstatement that was
+   corrected in `cors.go` beside it.
+
+**And one of mine:** `gate.sh` reported a failed govulncheck run as
+`✗ govulncheck: 0 vulnerability(ies)` — zero findings presented as a failure, which reads as
+a contradiction and cost a verifier a debug cycle. Same family as the cargo-audit flake that
+printed an empty reason. It now says **"COULD NOT COMPLETE — this is NOT a finding"**.

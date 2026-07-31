@@ -650,6 +650,12 @@ fn the_desktop_is_a_network_peer_with_the_cli_and_a_real_sigild() {
         &[
             "vault",
             "rekey",
+            // ⛔ `vault rekey` is a ONE-WAY DOOR: it replaces the vault PASSWORD
+            // with a random key stored in the clear in vault-keys.json, and the
+            // password never opens the vault again. It therefore REQUIRES an
+            // explicit acknowledgement. This test is a scripted caller, so it
+            // gives one; a human gets the full warning instead.
+            "--yes",
             "--vault",
             VAULT_FROM_CLI,
             "--file",
@@ -1937,5 +1943,194 @@ fn two_devices_that_each_added_offline_keep_both_accounts_after_a_merge() {
         "\nPASS — two devices each added an account offline; after syncing BOTH hold BOTH, \
          the secrets survived (RFC 6238 {RFC_CODE}), and a delete converges without \
          resurrecting.\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// THE CLOCK DIAGNOSTIC — `DeviceConfig::clock()`.
+//
+// ⛔ WHY THIS TEST EXISTS. `clock()` shipped with NO test at all, and the
+// desktop clock UI is by-eye only, which made the desktop the client whose new
+// user-safety behaviour was least covered — while the same phase's desktop
+// delete confirmation turned out to be deletable without its guard noticing.
+// "The other clients have tests for the shared helper" is not coverage of THIS
+// call: the shared helper is `sigil-cli`'s, and what is unproven here is the
+// desktop's own three-way mapping of it onto `available` / `skewed` / `detail`.
+//
+// The three states are asserted against REAL HTTP, because the whole feature is
+// a reading taken off a real response header:
+//
+//   * a REAL sigild            -> available, not skewed, and it says "clock OK"
+//   * a server with a fixed
+//     PAST / FUTURE `Date`     -> available, SKEWED, and it names the DIRECTION
+//   * a dead port              -> NOT available, NOT skewed, and it explicitly
+//                                 refuses to be read as "your clock is fine"
+//   * a server that answers
+//     with NO `Date` header    -> the same NO READING state, never a zero skew
+//
+// ⛔⛔ AND IT NEVER CORRECTS. With a reading a billion seconds out, the vault
+// still produces the RFC 6238 vector, because codes come from the LOCAL clock
+// (ADR 0007) and nothing here feeds it.
+// ---------------------------------------------------------------------------
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT` — RFC 9110's own example, unix 784111777.
+const DATE_1994: &str = "Sun, 06 Nov 1994 08:49:37 GMT";
+const DATE_1994_UNIX: i64 = 784_111_777;
+/// A fixed FUTURE instant, so the reading is unambiguously "this machine is
+/// BEHIND". Unix 4102444800.
+const DATE_2100: &str = "Fri, 01 Jan 2100 00:00:00 GMT";
+const DATE_2100_UNIX: i64 = 4_102_444_800;
+
+/// A one-line HTTP responder that serves a FIXED `Date` header (or none), so a
+/// skew of a known sign can be produced without a clock library and without a
+/// new dependency. Runs until the test process exits.
+fn spawn_dated_server(date: Option<&'static str>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind date server");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            // Drain whatever was asked; the answer does not depend on it.
+            let mut buf = [0u8; 2048];
+            use std::io::Read as _;
+            let _ = s.read(&mut buf);
+            let date_line = date.map(|d| format!("Date: {d}\r\n")).unwrap_or_default();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n{date_line}Content-Type: text/plain\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\nok"
+            );
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.flush();
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn the_desktop_clock_diagnostic_reports_all_three_states_and_never_corrects() {
+    let h = Harness::start();
+    let dir = h.tmp.join("clock/.sigil");
+
+    // --- 1. a REAL sigild: a reading, and it is a healthy one ---------------
+    // No enrollment: the reading comes off `GET /healthz`, which is never
+    // dev-gated and never authenticated. A user whose clock is broken is
+    // frequently a user who cannot authenticate, so this MUST work unenrolled.
+    let live = DeviceConfig::new(&h.server, &dir).clock();
+    assert!(
+        live.available,
+        "a live sigild must yield a reading: {live:?}"
+    );
+    assert!(!live.skewed, "this machine and its own server: {live:?}");
+    assert!(
+        live.skew_seconds.abs() <= 5,
+        "skew against a local server should be ~0, got {}",
+        live.skew_seconds
+    );
+    assert!(
+        live.detail.contains("clock OK"),
+        "detail should say the clock is OK: {}",
+        live.detail
+    );
+    say("a real sigild yields an available, unskewed reading (unenrolled)");
+
+    // --- 2. a server whose clock is far in the PAST: AHEAD -----------------
+    let past = spawn_dated_server(Some(DATE_1994));
+    let before = now_unix() as i64;
+    let ahead = DeviceConfig::new(&past, &dir).clock();
+    let after = now_unix() as i64;
+    assert!(ahead.available, "{ahead:?}");
+    assert!(ahead.skewed, "a 30-year drift must be reported: {ahead:?}");
+    assert!(
+        ahead.skew_seconds >= before - DATE_1994_UNIX
+            && ahead.skew_seconds <= after - DATE_1994_UNIX,
+        "skew must be local - server; got {} for local in [{before}, {after}]",
+        ahead.skew_seconds
+    );
+    assert!(
+        ahead.detail.contains("AHEAD OF"),
+        "a positive skew must be named AHEAD, not left as a signed integer: {}",
+        ahead.detail
+    );
+    assert!(!ahead.detail.contains("clock OK"), "{}", ahead.detail);
+
+    // --- 3. a server whose clock is far in the FUTURE: BEHIND --------------
+    let future = spawn_dated_server(Some(DATE_2100));
+    let behind = DeviceConfig::new(&future, &dir).clock();
+    assert!(behind.available && behind.skewed, "{behind:?}");
+    assert!(behind.skew_seconds < 0, "{behind:?}");
+    assert!(
+        behind.skew_seconds > -(DATE_2100_UNIX - 1_600_000_000),
+        "sanity: {behind:?}"
+    );
+    assert!(
+        behind.detail.contains("BEHIND"),
+        "a negative skew must be named BEHIND: {}",
+        behind.detail
+    );
+    say("a fixed past/future Date header is reported as skewed, with the DIRECTION named");
+
+    // --- 4. a dead port: NO READING, and never "fine" ----------------------
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let offline = DeviceConfig::new(format!("http://127.0.0.1:{dead_port}"), &dir).clock();
+    assert!(!offline.available, "{offline:?}");
+    assert!(
+        !offline.skewed && offline.skew_seconds == 0,
+        "an absent reading must not masquerade as a measured zero: {offline:?}"
+    );
+    assert!(offline.detail.contains("NO READING"), "{}", offline.detail);
+    assert!(
+        offline
+            .detail
+            .contains("NOT a report that the clock is fine"),
+        "{}",
+        offline.detail
+    );
+    assert!(
+        !offline.detail.contains("clock OK"),
+        "⛔ an unreachable server was rendered as a healthy clock: {}",
+        offline.detail
+    );
+
+    // --- 5. a server that ANSWERS but sends no Date: the same NO READING ---
+    let mute = spawn_dated_server(None);
+    let unread = DeviceConfig::new(&mute, &dir).clock();
+    assert!(
+        !unread.available && !unread.skewed && unread.skew_seconds == 0,
+        "a response with no Date header is NO READING, not zero skew: {unread:?}"
+    );
+    assert!(!unread.detail.contains("clock OK"), "{}", unread.detail);
+    say("unreachable AND unreadable are both NO READING — never 'your clock is fine'");
+
+    // --- 6. ⛔ IT REPORTS; IT NEVER CORRECTS -------------------------------
+    // The vault is opened AFTER a reading a billion seconds out. If anything
+    // fed the server's time into code generation, this vector would move.
+    let vault = h.tmp.join("clock/vault.sigil");
+    let mut session = VaultSession::create(&vault, DESKTOP_PASSWORD.as_bytes())
+        .expect("create vault")
+        .with_params(FAST);
+    session
+        .add_secret_base32(
+            "rfc",
+            None,
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("add");
+    let skewed_again = DeviceConfig::new(&past, &dir).clock();
+    assert!(skewed_again.skewed, "{skewed_again:?}");
+    assert_eq!(
+        session.entries_now().expect("codes")[0].code,
+        RFC_CODE,
+        "⛔ the clock DIAGNOSTIC changed the clock codes are generated from"
+    );
+    say("a wildly skewed reading leaves code generation on the LOCAL clock (RFC 6238 unchanged)");
+
+    println!(
+        "\nPASS — clock() reports available/skewed/no-reading correctly and never corrects.\n"
     );
 }

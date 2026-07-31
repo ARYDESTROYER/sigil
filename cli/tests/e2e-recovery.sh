@@ -154,7 +154,7 @@ run_as "$HOME_A" device hybrid-publish >/dev/null
 
 SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" totp add work \
 	--secret "$RFC_SEED" --issuer RFC6238 --algorithm sha1 --digits 8 --period 30 >/dev/null
-SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --vault "$VAULT" --publish >/dev/null
+SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --yes --vault "$VAULT" --publish >/dev/null
 A_FP="$(run_as "$HOME_A" vault list | grep "$VAULT" | sed 's/.*key_sha256=//')"
 [[ -n "$A_FP" ]] || fail "A has no vault key after rekey"
 run_as "$HOME_A" push --vault "$VAULT" --in "$HOME_A/.sigil/totp-vault.sigil" >/dev/null
@@ -319,7 +319,7 @@ Z_ID="$(device_id "$(run_as "$HOME_Z" device enroll --token "$TOK_Z" --label dev
 [[ -n "$Z_ID" ]] || fail "Z did not enroll"
 run_as "$HOME_Z" device hybrid-publish >/dev/null
 SIGIL_PASSWORD='zzz password zzz' run_as "$HOME_Z" totp add z --secret "$RFC_SEED" >/dev/null
-SIGIL_PASSWORD='zzz password zzz' run_as "$HOME_Z" vault rekey --vault "zvault-$RUN_TAG" --publish >/dev/null
+SIGIL_PASSWORD='zzz password zzz' run_as "$HOME_Z" vault rekey --yes --vault "zvault-$RUN_TAG" --publish >/dev/null
 run_as "$HOME_Z" push --vault "zvault-$RUN_TAG" --in "$HOME_Z/.sigil/totp-vault.sigil" >/dev/null
 Z_GEN="$(run_as "$HOME_Z" recovery generate --vault "zvault-$RUN_TAG" 2>&1)"
 Z_CODE="$(grep '^SECRET' <<<"$Z_GEN" | awk '{print $2}')"
@@ -375,7 +375,7 @@ SIGIL_PASSWORD='dee password dee' HOME="$HOME_D" "$SIGIL" totp add second \
 # Deliberately NO --publish: nothing is wrapped to anyone, so the kit genuinely
 # does not cover this vault yet. (D adopted the kit, so --publish here would have
 # wrapped the key straight to the kit and there would be no gap to demonstrate.)
-HOME="$HOME_D" SIGIL_PASSWORD='dee password dee' "$SIGIL" vault rekey --vault "$VAULT2" \
+HOME="$HOME_D" SIGIL_PASSWORD='dee password dee' "$SIGIL" vault rekey --yes --vault "$VAULT2" \
 	--file "$HOME_D/.sigil/second.sigil" --keyring "$HOME_D/.sigil/vault-keys.json" \
 	--key "$HOME_D/.sigil/device.key" --server "$SERVER" >/dev/null
 HOME="$HOME_D" "$SIGIL" push --vault "$VAULT2" --in "$HOME_D/.sigil/second.sigil" \
@@ -405,7 +405,7 @@ step "9b. from a device with NO derived pin, cover REQUIRES the printed safety n
 # Give B a real shared vault of its own, so the refusal is unambiguously about
 # the safety number and not about a missing key.
 SIGIL_PASSWORD='bee password bee' run_as "$HOME_B" totp add b --secret "$RFC_SEED" >/dev/null
-SIGIL_PASSWORD='bee password bee' run_as "$HOME_B" vault rekey --vault "bvault-$RUN_TAG" --publish >/dev/null
+SIGIL_PASSWORD='bee password bee' run_as "$HOME_B" vault rekey --yes --vault "bvault-$RUN_TAG" --publish >/dev/null
 run_as "$HOME_B" push --vault "bvault-$RUN_TAG" --in "$HOME_B/.sigil/totp-vault.sigil" >/dev/null
 
 expect_fail "$HOME_B" 'safety-number' recovery cover --device-id "$KIT_ID" --vault "bvault-$RUN_TAG"
@@ -468,7 +468,7 @@ ok "E=$E_ID is a sibling in the kit's account with 0 pins for $KIT_ID"
 # the kit's key and not about a missing vault key.
 EVAULT="evault-$RUN_TAG"
 SIGIL_PASSWORD='eee password eee' run_as "$HOME_E" totp add e --secret "$RFC_SEED" >/dev/null
-SIGIL_PASSWORD='eee password eee' run_as "$HOME_E" vault rekey --vault "$EVAULT" --publish >/dev/null
+SIGIL_PASSWORD='eee password eee' run_as "$HOME_E" vault rekey --yes --vault "$EVAULT" --publish >/dev/null
 run_as "$HOME_E" push --vault "$EVAULT" --in "$HOME_E/.sigil/totp-vault.sigil" >/dev/null
 
 # ⭐ 1/3: SHARE. This is the command the verifier used to walk straight past the

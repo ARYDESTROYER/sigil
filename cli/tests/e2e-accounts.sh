@@ -195,7 +195,7 @@ ok "published (secret halves stay local, 0600)"
 step "A seals the RFC 6238 seed, re-keys the vault, and pushes it (claiming '$VAULT')"
 SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" totp add rfc \
 	--secret "$RFC_SEED" --issuer RFC6238 --algorithm sha1 --digits 8 --period 30 >/dev/null
-SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --vault "$VAULT" --publish >/dev/null
+SIGIL_PASSWORD="$PASSWORD_A" run_as "$HOME_A" vault rekey --yes --vault "$VAULT" --publish >/dev/null
 run_as "$HOME_A" push --vault "$VAULT" --in "$HOME_A/.sigil/totp-vault.sigil" >/dev/null
 A_FP="$(run_as "$HOME_A" vault list | grep "$VAULT" | sed 's/.*key_sha256=//')"
 [[ -n "$A_FP" ]] || fail "A holds no vault key"

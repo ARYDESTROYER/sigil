@@ -1379,6 +1379,40 @@ fn entitlement_refresh(state: State<'_, AppState>) -> CmdResult<EntitlementDto> 
     Ok(dto)
 }
 
+/// A clock reading as the webview sees it. PUBLIC facts only — two integers and
+/// a sentence; no key, no identity, nothing secret.
+#[derive(Serialize, Clone)]
+struct ClockDto {
+    available: bool,
+    skewed: bool,
+    skew_seconds: i64,
+    detail: String,
+}
+
+/// Compare this machine's clock against the server's.
+///
+/// ⛔ THE FAILURE THIS EXISTS FOR: a TOTP code rejected because this machine's
+/// clock drifted is indistinguishable, to the user, from a wrong secret — so
+/// they re-scan the QR, re-import the export, delete and re-add the account, and
+/// none of it helps.
+///
+/// ⛔⛔ IT REPORTS. IT NEVER CORRECTS. `list` still computes codes from
+/// `now_unix()`, this machine's own system clock, exactly as before. Nothing in
+/// this command's path touches it.
+///
+/// ⚠️ An unreachable server yields `available: false` — NO READING, which is a
+/// different answer from "your clock is fine", and the UI renders it as such.
+#[tauri::command]
+fn clock_skew(state: State<'_, AppState>) -> CmdResult<ClockDto> {
+    let r = sync_config(&state)?.clock();
+    Ok(ClockDto {
+        available: r.available,
+        skewed: r.skewed,
+        skew_seconds: r.skew_seconds,
+        detail: r.detail,
+    })
+}
+
 fn main() {
     // The banner is not only a UI element: anyone launching from a terminal sees
     // it too, and it is the same constant the window renders.
@@ -1431,7 +1465,8 @@ fn main() {
             recovery_revoke,
             recovery_kits,
             entitlement_status,
-            entitlement_refresh
+            entitlement_refresh,
+            clock_skew
         ])
         .run(tauri::generate_context!())
         .expect("could not start the Sigil desktop window");

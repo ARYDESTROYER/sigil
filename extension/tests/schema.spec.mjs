@@ -204,6 +204,11 @@ test("⭐ an edit made through the REAL popup preserves vault fields this build 
 
   // ── and again through a REMOVAL, the other edit the popup offers ────────
   await page.locator('[data-label="added-after-seeding"] [data-testid="remove"]').click();
+  // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+  // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+  // button inches from the code is permanent. Confirm it — this spec is about the
+  // merge/schema/import, not about the gate.
+  await page.locator('[data-label="added-after-seeding"] [data-testid="remove-confirm-yes"]').click();
   await expect(page.getByTestId("account")).toHaveCount(1);
   const afterRemove = decrypt(await readStored(page));
   expect(afterRemove.min_reader_version).toBe(UNKNOWN_VAULT_FIELDS.min_reader_version);

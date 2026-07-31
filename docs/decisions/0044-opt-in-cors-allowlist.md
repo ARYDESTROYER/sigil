@@ -304,3 +304,28 @@ green.
 - What is actually authenticating the request:
   [ADR 0031](0031-multi-device-auth-model.md) and [`../api.md`](../api.md)
   (signed request contract v3).
+
+## Addendum (2026-07-31, Phase 62) — the exposed-header list gained `Date`
+
+`corsExposedResponseHeaders` now names **`Date`** alongside `X-Request-ID` and the
+three `X-Sigil-Entitlement*` headers. One additive line, plus its assertion in
+`cors_test.go`.
+
+**Why.** `Date` is **not** one of the seven CORS-safelisted response headers, so a
+browser on a different origin reads **`null`** for it. That was **measured, not
+assumed** — probed from a real Chromium against a real `sigild`, the only readable
+headers were `content-length`, `content-type` and `x-request-id`. The clock-skew
+diagnostic added in [0050](0050-confirmations-honest-claims-and-the-clock-diagnostic.md)
+reads the server's clock off that header, so **without this line the browser half
+of the diagnostic is dead**: it would report *no reading* forever on the two
+clients that need it most. (The MV3 extension was never affected — a
+`host_permissions` page is exempt from CORS, the same asymmetry that hid the
+original CORS hole for twelve phases.)
+
+**What it does not change.** The header is **already sent on every response** and
+already readable by `curl`, the CLI and the desktop; all that changes is whether
+same-machine JavaScript may read a value the browser already received. Nothing is
+disclosed that was not disclosed before. And this middleware is still **not
+installed at all** unless `SIGILD_CORS_ORIGINS` is set — with it unset, `sigild`
+remains byte-identical to before. `*` is still refused at boot, and
+`Access-Control-Allow-Credentials` is still never set.

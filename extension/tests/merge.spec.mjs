@@ -203,6 +203,17 @@ test("a delete made on one device stays deleted after another device syncs", asy
     .filter({ hasText: "delete-me" })
     .getByTestId("remove")
     .click();
+  // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+  // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+  // button inches from the code is permanent. Confirm it — this spec is about the
+  // merge/schema/import, not about the gate.
+  // ⚠️ SCOPED to the row: every row carries a hidden confirm box, so an
+  // unscoped locator is ambiguous under Playwright strict mode.
+  await a.page
+    .getByTestId("account")
+    .filter({ hasText: "delete-me" })
+    .getByTestId("remove-confirm-yes")
+    .click();
   await expect(a.page.getByTestId("account")).toHaveCount(1, { timeout: 30_000 });
   await push(a.page);
 
@@ -236,6 +247,16 @@ test("the same label at two issuers is two accounts, and removing one removes on
 
   // Removing ONE must remove exactly one — a label-keyed filter removed both.
   await a.page.getByTestId("account").filter({ hasText: "GitHub" }).getByTestId("remove").click();
+  // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+  // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+  // button inches from the code is permanent. Confirm it — this spec is about the
+  // merge/schema/import, not about the gate.
+  // ⚠️ SCOPED to the row (see above).
+  await a.page
+    .getByTestId("account")
+    .filter({ hasText: "GitHub" })
+    .getByTestId("remove-confirm-yes")
+    .click();
   await expect(a.page.getByTestId("account")).toHaveCount(1, { timeout: 30_000 });
   const left = await a.page.getByTestId("account").first().textContent();
   expect(left).toContain("GitLab");

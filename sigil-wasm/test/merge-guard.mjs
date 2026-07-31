@@ -51,7 +51,7 @@ function hits(src, re) {
   const rx = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
   let m;
   while ((m = rx.exec(src)) !== null) {
-    out.push({ index: m.index, line: lineOf(src, m.index), text: m[0] });
+    out.push({ index: m.index, line: lineOf(src, m.index), text: m[0], groups: m.slice(1) });
   }
   return out;
 }
@@ -122,6 +122,201 @@ function stripComments(src) {
     }
   }
   return out.join("\n");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ⭐ LENGTH-PRESERVING VIEWS + BRACE MATCHING.
+//
+// `stripComments` above blanks whole COMMENT LINES, which is enough to keep a
+// comment from being read as code but destroys character offsets (it replaces a
+// line's text with ""). Section 3b needs offsets: it asks "does the confirmation
+// run BEFORE the destructive call, inside the same handler?", and that is a
+// question about POSITIONS, not about whether two patterns both appear somewhere
+// in a 1,200-line file.
+//
+// So there are two views, both EXACTLY as long as the original and therefore
+// index-compatible with it and with each other:
+//
+//   blank(src, { strings: true })  — comments AND string/template/regex literals
+//                                    blanked. Braces here are structure only, so
+//                                    it is what brace matching walks.
+//   blank(src, { strings: false }) — only comments blanked. String CONTENTS
+//                                    survive, so `data-testid="…"` and prompt
+//                                    wording can be matched.
+//
+// ⚠️ Why not a real parser: adding one would be a new dependency in a repo whose
+// whole posture is "don't", for a guard. The self-test at the end of section 3b
+// pins this machinery against the exact mutations it exists to catch, so a
+// botched scanner reads as RED rather than as a clean tree.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Can a `/` at this point start a regex literal? Standard prev-token rule. */
+const REGEX_MAY_FOLLOW = /[({[,;:=!&|?+\-*%~^<>]/;
+
+/**
+ * Blank comments (and optionally literals), preserving length and newlines.
+ *
+ * @param {string} src
+ * @param {{strings:boolean}} opts
+ * @returns {string} the same length as `src`
+ */
+function blank(src, { strings }) {
+  const out = src.split("");
+  const n = src.length;
+  const wipe = (from, to) => {
+    for (let k = from; k < to && k < n; k += 1) if (out[k] !== "\n") out[k] = " ";
+  };
+  let i = 0;
+  let lastSig = "";
+  while (i < n) {
+    const c = src[i];
+    const d = src[i + 1];
+    if (c === "/" && d === "/") {
+      let j = i;
+      while (j < n && src[j] !== "\n") j += 1;
+      wipe(i, j);
+      i = j;
+      continue;
+    }
+    if (c === "/" && d === "*") {
+      const k = src.indexOf("*/", i + 2);
+      const j = k === -1 ? n : k + 2;
+      wipe(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (src[j] === c || src[j] === "\n") break;
+        j += 1;
+      }
+      const end = Math.min(j + 1, n);
+      if (strings) wipe(i, end);
+      i = end;
+      lastSig = "x";
+      continue;
+    }
+    if (c === "`") {
+      // Blank the WHOLE template, `${…}` included. Blanking a matched pair
+      // removes one `{` and one `}`, so brace balance is preserved either way.
+      let j = i + 1;
+      let depth = 0;
+      while (j < n) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (depth === 0 && src[j] === "`") break;
+        if (src[j] === "$" && src[j + 1] === "{") {
+          depth += 1;
+          j += 2;
+          continue;
+        }
+        if (depth > 0 && src[j] === "{") depth += 1;
+        else if (depth > 0 && src[j] === "}") depth -= 1;
+        j += 1;
+      }
+      const end = Math.min(j + 1, n);
+      if (strings) wipe(i, end);
+      i = end;
+      lastSig = "x";
+      continue;
+    }
+    if (c === "/" && (lastSig === "" || REGEX_MAY_FOLLOW.test(lastSig))) {
+      let j = i + 1;
+      let cls = false;
+      let closed = false;
+      while (j < n) {
+        const e = src[j];
+        if (e === "\\") {
+          j += 2;
+          continue;
+        }
+        if (e === "\n") break;
+        if (e === "[") cls = true;
+        else if (e === "]") cls = false;
+        else if (e === "/" && !cls) {
+          closed = true;
+          break;
+        }
+        j += 1;
+      }
+      if (closed) {
+        const end = Math.min(j + 1, n);
+        if (strings) wipe(i, end);
+        i = end;
+        lastSig = "x";
+        continue;
+      }
+    }
+    if (!/\s/.test(c)) lastSig = c;
+    i += 1;
+  }
+  return out.join("");
+}
+
+/**
+ * The `{` of every block enclosing `index`, INNERMOST FIRST.
+ *
+ * `code.slice(open, index)` is therefore exactly the source that provably runs
+ * before `index` within that block — not code after it, and not code in a
+ * sibling block. That distinction is the whole point: the old desktop check
+ * asked only whether `window.confirm(` appeared ANYWHERE in the file, and the
+ * file has six of them for unrelated things.
+ *
+ * @param {string} code a `blank(src, {strings:true})` view
+ */
+function enclosingOpens(code, index, levels = 8) {
+  const out = [];
+  let depth = 0;
+  for (let i = index - 1; i >= 0 && out.length < levels; i -= 1) {
+    const c = code[i];
+    if (c === "}") depth += 1;
+    else if (c === "{") {
+      if (depth === 0) out.push(i);
+      else depth -= 1;
+    }
+  }
+  return out;
+}
+
+/** The index of the `}` closing the `{` at `open`, or -1. */
+function matchBrace(code, open) {
+  let depth = 0;
+  for (let i = open; i < code.length; i += 1) {
+    if (code[i] === "{") depth += 1;
+    else if (code[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The receiver of the INNERMOST `<recv>.addEventListener("click", …)` whose
+ * handler body contains `index`, or null.
+ *
+ * Exact rather than proximity-based: for each candidate listener the handler's
+ * opening brace is found and matched, and the candidate only counts when
+ * `index` falls inside it.
+ */
+function enclosingClickListener(code, text, index) {
+  let best = null;
+  for (const m of hits(text, /(\w+)\s*\.addEventListener\s*\(\s*["']click["']/)) {
+    if (m.index >= index) continue;
+    const open = code.indexOf("{", m.index);
+    if (open === -1 || open > index) continue;
+    const close = matchBrace(code, open);
+    if (close === -1 || close < index) continue;
+    if (best === null || m.index > best.index) best = { index: m.index, recv: m.groups[0] };
+  }
+  return best;
 }
 
 console.log("merge-guard: no shipping client may adopt the tip, and no removal may skip a tombstone\n");
@@ -314,6 +509,443 @@ for (const { rel, requires, banned } of REMOVERS) {
       console.log(`  ok  ${rel}: removes by identity`);
     } else {
       fail(`${rel}: does not call remove_by_id — removing by label is ambiguous`);
+    }
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 3b. ⛔ EVERY GUI REMOVAL MUST BE CONFIRMED FIRST.
+//
+// The tombstone is what makes this a source-structure concern and not a taste
+// one. A removal is now PERMANENT AND PROPAGATING by design: it writes a
+// tombstone that every other device merges and that is specifically protected
+// against resurrection (ADR 0049 §3 — delete wins, and a stale snapshot re-adding
+// the id LOSES). Before Phase 61 a mis-click might have been undone by accident
+// on the next sync; now it provably will not be. And losing a 2FA secret can mean
+// losing the account it protects.
+//
+// In every GUI the Remove control sits inches from the code the user came to
+// read, on a row that re-renders once a second — so a bare one-click delete is
+// not an edge case, it is the expected mis-click.
+//
+// ⚠️ THE CLI IS DELIBERATELY EXEMPT: `sigil totp remove <label>` is already a
+// typed, deliberate statement of intent, and a prompt would break every script.
+// It prints the consequence instead, which is checked separately below.
+//
+// ⚠️ WHAT THIS PROVES AND DOES NOT. It proves a confirmation EXISTS on the path,
+// not that it is correct or unbypassable — the behavioural proofs are
+// `web/apps/webapp/tests/user-safety.spec.ts` and
+// `extension/tests/user-safety.spec.mjs`, which click the real buttons.
+//
+// ⛔⛔ THIS CHECK WAS REWRITTEN AFTER IT FAILED ON ITS OWN SUBJECT MATTER — the
+// FIFTH guard in this repo to do so (`docs/engineering-lessons.md`). The first
+// version asserted two things that were true whether or not the confirmation
+// existed:
+//
+//   (a) DESKTOP. It required `/window\.confirm\(/` to appear ANYWHERE in
+//       `desktop/ui/main.js`. That file has SIX `window.confirm(` calls, for
+//       re-pinning a changed key, rekeying, forgetting the vault and so on. A
+//       verifier deleted the delete confirmation OUTRIGHT and the guard still
+//       printed a green line. It was matching the wrong five calls.
+//   (b) EXTENSION. It banned the single spelling
+//       `/rm\.addEventListener\(\s*"click"\s*,\s*async/`. A verifier replaced it
+//       with a NON-async handler that still performed the removal
+//       (`rm.addEventListener("click", () => { void withVault(...) })`) and the
+//       guard passed. Banning one spelling of a bypass bans that spelling, not
+//       the bypass.
+//
+// ⭐ THE RULE THIS NOW FOLLOWS: assert the PRESENCE of the confirmation ON THE
+// PATH TO THE DESTRUCTIVE CALL, never the ABSENCE of some spelling of its
+// bypass. There are infinitely many spellings of a bypass and exactly one
+// question worth asking — "can this call be reached without the gate?" — so each
+// client is checked by locating the destructive call and walking OUT from it.
+//
+// Each check is a pure `src -> {ok, why}` predicate so the SELF-TEST below can
+// run it against specimens that ARE the two mutations above. That is what stops
+// this from regressing a sixth time: the mutations are now encoded in the guard.
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * DESKTOP — `desktop/ui/main.js` calls `call("remove_by_id", …)`. Every such
+ * call must be DOMINATED, inside one of its own enclosing blocks, by a
+ * `window.confirm(` whose result is acted on (`return`) and whose prompt both
+ * names the account (a `Delete ${…}` template) and states the consequence.
+ */
+function desktopDeleteGate(src) {
+  const code = blank(src, { strings: true });
+  const text = blank(src, { strings: false });
+  // Found in the STRING-PRESERVING view — the command name is a string literal,
+  // so the structure view has blanked it. The two views are the same length, so
+  // the index carries straight over to the brace walk below.
+  const sites = hits(text, /call\(\s*"remove_by_id"/);
+  if (sites.length === 0) {
+    return {
+      ok: false,
+      why:
+        "no `call(\"remove_by_id\", …)` site found at all. Either the removal moved (this guard " +
+        "must move with it) or the desktop removes by LABEL again, which cannot disambiguate " +
+        "two accounts sharing one.",
+    };
+  }
+  for (const site of sites) {
+    const opens = enclosingOpens(code, site.index);
+    // ⛔ THE ANSWER MUST BE CONSUMED, NOT MERELY ASKED FOR.
+    //
+    // This used to accept any enclosing block containing BOTH `window.confirm(`
+    // and a `return`. A verifier defeated it by keeping the full confirmation
+    // text and DISCARDING its result:
+    //
+    //     window.confirm(`Delete ${who}? …`);   // <- Cancel deletes anyway
+    //     await call("remove_by_id", { uuid });
+    //
+    // The dialog appears, the user clicks Cancel, and the secret is destroyed —
+    // the single worst outcome this whole phase exists to prevent, passing a
+    // guard whose failure message promised "(and acts on its answer)". It
+    // promised a property it did not check.
+    //
+    // A call whose value is used is never at STATEMENT POSITION: it is preceded
+    // by `if (`, `!`, `=`, `return`, `&&`, `||`, `? `, and so on. A call whose
+    // value is thrown away sits directly after `;`, `{`, `}` or the start of the
+    // block. That distinction is the whole check.
+    const gated = opens.some((o) => {
+      const before = code.slice(o, site.index);
+      const m = [...before.matchAll(/window\.confirm\s*\(/g)].pop();
+      if (!m) return false;
+      const prefix = before.slice(0, m.index).replace(/\s+$/, "");
+      const last = prefix.slice(-1);
+      const consumed = last !== "" && last !== ";" && last !== "{" && last !== "}";
+      return consumed && /\breturn\b/.test(before.slice(m.index));
+    });
+    if (!gated) {
+      return {
+        ok: false,
+        why:
+          `the removal at line ${site.line} is reachable without a confirmation: no enclosing ` +
+          `block runs \`window.confirm(\` (and acts on its answer) before it`,
+      };
+    }
+    // ⛔ …AND IT MUST NOT PROMISE A SYNC THE PRODUCT DOES NOT PERFORM. The
+    // desktop is the ONE client whose delete confirmation has no behavioural
+    // spec (its UI is by-eye), so this is the only thing standing between it and
+    // a repeat of the copy that said the deletion "is synced to every other
+    // device holding it". Sync here is MANUAL — explicit Push / Pull — and a
+    // vault with no server configured never propagates at all.
+    const overclaims = opens.some((o) =>
+      /is synced to every other device/.test(text.slice(o, site.index)),
+    );
+    if (overclaims) {
+      return {
+        ok: false,
+        why:
+          `the confirmation before line ${site.line} claims the deletion "is synced to every ` +
+          `other device", which is FALSE: sync is MANUAL (Push / Pull) and a vault with no ` +
+          `server configured never propagates at all`,
+      };
+    }
+    const named = opens.some((o) => /Delete \$\{/.test(text.slice(o, site.index)));
+    const explained = opens.some((o) => /permanently deletes/.test(text.slice(o, site.index)));
+    if (!named || !explained) {
+      return {
+        ok: false,
+        why:
+          `the confirmation before line ${site.line} does not ${!named ? "NAME the account" : "state that the deletion is permanent"}` +
+          ` — labels stopped being unique in Phase 61, so a prompt that cannot say WHICH account ` +
+          `is about to be destroyed is not a confirmation`,
+      };
+    }
+  }
+  return { ok: true, why: `${sites.length} removal site(s), each gated by a naming confirmation` };
+}
+
+/**
+ * EXTENSION — `extension/src/popup/popup.js` gates with a two-button confirm
+ * strip rather than a blocking `confirm()`, so the property is STRUCTURAL: every
+ * `removeEntry(` call must sit inside the click handler of the button that
+ * carries `data-testid = "remove-confirm-yes"`, and not the row's Remove button.
+ *
+ * ⭐ The handler's SHAPE is never inspected. async or not, arrow or function,
+ * wrapped in `void` or awaited — all that is asked is which button it hangs off.
+ */
+function extensionDeleteGate(src) {
+  const code = blank(src, { strings: true });
+  const text = blank(src, { strings: false });
+  const yes = text.match(/(\w+)\.dataset\.testid\s*=\s*"remove-confirm-yes"/);
+  if (!yes) {
+    return {
+      ok: false,
+      why:
+        'no element is tagged `dataset.testid = "remove-confirm-yes"`, so there is no confirm ' +
+        "button to hang the removal off (and `user-safety.spec.mjs` cannot address one either)",
+    };
+  }
+  const yesVar = yes[1];
+  const sites = hits(code, /\bremoveEntry\s*\(/);
+  if (sites.length === 0) {
+    return {
+      ok: false,
+      why:
+        "no `removeEntry(` site found at all — either the removal moved (this guard must move " +
+        "with it) or the popup removes without writing a tombstone",
+    };
+  }
+  for (const site of sites) {
+    const listener = enclosingClickListener(code, text, site.index);
+    if (listener === null) {
+      return {
+        ok: false,
+        why: `the removal at line ${site.line} is not inside any click handler — it cannot be told whether it is gated`,
+      };
+    }
+    if (listener.recv !== yesVar) {
+      return {
+        ok: false,
+        why:
+          `the removal at line ${site.line} runs from \`${listener.recv}\`'s click handler, not ` +
+          `\`${yesVar}\`'s (the "remove-confirm-yes" button) — one click on the row destroys a ` +
+          `2FA secret`,
+      };
+    }
+  }
+  return {
+    ok: true,
+    why: `${sites.length} removal site(s), all inside \`${yesVar}\` (the confirm button) — handler shape irrelevant`,
+  };
+}
+
+/**
+ * WEBAPP — `AccountRow` in `authenticator.tsx`. The destructive prop
+ * `onRemove()` may only be INVOKED from inside the element carrying
+ * `data-testid="remove-confirm-yes"`, and the row's own Remove button element
+ * must not mention it at all.
+ *
+ * Scoped to `AccountRow`, because the parent components legitimately PASS
+ * `onRemove` down; what is banned is CALLING it outside the gate.
+ */
+function webappDeleteGate(src) {
+  const text = blank(src, { strings: false });
+  const start = text.indexOf("function AccountRow(");
+  if (start === -1) {
+    return { ok: false, why: "no `function AccountRow(` — the row component moved; move this guard with it" };
+  }
+  const rest = text.indexOf("\nfunction ", start + 1);
+  const body = text.slice(start, rest === -1 ? text.length : rest);
+  const at = (i) => lineOf(text, start + i);
+  if (!/data-testid="remove-confirm-yes"/.test(body)) {
+    return { ok: false, why: 'AccountRow has no `data-testid="remove-confirm-yes"` element to confirm with' };
+  }
+  if (!/setConfirming\s*\(\s*true\s*\)/.test(body)) {
+    return { ok: false, why: "AccountRow never opens a confirmation (`setConfirming(true)`)" };
+  }
+  // ⚠️ ANY invocation, not just the zero-arg one: `onRemove(id)` destroys just
+  // as much, and a guard that only knows one call shape is the bug this whole
+  // section was rewritten to remove.
+  const calls = hits(body, /\bonRemove\s*\(/);
+  if (calls.length === 0) {
+    return { ok: false, why: "AccountRow never invokes `onRemove()` — the removal moved; move this guard with it" };
+  }
+  for (const c of calls) {
+    const tag = body.lastIndexOf("<button", c.index);
+    const region = tag === -1 ? "" : body.slice(tag, c.index);
+    if (!/data-testid="remove-confirm-yes"/.test(region)) {
+      return {
+        ok: false,
+        why:
+          `\`onRemove()\` is invoked at line ${at(c.index)} from an element that is NOT the ` +
+          `"remove-confirm-yes" button — one click destroys a 2FA secret`,
+      };
+    }
+  }
+  const openIdx = body.indexOf('data-testid="account-remove"');
+  if (openIdx === -1) {
+    return { ok: false, why: 'the row has no `data-testid="account-remove"` button' };
+  }
+  const tagStart = body.lastIndexOf("<button", openIdx);
+  const tagEnd = body.indexOf("</button>", openIdx);
+  const el = body.slice(tagStart === -1 ? openIdx : tagStart, tagEnd === -1 ? body.length : tagEnd);
+  if (/onRemove/.test(el)) {
+    return {
+      ok: false,
+      why:
+        `the row's Remove button (line ${at(openIdx)}) references \`onRemove\` itself — it must ` +
+        `only open the confirmation`,
+    };
+  }
+  return { ok: true, why: `${calls.length} \`onRemove()\` call(s), all inside the confirm button` };
+}
+
+const DELETE_GATES = [
+  { rel: "web/apps/webapp/app/authenticator.tsx", gate: webappDeleteGate, what: "the webapp's account row" },
+  { rel: "extension/src/popup/popup.js", gate: extensionDeleteGate, what: "the extension popup's account row" },
+  { rel: "desktop/ui/main.js", gate: desktopDeleteGate, what: "the desktop's account row" },
+];
+
+for (const { rel, gate, what } of DELETE_GATES) {
+  const src = read(rel);
+  if (src === null) continue;
+  checks += 1;
+  const r = gate(src);
+  if (r.ok) {
+    console.log(`  ok  ${rel}: ${what} cannot delete without confirming — ${r.why}`);
+  } else {
+    fail(
+      `${rel}: ${what} — ${r.why}. A removal writes a PROPAGATING, resurrection-proof tombstone ` +
+        `(ADR 0049 §3): a mis-click is permanent, and losing a 2FA secret can mean losing the ` +
+        `account it protects.`,
+    );
+  }
+}
+
+// ⛔⛔ THE SELF-TEST — the two mutations that got past the first version of this
+// check, encoded so they can never get past it silently again, plus the good
+// shapes so a "fix" that just returns false forever is caught too.
+//
+// ⚠️ The specimens are deliberately MINIMAL rather than copies of the real
+// files: a specimen that tracked the real source would have to be updated
+// whenever the UI moved, and would then be updated to whatever the source
+// happened to say — including a broken version.
+{
+  const DESKTOP_OK = `
+    del.addEventListener("click", async () => {
+      const who = row.issuer ? \`\${row.issuer}, \${row.label}\` : row.label;
+      if (!window.confirm(\`Delete \${who}?\\n\\nThis permanently deletes the secret.\`)) return;
+      await call("remove_by_id", { uuid: row.uuid });
+    });
+    forget.addEventListener("click", () => { if (!window.confirm("Forget the vault?")) return; });
+  `;
+  // ⛔ MUTATION (a), verbatim in shape: the confirmation is gone, but the file
+  // still has other window.confirm() calls for unrelated controls.
+  const DESKTOP_MUTATED = `
+    del.addEventListener("click", async () => {
+      // confirmation removed
+      await call("remove_by_id", { uuid: row.uuid });
+    });
+    forget.addEventListener("click", () => { if (!window.confirm("Forget the vault?")) return; });
+  `;
+  // ⛔ The copy defect this phase introduced and then had to remove: a prompt
+  // that promises a sync the product does not perform.
+  const DESKTOP_OVERCLAIM = `
+    del.addEventListener("click", async () => {
+      const who = row.issuer ? \`\${row.issuer}, \${row.label}\` : row.label;
+      if (!window.confirm(\`Delete \${who}?\\n\\nThis permanently deletes the secret, and the deletion is synced to every other device holding it.\`)) return;
+      await call("remove_by_id", { uuid: row.uuid });
+    });
+  `;
+  const EXT_OK = `
+    yes.dataset.testid = "remove-confirm-yes";
+    rm.addEventListener("click", () => { confirmBox.hidden = false; });
+    no.addEventListener("click", closeConfirm);
+    yes.addEventListener("click", async () => {
+      await withVault((d) => { removeEntry(wasm, d, { uuid: li.dataset.uuid }, t); });
+    });
+  `;
+  // ⛔ MUTATION (b), verbatim in shape: a NON-async handler on the row's own
+  // Remove button that still performs the removal.
+  const EXT_MUTATED = `
+    yes.dataset.testid = "remove-confirm-yes";
+    rm.addEventListener("click", () => {
+      void withVault((d) => { removeEntry(wasm, d, { uuid: li.dataset.uuid }, t); });
+    });
+    no.addEventListener("click", closeConfirm);
+  `;
+  const WEBAPP_OK = `
+function AccountRow({ onRemove }) {
+  const [confirming, setConfirming] = useState(false);
+  if (confirming) {
+    return (<button data-testid="remove-confirm-yes" onClick={() => { setConfirming(false); onRemove(); }}>Delete permanently</button>);
+  }
+  return (<button data-testid="account-remove" onClick={() => setConfirming(true)}>Remove</button>);
+}
+function Next() {}
+`;
+  // ⛔ The webapp's equivalent evasion: not the banned literal `onClick={onRemove}`,
+  // but an arrow that calls it — which the old banned-spelling check missed.
+  //
+  // ⚠️ The confirmation UI is left FULLY INTACT here, `setConfirming(true)`
+  // included, so this specimen can only fail on the rule that matters: WHICH
+  // element invokes `onRemove()`. A specimen that also deleted the confirm
+  // would pass for the wrong reason and prove nothing about the bypass.
+  const WEBAPP_MUTATED = `
+function AccountRow({ onRemove }) {
+  const [confirming, setConfirming] = useState(false);
+  if (confirming) {
+    return (<button data-testid="remove-confirm-yes" onClick={() => { setConfirming(false); onRemove(); }}>Delete permanently</button>);
+  }
+  return (<><button data-testid="account-review" onClick={() => setConfirming(true)}>Review</button><button data-testid="account-remove" onClick={() => onRemove()}>Remove</button></>);
+}
+function Next() {}
+`;
+  const SPECIMENS = [
+    [desktopDeleteGate, DESKTOP_OK, true, "desktop: gated removal passes"],
+    [desktopDeleteGate, DESKTOP_MUTATED, false, "desktop: DELETING the confirmation is caught (other confirms present)"],
+    [desktopDeleteGate, DESKTOP_OVERCLAIM, false, "desktop: a prompt promising an automatic sync is caught"],
+    [extensionDeleteGate, EXT_OK, true, "extension: removal on the confirm button passes"],
+    [extensionDeleteGate, EXT_MUTATED, false, "extension: a NON-async handler on the row button is caught"],
+    [webappDeleteGate, WEBAPP_OK, true, "webapp: onRemove() only inside the confirm button passes"],
+    [webappDeleteGate, WEBAPP_MUTATED, false, "webapp: `onClick={() => onRemove()}` on the row button is caught"],
+  ];
+  for (const [gate, specimen, want, what] of SPECIMENS) {
+    checks += 1;
+    const got = gate(specimen).ok;
+    if (got === want) {
+      console.log(`  ok  self-test: ${what}`);
+    } else {
+      fail(
+        `SELF-TEST FAILED: ${what} — the gate returned ok=${got}, expected ${want}. ` +
+          (want
+            ? `A guard that rejects the CORRECT shape gets deleted, which is the same as never ` +
+              `having written it.`
+            : `This specimen IS a mutation a verifier already got past this check once. Fix the ` +
+              `gate, do not weaken the specimen.`),
+      );
+    }
+  }
+
+  // The literal/brace machinery the gates stand on, pinned directly: a scanner
+  // that silently mis-handles a string or a template makes every gate above
+  // meaningless without failing anything.
+  const B = blank(`const a = "}{"; /* } */ const b = \`x\${ {y:1} }z\`; // }\nconst c = 1;`, {
+    strings: true,
+  });
+  checks += 1;
+  if ((B.match(/[{}]/g) ?? []).length === 0) {
+    console.log("  ok  self-test: braces inside strings, templates and comments are not structure");
+  } else {
+    fail(
+      `SELF-TEST FAILED: blank() left ${JSON.stringify(B)} — braces in literals or comments are ` +
+        `being counted as structure, so enclosingOpens() walks to the wrong block.`,
+    );
+  }
+  checks += 1;
+  const withStrings = blank('const a = "keep me"; // drop me\n', { strings: false });
+  if (withStrings.includes("keep me") && !withStrings.includes("drop me")) {
+    console.log("  ok  self-test: the string-preserving view keeps strings and drops comments");
+  } else {
+    fail(`SELF-TEST FAILED: blank(src,{strings:false}) produced ${JSON.stringify(withStrings)}`);
+  }
+  checks += 1;
+  if (blank("x", { strings: true }).length === 1 && B.length === B.length) {
+    const sample = 'a\n"b}c"\n`d`\n';
+    if (blank(sample, { strings: true }).length === sample.length) {
+      console.log("  ok  self-test: blank() preserves length, so offsets stay comparable");
+    } else {
+      fail("SELF-TEST FAILED: blank() changed the source length — every offset above is wrong.");
+    }
+  }
+}
+
+// The CLI's exemption is conditional on it SAYING what it just did.
+{
+  const rel = "cli/src/main.rs";
+  const src = read(rel);
+  if (src !== null) {
+    checks += 1;
+    if (/PERMANENT: the second-factor secret is gone/.test(src)) {
+      console.log(`  ok  ${rel}: \`totp remove\` states the consequence`);
+    } else {
+      fail(
+        `${rel}: \`sigil totp remove\` no longer states that the removal is PERMANENT and ` +
+          `propagates. It is exempt from a confirmation PROMPT only because it says this.`,
+      );
     }
   }
 }

@@ -53,7 +53,7 @@ use sigil_cli::{
     enroll_device, fetch_hybrid_key, fetch_subscription, generate_hybrid_identity, generate_key,
     generate_vault_key, keyring_get, keyring_put, load_hybrid_public, load_hybrid_secret,
     load_identity, load_key_file, load_keyring, publish_hybrid_key, pull_ops_auth, push_op_auth,
-    save_hybrid_public, save_hybrid_secret, save_key, share_vault_to_known_key,
+    save_hybrid_public, save_hybrid_secret, save_key, server_clock_skew, share_vault_to_known_key,
     vault_key_fingerprint, CliError, DeviceIdentity, RequestAuth, VaultKeyring, VAULT_KEYRING_FILE,
     VAULT_KEY_LEN,
 };
@@ -166,6 +166,23 @@ pub struct ServerCheck {
     /// Whether the server holds this device's published hybrid public key.
     pub hybrid_published: bool,
     /// A short human-readable explanation, safe to display. Never secret.
+    pub detail: String,
+}
+
+/// The result of comparing this machine's clock against a server's.
+///
+/// ⚠️ `available == false` means NO READING — deliberately a distinct state from
+/// "the clock is fine", so a UI cannot render an unreachable server as a clean
+/// bill of health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockReading {
+    /// Whether a reading was obtained at all.
+    pub available: bool,
+    /// Whether the drift is large enough to start costing the user codes.
+    pub skewed: bool,
+    /// `local - server`, in seconds. POSITIVE means this machine is AHEAD.
+    pub skew_seconds: i64,
+    /// A sentence safe to display. Never secret.
     pub detail: String,
 }
 
@@ -1132,6 +1149,63 @@ impl DeviceConfig {
                 },
             ),
         )
+    }
+
+    /// Compare this machine's clock against the server's — the DIAGNOSTIC for
+    /// the top real-world TOTP failure.
+    ///
+    /// ⛔ A TOTP code is a function of a secret and the CURRENT TIME, so a
+    /// machine whose clock has drifted past half a step has its codes start
+    /// falling outside the window a verifier accepts (RFC 6238 §5.2 permits one
+    /// step either side, so it is LIKELY and increasingly certain, not immediate
+    /// and total) — and to the user a rejected code is indistinguishable from a
+    /// wrong secret. They
+    /// re-scan the QR, re-import the export, delete and re-add the account, and
+    /// none of it helps.
+    ///
+    /// ⛔⛔ IT REPORTS. IT NEVER CORRECTS. `entries_now` still reads
+    /// [`crate::now_unix`], the system clock, exactly as before; nothing here
+    /// feeds it. A code generated against a server-supplied time is one the user
+    /// cannot reproduce, cannot compare against another authenticator, and
+    /// cannot reason about when the server is wrong or hostile.
+    ///
+    /// ⭐ REUSE, DO NOT REIMPLEMENT (ADR 0037): the reading, the threshold and
+    /// the wording all come from the `sigil-cli` library, so the desktop cannot
+    /// disagree with the CLI about whether the same machine has a problem.
+    ///
+    /// ⚠️ UNREACHABLE IS NOT "FINE". [`ClockReading::available`] is false and
+    /// `detail` says so, exactly like [`Self::check_server`] reports
+    /// reachability as DATA rather than as an error.
+    #[must_use]
+    pub fn clock(&self) -> ClockReading {
+        let local = i64::try_from(crate::now_unix()).unwrap_or(0);
+        match server_clock_skew(&self.server, local) {
+            Ok(skew) => ClockReading {
+                available: true,
+                skewed: skew.significant(),
+                skew_seconds: skew.skew_seconds,
+                detail: skew.describe(),
+            },
+            Err(e) => ClockReading {
+                available: false,
+                skewed: false,
+                skew_seconds: 0,
+                // ⚠️ "no reading", NOT "could not reach": this arm also covers a
+                // server that ANSWERED but sent no usable `Date` header, and
+                // saying we could not reach a server we did reach would send the
+                // reader to the wrong layer — the same class of small untruth
+                // this phase exists to remove. The underlying reason is carried
+                // in `{e}`.
+                detail: format!(
+                    "NO READING: could not compare clocks against {server} ({e}). This is NOT a \
+                     report that the clock is fine — it is the absence of a report. Codes are \
+                     generated entirely on this machine from its system clock, so if codes are \
+                     being rejected, check the clock by hand against any phone with automatic \
+                     time sync.",
+                    server = self.server,
+                ),
+            },
+        }
     }
 
     /// MINT a single-use invite letting ONE more device join this account.

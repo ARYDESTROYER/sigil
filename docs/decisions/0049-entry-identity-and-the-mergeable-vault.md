@@ -432,3 +432,32 @@ re-justified rather than silently absorbed.
   objection, plus it would give the server the ability to *suppress* a delete.
   Compaction has to be a client-side, retention-window rule; it is not built, and
   limit 1 says so rather than implying otherwise.
+
+## Addendum (2026-07-31, Phase 62) — this decision RAISED the stakes of a mis-click
+
+Stated here because the consequence belongs with the decision that caused it.
+
+Before the 2P-Set, a delete wrote a whole snapshot, and a device that had not
+pulled could push an older snapshot that **accidentally resurrected** the deleted
+entry. That was a data-loss bug and §3 fixed it: a tombstone now propagates, and
+a stale snapshot re-adding the same `uuid` **loses**. Deliberately, and correctly.
+
+⚠️ **The side effect is that an accidental delete became MORE permanent than it
+used to be**, and no client's UI had been adjusted to match — every account row
+still carried a bare one-click **Remove**, inches from the code the user came to
+read, on a row repainting once a second.
+
+[0050](0050-confirmations-honest-claims-and-the-clock-diagnostic.md) closes that
+on all four clients with a confirmation that **names the entry**, and it records
+why the answer is **not an undo**: an undo would have to either retract a
+tombstone — the exact resurrection this ADR exists to prevent, and unretractable
+once any other device has merged it — or hold the intent in memory, where closing
+a tab or a popup silently discards it. The gate goes **before** the irreversible
+act; the tombstone is still written at commit and never before, so nothing in
+this decision's semantics changed.
+
+The immutability source guard (`sigil-wasm/test/merge-guard.mjs`) grew from **51**
+checks to **108** in the same phase, its delete gates rewritten from
+"does this pattern appear anywhere in the file?" into predicates that **locate the
+destructive call and walk outward** — after two planted mutations survived the
+first version.

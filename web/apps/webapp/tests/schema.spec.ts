@@ -154,6 +154,11 @@ test("⭐ an edit made through the REAL UI preserves vault fields this build doe
     .filter({ hasText: "added-after-seeding" })
     .getByTestId("account-remove")
     .click();
+  // ⛔ Remove now OPENS A CONFIRMATION rather than deleting: a removal writes a
+  // PROPAGATING, resurrection-proof tombstone (ADR 0049 §3), so a mis-click on a
+  // button that sits inches from the code is permanent. Confirm it — this spec is
+  // about the merge/schema, not about the gate.
+  await page.getByTestId("remove-confirm-yes").click();
   await expect(page.getByTestId("account-count")).toHaveText("1", { timeout: T });
   const afterRemove = decrypt(await readStoredVault(page));
   expect(afterRemove.min_reader_version).toBe(UNKNOWN_VAULT_FIELDS.min_reader_version);

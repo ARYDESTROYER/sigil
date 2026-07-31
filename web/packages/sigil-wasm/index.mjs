@@ -117,3 +117,12 @@ export * from "../../../sigil-wasm/passkey.mjs";
 // machine-readable 402. Reading it is how a client can say the TRUE thing —
 // writes may be refused, reads and same-account key recovery never are.
 export * from "../../../sigil-wasm/entitlement.mjs";
+// CLOCK SKEW (the diagnostic, never a correction): a TOTP code that is rejected
+// because the device clock drifted is indistinguishable, to the user, from a
+// wrong secret. This reads the server's clock off the `Date` header a sigild
+// response already carries and says which it is. It NEVER adjusts the clock
+// codes are generated from.
+//
+// ⚠️ Re-exported HERE **and** declared in index.d.ts — two separate holes, see
+// the note above `passkey.mjs`.
+export * from "../../../sigil-wasm/clock-skew.mjs";

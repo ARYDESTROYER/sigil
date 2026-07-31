@@ -711,7 +711,8 @@ try {
   sigil(["totp", "add", "ratchet", "--secret", "GEZDGNBVGY3TQOJQ", "--vault", rekeyVault]);
   const beforeRekey = containerParams(wasm, new Uint8Array(readFileSync(rekeyVault)));
   const keyring = join(work, "rekey-keys.json");
-  sigil(["vault", "rekey", "--vault", "ratchet-vault", "--file", rekeyVault, "--keyring", keyring]);
+  // ⛔ `--yes`: rekey is a ONE-WAY DOOR (the password stops opening the vault).
+  sigil(["vault", "rekey", "--yes", "--vault", "ratchet-vault", "--file", rekeyVault, "--keyring", keyring]);
   const afterRekey = containerParams(wasm, new Uint8Array(readFileSync(rekeyVault)));
   assert(
     afterRekey.m_cost >= beforeRekey.m_cost &&

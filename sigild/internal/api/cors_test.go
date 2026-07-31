@@ -108,10 +108,26 @@ func TestCORSActualRequestEchoesOriginAndExposesEntitlementHeaders(t *testing.T)
 		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, allowedOrigin)
 	}
 	exposed := rec.Header().Get("Access-Control-Expose-Headers")
-	for _, h := range []string{headerEntitlement, headerEntitlementStatus, headerEntitlementGraceEnds} {
+	// "Date" is here for the CLOCK-SKEW DIAGNOSTIC, and it is load-bearing: a
+	// browser cannot read Date cross-origin unless it is exposed (measured — the
+	// only readable headers otherwise were content-length, content-type and
+	// x-request-id). Without it the browser clients cannot tell a user that their
+	// clock, not their secret, is the likely reason a code is being rejected.
+	// (Not "every code": RFC 6238 §5.2 lets a verifier accept one step either
+	// side, so a small drift may still validate — the same overstatement was
+	// corrected in cors.go and in all four clients this phase.)
+	for _, h := range []string{
+		headerEntitlement, headerEntitlementStatus, headerEntitlementGraceEnds, "Date",
+	} {
 		if !strings.Contains(exposed, h) {
 			t.Fatalf("Access-Control-Expose-Headers %q is missing %q", exposed, h)
 		}
+	}
+	// And the header it names must actually be present on the response.
+	if rec.Header().Get("Date") == "" {
+		// httptest.Recorder does not stamp Date the way a real server does, so
+		// this is only a sanity check that nothing stripped it.
+		t.Log("no Date on the recorder (expected: httptest does not add it; the real server does)")
 	}
 }
 

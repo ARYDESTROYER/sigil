@@ -47,6 +47,10 @@ use sigil_cli::{
     recovery_revoke, recovery_verify,
 };
 use sigil_core::format_recovery_kit;
+// Clock-skew DIAGNOSTIC (never a correction): the reading comes from the HTTP
+// `Date` header a sigild response already carries, so there is no new route and
+// no new dependency. Codes are still generated from the SYSTEM clock.
+use sigil_cli::server_clock_skew;
 
 /// Environment variable the password is read from. Empty/unset is a hard error.
 const PASSWORD_ENV: &str = "SIGIL_PASSWORD";
@@ -121,9 +125,12 @@ USAGE:
   sigil device hybrid-publish [--key <file>] [--hybrid-key <file>] [--regenerate] [--server <url>]
                                          Generate (if absent) this device's HYBRID identity and
                                          publish only its PUBLIC half, so others can share to it
-  sigil vault rekey --vault <id> [--file <vaultfile>] [--publish] [--keyring <f>] [--key <f>]
+  sigil vault rekey --vault <id> --yes [--file <vaultfile>] [--publish] [--keyring <f>] [--key <f>]
                                          Re-seal a PASSWORD vault under a fresh random VAULT KEY
-                                         (--publish also wraps it to THIS device and uploads it)
+                                         (--publish also wraps it to THIS device and uploads it).
+                                         ONE-WAY DOOR: SIGIL_PASSWORD stops opening the vault and
+                                         the key file becomes the only thing that does, so --yes
+                                         is required. Run it without --yes to read the full warning
   sigil vault share --vault <id> --to <deviceID> [--permission read|write] [--keyring <f>]
                     [--safety-number \"<digits>\"] [--key <f>] [--pins <f>] [--server <url>]
                     [--envelope-out <f>]
@@ -198,6 +205,10 @@ USAGE:
                                          Upload an opaque container to the dev op-log
   sigil pull --vault <id> --out-dir <dir> [--since <N>] [--server <url>] [--key <file>]
                                          Download NEW opaque containers from the dev op-log
+  sigil clock [--server <url>]           Is this machine's clock right? Compares it against the
+                                         server's HTTP Date header and warns past half a TOTP
+                                         step. A DIAGNOSTIC ONLY — it never adjusts the clock
+                                         codes are generated from. Offline it says NO READING
   sigil --help                           Show this help
   sigil --version                        Show the version
 
@@ -439,7 +450,8 @@ DEVICE-TO-DEVICE VAULT SHARING (sigil vault ...) — DEV-ONLY, UNAUDITED:
 
     # A: turn its password vault into a SHARED vault (fresh random vault key),
     # wrap that key to itself, and push the sealed vault to the op-log.
-    SIGIL_PASSWORD=... sigil vault rekey --vault demo --file ./a-vault.sigil --publish --key ./a.key
+    # --yes is the acknowledgement that the password stops working (one-way).
+    SIGIL_PASSWORD=... sigil vault rekey --vault demo --file ./a-vault.sigil --yes --publish --key ./a.key
     sigil push --vault demo --in ./a-vault.sigil --key ./a.key
 
     # BEFORE the first share: verify B's key out of band. Pinning cannot protect
@@ -584,6 +596,7 @@ fn run() -> Result<(), String> {
             let p = parse_pull(args)?;
             cmd_pull(&p)
         }
+        "clock" => cmd_clock(args),
         other => Err(format!(
             "unknown command {other:?}; try `sigil --help`\n\n{HELP}"
         )),
@@ -1020,7 +1033,35 @@ fn cmd_push(p: &PushArgs) -> Result<(), String> {
     let seq = push_op_auth(&p.server, &p.vault, &container, &auth)
         .map_err(|e| explain_sync_error(e, &p.vault, auth.contract()))?;
     println!("pushed vault {} seq {}", p.vault, seq);
+    warn_if_clock_skewed(&p.server);
     Ok(())
+}
+
+/// Print a clock-skew warning to STDERR when this machine has drifted far enough
+/// to start costing the user codes.
+///
+/// ⭐ Called from the paths that ALREADY talk to a server, so the user finds out
+/// about a broken clock while doing something else — long before they are sitting
+/// in front of a rejected login trying to work out whether their secret is wrong.
+///
+/// ⛔ SILENT ON SUCCESS-WITHIN-TOLERANCE and silent when there is NO reading. It
+/// never prints anything that could be read as "your clock is fine", because it
+/// cannot know that when it could not ask. `sigil clock` is the command that
+/// answers the question explicitly, including saying "NO READING" out loud.
+///
+/// ⛔ IT NEVER ADJUSTS ANYTHING. Codes are still generated from the system clock.
+fn warn_if_clock_skewed(server: &str) {
+    let Ok(now) = now_unix_secs() else { return };
+    let Ok(local) = i64::try_from(now) else {
+        return;
+    };
+    // A failure here means the diagnostic is unavailable, not that anything is
+    // wrong: stay quiet and let the operation the user actually asked for speak.
+    if let Ok(skew) = server_clock_skew(server, local) {
+        if skew.significant() {
+            eprintln!("{}", skew.describe());
+        }
+    }
 }
 
 fn cmd_pull(p: &PullArgs) -> Result<(), String> {
@@ -1072,6 +1113,7 @@ fn cmd_pull(p: &PullArgs) -> Result<(), String> {
     let new_cursor = saved.max(max_seq);
     write_cursor(&state_path, &key, new_cursor).map_err(|e| e.to_string())?;
     println!("cursor for {} now at {}", p.vault, new_cursor);
+    warn_if_clock_skewed(&p.server);
     Ok(())
 }
 
@@ -3017,6 +3059,65 @@ fn now_unix_secs() -> Result<u64, String> {
         .map_err(|e| format!("system clock is before the Unix epoch: {e}"))
 }
 
+/// `sigil clock [--server <url>]` — is this machine's clock right?
+///
+/// ⛔ THE FAILURE THIS EXISTS FOR. A TOTP code is a function of a secret and the
+/// CURRENT TIME. When the clock drifts past half a step the codes it produces
+/// start being rejected (RFC 6238 §5.2 lets a verifier accept one step either
+/// side, so it is LIKELY and increasingly certain, not immediate and total), and
+/// to the user a rejected code is indistinguishable from a wrong secret — so they
+/// re-scan the QR, re-import the export, delete and re-add the account, and none
+/// of it helps. No Sigil client reported this anywhere until now.
+///
+/// ⛔⛔ IT IS A DIAGNOSTIC AND NEVER A CORRECTION. It prints a reading. It does
+/// not adjust, offset or override the clock any command uses to generate a code
+/// — see the module comment on [`sigil_cli::server_clock_skew`].
+///
+/// An OFFLINE machine gets NO reading, and is told exactly that: "no reading"
+/// is a different answer from "your clock is fine", and printing the second when
+/// we mean the first is the failure this whole item is about.
+fn cmd_clock(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut server: Option<String> = None;
+    let mut it = args.into_iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--server" => set_once(&mut server, &mut it, "--server")?,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    let server = resolve_server(server);
+    let local = i64::try_from(now_unix_secs()?).map_err(|_| "clock out of range".to_string())?;
+
+    match server_clock_skew(&server, local) {
+        Ok(skew) => {
+            println!("server:      {server}");
+            println!(
+                "server time: {} (unix, from the HTTP Date header)",
+                skew.server_unix
+            );
+            println!("local time:  {} (unix)", skew.local_unix);
+            println!("{}", skew.describe());
+            if skew.significant() {
+                // Non-zero so a script can act on it. The reading itself already
+                // printed, so nothing is hidden behind the exit code.
+                return Err(
+                    "clock skew exceeds half a TOTP step — codes generated here are likely to be \
+                     rejected"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "{e}\n  -> NO READING: could not reach {server} to compare clocks. This is NOT a \
+             report that your clock is fine — it is the absence of a report. Sigil generates \
+             codes entirely offline from your system clock, so if codes are being rejected and \
+             you cannot reach a server, check the system clock by hand (it should agree with \
+             time.is or any phone with automatic time sync to within a few seconds)."
+        )),
+    }
+}
+
 /// Dispatch `sigil totp <sub> ...`.
 fn cmd_totp(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let Some(sub) = args.next() else {
@@ -3384,10 +3485,12 @@ fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
     };
     println!(
         "removed {who} from vault {path}\n  \
-         ⚠️ PERMANENT: the second-factor secret is gone from this vault, and the \
-         removal is recorded as a tombstone that propagates to every other device \
-         holding it. If you have this secret nowhere else, you may have lost \
-         access to the account it protects.",
+         ⚠️ PERMANENT: the second-factor secret is gone from this vault. The \
+         removal is recorded as a tombstone, and Sigil syncs only when you ask it \
+         to — so it reaches every other device holding this vault the next time \
+         you `push` and they `pull`; until you do, and forever if you never sync, \
+         it applies to this copy alone. If you have this secret nowhere else, you \
+         may have lost access to the account it protects.",
         path = vault_path.display()
     );
     Ok(())
@@ -3591,11 +3694,13 @@ fn cmd_totp_sync(args: Vec<String>) -> Result<(), String> {
     };
     if tip_matches {
         println!("the server tip already matches; nothing pushed (op #{tip_seq})");
+        warn_if_clock_skewed(&server);
         return Ok(());
     }
     let seq = push_op_auth(&server, &vault_id, &container, &auth)
         .map_err(|e| explain_sync_error(e, &vault_id, auth.contract()))?;
     println!("pushed the merged vault as op #{seq}");
+    warn_if_clock_skewed(&server);
     Ok(())
 }
 

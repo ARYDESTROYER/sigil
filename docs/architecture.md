@@ -1064,7 +1064,7 @@ cryptography of its own; see the status note above). The pieces in this repo:
   server-facing half in `desktop/core/src/net.rs` (below) — and is
   `#![forbid(unsafe_code)]`; **`sigil-desktop`** (`desktop/src-tauri`) is a thin
   shell holding an `AppState { session: Mutex<Option<VaultSession>>, sync:
-  Mutex<Option<DeviceConfig>> }` and **41 `#[tauri::command]`s** — the ten
+  Mutex<Option<DeviceConfig>> }` and **42 `#[tauri::command]`s** — the ten
   offline ones (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`,
   `import`, `remove`, `export_uris`, `export_migration`), **eleven added in
   Phase 49** (`unlock_shared`, `set_server`, `sync_status`, `enroll`,
@@ -1073,7 +1073,11 @@ cryptography of its own; see the status note above). The pieces in this repo:
   **nine added in Phase 56** (`recovery_generate`/`_cover`/`_check`/`_verify`/
   `_restore`/`_revoke`/`_kits`, `entitlement_status`, `entitlement_refresh` — the
   kit lifecycle and the payment warning, both over the `sigil-cli` library, with no
-  second copy of the codec, the derivation or the safety-number digest), each of
+  second copy of the codec, the derivation or the safety-number digest) and **one
+  added in Phase 62** (`clock_skew` — the clock **diagnostic**, over
+  `DeviceConfig::clock()`, again via the `sigil-cli` library and therefore with no
+  second HTTP client; ⛔ it reports and **never corrects** — `list` still computes
+  every code from this machine's own `now_unix()`), each of
   which clones the `DeviceConfig` out of the mutex *before* any
   network call so no lock is held across I/O. `desktop/ui` is framework-free HTML/CSS/JS —
   **no npm, no bundler, no CDN**. The split is deliberate: a GUI cannot be clicked by
@@ -1265,7 +1269,7 @@ cryptography of its own; see the status note above). The pieces in this repo:
      no sync, no background worker; dev / UNAUDITED; not published to any store.
    desktop (Tauri v2): the FIRST NATIVE client — sigil-core linked as a plain Rust
      dependency, NO wasm. sigil-desktop-core (headless logic, all the tests) +
-     sigil-desktop (shell: 41 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
+     sigil-desktop (shell: 42 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
      SIGILcli container + TotpVault schema + migration codec, and shares the CLI's
      $HOME/.sigil/totp-vault.sigil, so desktop and `sigil totp` drive ONE vault file.
      Sealed-only vault persistence, in-memory password; webview does no crypto
@@ -1629,6 +1633,55 @@ lie is what gets pinned, and only a human comparing the safety number out of ban
 catches it. A user who re-pins without checking defeats it. Rotation protects **future
 content only**; a device that already unwrapped a key keeps what it copied. And all of
 it is **new, unaudited code** in a dev-gated, plain-HTTP posture.
+
+### 2d. The device clock — a reading that never becomes a correction
+
+`sigil-core` reads **no clock** ([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)):
+the instant a code is computed at is always supplied by the caller from the *host's*
+system clock. That is a deliberate property of the core, and it has a product-level
+consequence the core cannot see — **if the host's clock is wrong, every code is
+wrong**, and a rejected code is indistinguishable, to the user, from a wrong secret.
+So they re-scan the QR, re-import the export, delete and re-add the account, and none
+of it helps.
+
+Since Phase 62 every client can *diagnose* that
+([ADR 0050](decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)).
+The data flow is one hop and adds no server surface:
+
+```
+client ──► GET /healthz (unauthenticated, never dev-gated, never rate limited)
+       ◄── 200 + Date: Sun, 06 Nov 1994 08:49:37 GMT     (RFC 9110 §6.6.1)
+
+parse ──► server_unix          local_unix = the host's own clock
+skew  = local_unix - server_unix        (POSITIVE ⇒ this device is AHEAD)
+|skew| > 15 s  (half a 30 s TOTP step) ⇒ warn, naming the DIRECTION
+```
+
+- Rust: `parse_http_date` / `ClockSkew` / `server_clock_skew` in `cli/src/lib.rs`,
+  surfaced as `sigil clock` and as a stderr warning appended to `push`/`pull`.
+- JavaScript: [`../sigil-wasm/clock-skew.mjs`](../sigil-wasm/clock-skew.mjs)
+  (`skewFromDateHeader` / `readClockSkew` / `fetchClockSkew` /
+  `describeClockSkew`), re-exported by `@sigil/wasm` and vendored into the
+  extension. It imports nothing and does no crypto.
+- Desktop: the `clock_skew` command over `DeviceConfig::clock()`, which calls the
+  **CLI library** rather than adding a second HTTP client
+  ([ADR 0037](decisions/0037-desktop-reuses-cli-library-for-protocol.md)).
+
+⛔⛔ **It reports; it never corrects.** Nothing on this path feeds the clock codes
+are generated from. A client that silently generated codes against server time would
+produce codes the user cannot reproduce, cannot compare against any other
+authenticator, and cannot reason about when the server is wrong.
+
+⭐ **"No reading" is a distinct outcome from "your clock is fine."** Offline, or a
+server that answers without a usable `Date`, yields an explicit *unavailable* state
+rendered as **NO CLOCK READING — this is not a report that your clock is fine.**
+
+⚠️ **`Date` is not CORS-safelisted**, so a browser reads `null` for it cross-origin
+unless the server exposes it — the one line `sigild` gained in this phase (see
+[`api.md`](api.md) and [ADR 0044](decisions/0044-opt-in-cors-allowlist.md)'s
+addendum). ⚠️ And it is **not a security control**: the reading is an
+unauthenticated plaintext header over plain HTTP, a hostile server can make the hint
+wrong in either direction, and no key, signature, envelope or code depends on it.
 
 ---
 

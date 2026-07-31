@@ -426,8 +426,11 @@ audited; see the status note below.)
   The CLI is also the **reference client for sharing a vault between devices** (the
   webapp and the extension do the same thing from the browser) —
   `sigil device hybrid-publish` publishes this device's hybrid public key, `sigil
-  vault rekey` re-seals a vault under a random vault key (your password is never
-  shared), `sigil vault share --to <deviceID>` wraps that key to the recipient's
+  vault rekey --yes` re-seals a vault under a random vault key (your password is never
+  shared) — ⚠️ **a one-way door, which is why it needs `--yes`: afterwards your password
+  does NOT open that vault (not "also" — instead), the new key lives in
+  `~/.sigil/vault-keys.json` in the clear, and losing that one file loses the vault; run
+  it without `--yes` to read the full warning** — `sigil vault share --to <deviceID>` wraps that key to the recipient's
   hybrid public key and uploads the opaque envelope, and `sigil vault accept`
   unwraps it on the other side; `sigil totp … --vault-id <id>` then opens the shared
   vault. Keys are never printed — only a short fingerprint. `sigil device
@@ -438,6 +441,17 @@ audited; see the status note below.)
   UNAUDITED**, and revoking a device cannot make it forget a key it already
   accepted — rotation only protects what is written afterwards (see the sharing note
   above).
+  `sigil clock` answers the question every authenticator user eventually has: **is my
+  clock the problem?** A TOTP code is a function of a secret *and the current time*, so a
+  device drifted past half a step starts having codes rejected — and a rejected code looks
+  exactly like a wrong secret, which is why people re-scan the QR, re-import, delete and
+  re-add the account, and none of it helps. It compares this machine against the server's
+  ordinary HTTP `Date` header (no new endpoint, no new dependency), and `push`/`pull`
+  warn on their own once you have drifted far enough to start losing codes.
+  ⛔ **It is a diagnostic and never a correction — nothing here changes the clock your
+  codes are generated from**, and offline it says **NO READING**, which is deliberately
+  not the same answer as "your clock is fine"
+  ([ADR 0050](docs/decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)).
   **The CLI can also print and use a RECOVERY KIT** (and since Phase 56 so can the
   webapp, the extension and the desktop app).
   `sigil recovery generate | cover | check | verify | restore | revoke` produces a
@@ -564,6 +578,20 @@ audited; see the status note below.)
   UNAUDITED, unsigned, unnotarized and not distributed** — no installer was built, and
   there is no QR scanning. Do not store real 2FA
   secrets.
+- **Across all four clients** (Phase 62,
+  [ADR 0050](docs/decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)):
+  deleting an account now requires a **confirmation that names it**, because the button
+  sits inches from the code you came to read on a row that repaints every second — and
+  because a deletion now writes a tombstone that propagates and is protected against
+  being resurrected, so it is *more* permanent than it used to be. ⛔ **A confirmation is
+  not an undo: a confirmed delete is still permanent**, and an undo was rejected on the
+  merits rather than deferred (it would have to retract a tombstone, which is
+  unretractable once another device has merged it, or hold your intent in memory, where
+  closing a tab discards it). Every client can also **check whether its clock is the
+  problem** — a reading, ⛔ **never a correction**, and offline it reports **no reading**
+  rather than claiming your clock is fine. And two clients that had been telling you, in
+  the product, that they *"cannot print"* a recovery kit — false since Phase 56, with the
+  button on the same screen — now say the true thing.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.

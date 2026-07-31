@@ -252,6 +252,23 @@
           <button id="push-btn" class="ghost">Push</button>
           <button id="pull-btn" class="ghost">Pull</button>
         </div>
+
+        <!-- ⛔ THE CLOCK DIAGNOSTIC. A TOTP code rejected because this machine's
+             clock drifted is indistinguishable, to the user, from a wrong
+             secret. ⛔⛔ It REPORTS; it never adjusts the clock codes come from. -->
+        <p class="hint">
+          Codes are computed from <strong>this machine&rsquo;s</strong> system
+          clock. Once it has drifted more than half a TOTP step, codes are likely
+          to be rejected even though the secret is perfectly correct, and the
+          further it drifts the more certain that becomes. Some verifiers accept a
+          code from one step either side, so a small drift may still get through,
+          but you cannot count on it. This compares it against the server&rsquo;s
+          clock and never changes it.
+        </p>
+        <div class="row">
+          <button id="clock-btn" class="ghost">Check clock</button>
+        </div>
+        <p class="hint" id="clock-status" data-state="unread">Not checked yet.</p>
       </details>
 
       <details id="share-block" hidden>

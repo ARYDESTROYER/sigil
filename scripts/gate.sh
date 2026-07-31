@@ -97,8 +97,21 @@ else
   elif printf '%s' "$gv" | grep -q 'No vulnerabilities found'; then
     ok "govulncheck clean ($("$SCANGO" version | awk '{print $3}'), the shipped line)"
   else
-    bad "govulncheck ($("$SCANGO" version | awk '{print $3}')): $(printf '%s' "$gv" | grep -c '^Vulnerability #') vulnerability(ies)
+    n=$(printf '%s' "$gv" | grep -c '^Vulnerability #')
+    if [ "$n" -gt 0 ]; then
+      bad "govulncheck ($("$SCANGO" version | awk '{print $3}')): $n vulnerability(ies)
 $(printf '%s' "$gv" | grep -E '^Vulnerability #|^    Found in:|^    Fixed in:' | sed 's/^/      /')"
+    else
+      # ⚠️ OUTPUT THAT IS NEITHER "clean" NOR A FINDING MEANS THE SCAN DID NOT
+      # COMPLETE — a module download failure, a proxy timeout, a toolchain
+      # hiccup. The first version reported this as
+      #     ✗ govulncheck (go1.25.12): 0 vulnerability(ies)
+      # which reads like a contradiction and cost a verifier a debug cycle: zero
+      # findings presented as a failure. Same family as the cargo-audit flake
+      # that printed an EMPTY reason. Say which it is.
+      bad "govulncheck COULD NOT COMPLETE — this is NOT a finding, the scan failed to run:
+$(printf '%s' "$gv" | tail -5 | sed 's/^/      /')"
+    fi
   fi
 fi
 

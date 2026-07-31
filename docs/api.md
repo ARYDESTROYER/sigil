@@ -236,7 +236,7 @@ leaves no origins at all is a **startup failure**. **`*` is REFUSED at boot**
 | `Vary: Origin` | added to **every** response the middleware touches, allowed or not |
 | `Access-Control-Allow-Origin` | the **echoed** request origin, and only when it is on the list — never `*`, never a value the request did not present |
 | `Access-Control-Allow-Credentials` | ⛔ **never set** |
-| `Access-Control-Expose-Headers` | `X-Request-ID`, `X-Sigil-Entitlement`, `X-Sigil-Entitlement-Status`, `X-Sigil-Entitlement-Grace-Ends` — without this a browser client cannot read its own [grace warning](#warning-headers) |
+| `Access-Control-Expose-Headers` | `X-Request-ID`, **`Date`**, `X-Sigil-Entitlement`, `X-Sigil-Entitlement-Status`, `X-Sigil-Entitlement-Grace-Ends` — without this a browser client cannot read its own [grace warning](#warning-headers), nor the server clock its [clock-skew diagnostic](#the-date-header-and-the-client-clock-skew-diagnostic) compares against |
 | preflight from an **allowed** origin | **`204`**, with `Access-Control-Allow-Methods` (`GET, HEAD, POST, PUT, DELETE, OPTIONS`), an explicit `Access-Control-Allow-Headers` (`Content-Type, X-Request-ID, X-Sigil-Device, X-Sigil-Timestamp, X-Sigil-Nonce, X-Sigil-Signature, X-Sigil-Enroll-Token, X-Sigil-Admin-Token`) and `Access-Control-Max-Age: 600` |
 | preflight from an **unknown** origin | falls through to the mux → `405`, exactly as before — so there is no probe distinguishing *"this route exists"* from *"your origin is allowed"* |
 | a preflight the middleware answers | reaches **no handler**: no op-log, no device registry, no rate limiter, no database |
@@ -254,6 +254,43 @@ can still have up to ten minutes of cached preflight in an already-open browser.
 No Private Network Access header is sent. **In production, serve the app and the
 API from the same origin behind the reverse proxy and set nothing here** — see
 [`deployment.md` §18](deployment.md#18-browser-origins--cors-operator-guide--opt-in).
+
+### The `Date` header and the client clock-skew diagnostic
+
+Every response `sigild` produces carries a standard HTTP **`Date`** header (RFC
+9110 §6.6.1) — Go's `net/http` stamps it, and nothing here adds, removes or
+rewrites it. There is **no time endpoint**, and none is planned: `Date` is already
+on the wire on every response, including non-2xx ones.
+
+Clients use it as a **clock reference**. A TOTP code is a function of a secret and
+the current time, so a device whose clock has drifted past half a step starts
+having codes rejected — and to the user that is indistinguishable from a wrong
+secret. Every Sigil client can compare its own clock against the server's and say
+which it is: `sigil clock`, the desktop's `clock_skew` command, and the browser
+clients' *Check clock* control (all over
+[`sigil-wasm/clock-skew.mjs`](../sigil-wasm/clock-skew.mjs) or its Rust twin in
+`cli/src/lib.rs`). The reading is normally taken from an unauthenticated
+`GET /healthz`, which is never dev-gated and never rate limited, so it works
+against a server whose entire stateful surface is still answering `501`.
+
+⚠️ **`Date` is NOT a CORS-safelisted response header**, so a browser on a
+different origin reads **`null`** for it unless the server exposes it — measured,
+not assumed: with a real Chromium against a real `sigild`, the only readable
+headers were `content-length`, `content-type` and `x-request-id`. That is why
+`Date` is on the `Access-Control-Expose-Headers` list above. It is exposed only
+when an allowlist is configured; **with `SIGILD_CORS_ORIGINS` unset the middleware
+is not installed and nothing changes**, and the header itself has always been sent
+and has always been readable by `curl`, the CLI and the desktop.
+
+⛔ **This is a client-side DIAGNOSTIC and it is not a security control.** The
+server does no clock validation of any kind: it never rejects a request for a
+skewed clock on this basis (the ±300 s window on the signed-request contract is a
+separate, unrelated mechanism), and it offers no time-sync service. The reading is
+an unauthenticated plaintext header over plain HTTP, so anyone who can see the
+traffic can change it — a hostile or merely wrong server can make the hint wrong
+in either direction. **No key, signature, envelope or generated code depends on
+it.** Clients never generate codes against server time — see
+[ADR 0050](decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md).
 
 ---
 

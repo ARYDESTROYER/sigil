@@ -44,7 +44,15 @@ as whole snapshots was **last-writer-wins**, so a device that never pulled could
 destroy another device's 2FA account and both pushes reported success — the fix is
 a **2P-Set** merged over **every** op rather than the tip, which is free on the
 wire and therefore **retroactive**, and it is the ADR to read for what a hostile
-server can do with a **tombstone**).
+server can do with a **tombstone**) and
+[0050](decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)
+(the non-cryptographic defects that still lose a user their accounts — a one-click
+delete whose stakes **0049 had just raised**, two clients denying **in the
+product** that they could print the recovery kit that prevents permanent account
+loss, and a clock diagnostic that is ⛔ **a reading and never a correction**; it is
+also the one recent phase where **`sigild` was modified**, by exactly one additive
+line, and it says so rather than reaching for the usual *"`sigild` gained
+nothing"*).
 
 **What is real, and what is not.** The cryptography is real and
 **unaudited**. `sigild` is a working dev server whose stateful surface is
@@ -88,7 +96,20 @@ warning is built); and the merge is correct **only because entries are immutable
 so **adding an edit would silently break it** unless the edit is expressed as
 delete + add with a fresh id — guarded by a source check that makes that decision
 loud rather than impossible
-([0049](decisions/0049-entry-identity-and-the-mergeable-vault.md)). Each
+([0049](decisions/0049-entry-identity-and-the-mergeable-vault.md)). Since Phase 62,
+add three that are about the **product** rather than the cryptography
+([0050](decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)):
+a delete is now confirmed on every client, but **a confirmation is not an undo** —
+a confirmed delete writes a tombstone that propagates and is protected against
+resurrection, so it is still permanent, and an undo was rejected on the merits
+rather than deferred; the **clock-skew reading is a diagnostic and never a
+correction**, an **offline client gets no reading at all** (which is not a report
+that its clock is fine), the reading is an unauthenticated plaintext header a
+hostile server can lie about, and the desktop's clock UI is **by-eye only** while
+the browsers' clock specs run against a **test double**; and two clients had been
+telling users **in the product** that they *"cannot print"* a recovery kit — false
+since Phase 56 — which is worth reading as a warning about how this project's
+in-product claims drift, not only its documents. Each
 ADR ends with its own limits, and they are meant to be read as
 findings-in-waiting rather than disclaimers.
 

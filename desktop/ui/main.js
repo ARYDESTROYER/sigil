@@ -156,10 +156,13 @@ async function refresh() {
       if (
         !window.confirm(
           `Delete ${who}?\n\n` +
-            "This permanently deletes the second-factor secret from this vault, " +
-            "and the deletion is synced to every other device holding it. It " +
-            "cannot be undone from here — if you no longer have this secret " +
-            "anywhere else, you may lose access to the account it protects."
+            "This permanently deletes the second-factor secret from this vault. " +
+            "Sigil syncs only when you ask it to, so the deletion reaches every " +
+            "other device holding this vault the next time you Push and they " +
+            "Pull; until you do — and forever, if you never sync — it applies " +
+            "to this machine alone. It cannot be undone from here — if you no " +
+            "longer have this secret anywhere else, you may lose access to the " +
+            "account it protects."
         )
       )
         return;
@@ -466,11 +469,24 @@ $("account-revoke-form").addEventListener("submit", async (e) => {
 $("convert-btn").addEventListener("click", async () => {
   const id = vaultId();
   if (!id) return;
+  // ⛔ The same ONE-WAY DOOR the CLI's `vault rekey --yes` gates. The old prompt
+  // said "the vault opens with that key, not your password" — true, but it never
+  // said WHERE that key then lives (vault-keys.json, in the clear, 0600) or that
+  // losing that one file loses the vault outright while the remembered password
+  // is worth nothing. Say both, before acting.
   if (
     !window.confirm(
       `Re-seal this vault under a random vault key for "${id}"?\n\n` +
-        "This is one-way: afterwards the vault opens with that key, not your " +
-        "password. Your password is never shared or uploaded."
+        "THIS IS ONE-WAY AND THERE IS NO WAY BACK.\n\n" +
+        "• Your password will NO LONGER OPEN THIS VAULT — not \"as well as\", instead.\n" +
+        "• The new key is written to vault-keys.json in this app's state directory " +
+        "(mode 0600, but stored in the clear). That file becomes the ONLY thing " +
+        "that opens the vault.\n" +
+        "• Lose it — a wiped home directory, a backup that skipped dotfiles, a " +
+        "fresh install — and the vault is unreadable by you and by us, password " +
+        "or not. Back it up.\n\n" +
+        "Do this only if you are converting the vault for device-to-device sharing. " +
+        "Your password is never shared or uploaded."
     )
   )
     return;
@@ -499,6 +515,8 @@ $("push-btn").addEventListener("click", async () => {
   // surface the deadline.
   await refreshEntitlement();
   await pullEntitlementFromServer();
+  // A successful push means a reachable server, i.e. a free clock reference.
+  await refreshClock();
 });
 
 $("pull-btn").addEventListener("click", async () => {
@@ -511,6 +529,40 @@ $("pull-btn").addEventListener("click", async () => {
       : "nothing new on the server"
   );
   if (r.adopted) refresh();
+  await refreshClock();
+});
+
+// ── clock skew (the DIAGNOSTIC) ─────────────────────────────────────────────
+//
+// ⛔ A TOTP code rejected because this machine's clock drifted is
+// INDISTINGUISHABLE, to the user, from a wrong secret — they re-scan the QR,
+// re-import the export, delete and re-add the account, and none of it helps.
+//
+// ⛔⛔ IT REPORTS. IT NEVER CORRECTS. `list` still computes every code from this
+// machine's own system clock; nothing on this path touches it.
+//
+// ⭐ `available: false` renders as NO READING, never as "your clock is fine".
+async function refreshClock() {
+  const el = $("clock-status");
+  if (!el) return;
+  let r;
+  try {
+    r = await invoke("clock_skew");
+  } catch (e) {
+    el.dataset.state = "unavailable";
+    el.className = "warn";
+    el.textContent =
+      "NO CLOCK READING — this is not a report that the clock is fine, it is the " +
+      `absence of a report (${e?.message ?? e}).`;
+    return;
+  }
+  el.dataset.state = r.available ? (r.skewed ? "skewed" : "ok") : "unavailable";
+  el.className = r.skewed || !r.available ? "warn" : "hint";
+  el.textContent = r.detail;
+}
+
+$("clock-btn").addEventListener("click", () => {
+  void refreshClock();
 });
 
 $("share-form").addEventListener("submit", async (e) => {

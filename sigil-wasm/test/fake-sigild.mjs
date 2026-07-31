@@ -104,9 +104,17 @@ function makeCors(allowed) {
     const origin = req.headers.origin ?? "";
     if (!origin || !list.has(origin.toLowerCase())) return false;
     res.setHeader("Access-Control-Allow-Origin", origin);
+    // ⚠️ MUST MATCH `corsExposedResponseHeaders` in sigild/internal/api/cors.go.
+    // "Date" is on that list because it is NOT one of the seven CORS-safelisted
+    // response headers, so a browser reads null for it cross-origin — which is
+    // what the clock-skew diagnostic depends on. This double omitting it made
+    // the webapp's "Check clock" spec report NO READING against a server whose
+    // real counterpart answers fine: a double that is more RESTRICTIVE than the
+    // thing it stands in for fails an honest test, which is the benign
+    // direction, but it is still a divergence and it still cost a debug cycle.
     res.setHeader(
       "Access-Control-Expose-Headers",
-      "X-Sigil-Entitlement, X-Sigil-Entitlement-Status, X-Sigil-Entitlement-Grace-Ends",
+      "X-Request-ID, Date, X-Sigil-Entitlement, X-Sigil-Entitlement-Status, X-Sigil-Entitlement-Grace-Ends",
     );
     return true;
   };

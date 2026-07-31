@@ -108,8 +108,28 @@ var corsAllowedMethods = strings.Join([]string{
 // to a browser client (they are not on the CORS-safelisted set), and a customer
 // inside their grace period would never be told — which is the exact defect the
 // entitlement work exists to fix.
+//
+// ⭐ "Date" IS ON THIS LIST FOR THE SAME REASON, and it was measured rather than
+// assumed. A TOTP code is a function of a secret and the current time, so a
+// device whose clock has drifted past half a step starts having its codes
+// rejected (RFC 6238 §5.2 lets a verifier accept one step either side, so it is
+// LIKELY and increasingly certain, not immediate and total) — and to the user a
+// rejected code is indistinguishable from a wrong secret. The client-side
+// diagnostic that tells them apart (sigil-wasm/clock-skew.mjs) reads the server's
+// clock off the `Date` header every Go response already carries. But `Date` is
+// NOT one of the seven CORS-safelisted response headers, so a browser on a
+// different origin gets null for it: probed against a real sigild from a real
+// Chromium, the only readable headers were content-length, content-type and
+// x-request-id. Naming it here is what makes the browser half of that diagnostic
+// possible at all.
+//
+// It discloses nothing: the header is ALREADY sent on every response and already
+// readable by curl, the CLI and the desktop. All that changes is whether
+// same-machine JavaScript may read a value the browser already received. And
+// this whole middleware is not installed unless SIGILD_CORS_ORIGINS is set.
 var corsExposedResponseHeaders = strings.Join([]string{
 	"X-Request-ID",
+	"Date",
 	headerEntitlement,
 	headerEntitlementStatus,
 	headerEntitlementGraceEnds,

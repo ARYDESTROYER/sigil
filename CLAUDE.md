@@ -828,6 +828,21 @@ public, make no security claims, until the audit completes and trademark clears.
   SAME ORIGIN behind the reverse proxy and set nothing here**; this is for the localhost dev
   topology, and the boot log says so. It constrains **browsers only** — `curl`, the CLI and
   the desktop ignore it — and it does not make plain HTTP safe.
+  ⚠️ **Phase 62 (ADR 0050) MODIFIED `sigild` — say so, do NOT reach for the "sigild gained
+  nothing" line.** It is **ONE additive `"Date",`** in `corsExposedResponseHeaders`
+  (`internal/api/cors.go`) **plus its assertion** in `cors_test.go`. **WHY:** `Date` is
+  **NOT one of the seven CORS-safelisted response headers**, so a browser on another origin
+  reads **`null`** for it — **measured, not assumed**: probed from a real Chromium against a
+  real `sigild`, the only readable headers were `content-length`, `content-type` and
+  `x-request-id`. The clock-skew diagnostic reads the server's clock off that header, so
+  **without this line the BROWSER half of the diagnostic is DEAD** (it would report *no
+  reading* forever). It **discloses nothing**: the header was already sent on every response
+  and already readable by `curl`, the CLI and the desktop — all that changes is whether
+  same-origin-policy-bound JavaScript may read a value the browser already received — and
+  the middleware **is not installed at all unless `SIGILD_CORS_ORIGINS` is set**. No route,
+  header, canonical message, migration, table, metric or dependency; `sigild` still has
+  **exactly ONE direct Go dependency**. (The MV3 extension never needed it — a
+  `host_permissions` page is exempt from CORS.)
 - `sigild/` also carries **seven committed but INERT scaffold packages** (compile, do
   nothing, wired to nothing): `cmd/worker-audit`, `cmd/worker-breach`, `cmd/worker-rehash`
   (~15-line `main.go` stubs) and `internal/admin`, `internal/auth`, `internal/push`,
@@ -1050,6 +1065,37 @@ public, make no security claims, until the audit completes and trademark clears.
   **NODE-target** wasm (`sigil-wasm/pkg-node`) in the TEST process to open the app's
   sealed container — `@sigil/wasm` is a **bundler-target** package Node cannot require —
   so `.github/workflows/web.yml` now also runs the repo-root `build-wasm.sh`.
+  ⭐ **PHASE 62 (ADR 0050) — the app stops harming and lying to its user.** THREE things,
+  all in `app/authenticator.tsx`, all pinned by a NEW **`tests/user-safety.spec.ts`** that
+  drives the **REAL shipping UI** (13 spec files now): **(1) a DELETE CONFIRMATION that
+  NAMES the entry.** `onRemove` went straight to the removal from a button inches from the
+  code the user came to read, on a row that **re-renders every second** — and ⭐ **Phase 61
+  RAISED the stakes**, because a removal now writes a **TOMBSTONE that propagates and is
+  specifically protected against resurrection** (ADR 0049 §3), so the accidental safety net
+  is gone by design. ⭐ **A CONFIRM, deliberately NOT an UNDO:** an undo must either write
+  the tombstone and retract it (**the exact resurrection ADR 0049 prevents, unretractable
+  once another device has merged it**) or hold the intent in memory, where **closing the tab
+  discards it** — so the gate goes BEFORE the irreversible act and the tombstone is written
+  at commit and never before. ⚠️ **The copy must NOT overclaim propagation:** Sigil syncs
+  **only when asked**, so it says the deletion reaches other devices *the next time you Push
+  and they Pull*, and **until you do — and forever, if you never sync — it applies to this
+  device alone** (the first draft said "is synced to every other device holding it", which
+  is FALSE; the spec now asserts the honest wording positively **and** asserts the
+  overclaiming sentence is ABSENT). **(2) A FALSE CAPABILITY CLAIM DELETED.** The account
+  panel told the user, in the product, that *"this app cannot print one"* about a recovery
+  kit — **true before Phase 56, false ever since**, with the **Generate a kit** button on
+  the same screen. ⛔ **That is the worst class of stale claim this repo produces: it does
+  not merely fail to help, it routes the user PAST the one control (ADR 0042) that prevents
+  permanent, unrecoverable loss of every account** (ADR 0040 limitation 1). Now ONE
+  `RECOVERY_ADVICE` constant per client, used everywhere the subject comes up. ⚠️ **The
+  finding named only the extension — the webapp carried the identical sentence and was
+  found by GREPPING for the claim.** A false sentence is a class, not an instance.
+  **(3) A CLOCK PANEL** over `wasm.fetchClockSkew` / `describeClockSkew`, also refreshed
+  after a successful sync (a reachable server is a free clock reference). ⛔⛔ **It reports,
+  never corrects** — `useUnixClock` still drives every code from this device's own clock —
+  and `state:"unavailable"` renders as **NO READING, not "your clock is fine"**.
+  ⚠️ `user-safety.spec.ts` runs against **`fake-sigild.mjs`, a DOUBLE**; the server-side
+  half is `clock-skew-interop.mjs` against a real `sigild`.
 - `web/apps/webapp/` + `web/packages/sigil-wasm/` — **the first real product client
   surface** (no longer reserved). `web/packages/sigil-wasm` is the **`@sigil/wasm`**
   workspace loader package: its `build.sh` compiles the **repo-root `sigil-wasm` Rust
@@ -1080,9 +1126,13 @@ public, make no security claims, until the audit completes and trademark clears.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices; latest is
-  **0047**, the container parameter ceiling + the no-downgrade ratchet + the
-  forward-compatible vault schema — which also carries **dated addenda on 0020, 0024,
-  0025, 0026 and 0046**, per this repo's addendum rule: append, never rewrite).
+  **0050**, *"the product stops harming and lying to its user"* — the delete
+  confirmation and why it is a **CONFIRM and not an UNDO**, the two false in-product
+  recovery-kit claims, `vault rekey`'s one-way door, and the clock-skew **diagnostic**;
+  it carries **dated addenda on 0042, 0044 and 0049**, per this repo's addendum rule:
+  append, never rewrite. **0047** — the container parameter ceiling + the no-downgrade
+  ratchet + the forward-compatible vault schema — likewise carries addenda on 0020,
+  0024, 0025, 0026 and 0046).
   ⚠️ **Audit #4 found the STATUS BLOCKS an external
   reviewer reads FIRST were false** and would have scoped sigild's cryptography out of
   review: `api.md`, `architecture.md` and `deployment.md` each opened with *"performs no
@@ -1603,6 +1653,35 @@ public, make no security claims, until the audit completes and trademark clears.
   in the library (a RAW-STRING read of `GET /v1/billing/subscription`, deliberately
   unparsed so the `entitlement` block is interpreted in exactly one place per client) —
   the function the desktop's grace warning needed and did not have.
+  ⭐ **Phase 62 (ADR 0050) — TWO user-safety changes and ONE new command.**
+  **(1) `sigil vault rekey` now REQUIRES `--yes`.** It is a **ONE-WAY DOOR** and it used to
+  run on a bare invocation: afterwards `SIGIL_PASSWORD` does **NOT** open that vault — not
+  "also", **INSTEAD** — and the fresh random key lives in `~/.sigil/vault-keys.json`, mode
+  0600 but **IN THE CLEAR**, so losing that one file loses the vault outright while the user
+  carefully remembers a password now worth nothing. Worse, the aftermath is **silently
+  misdiagnosed**: the next ordinary `sigil totp list` fails with
+  `could not open record: Aead(Authentication)` — **BYTE-IDENTICAL to a wrong password** —
+  so the obvious reaction ("I must have mistyped") is the wrong one. Without `--yes` it
+  **REFUSES** and prints the whole consequence; ⭐ **a REFUSAL, not a prompt**, so it behaves
+  the same in a script as at a terminal and the operator has to type the acknowledgement.
+  A separate `rekey_hint` explains the aftermath when an open fails and the keyring names
+  vaults. **(2) `sigil clock [--server <url>]`** — the CLOCK-SKEW **DIAGNOSTIC**
+  (`CLOCK_SKEW_WARN_SECONDS` = **15** = half a 30 s step, `ClockSkew`, `parse_http_date`,
+  `server_clock_skew` in `cli/src/lib.rs`), plus a **stderr warning appended to `push` and
+  `pull`** so a broken clock is found while doing something else rather than in front of a
+  rejected login. ⭐ **The source of truth was ALREADY ON THE WIRE** — every Go response
+  carries a `Date` header (RFC 9110 §6.6.1), so any `sigild` is a clock reference: **no new
+  route, no new endpoint, NO NEW DEPENDENCY** (the IMF-fixdate parse is hand-rolled;
+  a date crate for one 29-character field is not worth it here). It reads
+  **unauthenticated `GET /healthz`**, deliberately its **OWN** request rather than a value
+  threaded out of push/pull, because **the reading must still work when the sync FAILED** —
+  exactly when the user is trying to work out what is wrong. ⛔⛔ **IT REPORTS AND NEVER
+  CORRECTS:** nothing feeds the clock codes are generated from. ⭐ **Offline ⇒ NO READING,
+  and the push/pull warning stays SILENT rather than implying the clock is fine.**
+  ⚠️ **Say it accurately:** RFC 6238 §5.2 lets a verifier accept a code from **one step
+  either side** and real verifiers commonly do, so past the threshold codes are **LIKELY**
+  to be rejected and increasingly certainly so — **never "every code"**. That overstatement
+  shipped in eight places in this phase's first cut and was corrected; do not reintroduce it.
   **Standalone crate** (own `cli/Cargo.lock`, NOT a libsigil workspace member) so
   it can use `getrandom` (+ `ureq`/`serde`/`base64`) without polluting the
   wasm-pure core.
@@ -1966,6 +2045,26 @@ public, make no security claims, until the audit completes and trademark clears.
   unless a caller passes an explicit allowlist**: an earlier revision always sent
   `Access-Control-Allow-Origin: *`, which made six webapp specs pass green while the real
   path was dead. **A double must never be MORE permissive than the thing it doubles.**
+  ⭐ **Phase 62 (ADR 0050) added the CLOCK-SKEW DIAGNOSTIC to JavaScript:**
+  **`sigil-wasm/clock-skew.mjs`** — framework-free, dependency-free, **imports NOTHING**,
+  does **no crypto**, holds **no state**, runs in Node and the browser
+  (`CLOCK_SKEW_WARN_SECONDS` = **15**, `HEADER_DATE`, `parseHttpDate`,
+  `skewFromDateHeader`, `readClockSkew`, `fetchClockSkew`, `describeClockSkew`),
+  re-exported by `@sigil/wasm` in **BOTH `index.mjs` AND `index.d.ts`** (the two-hole trap
+  Phase 56 fell into) and vendored into the extension (`build.sh` now copies **EIGHT**
+  helpers). ⛔⛔ **IT IS A DIAGNOSTIC AND NEVER A CORRECTION** — nothing feeds the clock
+  codes are GENERATED from; the core reads no clock (ADR 0007) and the instant is always
+  the caller's. ⭐ **OFFLINE = `state:"unavailable"` = NO READING, which is a DIFFERENT
+  ANSWER from "your clock is fine"** and is rendered as such everywhere. ⛔ **A mis-parse
+  must be `null`, never a wrong number:** `Date.parse("12345")` returns a FINITE number
+  (the year 12345), and the first version turned a nonsensical header into a confident
+  reading ~10,000 years out — i.e. a screaming skew warning aimed at a user whose clock was
+  PERFECT — so the shape is checked against RFC 9110 IMF-fixdate **before** `Date.parse` is
+  trusted (the Rust half hand-rolls the parse and never had the exposure). ⚠️ **The 15 s
+  threshold and the description are MIRRORED — not shared — with `cli/src/lib.rs`** and
+  **MUST stay in sync**; `clock-skew-interop.mjs` guards it **two ways** (the literal, BOTH
+  sides pinned to the golden `15`, because a *coordinated* retune passes an equality check;
+  and the behaviour, the real binary and the JS reader judging ONE identical reading).
 - `extension/` — **no longer reserved**: a real **Manifest V3 browser extension**
   whose **popup is a multi-account encrypted TOTP vault**, running the libsigil core
   as **WebAssembly inside the extension page** — the **second real product client
@@ -2075,6 +2174,16 @@ public, make no security claims, until the audit completes and trademark clears.
   zeroization); the reserved-stub ambitions (phishing protection, passkey provider,
   content scripts) are **NOT** implemented. Do NOT store real 2FA
   secrets. ADR 0030, ADR 0033.
+  ⭐ **Phase 62 (ADR 0050) gave the popup the SAME three user-safety changes as the
+  webapp** — a **delete confirmation naming the entry** (`remove-confirm-yes`; the same
+  CONFIRM-not-UNDO reasoning, and the same corrected propagation wording: *the next time
+  you Push and they Pull; until you do — and forever, if you never sync — it applies to
+  this device alone*), the **`RECOVERY_ADVICE` constant** replacing the false *"this app
+  cannot print one"* sentence, and a **Check clock** control over the newly vendored
+  `clock-skew.mjs` (`build.sh` now vendors **EIGHT** helpers; `clock-skew.mjs` imports
+  nothing). Pinned by a NEW **`tests/user-safety.spec.mjs`** driving the real popup —
+  **9 spec files** now. ⚠️ Against the `fake-sigild.mjs` DOUBLE. ⛔⛔ The clock control
+  **reports and never corrects**; offline is **NO READING**, not "fine".
 - `desktop/` — **the NATIVE client column** (fourth client surface, FIRST native
   one): a **Tauri v2** desktop authenticator. **THE ARCHITECTURAL POINT: `sigil-core`
   is a plain NATIVE Rust dependency here — there is NO wasm, `wasm-bindgen` or
@@ -2093,9 +2202,9 @@ public, make no security claims, until the audit completes and trademark clears.
   constants, **plus the whole server-facing half in `desktop/core/src/net.rs`**
   (below); **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
   an `AppState { session: Mutex<Option<VaultSession>>, sync: Mutex<Option<DeviceConfig>> }`,
-  and **41 `#[tauri::command]`s** (count verified against
+  and **42 `#[tauri::command]`s** (count verified against
   `desktop/src-tauri/src/main.rs` — every one registered in `generate_handler!`; this
-  line said "twenty-one", then "thirty-one", then "forty", each stale within a phase
+  line said "twenty-one", then "thirty-one", then "forty", then "forty-one", each stale within a phase
   or two, which is why `sigil-wasm/test/docs-claims-guard.mjs` now checks it
   mechanically): the ten
   offline ones (`status`, `unlock`,
@@ -2267,7 +2376,8 @@ public, make no security claims, until the audit completes and trademark clears.
   path under `desktop/`.** Do NOT store real 2FA
   secrets. ADR 0032, ADR 0037, ADR 0038, ADR 0042, ADR 0043.
   ⭐ **Phase 59 (ADR 0047) reached the desktop by the same REUSE rule, and added no
-  commands** (still **41**): `ImportSummary` gained **`partial_batches`** (one note
+  commands** (**41** at the time; **42** since Phase 62 added `clock_skew`):
+  `ImportSummary` gained **`partial_batches`** (one note
   per multi-QR Google Authenticator batch seen) and **`batches_outstanding`**, plus
   `is_complete()`; the `import` command passes both across the IPC and `desktop/ui/main.js`
   keys its **"⚠️ INCOMPLETE"** framing off **`batches_outstanding`**, NOT off
@@ -2280,6 +2390,29 @@ public, make no security claims, until the audit completes and trademark clears.
   whole vault, so a single non-30 s entry now makes the desktop's migration export fail
   **wholesale**; and the **no-downgrade ratchet does not cover `VaultSession::save`**,
   which seals at `self.params` without reading the existing container.
+  ⭐ **Phase 62 (ADR 0050) — the desktop got the same three user-safety changes, plus its
+  FIRST clock test.** **(1) A DELETE CONFIRMATION** in `desktop/ui/main.js` (a
+  `window.confirm` on the path to `remove_by_id`, with the corrected propagation wording —
+  *the next time you Push and they Pull; until you do — and forever, if you never sync — it
+  applies to this machine alone*). **(2) The CONVERT-TO-SHARED dialog now says what the CLI's
+  `vault rekey --yes` says** — the old prompt said "the vault opens with that key, not your
+  password", true but never naming **WHERE that key then lives** (`vault-keys.json`, 0600
+  but **in the clear**) nor that losing that one file loses the vault while the remembered
+  password is worth nothing. **(3) A `clock_skew` command** (the **42nd**) over
+  `DeviceConfig::clock()` → the `sigil-cli` library — ⭐ **still no second HTTP client, no
+  signing path and no canonical-message copy under `desktop/`** — returning a `ClockDto
+  {available, skewed, skew_seconds, detail}` of **PUBLIC facts only**. ⛔⛔ **It reports and
+  never corrects:** `list` still computes every code from this machine's `now_unix()`.
+  ⭐ **`DeviceConfig::clock()` HAS A REAL TEST against real HTTP** (all three states, both
+  directions of skew, a dead port, a server sending NO `Date` — and after a reading a
+  BILLION seconds out the vault still prints `94287082`), mutation-proven twice; and a real
+  wording bug was fixed there — the error detail said *"could not reach {server}"* on a
+  branch that also covers a server that **answered** but sent no usable `Date`, i.e. telling
+  the reader we could not reach a server we did reach. ⚠️ **STILL BY-EYE:** the clock PANEL
+  in `desktop/ui/` and the delete-confirm dialog are rendered by **no test**;
+  `desktopDeleteGate` in `merge-guard.mjs` is a **source-structure** check proving the
+  confirmation is on the PATH, and nothing about whether the window shows it. **The desktop
+  remains the least-verified client — less so, not fixed.**
 - `web/apps/admin` — reserved. (`web/apps/webapp` + `web/packages/sigil-wasm`,
   `extension/` and `desktop/` are now real — see above.)
 
@@ -2451,30 +2584,31 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (34 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the NINETEEN Node suites below must all PASS.
+# pkg-web/pkg-node (needs wasm-pack); then the TWENTY Node suites below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/19 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/19 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/19 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/19 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/19 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/19 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/19 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/19 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
-node sigil-wasm/test/pinning-interop.mjs            # 9/19 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
-node sigil-wasm/test/accounts-interop.mjs            # 10/19 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
-node sigil-wasm/test/recovery-interop.mjs           # 11/19 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
-node sigil-wasm/test/entitlement-interop.mjs         # 12/19 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
-node sigil-wasm/test/schema-interop.mjs             # 13/19 (Phase 59) the ONLY guard on TWO Rust<->JS mirrors that were silently LOSSY: the TotpVault/TotpEntry schema (serde DROPPED unknown fields; the JS clients rebuilt `{version, entries}` by hand, so an OLD client that merely opened and re-sealed a vault DELETED a newer client's data on a sync path where the OLDEST WRITER WINS) and the Google Authenticator BATCH FRAMING (both codecs discarded batch_size/batch_index/batch_id, so the first QR of a three-QR export imported a THIRD of the accounts and reported success). Drives the REAL `sigil` binary as the Rust half; 10 proofs, incl. min_reader_version failing closed, entry uuids, the period refusal + --skip-unsupported, the hostile-Argon2-header refusal on BOTH sides, and the JS ratchet vs the CLI's own rekey. Needs no server; PASS
-node sigil-wasm/test/passkey-uv-interop.mjs         # 14/19 (Phase 59) the ONLY exercise of the passkey USER-VERIFICATION check. Chrome's CDP virtual authenticator CANNOT produce a "completed but unverified" assertion, so the Playwright passkey suite cannot reach this branch at all, at any size — and an unenforced UV means sealing the hardware slot with CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to prevent. Drives the SHIPPED evaluatePrf over a stubbed navigator.credentials (⚠️ a double MORE PERMISSIVE than any real authenticator — the point); 4 proofs; PASS
-node sigil-wasm/test/seal-params-guard.mjs          # 15/19 (Phase 59) a SOURCE-STRUCTURE guard, not a behavioural one: every product re-seal site must ratchet its Argon2 parameters. A verifier proved mutating five of the six sites left webapp 50/50 and extension 14/14 GREEN, so this buys the regression guard for the failure that actually happens — a NEW call site that forgets. Checks 6 sealing sites across 2 product sources and FAILS if it finds ZERO; PASS
-node sigil-wasm/test/portability-guard.mjs          # 16/19 ⚠️ NOT Phase 59 feature work — it belongs to the 2026-07-30 CI-portability repair that shares this working tree. The suites are WRITTEN on macOS and RUN on ubuntu-latest, and nothing checked the two agreed: six suites hardcoded /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used `stat -f … || stat -c …`, which GNU stat does NOT fail on — so those jobs were RED for several phases while the macOS gate printed ALL GREEN. A SOURCE check, NOT a Linux run: it guards the two idioms that have actually bitten and CANNOT prove portability. PASS
-node sigil-wasm/test/merge-interop.mjs               # 17/19 (Phase 61) the ONLY cross-language proof that a vault MERGES instead of overwriting. Real sigild + the REAL `sigil` binary + JS clients, 16 blocks: the HEADLINE reproduction (two devices, neither pulls, BOTH accounts survive — this was a reproduced data LOSS), convergence/idempotence/associativity, delete + re-add, the LEGACY derived-id path, import de-dup on CONTENT (`work@github` and `work@gitlab` both live), the entry-id KAT, a PROPERTY block (600 generated vault pairs, order-independence asserted byte-for-byte and FAILING if fewer than 20 rounds hit the interesting same-uuid conflict), TOMB-XTRA (Rust and JS must pick the SAME winner for a conflicting unknown tombstone field), THREE-DEV (a device joining LATE with UNPUSHED local work of its own — the only account in the repo that exists nowhere but one client's memory when a three-branch log is folded) and SIZE (a 750-tombstone vault warns without failing). ⚠️ SLOW (~10-15 min: every sync runs Argon2id at RECOMMENDED); PASS
-node sigil-wasm/test/merge-guard.mjs                 # 18/19 (Phase 61) a SOURCE-STRUCTURE guard on the property the merge RESTS on: entries are IMMUTABLE. 51 checks across the shipping clients — no in-place write to a content field (exact per-file counts with written justifications, so a MISSING hit fails too), no edit-shaped declaration (`rename*`/`edit[Ee]ntry*`/`set(Label|Secret|…)`), the `sigil totp` subcommand set stays {add,code,export,import,list,remove,sync}, the in-code immutability warning cannot be deleted, every adoption path merges, every removal tombstones, every import de-dups by content, the id derivation is NOT reimplemented in JS, and the 64 KiB op cap agrees across Go/Rust/JS. ⚠️ It CANNOT catch an edit routed through an unknown helper; PASS
-node sigil-wasm/test/docs-claims-guard.mjs           # 19/19 the COUNTABLE claims in every .md (except docs/decisions/, whose ADRs are dated records) must match the tree: the desktop Tauri command count (drifted 21 -> 31 -> 40 -> 41), sigild's direct dependency count, the node interop + shell e2e suite counts, no dangling/gapped ADR reference, and getrandom==0. ⚠️ It checks NUMBERS, not PROSE — the threat-model row that asserted a defence which did not exist is invisible to it. ⛔ NOT YET RUN BY ANY WORKFLOW; PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/20 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/20 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/20 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/20 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/20 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/20 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/20 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/20 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/20 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/accounts-interop.mjs            # 10/20 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
+node sigil-wasm/test/recovery-interop.mjs           # 11/20 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
+node sigil-wasm/test/entitlement-interop.mjs         # 12/20 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
+node sigil-wasm/test/schema-interop.mjs             # 13/20 (Phase 59) the ONLY guard on TWO Rust<->JS mirrors that were silently LOSSY: the TotpVault/TotpEntry schema (serde DROPPED unknown fields; the JS clients rebuilt `{version, entries}` by hand, so an OLD client that merely opened and re-sealed a vault DELETED a newer client's data on a sync path where the OLDEST WRITER WINS) and the Google Authenticator BATCH FRAMING (both codecs discarded batch_size/batch_index/batch_id, so the first QR of a three-QR export imported a THIRD of the accounts and reported success). Drives the REAL `sigil` binary as the Rust half; 10 proofs, incl. min_reader_version failing closed, entry uuids, the period refusal + --skip-unsupported, the hostile-Argon2-header refusal on BOTH sides, and the JS ratchet vs the CLI's own rekey. Needs no server; PASS
+node sigil-wasm/test/passkey-uv-interop.mjs         # 14/20 (Phase 59) the ONLY exercise of the passkey USER-VERIFICATION check. Chrome's CDP virtual authenticator CANNOT produce a "completed but unverified" assertion, so the Playwright passkey suite cannot reach this branch at all, at any size — and an unenforced UV means sealing the hardware slot with CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to prevent. Drives the SHIPPED evaluatePrf over a stubbed navigator.credentials (⚠️ a double MORE PERMISSIVE than any real authenticator — the point); 4 proofs; PASS
+node sigil-wasm/test/seal-params-guard.mjs          # 15/20 (Phase 59) a SOURCE-STRUCTURE guard, not a behavioural one: every product re-seal site must ratchet its Argon2 parameters. A verifier proved mutating five of the six sites left webapp 50/50 and extension 14/14 GREEN, so this buys the regression guard for the failure that actually happens — a NEW call site that forgets. Checks 6 sealing sites across 2 product sources and FAILS if it finds ZERO; PASS
+node sigil-wasm/test/portability-guard.mjs          # 16/20 ⚠️ NOT Phase 59 feature work — it belongs to the 2026-07-30 CI-portability repair that shares this working tree. The suites are WRITTEN on macOS and RUN on ubuntu-latest, and nothing checked the two agreed: six suites hardcoded /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used `stat -f … || stat -c …`, which GNU stat does NOT fail on — so those jobs were RED for several phases while the macOS gate printed ALL GREEN. A SOURCE check, NOT a Linux run: it guards the two idioms that have actually bitten and CANNOT prove portability. PASS
+node sigil-wasm/test/merge-interop.mjs               # 17/20 (Phase 61) the ONLY cross-language proof that a vault MERGES instead of overwriting. Real sigild + the REAL `sigil` binary + JS clients, 16 blocks: the HEADLINE reproduction (two devices, neither pulls, BOTH accounts survive — this was a reproduced data LOSS), convergence/idempotence/associativity, delete + re-add, the LEGACY derived-id path, import de-dup on CONTENT (`work@github` and `work@gitlab` both live), the entry-id KAT, a PROPERTY block (600 generated vault pairs, order-independence asserted byte-for-byte and FAILING if fewer than 20 rounds hit the interesting same-uuid conflict), TOMB-XTRA (Rust and JS must pick the SAME winner for a conflicting unknown tombstone field), THREE-DEV (a device joining LATE with UNPUSHED local work of its own — the only account in the repo that exists nowhere but one client's memory when a three-branch log is folded) and SIZE (a 750-tombstone vault warns without failing). ⚠️ SLOW (~10-15 min: every sync runs Argon2id at RECOMMENDED); PASS
+node sigil-wasm/test/merge-guard.mjs                 # 18/20 (Phase 61; extended in Phase 62) a SOURCE-STRUCTURE guard on the property the merge RESTS on: entries are IMMUTABLE. 108 checks across the shipping clients — no in-place write to a content field (exact per-file counts with written justifications, so a MISSING hit fails too), no edit-shaped declaration (`rename*`/`edit[Ee]ntry*`/`set(Label|Secret|…)`), the `sigil totp` subcommand set stays {add,code,export,import,list,remove,sync}, the in-code immutability warning cannot be deleted, every adoption path merges, every removal tombstones, every import de-dups by content, the id derivation is NOT reimplemented in JS, and the 64 KiB op cap agrees across Go/Rust/JS. ⭐ **Phase 62 rewrote §3b into three `src -> {ok, why}` predicates** (`desktopDeleteGate`/`extensionDeleteGate`/`webappDeleteGate`) that **LOCATE the destructive call and walk OUT from it** (a length-preserving `blank()` + `matchBrace()` + `enclosingClickListener()`), after TWO planted mutations survived the old "does this pattern appear anywhere in the file?" form — the desktop check required `window.confirm(` anywhere in a file holding **SIX** of them, and the extension check banned exactly ONE spelling of the bypass. The three mutations are now encoded as self-test specimens. ⚠️ It CANNOT catch an edit routed through an unknown helper, it is a hand-rolled scanner and NOT a parser, and a legitimate refactor (hoisting the confirm into a helper) FALSE-ALARMS by design; PASS
+node sigil-wasm/test/clock-skew-interop.mjs          # 19/20 (Phase 62, ADR 0050) the CLOCK-SKEW DIAGNOSTIC agrees Rust <-> JS, guarded TWO ways because a MIRROR is what it is: (3a) the LITERAL — CLOCK_SKEW_WARN_SECONDS is read out of `cli/src/lib.rs` and compared to the JS export, and BOTH are pinned to the golden 15, because a COORDINATED retune passes a cross-language equality check while changing what every client tells a user (the `"recovery-kit"` lesson); (3b) the BEHAVIOUR — a local `node:http` server serves a `Date` offset by a chosen number of seconds and the REAL `sigil clock` binary is driven against it at 0, ±14, ±15, ±16, ±17, ±60, its printed server/local pair handed to the JS `skewFromDateHeader` so BOTH HALVES JUDGE ONE IDENTICAL READING (zero jitter, no clock race) and verdict + exit status + direction word must all agree. Plus: offline reads as NO READING (never "fine") and `Date` is readable CROSS-ORIGIN off a real sigild. ⚠️ Uses async `spawn` for the CLI, NOT `spawnSync` — `spawnSync` blocks Node's event loop, so the in-process Date server can never answer and the suite HANGS. Mutation-proven on the RUST constant alone (15->45 and 15->16 both RED); PASS
+node sigil-wasm/test/docs-claims-guard.mjs           # 20/20 the COUNTABLE claims in every .md (except docs/decisions/, whose ADRs are dated records) must match the tree: the desktop Tauri command count (drifted 21 -> 31 -> 40 -> 41 -> 42), sigild's direct dependency count, the node interop + shell e2e suite counts, the Playwright spec-FILE counts, no dangling/gapped ADR reference, and getrandom==0. ⚠️ It checks NUMBERS, not PROSE — the threat-model row that asserted a defence which did not exist is invisible to it. ✅ It IS run by `interop.yml` as of `27f0da6` (the fix that wired it also had to fix the guard itself, which had shipped a hardcoded Homebrew Go path — see the journal); PASS
 # ⚠️ sigil-wasm/test/fake-sigild.mjs is a SERVER DOUBLE for the BROWSER suites, NOT a
 # test — running it in a `test/*.mjs` loop HANGS. It sends NO CORS header unless a
 # caller passes an explicit allowlist, deliberately matching real sigild (an earlier
@@ -2520,7 +2654,7 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium: 12 spec files, PASS
+corepack pnpm --filter webapp exec playwright test   # webapp: 66 tests in 13 spec files, PASS
 # ⛔ It serves on http://localhost:3210, NOT 127.0.0.1 — Chrome refuses WebAuthn on an IP
 # literal, so every passkey spec (ADR 0046) fails there for a reason unrelated to the code.
 # `workers: 2` and `reuseExistingServer: false` are also deliberate (see the config's comments).
@@ -2539,7 +2673,7 @@ corepack pnpm --filter webapp exec playwright test   # headless chromium: 12 spe
 # the extension can be loaded unpacked or tested). NOT wired into CI.
 corepack pnpm -C extension install
 ./extension/build.sh                          # -> extension/vendor/ (gitignored)
-corepack pnpm -C extension test               # `pretest` re-runs build.sh; 8 spec files, PASS
+corepack pnpm -C extension test               # extension: 30 tests in 9 spec files, PASS
 # ⚠️ Use `pnpm test`, NOT `pnpm -C extension exec playwright test`: only the former
 # runs the `pretest` vendor hook, so the latter can test a STALE extension/vendor/.
 # The suite loads the REAL unpacked extension in a full Chromium (channel:
@@ -2553,15 +2687,16 @@ corepack pnpm -C extension test               # `pretest` re-runs build.sh; 8 sp
 # perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
 cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path desktop/Cargo.toml   # 25 unit + 7 integration (2 files) = 32
+cargo test  --manifest-path desktop/Cargo.toml   # 25 unit + 9 integration (2 files) = 34
 grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
 # Integration test 1 is THE VAULT INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
 # builds the real `sigil` binary itself and drives it against ONE shared vault file in
 # both directions, so it needs no setup (~20 s: real Argon2id + a CLI build).
 cargo test  --manifest-path desktop/Cargo.toml --test cli_interop -- --nocapture
 # Integration test file 2 is THE NETWORK PROOF (desktop/core/tests/server_interop.rs) and
-# holds SIX tests (CLAUDE.md said TWO until Phase 57 — it had not been recounted since
-# Phase 51): it builds a REAL sigild (go build ./cmd/server; GO=… overrides
+# holds EIGHT tests (CLAUDE.md said TWO until Phase 57 and SIX until Phase 62; it is
+# not recounted unless somebody makes a point of it, which is why it keeps drifting):
+# it builds a REAL sigild (go build ./cmd/server; GO=… overrides
 # /opt/homebrew/bin/go) AND the real `sigil` binary, boots sigild on a free loopback port
 # with dev ops + device auth v3, and proves (a) desktop<->CLI sharing BOTH ways (94287082
 # each way) plus the 403 / NotEnrolled / Unreachable negatives, (b) Phase 51's
@@ -2571,8 +2706,18 @@ cargo test  --manifest-path desktop/Cargo.toml --test cli_interop -- --nocapture
 # re-pin to a WRONG number is refused, and only a deliberate re-pin resumes sharing,
 # (c) a printed sheet recovering the vaults after every device is gone, (d) a sibling
 # device refused a kit cover without the printed safety number, (e) a lapsed account
-# refused WRITES but never reads or key recovery, and (f) a desktop inside its grace
-# period WARNED before any write is refused.
+# refused WRITES but never reads or key recovery, (f) a desktop inside its grace
+# period WARNED before any write is refused, (g) — Phase 61 — the merge, and (h) —
+# Phase 62, ADR 0050 — THE CLOCK DIAGNOSTIC in all three states against real HTTP:
+# a real sigild (clock OK, taken UNENROLLED because the reading comes off
+# unauthenticated /healthz and a user with a broken clock often cannot authenticate),
+# a fixed PAST Date (SKEWED, "AHEAD OF", the local-minus-server sign pinned by
+# bracketing now_unix() either side), a fixed FUTURE Date ("BEHIND"), a dead port and
+# a server that answers with NO Date header (both NO READING, never a measured zero,
+# never "clock OK") — and then, after a reading a BILLION seconds out, the vault still
+# prints 94287082. ⛔ IT REPORTS, IT NEVER CORRECTS. Mutation-proven twice.
+# ⚠️ The desktop's clock PANEL and its delete-confirm dialog are still BY-EYE: no test
+# renders desktop/ui/.
 # No setup, no mocks. The tests run in PARALLEL threads of one process, which
 # is why Harness::start() puts an AtomicUsize counter in its temp-dir name.
 cargo test  --manifest-path desktop/Cargo.toml --test server_interop -- --nocapture
@@ -2623,11 +2768,11 @@ list of `.github/workflows/` (ten files):
   fmt/clippy/test** — which had no CI gate either, and which includes the golden
   `SIGILcli` / `SIGILhyb` header tests guarding the constants that MUST stay
   byte-identical with `cli/src/lib.rs` — builds the bindings and the real `sigil`
-  binary, runs **EIGHTEEN of the NINETEEN** Node interop suites — ⛔ **every one
-  except `docs-claims-guard.mjs`, which as of Phase 61 is run by NO workflow**
-  (`grep -rl docs-claims-guard .github/workflows/` returns nothing); it is the exact
-  shape of drift this repo has shipped three times before, and it is
-  `scripts/gate.sh`'s CI-drift check that flags it — (roundtrip, interop, hybrid-interop,
+  binary, runs **ALL TWENTY** Node interop suites — ✅ **including `docs-claims-guard.mjs`,
+  which as of Phase 61 was run by NO workflow and was wired in `27f0da6`** (it was the
+  exact shape of drift this repo has shipped three times before, and `scripts/gate.sh`'s
+  CI-drift check is what flagged it) **and `clock-skew-interop.mjs`, added in Phase 62** —
+  (roundtrip, interop, hybrid-interop,
   sync-interop, totp-interop, migration-interop, device-auth-interop, sharing-interop,
   pinning-interop, accounts-interop, recovery-interop, **entitlement-interop** —
   the twelfth, added in Phase 56, and the **only** thing that parses a real `sigild`'s
@@ -2638,7 +2783,9 @@ list of `.github/workflows/` (ten files):
   **seal-params-guard** (no product re-seal site can silently downgrade Argon2); and
   **portability-guard**, which is ⚠️ **NOT Phase 59** but the 2026-07-30 CI-portability
   repair sharing the same working tree — the suites are written on macOS and run on
-  ubuntu-latest, and nothing checked that the two agreed), and re-asserts `getrandom`==0 in both
+  ubuntu-latest, and nothing checked that the two agreed; then **Phase 61**'s
+  **merge-interop** + **merge-guard**, and **Phase 62**'s **clock-skew-interop**
+  beside the now-wired **docs-claims-guard**), and re-asserts `getrandom`==0 in both
   lockfiles. The other jobs run the **three** shell e2e scripts —
   **`cli/tests/e2e-sharing.sh`** (added Phase 51), plus **`e2e-accounts.sh`** and
   **`e2e-recovery.sh`**. They need Go + Rust + bash + curl + python3 and no wasm, so

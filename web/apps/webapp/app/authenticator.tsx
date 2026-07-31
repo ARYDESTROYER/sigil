@@ -2078,13 +2078,22 @@ function AccountRow({
           </p>
           {/* NAMES the account, and states the two things that make this
               different from an ordinary delete: it is permanent, and it
-              propagates. */}
+              propagates.
+              ⚠️ IT MUST NOT PROMISE A SYNC IT DOES NOT PERFORM. An earlier
+              revision said "the deletion is synced to every other device holding
+              it", which is FALSE here: sync in this product is MANUAL (explicit
+              Push / Pull) and a vault with no server configured never propagates
+              at all. This is the sentence a user reads while deciding whether to
+              destroy a second factor, so it says exactly what happens and
+              exactly what it is conditional on. */}
           <p data-testid="remove-confirm-warning" className="text-xs">
             This permanently deletes the second-factor secret for{" "}
-            <strong>{who}</strong> from this vault, and the deletion is synced to
-            every other device holding it. It cannot be undone from here — if you
-            no longer have this secret anywhere else, you may lose access to the
-            account it protects.
+            <strong>{who}</strong> from this vault. Sigil syncs only when you ask
+            it to, so the deletion reaches every other device holding this vault
+            the next time you Push and they Pull; until you do &mdash; and forever,
+            if you never sync &mdash; it applies to this device alone. It cannot be
+            undone from here — if you no longer have this secret anywhere else, you
+            may lose access to the account it protects.
           </p>
           <div className="flex flex-wrap items-center gap-3">
             <button
@@ -2751,9 +2760,34 @@ function SyncPanel({
   // ⭐ A 402 is a BILLING state, not an auth failure and not a bug. It gets its
   // own non-error region so it can never be rendered as "unauthorized".
   const [payment, setPayment] = useState<{ headline: string; detail: string } | null>(null);
+  // ⛔ CLOCK SKEW — the top real-world TOTP failure, and the one nothing in this
+  // product reported. A code rejected because this device's clock drifted is
+  // INDISTINGUISHABLE, to the user, from a wrong secret: they re-scan the QR,
+  // re-import the export, delete and re-add the account, and none of it helps.
+  //
+  // ⛔⛔ IT IS A DIAGNOSTIC, NEVER A CORRECTION. `useUnixClock` still drives every
+  // code from this device's own system clock; nothing here adjusts it. A code
+  // generated against a server-supplied time is one the user cannot reproduce or
+  // compare against any other authenticator.
+  const [clock, setClock] = useState<import("@sigil/wasm").ClockSkewReading | null>(null);
   // Passkey-protected AND personal => the container is sealed under a key only
   // this browser holds, so there is nothing useful to upload.
   const protectedPersonal = protection !== null && activeVaultId === null;
+
+  // Read the server's clock (one unauthenticated GET /healthz) and keep the
+  // result — including the explicit "unavailable", which is NOT "your clock is
+  // fine". Never throws: a diagnostic must not be able to break a sync.
+  const checkClock = useCallback(async () => {
+    try {
+      const reading = await wasm.fetchClockSkew(
+        { baseUrl: url.trim() },
+        Math.floor(Date.now() / 1000),
+      );
+      setClock(reading);
+    } catch (e) {
+      setClock({ state: "unavailable", reason: msg(e) });
+    }
+  }, [wasm, url]);
 
   // Map any failure to a message; a device-auth failure carries the status, so
   // 401 (not authenticated) and 403 (not authorized for this vault) are called
@@ -2845,6 +2879,10 @@ function SyncPanel({
             : "") +
           (sizeWarn ? ` ⚠️ ${sizeWarn}` : ""),
       );
+      // A successful sync means a reachable server, i.e. a free clock reference.
+      // Take the reading here so a broken clock is found while doing something
+      // else, long before the user is staring at a rejected login.
+      void checkClock();
     } catch (e) {
       // ⚠️ The size warning must survive the FAILURE path too — a 413 is exactly
       // where it matters, and reporting only "Push failed" there tells the user
@@ -2908,6 +2946,7 @@ function SyncPanel({
           `${res.removed} removed by a delete from another device. ` +
           `${res.vault.entries.length} account(s) now.${skipNote}${conflictNote}`,
       );
+      void checkClock();
     } catch (e) {
       setStatus(`Pull failed: ${authMsg(e)}`);
     } finally {
@@ -2946,6 +2985,59 @@ function SyncPanel({
             spellCheck={false}
           />
         </label>
+      </div>
+
+      {/* ⛔ THE CLOCK DIAGNOSTIC. A TOTP code rejected because this device's
+          clock drifted is indistinguishable, to the user, from a wrong secret.
+          This is the only place in the product that can tell them apart.
+          ⛔⛔ It reports. It never adjusts the clock codes are generated from. */}
+      <div className="mt-4 rounded border border-neutral-200 p-3 dark:border-neutral-800">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <h4 className="text-sm font-semibold">Device clock</h4>
+          <button
+            data-testid="clock-check"
+            className={btnGhost}
+            type="button"
+            onClick={() => void checkClock()}
+          >
+            Check clock
+          </button>
+        </div>
+        <p className="mb-2 text-xs text-neutral-600 dark:text-neutral-400">
+          Codes are computed from <em>this device&rsquo;s</em> system clock. Once it
+          has drifted more than {wasm.CLOCK_SKEW_WARN_SECONDS}s &mdash; half a TOTP
+          step &mdash; codes are likely to be rejected even though the secret is
+          perfectly correct, and the further it drifts the more certain that
+          becomes. Some verifiers accept a code from one step either side, so a
+          small drift may still get through, but that is optional and you cannot
+          count on it. A rejected code looks identical to a wrong secret from the
+          login screen. This compares against the server&rsquo;s clock; it never
+          changes the one codes are generated from.
+        </p>
+        {clock === null ? (
+          <p
+            data-testid="clock-status"
+            data-state="unread"
+            className="text-xs text-neutral-600 dark:text-neutral-400"
+          >
+            Not checked yet.
+          </p>
+        ) : (
+          <p
+            data-testid="clock-status"
+            data-state={clock.state}
+            role={clock.state === "skewed" ? "alert" : undefined}
+            className={
+              clock.state === "skewed"
+                ? "text-xs font-medium text-red-700 dark:text-red-300"
+                : clock.state === "unavailable"
+                  ? "text-xs text-amber-800 dark:text-amber-300"
+                  : "text-xs text-neutral-700 dark:text-neutral-300"
+            }
+          >
+            {wasm.describeClockSkew(clock)}
+          </p>
+        )}
       </div>
 
       <div className="mt-4 rounded border border-neutral-200 p-3 dark:border-neutral-800">

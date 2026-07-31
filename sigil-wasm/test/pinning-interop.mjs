@@ -493,7 +493,11 @@ http
   // =====================================================================
   const vaultFile = join(homes.A, "vault.sigil");
   sigil("A", ["totp", "add", "work", "--secret", RFC_SEED_B32, "--vault", vaultFile]);
-  sigil("A", ["vault", "rekey", "--vault", VAULT, "--file", vaultFile, "--publish"]);
+  // ⛔ `--yes` is REQUIRED: `vault rekey` is a ONE-WAY DOOR that replaces the vault
+  // PASSWORD with a random key stored in the clear in vault-keys.json, so the
+  // password never opens the vault again. A scripted caller acknowledges it; a
+  // human gets the full warning and a refusal.
+  sigil("A", ["vault", "rekey", "--yes", "--vault", VAULT, "--file", vaultFile, "--publish"]);
   sigil("A", ["push", "--vault", VAULT, "--in", vaultFile]);
 
   const envHonest = join(work, "envelope-B-honest.bin");

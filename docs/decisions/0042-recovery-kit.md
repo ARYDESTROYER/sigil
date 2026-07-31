@@ -608,3 +608,30 @@ unlock, it moves into `recovery.rs` and the JS becomes a shell.
   either** — no route, no table, no migration, no metric, no dependency.
 
 Limitations 1–13 stand as written, with 1 and 4 read in the light above.
+
+## Addendum (2026-07-31, Phase 62) — two clients were DENYING this capability in the product
+
+The webapp's and the extension's account panels both told the user, in the
+product, that *"a recovery kit was printed in advance … this app cannot print
+one"*. That was **true until Phase 56 and false ever since** — both clients gained
+the full recovery UI in that phase, and in the webapp the **Generate a kit**
+button sits on the same screen as the sentence denying it exists.
+
+⚠️ **This is the worst class of stale claim this repo has produced.** A stale
+status line in a `.md` misleads a maintainer. A stale *capability* claim inside
+the product, about the one control that prevents the permanent, unrecoverable
+loss described in limitation 1 of [0040](0040-account-model.md), does not merely
+fail to help — **it routes the user past the fix.**
+
+Both clients now hold a **single `RECOVERY_ADVICE` constant**, used everywhere the
+subject comes up, saying the true thing: a kit cannot be created after access is
+lost — *but this app can print one right now* — and naming the control. The
+surviving half of the old sentence is retained because it is a property of **this
+design**, not of a client. Fixed in
+[0050](0050-confirmations-honest-claims-and-the-clock-diagnostic.md) §3, and
+pinned by `web/apps/webapp/tests/user-safety.spec.ts` and
+`extension/tests/user-safety.spec.mjs`, which drive the **real shipping UI**.
+
+⚠️ The finding that prompted this named only the extension. The webapp carried the
+identical sentence and was found by grepping for the claim. *A false sentence is a
+class, not an instance — sweep for it.*

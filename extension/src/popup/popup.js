@@ -28,12 +28,19 @@ import {
   openVault,
   sealVault,
   addEntry,
+  // ⭐ Phase 61: identity, the 2P-Set merge, and a remove that TOMBSTONES.
+  addEntryChecked,
+  entryIdentity,
+  mergeOpsInto,
+  removeEntry,
   cloneVault,
   codeForEntry,
   base32Decode,
   base64ToBytes,
   bytesToBase64,
   ratchetParams,
+  // ⛔ The tombstone growth limit: warn BEFORE the 64 KiB cap becomes a 413.
+  opBodySizeWarning,
 } from "../../vendor/totp-vault.mjs";
 import {
   parseOtpauthUri,
@@ -493,6 +500,19 @@ function hideEnvelopeRefusal() {
  * and re-render. A mutator that throws (duplicate label, bad secret, …) aborts
  * BEFORE anything is written.
  */
+/**
+ * Adopt an ALREADY-BUILT vault object: persist it, then swap it in.
+ *
+ * ⭐ Used by the merge, whose output is a whole vault rather than a mutation of
+ * the current one. It persists FIRST (that can throw), so a failed seal never
+ * leaves the UI showing accounts that are not on disk.
+ */
+async function replaceVault(next) {
+  await persist(next);
+  vault = next;
+  render();
+}
+
 async function withVault(mutate) {
   if (!vault) throw new Error("vault is locked");
   // ⭐ `cloneVault`, NOT `{ version, entries }`. Rebuilding the object
@@ -513,9 +533,12 @@ function render() {
   const entries = vault ? vault.entries : [];
   $("empty").hidden = entries.length > 0;
 
-  // Rebuild the rows only when the set of labels changed; otherwise just update
+  // Rebuild the rows only when the set of accounts changed; otherwise just update
   // the code + countdown so the DOM (and any focus) stays stable across ticks.
-  const want = entries.map((e) => e.label).join("\u0000");
+  // ⭐ Phase 61: keyed on IDENTITY, not label. Labels are no longer unique
+  // (`work` at two issuers is two accounts), so a label-keyed row set would
+  // collapse two accounts into one row and remove the wrong one.
+  const want = entries.map((e) => entryIdentity(wasm, e)).join("\u0000");
   if (list.dataset.labels !== want) {
     list.dataset.labels = want;
     list.replaceChildren(...entries.map(row));
@@ -527,6 +550,9 @@ function row(entry) {
   const li = document.createElement("li");
   li.dataset.testid = "account";
   li.dataset.label = entry.label;
+  // ⭐ Phase 61: the STABLE handle. `dataset.label` is retained for the existing
+  // specs' selectors but is no longer what anything is looked up by.
+  li.dataset.uuid = entryIdentity(wasm, entry);
 
   const who = document.createElement("div");
   who.className = "who";
@@ -560,8 +586,12 @@ function row(entry) {
   rm.setAttribute("aria-label", `Remove ${entry.label}`);
   rm.addEventListener("click", async () => {
     try {
+      // ⭐ Phase 61: remove by IDENTITY and RECORD A TOMBSTONE. Filtering by
+      // label removed every account sharing that label, and — worse — wrote no
+      // tombstone, so the entry came straight back the next time this vault met
+      // a snapshot that still held it.
       await withVault((d) => {
-        d.entries = d.entries.filter((e) => e.label !== entry.label);
+        removeEntry(wasm, d, { uuid: li.dataset.uuid }, Math.floor(Date.now() / 1000));
       });
       say(`Removed ${entry.label}.`);
     } catch (e) {
@@ -578,7 +608,7 @@ function tick() {
   if (!vault) return;
   const t = nowSeconds();
   for (const li of $("accounts").children) {
-    const entry = vault.entries.find((e) => e.label === li.dataset.label);
+    const entry = vault.entries.find((e) => entryIdentity(wasm, e) === li.dataset.uuid);
     if (!entry) continue;
     const code = li.querySelector(".code");
     const left = li.querySelector(".left");
@@ -778,7 +808,9 @@ $("add-form").addEventListener("submit", async (ev) => {
     const label = $("add-label").value.trim();
     const issuer = $("add-issuer").value.trim();
     await withVault((d) => {
-      addEntry(d, {
+      // ⭐ Phase 61: refuses an account already in the vault by CONTENT, not by
+      // label — so `work` at two different issuers is two accounts.
+      addEntryCheckedOrThrow(d, {
         label,
         issuer: issuer || undefined,
         secretBytes: base32Decode($("add-secret").value),
@@ -800,7 +832,11 @@ $("uri-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   try {
     const entry = parseOtpauthUri($("uri-input").value.trim());
-    await withVault((d) => mergeEntries(d, [entry]));
+    let res;
+    await withVault((d) => {
+      res = mergeEntries(d, [entry]);
+      if (res.added === 0) throw new Error("this exact account is already in the vault");
+    });
     $("uri-form").reset();
     say(`Added ${entry.label}.`);
   } catch (e) {
@@ -817,11 +853,20 @@ $("migration-form").addEventListener("submit", async (ev) => {
     const batch = decodeMigrationUri($("migration-input").value.trim());
     const entries = batch.entries;
     let added = 0;
+    let skippedNames = [];
     await withVault((d) => {
-      added = mergeEntries(d, entries);
+      const res = mergeEntries(d, entries);
+      added = res.added;
+      skippedNames = res.skippedNames;
     });
     $("migration-form").reset();
-    const base = `Imported ${added} of ${entries.length} account(s); duplicates skipped.`;
+    // ⭐ NAME the skips. "duplicates skipped" is exactly the message a user saw
+    // when the label-keyed de-dup silently dropped their second `work` account.
+    const base =
+      `Imported ${added} of ${entries.length} account(s)` +
+      (skippedNames.length
+        ? `; already in this vault: ${skippedNames.join("; ")}.`
+        : ".");
     if (batch.batchNote && !batch.finalBatch) {
       say(
         `${base} ⚠️ THIS IMPORT IS INCOMPLETE — ${batch.batchNote}. Import the remaining ` +
@@ -843,15 +888,32 @@ $("migration-form").addEventListener("submit", async (ev) => {
 });
 
 /**
- * Append already-parsed TotpEntry objects to a draft vault, skipping labels that
- * already exist. Goes through addEntry so the stored shape is exactly the CLI's
- * (base64 secret, lowercase algorithm, issuer omitted when absent).
+ * Append already-parsed TotpEntry objects to a draft vault, skipping accounts
+ * ALREADY IN IT. Goes through addEntryChecked so the stored shape is exactly the
+ * CLI's (base64 secret, lowercase algorithm, issuer omitted when absent).
+ *
+ * ⭐⭐ Phase 61 (CRITICAL 2): the skip test is the CONTENT FINGERPRINT, not the
+ * label. It used to be `draft.entries.some((x) => x.label === e.label)`, so a
+ * Google Authenticator export holding `work` at GitHub AND `work` at GitLab
+ * imported ONE of them and silently dropped the other — two different accounts,
+ * in the feature whose entire purpose is not losing accounts.
+ *
+ * Returns `{ added, skippedNames }`. ⭐ It NAMES the skips: a bare count is what
+ * let that defect hide, because a user saw "skipped 1" and could not learn which.
  */
+/** `addEntryChecked` that throws instead of returning false, for form handlers. */
+function addEntryCheckedOrThrow(draft, input) {
+  if (!addEntryChecked(wasm, draft, input)) {
+    throw new Error("this exact account is already in the vault");
+  }
+  return draft;
+}
+
 function mergeEntries(draft, entries) {
   let added = 0;
+  const skippedNames = [];
   for (const e of entries) {
-    if (draft.entries.some((x) => x.label === e.label)) continue;
-    addEntry(draft, {
+    const ok = addEntryChecked(wasm, draft, {
       label: e.label,
       issuer: e.issuer,
       secretBytes: base64ToBytes(e.secret),
@@ -859,9 +921,10 @@ function mergeEntries(draft, entries) {
       digits: e.digits,
       period: e.period,
     });
-    added++;
+    if (ok) added++;
+    else skippedNames.push(e.issuer ? `${e.issuer}: ${e.label}` : e.label);
   }
-  return added;
+  return { added, skippedNames };
 }
 
 $("export-uris").addEventListener("click", () => {
@@ -940,6 +1003,10 @@ $("account-show").addEventListener("click", async () => {
 });
 
 $("sync-push").addEventListener("click", async () => {
+  // ⚠️ Declared OUTSIDE the try so the size warning survives the FAILURE path
+  // too — a 413 is exactly where it matters, and "Push failed" alone tells the
+  // user nothing about why or what to do.
+  let sizeWarn = null;
   try {
     say("Pushing…");
     $("entitlement-402").hidden = true;
@@ -949,6 +1016,11 @@ $("sync-push").addEventListener("click", async () => {
     const container = base64ToBytes(sealed);
     const baseUrl = $("sync-url").value.trim();
     const vaultId = $("sync-vault").value.trim();
+    // ⛔ THE TOMBSTONE GROWTH LIMIT. A vault is a 2P-Set: its remove-set never
+    // shrinks, nothing prunes a tombstone, and past sigild's 64 KiB op cap the
+    // push is a 413 with no supported way to shrink. Warn while there is still
+    // room to act — meeting this first AT the 413 means sync is already gone.
+    sizeWarn = opBodySizeWarning(container.length);
     // ⭐ THE GRACE CHANNEL. sigild sets X-Sigil-Entitlement* on a write it is
     // still SERVING inside the grace period — a 2xx — so that warning lives ONLY
     // in the response headers and never in a body or an error. Reading it here is
@@ -969,7 +1041,10 @@ $("sync-push").addEventListener("click", async () => {
         `${NEVER_REFUSED}`;
       $("entitlement-402").hidden = false;
     }
-    say(`Pushed sealed container as op #${seq}${device ? " (signed)" : ""}.`);
+    say(
+      `Pushed sealed container as op #${seq}${device ? " (signed)" : ""}.` +
+        (sizeWarn ? ` ⚠️ ${sizeWarn}` : ""),
+    );
   } catch (e) {
     // ⭐ A 402 is a BILLING state, not an auth failure and not a bug: the server
     // authenticated AND authorized this device and then asked for payment.
@@ -983,7 +1058,7 @@ $("sync-push").addEventListener("click", async () => {
       say("Push was refused pending payment. Nothing else changed.");
       return;
     }
-    say(`Push failed: ${authErr(e)}`, "error");
+    say(`Push failed: ${authErr(e)}${sizeWarn ? ` ⚠️ ${sizeWarn}` : ""}`, "error");
   }
 });
 
@@ -996,10 +1071,30 @@ $("sync-pull").addEventListener("click", async () => {
       ? await pullContainersAuthed(wasm, device, baseUrl, vaultId, 0)
       : await pullContainers(baseUrl, vaultId, 0);
     if (ops.length === 0) return say("No ops on the server for that vault id.");
-    const latest = ops[ops.length - 1];
-    // Store the SEALED bytes only; lock + unlock to decrypt with your password.
-    await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(latest.container) });
-    say(`Pulled op #${latest.seq}. Lock and unlock to decrypt the pulled vault.`);
+    // ⭐⭐ MERGE EVERY OP — do NOT adopt `ops[ops.length - 1]`.
+    //
+    // ⛔ This used to take the newest op and write it over the stored container.
+    // If a laptop that had never pulled pushed after this browser did, the
+    // laptop's snapshot was the tip, it had never seen this browser's accounts,
+    // and one click destroyed them — with both devices reporting success.
+    if (!vault) return say("Unlock the vault first — a merge needs to open it.", "error");
+    const res = mergeOpsInto(wasm, sealSecret, vault, ops);
+    // ⚠️ REPLACE the vault wholesale — do NOT copy `entries`/`tombstones` onto a
+    // clone of the old one. `mergeVaults` already carried every unknown top-level
+    // field forward (ADR 0047), and a field-by-field copy would throw away
+    // exactly what a NEWER client wrote — the same defect `cloneVault` exists to
+    // prevent, one level up.
+    await replaceVault(res.vault);
+    const skipNote = res.skipped.length
+      ? ` ⚠️ ${res.skipped.length} op(s) could not be opened with this vault's secret and were NOT merged (${res.skipped
+          .map((x) => `#${x.seq}`)
+          .join(", ")}) — they are still on the server.`
+      : "";
+    say(
+      `Merged ${res.applied} op(s) through #${res.tip}. ${res.added} account(s) added, ` +
+        `${res.removed} removed by a delete from another device. ` +
+        `${res.vault.entries.length} account(s) now.${skipNote}`,
+    );
   } catch (e) {
     say(`Pull failed: ${authErr(e)}`, "error");
   }
@@ -1694,8 +1789,30 @@ $("restore-form").addEventListener("submit", async (ev) => {
           notes.push(`${v.vaultId}: key recovered, but the server holds no vault content for it`);
           continue;
         }
-        const container = ops[ops.length - 1].container;
-        opened = openVault(wasm, v.vaultKey, container); // throws before anything is stored
+        // ⭐ Phase 61: MERGE every op, do not adopt the tip. A restore is the one
+        // path where the user cannot check the result against anything, so
+        // reconstructing the UNION of every snapshot matters most here.
+        const merged = mergeOpsInto(wasm, v.vaultKey, newVault(), ops);
+        if (merged.applied === 0) {
+          notes.push(
+            `${v.vaultId}: ${merged.skipped.length} op(s) present but none opened with the recovered key`,
+          );
+          continue;
+        }
+        for (const sk of merged.skipped) {
+          notes.push(`${v.vaultId}: op #${sk.seq} was not merged (${sk.reason})`);
+        }
+        const salt = crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+        const nonce = crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+        const container = sealVault(
+          wasm,
+          v.vaultKey,
+          merged.vault,
+          salt,
+          nonce,
+          ratchetParams(wasm, ops[ops.length - 1].container, ARGON2),
+        );
+        opened = merged.vault;
         openedId = v.vaultId;
         openedKey = v.vaultKey;
         openedContainer = container;

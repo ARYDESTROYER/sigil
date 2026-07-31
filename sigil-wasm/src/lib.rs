@@ -576,6 +576,41 @@ pub fn totp(
     totp_inner(key, unix_time, period, t0, digits, algorithm).map_err(|e| JsError::new(&e))
 }
 
+/// ⭐ The CONTENT-DERIVED id of a TOTP entry (Phase 61) — a one-line shell over
+/// `sigil_core::entry_id`, adding NO cryptography and NO codec.
+///
+/// It exists so the browser clients reach the SAME bytes the CLI and the desktop
+/// do, rather than a JavaScript reimplementation. A drift in this function would
+/// be **invisible**: it produces a vault that opens correctly everywhere and
+/// merely duplicates or mis-suppresses entries when two devices merge. So unlike
+/// the vault SCHEMA (which is mirrored, ADR 0024), the identity derivation is
+/// single-sourced in `sigil-core`.
+///
+/// `issuer` is `""` when the entry has none; `secret` is the DECODED key bytes
+/// (not the base64 the vault stores); `algorithm` is the lowercase name.
+/// `disambiguator` is `0` for every ordinary call. Draws no entropy and reads no
+/// clock, so the crate stays `getrandom`-free.
+#[wasm_bindgen]
+pub fn entry_id(
+    issuer: &str,
+    label: &str,
+    secret: &[u8],
+    algorithm: &str,
+    digits: u32,
+    period: u32,
+    disambiguator: u32,
+) -> String {
+    sigil_core::entry_id(
+        issuer,
+        label,
+        secret,
+        algorithm,
+        digits,
+        period,
+        disambiguator,
+    )
+}
+
 /// Compute an RFC 4226 HOTP code for `counter` under `key`.
 ///
 /// `counter` is a JS Number (`f64`) that MUST be a non-negative integer, as for
@@ -1947,6 +1982,26 @@ mod tests {
         assert!(!ed25519_verify_inner(&pk, msg, &bad_sig).unwrap());
         let other_pk = ed25519_public_key_inner(&[0x43u8; SIG_SEED_LEN]).unwrap();
         assert!(!ed25519_verify_inner(&other_pk, msg, &sig).unwrap());
+    }
+
+    // ⭐ The SAME known-answer vector asserted in `libsigil/core/src/entry_id.rs`,
+    // `cli/src/lib.rs` and `sigil-wasm/test/merge-interop.mjs`. If this export
+    // ever stopped reaching `sigil_core::entry_id`, two clients would disagree
+    // about which entries are the same account — silently.
+    #[test]
+    fn entry_id_matches_the_shared_known_answer_vector() {
+        assert_eq!(
+            entry_id(
+                "GitHub",
+                "alice@example.com",
+                b"12345678901234567890",
+                "sha1",
+                6,
+                30,
+                0
+            ),
+            "41828256-7397-80c1-bf67-e6b85ff84173"
+        );
     }
 
     #[test]

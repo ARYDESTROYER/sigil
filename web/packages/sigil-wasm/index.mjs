@@ -57,6 +57,12 @@ export const {
   recovery_derive_x25519_secret,
   recovery_derive_mlkem_seed,
   recovery_format,
+  // ⭐ THE CONTENT-DERIVED ENTRY ID (Phase 61). Without this re-exported HERE,
+  // `totp-vault.mjs` — which is handed this module namespace as its `wasm` —
+  // would call an undefined function and EVERY browser open, merge, add and
+  // import would throw at runtime. Third time this trap has been laid: the
+  // .d.ts declaration is a SEPARATE hole and is closed too.
+  entry_id,
   totp,
   hotp,
   format_code,

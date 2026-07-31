@@ -224,6 +224,27 @@ TOTP VAULT (totp add/list/code/remove) — the authenticator feature:
     sigil totp list
     sigil totp code work
     sigil totp remove work
+    sigil totp code work --id 3ec9e19e   # when two accounts share a label
+    sigil totp sync my-vault             # pull EVERY op, MERGE, save, push back
+
+  Labels are NOT unique: the same label at two issuers is two accounts. When a
+  label is ambiguous, `code`/`remove` REFUSE and list the candidates rather than
+  guessing — `sigil totp list` prints each entry's short id for --id.
+
+  MULTI-DEVICE SYNC: `sigil totp sync` MERGES every snapshot on the server into
+  the local vault instead of adopting the newest one, so two devices that each
+  added an account offline keep BOTH. A removal records a tombstone, so a delete
+  is not undone by a device that has not synced yet.
+
+  !! A KNOWN, UNSOLVED LIMIT — TOMBSTONE GROWTH. A tombstone is kept FOREVER
+  (dropping one would let a device that still holds the entry resurrect it), and
+  there is NO compaction command: nothing prunes them, and `sigil totp compact`
+  does not exist. The server caps ONE op at 64 KiB and answers 413 above it, so a
+  vault with enough removals eventually STOPS SYNCING with no supported way to
+  shrink it. `sigil totp sync` warns on stderr from 75% of that cap; if you reach
+  the wall, the way out is `sigil totp export --out <file>` (which prints your
+  secrets IN THE CLEAR) and re-importing under a FRESH vault id. Codes keep
+  working locally either way — only uploading stops.
 
   !! PRE-AUDIT / UNAUDITED / DEV-ONLY !! The OTP math is standard and RFC-vector
   checked, but the build is unaudited. Do NOT store real 2FA secrets yet.
@@ -232,7 +253,9 @@ TOTP IMPORT / EXPORT (totp import/export) — migrate 2FA in and out:
   import ingests either a Google Authenticator bulk-export migration URI
   (otpauth-migration://offline?data=<BASE64>, hand-rolled protobuf decode), a
   single otpauth:// URI, or a text file with one such URI per line. HOTP entries
-  and duplicate labels are SKIPPED; the vault is re-sealed with any new TOTP
+  and accounts ALREADY IN THE VAULT are SKIPPED (compared by content, not by
+  label, so `work` at GitHub and `work` at GitLab both import and each skip is
+  named); the vault is re-sealed with any new TOTP
   entries. export is the inverse: it prints each entry as an otpauth:// URI, or —
   with --migration — one otpauth-migration:// URI holding them all.
 
@@ -963,6 +986,22 @@ fn explain_sync_error(e: CliError, vault: &str, contract: &str) -> String {
             "{e}\n  -> HTTP 403: this device IS authenticated but is NOT authorized for vault {vault:?}.\n     \
              The vault is owned by another device. Ask its owner to run:\n       \
              sigil device grant <THIS_DEVICE_ID> --vault {vault} --permission read|write"
+        ),
+        // ⛔ 413 is the TOMBSTONE GROWTH LIMIT arriving as a hard stop. Without
+        // this arm the CLI printed a bare status and the user had no way to know
+        // that a never-pruned remove-set is what filled the budget, or that no
+        // command exists to shrink it. Say both, plainly.
+        CliError::Server { status: 413, .. } => format!(
+            "{e}\n  -> HTTP 413: this vault no longer fits in one op. sigild caps an op body at {} bytes\n     \
+             and the sealed vault is over it, so it CANNOT be pushed.\n     \
+             ⛔ WHY IT GREW: a vault is a 2P-Set — every removed entry leaves a tombstone that is kept\n     \
+             FOREVER, because dropping it would let any device still holding that entry resurrect it on\n     \
+             the next merge. Tombstones are never pruned and THERE IS NO COMPACTION COMMAND.\n     \
+             ⭐ NOTHING IS LOST LOCALLY. Your vault file still opens and `sigil totp code` still works —\n     \
+             codes need no server. What has stopped is uploading NEW changes.\n     \
+             The supported way out is to export (`sigil totp export --out <file>`, which prints your\n     \
+             secrets IN THE CLEAR) and re-import into a vault synced under a FRESH vault id.",
+            sigil_cli::MAX_OP_BODY_BYTES
         ),
         _ => e.to_string(),
     }
@@ -2880,7 +2919,10 @@ fn now_unix_secs() -> Result<u64, String> {
 /// Dispatch `sigil totp <sub> ...`.
 fn cmd_totp(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let Some(sub) = args.next() else {
-        return Err("missing totp subcommand: add | list | code | remove".to_string());
+        return Err(
+            "missing totp subcommand: add | list | code | remove | import | export | sync"
+                .to_string(),
+        );
     };
     let rest: Vec<String> = args.collect();
     match sub.as_str() {
@@ -2890,8 +2932,9 @@ fn cmd_totp(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         "remove" => cmd_totp_remove(rest),
         "import" => cmd_totp_import(rest),
         "export" => cmd_totp_export(rest),
+        "sync" => cmd_totp_sync(rest),
         other => Err(format!(
-            "unknown totp subcommand {other:?}; try add | list | code | remove | import | export"
+            "unknown totp subcommand {other:?}; try add | list | code | remove | import | export | sync"
         )),
     }
 }
@@ -3090,12 +3133,17 @@ fn cmd_totp_list(args: Vec<String>) -> Result<(), String> {
     for e in &vault.entries {
         let issuer = e.issuer.as_deref().unwrap_or("-");
         // Never print the secret.
+        // ⭐ Phase 61: print the short id. Labels are no longer unique (the same
+        // label at two issuers is two accounts), so this is what a user types
+        // into `--id` when `code`/`remove` refuse an ambiguous label.
+        let id = sigil_cli::entry_identity(e);
         println!(
-            "  {label}  issuer={issuer}  algorithm={algo}  digits={digits}  period={period}s",
+            "  {label}  issuer={issuer}  algorithm={algo}  digits={digits}  period={period}s  id={id}",
             label = e.label,
             algo = e.algorithm,
             digits = e.digits,
             period = e.period,
+            id = &id[..8.min(id.len())],
         );
     }
     Ok(())
@@ -3111,6 +3159,7 @@ fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
     // is what makes a code reproducible across two machines in a proof; it
     // changes nothing about how the code is computed.
     let mut at: Option<u64> = None;
+    let mut id: Option<String> = None;
     let mut it = rest.into_iter();
     while let Some(f) = it.next() {
         match f.as_str() {
@@ -3123,16 +3172,37 @@ fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
                         format!("--at must be non-negative unix seconds, got {raw:?}")
                     })?);
             }
+            // ⭐ Phase 61: labels are no longer unique (the same label at two
+            // issuers is two accounts), so `--id <prefix>` is how a human names
+            // exactly one of them. `sigil totp list` prints the ids.
+            "--id" => {
+                id = Some(
+                    it.next()
+                        .ok_or_else(|| "--id requires a value".to_string())?,
+                );
+            }
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
     }
-    let label = label.ok_or_else(|| "missing <label>".to_string())?;
 
     let password = access.secret()?;
     let vault = load_vault_required(&vault_path, &password)?;
-    let entry = vault
-        .find(&label)
-        .ok_or_else(|| format!("no entry labelled {label:?} in the vault"))?;
+    let entry = match (&id, &label) {
+        (Some(want), _) => vault
+            .find_by_uuid(want)
+            .ok_or_else(|| format!("no entry with id {want:?} in the vault"))?,
+        (None, Some(l)) => {
+            let all = vault.find_all(l);
+            match all.len() {
+                0 => return Err(format!("no entry labelled {l:?} in the vault")),
+                1 => all[0],
+                // ⛔ REFUSE, never guess. Showing the wrong account's code is a
+                // silent failure the user cannot detect.
+                _ => return Err(ambiguous_label_message(l, &all)),
+            }
+        }
+        (None, None) => return Err("missing <label> (or --id <prefix>)".to_string()),
+    };
 
     let now = match at {
         Some(t) => t,
@@ -3143,20 +3213,67 @@ fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// The refusal a user sees when a label names more than one account.
+fn ambiguous_label_message(label: &str, matches: &[&TotpEntry]) -> String {
+    let lines: Vec<String> = matches
+        .iter()
+        .map(|e| {
+            let id = sigil_cli::entry_identity(e);
+            format!(
+                "  {}{}  --id {}",
+                e.issuer
+                    .as_deref()
+                    .map(|s| format!("{s}: "))
+                    .unwrap_or_default(),
+                e.label,
+                &id[..8.min(id.len())]
+            )
+        })
+        .collect();
+    format!(
+        "{} entries are labelled {label:?}. Name one with --id <prefix>:\n{}",
+        matches.len(),
+        lines.join("\n")
+    )
+}
+
 fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
     let (label, flags) = take_positional(&args);
     let (access, rest) = extract_vault_access(flags.to_vec())?;
     let vault_path = access.path.clone();
-    if let Some(x) = rest.first() {
-        return Err(format!("unexpected argument {x:?}; try `sigil --help`"));
+    let mut id: Option<String> = None;
+    let mut it = rest.into_iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--id" => {
+                id = Some(
+                    it.next()
+                        .ok_or_else(|| "--id requires a value".to_string())?,
+                );
+            }
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
     }
-    let label = label.ok_or_else(|| "missing <label>".to_string())?;
 
     let password = access.secret()?;
     let mut vault = load_vault_required(&vault_path, &password)?;
-    vault.remove(&label).map_err(|e| e.to_string())?;
+    // ⭐ Phase 61: a removal writes a TOMBSTONE, stamped with this machine's
+    // clock. Without it the entry comes straight back the next time this vault
+    // meets a snapshot that still holds it — `sigil-core` reads no clock, so the
+    // timestamp is supplied here (ADR 0007). It is informational: no merge
+    // decision branches on it.
+    let now = now_unix_secs().ok();
+    let removed = match (&id, &label) {
+        (Some(want), _) => vault.remove_by_uuid(want, now).map_err(|e| e.to_string())?,
+        (None, Some(l)) => vault.remove_at(l, now).map_err(|e| e.to_string())?,
+        (None, None) => return Err("missing <label> (or --id <prefix>)".to_string()),
+    };
     save_vault(&vault_path, &password, &vault)?;
-    println!("removed {label:?} from vault {}", vault_path.display());
+    println!(
+        "removed {:?} from vault {}",
+        removed.label,
+        vault_path.display()
+    );
     Ok(())
 }
 
@@ -3242,6 +3359,130 @@ fn collect_from_uri(
     }
 }
 
+/// `sigil totp sync --vault-id <id> [--server <url>] [--vault <file>] [--key <f>]`
+/// — pull EVERY op for a vault, MERGE them all into the local vault, save, and
+/// push the result back if it differs from the tip.
+///
+/// ⛔⛔ THE DEFECT THIS EXISTS FOR. Every client adopted `ops[last]` wholesale:
+/// device A adds `github` and pushes; device B, which never pulled, adds `gitlab`
+/// and pushes; B's snapshot is now the tip and `github` is GONE — while both
+/// devices reported success. For an authenticator, a lost 2FA secret can mean a
+/// permanently lost account.
+///
+/// The op-log already holds every snapshot, so the fix costs nothing on the wire:
+/// fold them ALL (`sigil_cli::merge_ops_into`) instead of reading one row.
+///
+/// ⭐ It pushes only when the merged vault differs from the tip, and the merge is
+/// idempotent, so a second `sync` on a converged vault appends NO op — that is
+/// what stops two devices pushing at each other forever.
+fn cmd_totp_sync(args: Vec<String>) -> Result<(), String> {
+    // ⚠️ THE SERVER VAULT ID IS POSITIONAL, and that is deliberate. `--vault-id`
+    // already has a DIFFERENT meaning everywhere else in `sigil totp`: "open the
+    // local vault with the KEYRING KEY for this id" (Phase 46). Reusing it here
+    // would make `sigil totp sync --vault-id X` demand a keyring entry for X
+    // before it would talk to the server, so a password-sealed vault could never
+    // be synced at all. When `--vault-id` IS given (a shared vault) it is also
+    // the natural server id, so it is the default.
+    let (positional, flags) = take_positional(&args);
+    let (access, rest) = extract_vault_access(flags.to_vec())?;
+    let vault_path = access.path.clone();
+    let mut server: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut it = rest.into_iter();
+    while let Some(f) = it.next() {
+        match f.as_str() {
+            "--server" => set_once(&mut server, &mut it, "--server")?,
+            "--key" => set_once(&mut key, &mut it, "--key")?,
+            other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
+        }
+    }
+    let vault_id = positional.or_else(|| access.vault_id.clone()).ok_or_else(|| {
+        "missing <vaultID>: which vault on the server to sync (or pass --vault-id for a shared vault)"
+            .to_string()
+    })?;
+    let server = resolve_server(server);
+
+    let secret = access.secret()?;
+    let local = load_vault_or_empty(&vault_path, &secret)?;
+
+    // ⚠️ `resolve_key`, not the bare flag: every other network subcommand honours
+    // SIGIL_DEVICE_KEY, and a `sync` that silently went out UNSIGNED against a
+    // device-auth server would just 401 with no hint why.
+    let identity = load_identity_opt(&resolve_key(key))?;
+    let auth = auth_for(&identity);
+    let ops = pull_ops_auth(&server, &vault_id, 0, &auth)
+        .map_err(|e| explain_sync_error(e, &vault_id, auth.contract()))?;
+    let tip_seq = ops.iter().map(|o| o.seq).max().unwrap_or(0);
+    let tip = ops.iter().max_by_key(|o| o.seq).map(|o| o.blob.clone());
+
+    let (merged, report) = sigil_cli::merge_ops_into(&local, &secret, &ops);
+    for (seq, why) in &report.skipped {
+        eprintln!("sigil: ⚠️  op #{seq} could not be opened and was NOT merged: {why}");
+    }
+    for id in &report.merge.conflicts {
+        eprintln!("sigil: ⚠️  two snapshots disagree about entry {id}; kept one deterministically");
+    }
+
+    save_vault(&vault_path, &secret, &merged)?;
+    println!(
+        "merged {} op(s) into {} ({} entr{} now, {} skipped)",
+        report.applied,
+        vault_path.display(),
+        merged.entries.len(),
+        if merged.entries.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        report.skipped.len()
+    );
+
+    // Push only when the merged view differs from what the tip already says.
+    let container =
+        seal_vault(&secret, &merged, Argon2Params::RECOMMENDED).map_err(|e| e.to_string())?;
+
+    // ⛔ THE TOMBSTONE GROWTH LIMIT. The remove-set never shrinks and there is no
+    // compaction command, so a long-lived vault walks towards sigild's 64 KiB op
+    // cap and then simply stops syncing (413). Warn while there is still room to
+    // act — a user who first hears about this AT the 413 has already lost sync.
+    // ⚠️ Emitted BEFORE the "already converged" early return on purpose: the size
+    // problem is the vault's, not this push's, so a converged sync must report it
+    // too. Nothing here fails; it is a warning, not a gate.
+    if let Some(w) = sigil_cli::op_body_size_warning(container.len()) {
+        eprintln!("sigil: ⚠️  {w}");
+        eprintln!(
+            "sigil:     {} entr{}, {} tombstone(s) — a tombstone is kept forever so a delete \
+             cannot be undone by a device that still holds the entry",
+            merged.entries.len(),
+            if merged.entries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            merged.tombstones.len(),
+        );
+    }
+
+    let tip_matches = match &tip {
+        Some(bytes) => match sigil_cli::open_vault(&secret, bytes) {
+            Ok(v) => {
+                let (m, _) = sigil_cli::merge_vaults(&v, &v);
+                m == merged
+            }
+            Err(_) => false,
+        },
+        None => false,
+    };
+    if tip_matches {
+        println!("the server tip already matches; nothing pushed (op #{tip_seq})");
+        return Ok(());
+    }
+    let seq = push_op_auth(&server, &vault_id, &container, &auth)
+        .map_err(|e| explain_sync_error(e, &vault_id, auth.contract()))?;
+    println!("pushed the merged vault as op #{seq}");
+    Ok(())
+}
+
 /// `sigil totp import <ARG> [--vault <file>]` — import 2FA secrets.
 ///
 /// `<ARG>` is an `otpauth-migration://offline?data=…` URI (Google Authenticator
@@ -3294,15 +3535,47 @@ fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
         )?;
     }
 
-    // De-dup by label against the existing vault (and within this batch): SKIP a
-    // label that already exists rather than overwrite it.
+    // ⭐⭐ De-dup by CONTENT FINGERPRINT, not by label — this is the CRITICAL-2 fix.
+    //
+    // ⛔ It used to skip any entry whose LABEL already existed, so a Google
+    // Authenticator export containing `work` at GitHub AND `work` at GitLab
+    // imported ONE of them and reported the other as a duplicate. Two different
+    // accounts, one silently dropped, in the feature whose entire purpose is not
+    // losing accounts.
+    //
+    // ⚠️ It must be `entry_fingerprint` and NOT `entry_identity`. The imported
+    // entry carries no id (the `otpauth://` and migration formats have no field
+    // for one) while the copy already in the vault carries a RANDOM one, so
+    // comparing identities would never match and a re-import of the same export
+    // would duplicate every account in it. The fingerprint asks the question the
+    // import path actually has: "do I already have this exact account?".
     let mut imported = 0usize;
     let mut skipped_dup = 0usize;
     for e in entries {
-        if vault.find(&e.label).is_some() {
-            eprintln!("sigil: skipping {:?}: already in the vault", e.label);
+        let fp = sigil_cli::entry_fingerprint(&e);
+        if vault
+            .entries
+            .iter()
+            .any(|x| sigil_cli::entry_fingerprint(x) == fp)
+        {
+            // ⭐ NAME it. A bare count is what let the defect above hide.
+            eprintln!(
+                "sigil: skipping {}{:?}: this exact account is already in the vault",
+                e.issuer
+                    .as_deref()
+                    .map(|i| format!("{i}: "))
+                    .unwrap_or_default(),
+                e.label
+            );
             skipped_dup += 1;
             continue;
+        }
+        // Give the imported entry a fresh RANDOM id, so a re-import of an account
+        // that was deleted here comes back rather than being eaten by its own
+        // tombstone.
+        let mut e = e;
+        if e.uuid.is_none() {
+            e.uuid = Some(sigil_cli::random_entry_uuid().map_err(|x| x.to_string())?);
         }
         vault.add(e).map_err(|e| e.to_string())?;
         imported += 1;

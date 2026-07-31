@@ -102,16 +102,38 @@ async function startSigild(binary: string, corsOrigins: string | null): Promise<
   proc.stderr?.resume();
 
   const baseUrl = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 30_000;
+  // ⏱️ 60 s, not 30 s. The only cost of a generous deadline here is a slower
+  // FAILURE; the cost of a tight one is a red gate caused by a busy machine.
+  const started = Date.now();
+  const deadline = started + 60_000;
   for (;;) {
-    if (proc.exitCode !== null) throw new Error(`sigild exited early with ${proc.exitCode}`);
+    if (proc.exitCode !== null) {
+      // ⚠️ Name the likely cause. `freePort()` picks a port and CLOSES it, so
+      // anything else on the box can take it before sigild binds — which is a
+      // race in this harness, not a bug in sigild or in CORS.
+      throw new Error(
+        `sigild exited early with code ${proc.exitCode} after ${Date.now() - started}ms — it did ` +
+          `not fail to become healthy, it DIED. Most likely the port was taken between ` +
+          `freePort() choosing it and sigild binding it.`,
+      );
+    }
     try {
       const res = await fetch(`${baseUrl}/healthz`);
       if (res.ok) break;
     } catch {
       /* not up yet */
     }
-    if (Date.now() > deadline) throw new Error("sigild did not become healthy");
+    if (Date.now() > deadline) {
+      // ⚠️ "did not become healthy" was a symptom with four possible causes. Say
+      // which: a process that is alive but never bound looks nothing like one
+      // that bound and wedged.
+      throw new Error(
+        `sigild did not answer /healthz within 60000ms. The process is ALIVE (pid=${proc.pid}), ` +
+          `so this is not a crash — either it never reached its listener, or it bound and wedged. ` +
+          `Its stdout/stderr were piped and discarded by this harness; re-run with stdio "inherit" ` +
+          `to see them.`,
+      );
+    }
     await new Promise((r) => setTimeout(r, 150));
   }
   return { baseUrl, stop: () => proc.kill("SIGKILL") };
@@ -132,6 +154,18 @@ test.skip(skip, `the Go toolchain (${GO}) is unavailable — set GO=/path/to/go 
 test.describe.configure({ mode: "serial" });
 
 test.beforeAll(async () => {
+  // ⏱️ THIS HOOK IS THE EXPENSIVE PART OF THIS FILE, AND ITS FAILURES ARE
+  // REPORTED AGAINST THE FIRST TEST BELOW — which is why "cors.spec.ts:157
+  // failed under gate load" is usually not about the test at line 157 at all.
+  // It compiles sigild from source and boots TWO servers; under a full
+  // `scripts/gate.sh` run that competes with Rust and Go builds, a Postgres
+  // container and a second Chromium. The per-test bodies here each finish in
+  // about a second, so the envelope belongs on the hook, not on them.
+  //
+  // ⚠️ Playwright gives a hook the same timeout as a test (180 s from
+  // `playwright.config.ts`), and a cold `go build` on a loaded machine can eat
+  // most of it before the first server is even spawned.
+  test.setTimeout(420_000);
   if (skip) return;
   buildDir = mkdtempSync(path.join(tmpdir(), "sigil-cors-"));
   binary = path.join(buildDir, "sigild");
@@ -185,7 +219,10 @@ test("the REAL webapp enrols against a REAL sigild whose origin allowlist includ
     timeout: T,
   });
   await page.getByTestId("sync-pull").click();
-  await expect(page.getByTestId("sync-status")).toContainText("Pulled", { timeout: T });
+  // ⭐ Phase 61: a pull MERGES every op instead of adopting the tip, so the status
+  // reads "Merged N op(s)". What this assertion is for is unchanged: a signed,
+  // preflighted, cross-origin GET reached a real sigild and came back.
+  await expect(page.getByTestId("sync-status")).toContainText("Merged", { timeout: T });
 
   expect(consoleErrors.filter((l) => /blocked by CORS/i.test(l))).toEqual([]);
 });

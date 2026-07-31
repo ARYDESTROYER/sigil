@@ -180,7 +180,10 @@ test("past grace: a refused write reads as PAYMENT, and reads keep working", asy
   // ⭐ READS ARE NEVER REFUSED: the pull still works while the account is
   // lapsed, and the codes already held still generate in the wasm, offline.
   await page.getByTestId("sync-pull").click();
-  await expect(page.getByTestId("status")).toContainText("Pulled op #", { timeout: 30_000 });
+  // ⭐ Phase 61: the pull MERGES every op instead of adopting the tip, so the
+  // status line changed from "Pulled op #N" to "Merged N op(s)". What this
+  // assertion is for is unchanged: a lapsed account's READ is still served.
+  await expect(page.getByTestId("status")).toContainText("Merged", { timeout: 30_000 });
   await expect(page.getByTestId("code")).toHaveText(RFC_CODE_6);
 
   expect(failures).toEqual([]);

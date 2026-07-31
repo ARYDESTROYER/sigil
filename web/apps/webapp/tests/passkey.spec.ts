@@ -25,6 +25,38 @@ import { startFakeSigild } from "../../../../sigil-wasm/test/fake-sigild.mjs";
  */
 
 const T = 90_000;
+
+/**
+ * ⏱️ THE ENVELOPE FOR THE TWO SPECS THAT WAIT OUT A WEBAUTHN CEREMONY.
+ *
+ * ⛔ WHY IT IS SEPARATE FROM `playwright.config.ts`'s global 180 s. Two specs
+ * here — "2. THE MUTATION THAT MATTERS" and "22. NO LOCKOUT" — drive the
+ * NO-USABLE-AUTHENTICATOR path: the virtual authenticator is removed and the app
+ * then calls `navigator.credentials.get()`, which (verified live, and documented
+ * on `PASSKEY_TIMEOUT_MS` in `sigil-wasm/passkey.mjs`) NEVER SETTLES on its own.
+ * The only thing that ends it is the product's own 60 s `timeout`, and that 60 s
+ * is WALL CLOCK: it does not shrink on a fast machine and it does not grow on a
+ * slow one.
+ *
+ * MEASURED on an idle machine: spec 2 takes **72 s** and spec 22 **60 s**, while
+ * every other spec in the whole webapp suite finishes in **under 2.3 s**. So of
+ * the 180 s global envelope these two spend 60 s before any assertion can even be
+ * attempted, leaving ~2x headroom for the real work — and under a full
+ * `scripts/gate.sh` run (Rust, Go, a Postgres container and a second Chromium all
+ * competing) that headroom is what runs out. A security proof that goes red when
+ * the machine is busy is a proof people learn to re-run until it passes.
+ *
+ * ⭐ RAISED HERE, NOT GLOBALLY, ON PURPOSE. Every other spec finishing in ~1 s
+ * SHOULD fail at 180 s — that ceiling is a real signal for them, and giving the
+ * whole suite five minutes to hide in would throw it away for 55 specs to
+ * accommodate 2. The number below is 60 s of unavoidable wait plus a 4x margin on
+ * the ~12 s of actual work.
+ *
+ * ⚠️ IT IS NOT A RETRY. `retries` stays 0 (see `playwright.config.ts`): this
+ * changes how long a spec may take, never how many chances it gets.
+ */
+const NO_AUTHENTICATOR_T = 300_000;
+
 const RFC_SECRET_B32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const RFC_CODE = "287082";
 const WEBAPP_ORIGIN = "http://localhost:3210";
@@ -184,6 +216,9 @@ test("1. enable, reload, and unlock with password + passkey", async ({ page }) =
 test("2. ⭐ THE MUTATION THAT MATTERS: with the authenticator REMOVED, the CORRECT password must FAIL", async ({
   page,
 }) => {
+  // ⏱️ 60 s of this spec is the product's own WebAuthn ceremony timeout expiring
+  // with no authenticator present — wall clock, not work. See NO_AUTHENTICATOR_T.
+  test.setTimeout(NO_AUTHENTICATOR_T);
   const cdp = await enableWebAuthn(page);
   const authenticatorId = await addAuthenticator(cdp);
 
@@ -1002,6 +1037,8 @@ test("21. a passkey that lost PRF AFTER protection is pointed at the sheet, not 
 test("22. ⛔ NO LOCKOUT: hwslot written, BOTH containers still password-sealed, passkey gone", async ({
   page,
 }) => {
+  // ⏱️ Same fixed 60 s WebAuthn wait as spec 2. See NO_AUTHENTICATOR_T.
+  test.setTimeout(NO_AUTHENTICATOR_T);
   const cdp = await enableWebAuthn(page);
   const auth = await addAuthenticator(cdp);
 

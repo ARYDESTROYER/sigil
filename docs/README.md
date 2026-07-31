@@ -38,7 +38,13 @@ hostile blob, which moves every content-validation duty to the client) and
 with an **anonymous** public-key seal let anyone holding the recipient's
 *published* key install a vault key of their choosing — and it explains why the
 fix authenticates with the **hybrid** key rather than a signature, and why
-confidentiality is hybrid while **authenticity is classical X25519 only**).
+confidentiality is hybrid while **authenticity is classical X25519 only**) and
+[0049](decisions/0049-entry-identity-and-the-mergeable-vault.md) (a vault synced
+as whole snapshots was **last-writer-wins**, so a device that never pulled could
+destroy another device's 2FA account and both pushes reported success — the fix is
+a **2P-Set** merged over **every** op rather than the tip, which is free on the
+wire and therefore **retroactive**, and it is the ADR to read for what a hostile
+server can do with a **tombstone**).
 
 **What is real, and what is not.** The cryptography is real and
 **unaudited**. `sigild` is a working dev server whose stateful surface is
@@ -73,7 +79,16 @@ a shared vault key is now wrapped with an **authenticated** hybrid KEM, but that
 authentication is a **classical X25519 static-static DH** — ML-KEM has no
 static-static analogue — so **confidentiality is hybrid while authenticity is
 not**, and a wrap is **implicit, key-confirmed and non-transferable** rather than
-a signature ([0048](decisions/0048-authenticated-vault-key-envelopes.md)). Each
+a signature ([0048](decisions/0048-authenticated-vault-key-envelopes.md)). Since
+Phase 61, add two that come attached to a fix rather than to a feature: a vault's
+**remove-set grows without bound** — every deletion writes a tombstone that must be
+carried forever, nothing prunes them, and past `sigild`'s **64 KiB** op cap `push`
+becomes a permanent **413** with no supported way to shrink the vault (only a 75 %
+warning is built); and the merge is correct **only because entries are immutable**,
+so **adding an edit would silently break it** unless the edit is expressed as
+delete + add with a fresh id — guarded by a source check that makes that decision
+loud rather than impossible
+([0049](decisions/0049-entry-identity-and-the-mergeable-vault.md)). Each
 ADR ends with its own limits, and they are meant to be read as
 findings-in-waiting rather than disclaimers.
 

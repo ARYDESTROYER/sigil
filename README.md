@@ -10,7 +10,12 @@ audited; see the status note below.)
 > returns `501` unless explicitly enabled), but the clients are no longer stubs:
 > a CLI, an offline-capable web app, an MV3 browser extension and a native
 > desktop app all exist, share one sealed vault format, and are exercised by
-> tests that drive the real binaries. All of it is pre-audit.
+> tests that drive the real binaries. All of it is pre-audit. ⭐ Since Phase 61
+> those clients **merge** a synced vault instead of adopting the newest snapshot,
+> which fixes a reproduced multi-device **data loss** — but note the limit that
+> came with it: deletions write tombstones that are **never pruned**, and past the
+> server's 64 KiB per-op cap syncing stops permanently
+> ([ADR 0049](docs/decisions/0049-entry-identity-and-the-mergeable-vault.md)).
 > `libsigil` now has **real but UNAUDITED** crypto building blocks — an
 > Argon2id KDF, an XChaCha20-Poly1305 + HKDF AEAD, a C-ABI `seal`/`open`
 > over them, and a hybrid (X25519 + ML-KEM-768) public-key seal in two forms —
@@ -383,6 +388,26 @@ audited; see the status note below.)
   preserved through an edit (an older client used to silently delete a newer one's data
   on a sync path where the oldest writer wins) and a `min_reader_version` refuses only
   the vaults that genuinely need a newer reader, **failing closed** when it is absent.
+  ⭐ **Phase 61 then fixed a multi-device data loss that had been reproduced end to
+  end:** a vault synced as whole snapshots and every client **adopted the newest one**,
+  so a device that had never pulled could push a snapshot that **destroyed an account
+  added on another device** — and both pushes reported success. A vault is now a
+  **two-phase set** merged by a stable per-entry id (random for new entries; derived
+  deterministically from content for entries written before the id existed, so two
+  devices holding the same old vault agree without communicating), and clients fold
+  **every op in the log** into their local vault instead of taking the tip. ⭐ **That
+  costs nothing on the wire — the op-log had stored every snapshot all along — so it
+  also brings back accounts that were already shadowed.** `sigil totp add`/`import` now
+  de-duplicate on an entry's **content** rather than its label, so `work@github` and
+  `work@gitlab` both survive an import that used to silently keep one.
+  ⛔ **Two honest limits, and they are not small.** Deleting an entry writes a
+  **tombstone that is carried forever** — nothing prunes them, there is no `compact`
+  command, and past the server's 64 KiB per-op cap `push` fails permanently with no
+  supported way to shrink the vault (the clients warn from 75 %, which is a warning and
+  not a fix). And the merge is correct **only because entries are immutable**: there is
+  no rename or edit anywhere, and adding one would silently break convergence unless it
+  is expressed as delete + add with a fresh id
+  ([ADR 0049](docs/decisions/0049-entry-identity-and-the-mergeable-vault.md)).
   The CLI can also **enroll as a device** and sync under **per-vault authorization**
   against a `SIGILD_DEVICE_AUTH` dev server: `sigil device enroll --token <t>` proves
   possession of a fresh key and stores the server-assigned device ID in the 0600

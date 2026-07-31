@@ -151,7 +151,10 @@ test("past grace: a refused write reads as PAYMENT, never as an auth failure —
 
   // ⭐ READS ARE NEVER REFUSED. The pull still works while the account is lapsed…
   await page.getByTestId("sync-pull").click();
-  await expect(page.getByTestId("sync-status")).toContainText("Pulled op #", { timeout: T });
+  // ⭐ Phase 61: the pull MERGES every op instead of adopting the tip, so the
+  // status line changed from "Pulled op #N" to "Merged N op(s)". What this
+  // assertion is for is unchanged: a lapsed account's READ is still served.
+  await expect(page.getByTestId("sync-status")).toContainText("Merged", { timeout: T });
 
   // …and the codes this browser already holds still generate, in the wasm, with
   // no server involved at all. That is the promise the message makes.

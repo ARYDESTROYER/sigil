@@ -5,6 +5,7 @@ import type {
   AccountInfo,
   DeviceIdentity,
   HybridSecretIdentity,
+  MergeOpsResult,
   TotpEntry,
   TotpVault,
 } from "@sigil/wasm";
@@ -879,8 +880,31 @@ export default function Authenticator() {
           );
           continue;
         }
-        const container = ops[ops.length - 1].container;
-        opened = wasm.openVault(wasm, v.vaultKey, container); // throws before anything is stored
+        // ⭐ Phase 61: MERGE every op, do not adopt the tip. A restore is the one
+        // path where the user cannot check the result against anything, so
+        // reconstructing the UNION of every snapshot rather than whichever one
+        // happened to be pushed last matters most here. `mergeOpsInto` throws
+        // nothing on a bad op — it skips and names it — so an empty result still
+        // has to be treated as "nothing opened".
+        const merged = wasm.mergeOpsInto(wasm, v.vaultKey, wasm.newVault(), ops);
+        if (merged.applied === 0) {
+          notes.push(
+            `${v.vaultId}: ${merged.skipped.length} op(s) present but none opened with the recovered key`,
+          );
+          continue;
+        }
+        for (const sk of merged.skipped) {
+          notes.push(`${v.vaultId}: op #${sk.seq} was not merged (${sk.reason})`);
+        }
+        const container = wasm.sealVault(
+          wasm,
+          v.vaultKey,
+          merged.vault,
+          crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
+          crypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
+          wasm.ratchetParams(wasm, ops[ops.length - 1].container, ARGON2),
+        );
+        opened = merged.vault;
         openedId = v.vaultId;
         openedKey = v.vaultKey;
         openedContainer = container;
@@ -989,6 +1013,33 @@ export default function Authenticator() {
     return v;
   }
 
+  // ⭐⭐ THE FIX FOR LAST-WRITER-WINS (Phase 61), at the level that actually loses
+  // the data.
+  //
+  // ⛔ `pull()` used to take `ops[ops.length - 1]` and write it over the stored
+  // container. So: this browser adds `github` and pushes; a phone that never
+  // pulled adds `gitlab` and pushes; the phone's snapshot is now the tip, it has
+  // never seen `github`, and one Pull click destroys it — with both devices
+  // reporting success. For an authenticator a lost 2FA secret can mean a
+  // permanently lost account.
+  //
+  // ⭐ The op-log already holds EVERY snapshot, so the fix costs nothing on the
+  // wire: fold them all. It even recovers data the old behaviour already
+  // shadowed, because the entry is still sitting in an earlier op.
+  //
+  // This lives in the PARENT and not in `SyncPanel` because only the parent holds
+  // the opening secret — which is why the old panel could do nothing better than
+  // store bytes and say "lock and unlock".
+  function mergeOpsIntoVault(ops: { seq: number; container: Uint8Array }[]) {
+    if (!wasm || !vault) throw new Error("vault is locked");
+    const res = wasm.mergeOpsInto(wasm, vaultSealingSecret(), vault, ops);
+    // Persist FIRST (it can throw), then swap the in-memory vault in, so a failed
+    // seal never leaves the UI showing accounts that are not on disk.
+    persist(wasm, res.vault);
+    setVault(res.vault);
+    return res;
+  }
+
   // ⭐ The locked screen's own view of protection: the SLOT IS PRESENT. It cannot
   // know more than that until the ceremony and the password have both succeeded,
   // which is exactly right — the truth is the ciphertext.
@@ -1055,26 +1106,42 @@ export default function Authenticator() {
         onUpdateDevice={updateDevice}
         onRekey={rekeyVault}
         onAdoptSharedVault={adoptSharedVault}
-        onAdd={(input) => withVault((d) => wasm.addEntry(d, input))}
+        // ⭐ Phase 61: `addEntryChecked`, which refuses an account already in the
+        // vault by CONTENT FINGERPRINT rather than by label — so `work` at two
+        // different issuers is two accounts, and re-importing the same export is
+        // a no-op.
+        onAdd={(input) =>
+          withVault((d) => {
+            if (!wasm.addEntryChecked(wasm, d, input)) {
+              throw new Error("this exact account is already in the vault");
+            }
+          })
+        }
         onImportOtpauth={(uri) => {
           const e = wasm.parseOtpauthUri(uri);
-          withVault((d) =>
-            wasm.addEntry(d, {
+          withVault((d) => {
+            const added = wasm.addEntryChecked(wasm, d, {
               label: e.label,
               issuer: e.issuer,
               secretBytes: wasm.base64ToBytes(e.secret),
               algorithm: e.algorithm,
               digits: e.digits,
               period: e.period,
-            }),
-          );
+            });
+            if (!added) throw new Error("this exact account is already in the vault");
+          });
         }}
         onImportMigration={(uri) => importMigration(wasm, uri, withVault)}
-        onRemove={(label) =>
+        // ⭐ Phase 61: remove by IDENTITY (labels are no longer unique) AND record
+        // a TOMBSTONE. A removal that writes no tombstone is exactly the
+        // pre-Phase-61 behaviour: the entry comes straight back the next time
+        // this vault meets a snapshot that still holds it.
+        onRemove={(uuid) =>
           withVault((d) => {
-            d.entries = d.entries.filter((e) => e.label !== label);
+            wasm.removeEntry(wasm, d, { uuid }, Math.floor(Date.now() / 1000));
           })
         }
+        onMergeOps={mergeOpsIntoVault}
         onLock={lock}
       />
     );
@@ -1113,7 +1180,13 @@ function importMigration(
   wasm: Wasm,
   uri: string,
   withVault: (fn: (draft: TotpVault) => void) => TotpVault,
-): { imported: number; skipped: number; batchNote: string | null; finalBatch: boolean } {
+): {
+  imported: number;
+  skipped: number;
+  skippedNames: string[];
+  batchNote: string | null;
+  finalBatch: boolean;
+} {
   // ⛔ ONE URI IS ONE QR CODE. Google Authenticator splits a large export across
   // several, each carrying a SLICE of the accounts, so a count on its own is a
   // lie for exactly the users with the most to lose. `batchNote` is non-null
@@ -1122,10 +1195,19 @@ function importMigration(
   const entries: TotpEntry[] = batch.entries;
   let imported = 0;
   let skipped = 0;
+  // ⭐ NAME what was skipped. A bare count is what let the duplicate-label defect
+  // hide: a user saw "skipped 1" and had no way to learn WHICH account it was.
+  const skippedNames: string[] = [];
   withVault((draft) => {
     for (const e of entries) {
       try {
-        wasm.addEntry(draft, {
+        // ⭐ Phase 61: `addEntryChecked` compares the CONTENT FINGERPRINT, not the
+        // label. `work` at GitHub and `work` at GitLab are two accounts and both
+        // land; re-importing the same export adds nothing. The old `addEntry`
+        // threw on a duplicate LABEL, so the second of two same-labelled accounts
+        // was counted as "skipped" and SILENTLY DROPPED — in the feature whose
+        // entire purpose is not losing accounts.
+        const added = wasm.addEntryChecked(wasm, draft, {
           label: e.label,
           issuer: e.issuer,
           secretBytes: wasm.base64ToBytes(e.secret),
@@ -1133,13 +1215,25 @@ function importMigration(
           digits: e.digits,
           period: e.period,
         });
-        imported += 1;
-      } catch {
-        skipped += 1; // duplicate label or unsupported params
+        if (added) {
+          imported += 1;
+        } else {
+          skipped += 1; // already in the vault, compared by content
+          skippedNames.push(e.issuer ? `${e.issuer}: ${e.label}` : e.label);
+        }
+      } catch (err) {
+        skipped += 1; // unsupported params
+        skippedNames.push(`${e.issuer ? `${e.issuer}: ` : ""}${e.label} (${msg(err)})`);
       }
     }
   });
-  return { imported, skipped, batchNote: batch.batchNote, finalBatch: !!batch.finalBatch };
+  return {
+    imported,
+    skipped,
+    skippedNames,
+    batchNote: batch.batchNote,
+    finalBatch: !!batch.finalBatch,
+  };
 }
 
 // ── Presentational shell ─────────────────────────────────────────────────────
@@ -1771,6 +1865,7 @@ function VaultView({
   onImportOtpauth,
   onImportMigration,
   onRemove,
+  onMergeOps,
   onLock,
 }: {
   wasm: Wasm;
@@ -1792,12 +1887,17 @@ function VaultView({
   onImportMigration: (uri: string) => {
     imported: number;
     skipped: number;
+    /** ⭐ WHICH accounts were skipped. A bare count is what let a defect hide. */
+    skippedNames: string[];
     /** Non-null when this was ONE QR of a multi-QR export; must be shown. */
     batchNote: string | null;
     /** True when it was the LAST QR — say so, but do NOT call it incomplete. */
     finalBatch: boolean;
   };
-  onRemove: (label: string) => void;
+  /** ⭐ Phase 61: by IDENTITY, not label — labels are no longer unique. */
+  onRemove: (uuid: string) => void;
+  /** ⭐ Phase 61: fold every pulled op into the vault instead of adopting the tip. */
+  onMergeOps: (ops: { seq: number; container: Uint8Array }[]) => MergeOpsResult;
   onLock: () => void;
 }) {
   // Server URL + vault id are shared by the Sync and Sharing panels: a vault key
@@ -1832,12 +1932,15 @@ function VaultView({
       ) : (
         <ul data-testid="account-list" className="space-y-2">
           {vault.entries.map((entry) => (
+            // ⭐ Phase 61: keyed on IDENTITY, not label. Labels are no longer
+            // unique (`work` at two issuers is two accounts), and duplicate React
+            // keys make rows share state and the wrong row get removed.
             <AccountRow
-              key={entry.label}
+              key={wasm.entryIdentity(wasm, entry)}
               wasm={wasm}
               entry={entry}
               now={now}
-              onRemove={() => onRemove(entry.label)}
+              onRemove={() => onRemove(wasm.entryIdentity(wasm, entry))}
             />
           ))}
         </ul>
@@ -1864,6 +1967,7 @@ function VaultView({
         setVaultId={setVaultId}
         protection={protection}
         activeVaultId={activeVaultId}
+        onMergeOps={onMergeOps}
       />
       <SharingPanel
         wasm={wasm}
@@ -2012,6 +2116,8 @@ function AddAccountPanel({
   onImportMigration: (uri: string) => {
     imported: number;
     skipped: number;
+    /** ⭐ WHICH accounts were skipped. A bare count is what let a defect hide. */
+    skippedNames: string[];
     /** Non-null when this was ONE QR of a multi-QR export; must be shown. */
     batchNote: string | null;
     /** True when it was the LAST QR — say so, but do NOT call it incomplete. */
@@ -2075,9 +2181,18 @@ function AddAccountPanel({
     setMigrationError("");
     setImportResult("");
     try {
-      const { imported, skipped, batchNote, finalBatch } = onImportMigration(migration.trim());
+      const { imported, skipped, skippedNames, batchNote, finalBatch } = onImportMigration(
+        migration.trim(),
+      );
+      // ⭐ NAME the skips. "skipped 1 (duplicate or unsupported)" is exactly the
+      // message a user saw when the label-keyed de-dup silently dropped their
+      // second `work` account, and there was no way to learn which one it was.
       const base = `Imported ${imported} account${imported === 1 ? "" : "s"}${
-        skipped ? `, skipped ${skipped} (duplicate or unsupported)` : ""
+        skipped
+          ? `, skipped ${skipped} already in this vault or unsupported${
+              skippedNames.length ? `: ${skippedNames.join("; ")}` : ""
+            }`
+          : ""
       }.`;
       // ⛔ Never let the count be the last word on a multi-QR export: a user who
       // reads "Imported 12." and deletes the old app loses the other batches.
@@ -2503,6 +2618,7 @@ function SyncPanel({
   setVaultId,
   protection,
   activeVaultId,
+  onMergeOps,
 }: {
   wasm: Wasm;
   device: DeviceIdentity | null;
@@ -2513,6 +2629,13 @@ function SyncPanel({
   setVaultId: (v: string) => void;
   protection: ProtectionInfo | null;
   activeVaultId: string | null;
+  /**
+   * ⭐ Phase 61: fold every pulled op into the OPEN vault. It lives in the parent
+   * because only the parent holds the opening secret — which is exactly why this
+   * panel used to be able to do nothing better than store bytes and say
+   * "Lock and Unlock to decrypt it", i.e. adopt the tip and lose everything else.
+   */
+  onMergeOps: (ops: { seq: number; container: Uint8Array }[]) => MergeOpsResult;
 }) {
   const [token, setToken] = useState("");
   const [label, setLabel] = useState("this browser");
@@ -2586,6 +2709,11 @@ function SyncPanel({
       const stored = window.localStorage.getItem(STORAGE_KEY);
       if (!stored) throw new Error("no sealed vault to push");
       const container = wasm.base64ToBytes(stored);
+      // ⛔ THE TOMBSTONE GROWTH LIMIT. A vault is a 2P-Set: its remove-set never
+      // shrinks, nothing prunes a tombstone, and past sigild's 64 KiB op cap the
+      // push is a 413 with no supported way to shrink. Warn while there is still
+      // room to act — meeting this first AT the 413 means sync is already gone.
+      const sizeWarn = wasm.opBodySizeWarning(container.length);
       // ⭐ THE GRACE CHANNEL. sigild sets X-Sigil-Entitlement* on a write it is
       // still SERVING inside the grace period — a 2xx — so the warning exists
       // ONLY in the response headers and never in a body or an error. Reading it
@@ -2607,10 +2735,22 @@ function SyncPanel({
             ? ` ⚠️ Subscription ${w.status || "lapsed"} — uploading new changes stops${
                 w.graceEndsAt ? ` on ${wasm.formatInstant(w.graceEndsAt)}` : " soon"
               }. ${wasm.NEVER_REFUSED}`
-            : ""),
+            : "") +
+          (sizeWarn ? ` ⚠️ ${sizeWarn}` : ""),
       );
     } catch (e) {
-      if (!handledAsPayment(e, "Push")) setStatus(`Push failed: ${authMsg(e)}`);
+      // ⚠️ The size warning must survive the FAILURE path too — a 413 is exactly
+      // where it matters, and reporting only "Push failed" there tells the user
+      // nothing about why or what to do.
+      const suffix = wasm.opBodySizeWarning(
+        (() => {
+          const s = window.localStorage.getItem(STORAGE_KEY);
+          return s ? wasm.base64ToBytes(s).length : 0;
+        })(),
+      );
+      if (!handledAsPayment(e, "Push")) {
+        setStatus(`Push failed: ${authMsg(e)}${suffix ? ` ⚠️ ${suffix}` : ""}`);
+      }
     } finally {
       setBusy(false);
     }
@@ -2640,11 +2780,26 @@ function SyncPanel({
         setStatus("No ops on the server for that vault id.");
         return;
       }
-      const latest = ops[ops.length - 1];
-      // Store the sealed bytes; unlock again to decrypt with your password.
-      window.localStorage.setItem(STORAGE_KEY, wasm.bytesToBase64(latest.container));
+      // ⭐⭐ MERGE EVERY OP — do NOT adopt `ops[ops.length - 1]`.
+      //
+      // ⛔ This line used to be `const latest = ops[ops.length - 1]` followed by
+      // writing that container over STORAGE_KEY. If a phone that had never
+      // pulled pushed after this browser did, the phone's snapshot was the tip,
+      // it had never seen this browser's accounts, and one click destroyed them.
+      // Both devices reported success. Reproduced end to end before the fix.
+      const res = onMergeOps(ops);
+      const skipNote = res.skipped.length
+        ? ` ⚠️ ${res.skipped.length} op(s) could not be opened with this vault's secret and were NOT merged (${res.skipped
+            .map((s) => `#${s.seq}`)
+            .join(", ")}) — they are still on the server.`
+        : "";
+      const conflictNote = res.conflicts.length
+        ? ` ⚠️ ${res.conflicts.length} entr${res.conflicts.length === 1 ? "y" : "ies"} were claimed by two different snapshots; one was kept deterministically.`
+        : "";
       setStatus(
-        `Pulled op #${latest.seq}. Sealed vault saved locally — Lock and Unlock to decrypt it.`,
+        `Merged ${res.applied} op(s) through #${res.tip}. ${res.added} account(s) added, ` +
+          `${res.removed} removed by a delete from another device. ` +
+          `${res.vault.entries.length} account(s) now.${skipNote}${conflictNote}`,
       );
     } catch (e) {
       setStatus(`Pull failed: ${authMsg(e)}`);

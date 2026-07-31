@@ -10222,3 +10222,296 @@ CI output earlier today.
 too, and no language-level change can prevent that. A genuine reaper — a wrapper that
 records spawned pids and cleans them on the next run — is the durable answer; `pkill -x
 sigild` is the manual one.
+
+### 2026-07-30 — the last-writer-wins data loss, reproduced end to end (the "before" measurement)
+
+Before building Phase 61, the defect was reproduced with the **real `sigil` binary against a
+real `sigild`**, so the fix has a baseline to be measured against:
+
+```
+=== what each op on the server contains ===
+  op-1.sigil -> github          <- device A
+  op-2.sigil -> gitlab          <- device B, which never pulled
+=== the NEWEST op is what every browser client and pull_and_adopt adopt ===
+  newest = op-2.sigil
+  ⛔ the newest op contains ONLY gitlab
+```
+
+Both pushes reported success. A's `github` is destroyed the moment any client adopts the tip.
+
+⭐ **A PRECISION THE ORIGINAL FINDING LACKED, and it matters for the fix.** "Multi-device
+sync is last-writer-wins" is true of the *product*, but **the CLI's own `pull` is not
+lossy** — it writes every op to a separate file (`lww/op-1.sigil`, `op-2.sigil`) and loses
+nothing. The loss happens at **ADOPTION**: `desktop/core/src/net.rs`'s `pull_and_adopt`
+writes the pulled container over the local vault, and the browser clients take
+`ops[ops.length - 1]` wholesale. So the op-log is not the problem and does not need to
+change — **the merge belongs in the client, at adoption**, which is also the only place it
+*can* live, since `sigild` cannot read the blob.
+
+⚠️ My first two attempts at this reproduction were **invalid and looked conclusive**: the
+first globbed `pulled/*.sigil` when `pull` actually writes `pulled/<vault>/op-N.sigil`, so
+the glob matched nothing, `grep` found nothing, and the script printed the "⛔ CONFIRMED"
+branch for entirely the wrong reason. Same class as the mutation-planting misses earlier
+today: **an assertion that fires because its input was empty is not evidence.** Check what
+the command actually produced before believing what the check says about it.
+
+### 2026-07-31 — Phase 61: entry identity and the mergeable vault (ADR 0049)
+
+The fix for the loss reproduced in the entry above. **The op-log never lost
+anything** — `sigil pull` writes every op to its own file — so the defect was
+entirely at **adoption**, where `pull_and_adopt` overwrote the local vault and the
+browsers took `ops[ops.length - 1]`. That is also why the merge *had* to live in
+the client: `sigild` cannot read the blob.
+
+**What shipped.** A TOTP entry has a stable identity — the `uuid` that
+[ADR 0047](docs/decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
+added and deliberately left dead ("nothing keys off it yet"). It is **minted** (v4,
+caller entropy) for new entries and **derived** (v8, content, `sigil-core`'s
+`entry_id`) for entries written before the field existed. A vault is a **2P-Set**:
+`entries` ∪ `tombstones`, tombstone wins. Clients **fold every op** into their
+**local** vault instead of adopting the tip.
+
+⭐ **The fold is the whole fix, and it is free on the wire** — the append-only
+op-log had stored every snapshot all along. `sigild` changed by **zero lines**, and
+the change is therefore **retroactive**: a vault shadowed on a real server before
+this existed is repaired the first time an updated client syncs it.
+
+⭐ **Why determinism matters only for legacy entries.** A pre-Phase-61 entry has no
+id, and both devices must invent one *before* they can merge. Random ids would
+duplicate every account in every existing multi-device vault on first sync, and a
+tombstone naming A's id would say nothing about B's copy — so **delete could never
+work across the migration boundary**. Deriving from content makes two devices agree
+without communicating. New entries stay random precisely because two accounts that
+happen to share every field are still two accounts.
+
+**Import de-duplicates on a content *fingerprint*, not on the label** — the second
+defect. `work@github` and `work@gitlab` used to have the second silently dropped by
+an import that reported success. The fingerprint is deliberately **not** the merge
+identity: an imported entry carries no id while the stored copy carries a random
+one, so comparing identities would duplicate every account on every re-import.
+
+#### What the verification round found
+
+Four things, and three of them were real defects in this phase's own work:
+
+1. ⛔ **The commutativity claim was FALSE where it was written.** Tombstone-level
+   unknown `extra` fields merged **first-seen-wins** in both mirrors, so two vaults
+   whose tombstones shared a uuid with different unknown values **did not
+   converge** — while the doc comment beside the code claimed unqualified
+   commutativity. **Fixed rather than qualified**, because a forward-compatibility
+   field is exactly what a future version writes and a current one must carry
+   through a merge in either order. Both sides now take the lexicographically
+   greater **canonical** JSON, and both must sort keys (`serde_json::Value` is a
+   `BTreeMap`; JS uses `sortKeysDeep`) or they would pick different winners and
+   never converge. ⭐ **The mutation evidence is the point:** planting the old
+   first-seen-wins line back into `totp-vault.mjs` left **all ten pre-existing
+   blocks green** and failed only the new property block. The suite was **vacuous**
+   against this defect.
+2. ⛔ **"CRDT" was an over-claim in a shipped code comment**, and a verifier caught
+   it. The *entry set* is a 2P-Set with a convergent merge; that is not the same as
+   the vault being a general CRDT, and the convergence argument rests entirely on
+   entries being immutable. The word is now qualified everywhere it appears.
+3. ⚠️ **A late joiner with unpushed local work was untested.** Everywhere else in
+   the suite a device pushes *before* it merges, so a fold that started from a fresh
+   vault instead of `local` would still have looked correct. The new THREE-DEV block
+   adds the only account in the repo that exists nowhere but one client's memory
+   when a three-branch log is folded. Mutating `mergeOpsInto` to start from the
+   server's state left **thirteen** earlier blocks green and failed only that one.
+4. ⚠️ **The immutability guard immediately caught a miscount of its author's own** —
+   a hand count of 3 in-place writes in `cli/src/migration.rs` was actually 4 (a
+   multi-line assignment the grep missed). The exact-count idiom earned itself on
+   its first run.
+
+#### Still open — do not read these as solved
+
+- ⛔ **COMPACTION DOES NOT EXIST.** The remove-set never shrinks, `sigil totp
+  compact` is unbuilt, nothing prunes a tombstone. Past `sigild`'s 64 KiB op cap
+  `push` is a permanent **413** and the only way out is `export` (secrets in the
+  clear) into a fresh vault id. What was built is a **warning at 75 %** and an
+  honest 413 explainer — strictly less than compaction, and not pretended to be
+  more. `deleted_at` is written and merged by `min` so a hostile clock can only
+  make a delete look earlier, but **nothing reads it**; it exists so a future
+  compaction has a field to key on.
+- ⚠️ **The immutability guard is a source check, not a proof.** It cannot catch an
+  edit routed through a helper it does not know about, or an entry rebuilt
+  field-by-field under the same uuid. Structural enforcement was rejected on stated
+  grounds (a mirrored schema whose JS half is a plain object literal cannot be
+  sealed by any language feature, so it would cover half the implementations while
+  reading as if it covered all of them) — **not** because the guard is stronger.
+- ⚠️ **The browser and desktop size warnings are not behaviourally tested.** Only
+  the CLI's is proven end to end against a real server; `PushOutcome.size_warning`
+  crosses the desktop IPC untested.
+- ⚠️ **`merge-interop.mjs` is now slow (~10–15 min)** — every sync runs Argon2id at
+  RECOMMENDED. If a CI job has a per-job timeout, this is the suite that hits it
+  first.
+- ⚠️ **The 750-tombstone size fixture is tuned, not derived.** An earlier attempt at
+  900 landed 597 bytes below the push cap — one JSON tweak from failing for the
+  wrong reason.
+
+#### Documentation round (this entry)
+
+ADR **0049** written; addenda appended to **0024** (the schema gained a remove-set
+and `uuid` became load-bearing), **0025** / **0026** (import de-dups on content),
+and **0047** (its limitation 7 — *"the entry `uuid` is dead weight today"* — is
+**retired**, and its forward-compatibility work is what let a whole `tombstones`
+array ship with no flag day: the first real test of that design, and it held).
+`docs/crypto-spec.md` gained the byte-exact `sigil-totp-entry-id-v1` transcript and
+its golden vector, **independently re-derived in Python** rather than copied out of
+the implementation. `docs/threat-model.md` gained a **tombstone adversary** section:
+a hostile server can **withhold** (the strongest attack — a withheld op is
+indistinguishable from one never pushed, and withholding a delete **resurrects** an
+entry the user believes is gone), **replay** (harmless alone, since the merge is
+idempotent; dangerous combined with withholding) and **grow** the vault toward the
+cap it itself enforces; it **cannot** forge a tombstone for an id it does not know
+(ids live only inside the sealed vault), **cannot reorder its way to a different
+result** (the merge is order-independent, which reduces the whole surface to
+withholding), and cannot read or modify an entry. ⛔ Recorded as undefended: **there
+is no proof of completeness** — the hash chain is tamper-evident *within the served
+range*, so a server serving a **shorter prefix** produces a perfectly valid chain.
+
+⚠️ **Seven stale counts were fixed, all found by `docs-claims-guard.mjs`, not by
+reading.** CLAUDE.md and `docs/architecture.md` both said the desktop had **forty**
+`#[tauri::command]`s; the tree has **41** (`remove_by_id`, added by this phase).
+CLAUDE.md's build block numbered the node interop suites **N/16**; there are **19**.
+Every number written in this round was grepped or measured first — the tauri count
+by reconciling declared-vs-registered handlers (they matched), the 51 guard checks
+and 16 merge blocks by running the suites.
+
+⛔ **Left red, deliberately, and outside a documentation change:**
+**`docs-claims-guard.mjs` is run by NO workflow** (`grep -rl docs-claims-guard
+.github/workflows/` returns nothing; `merge-interop` and `merge-guard` *are* wired).
+`scripts/gate.sh`'s CI-drift check flags it, and it is the exact shape of drift this
+repo has shipped **three times** before. The counts it checks are now green, so
+wiring it in is safe — but that is a CI change, not a documentation one, and it
+needs whoever owns `.github/workflows/`. **This is the one remaining gate failure.**
+
+### A guard for the documentation itself — and what building it taught
+
+The user's standing requirement is that documentation be *extremely accurate*. This repo
+has failed that repeatedly, and always in the same direction: a sentence that was true when
+written, or a number nobody re-derived. `sigild` "performs no cryptography" while fifteen
+non-test files imported crypto; a threat-model row asserting a defence that did not exist;
+a fixed 1226-byte envelope that had become variable-length; a Tauri command count that
+drifted **three times**; four already-fixed items still listed as open.
+
+**`sigil-wasm/test/docs-claims-guard.mjs`** now checks the *countable* class mechanically —
+Tauri commands, `sigild`'s direct dependency count, node interop suites, shell e2e scripts,
+Playwright spec files, ADR contiguity and dangling ADR links, the `getrandom` invariant, and
+the entry-id golden-vector assertion sites. Each check names the command that produces its
+ground truth, so a failure says **which side is wrong**, not merely that they disagree.
+Wired into `interop.yml` as step 19/19; mutation-proven (9 → 11 findings with two planted
+lies, back to 9 on restore).
+
+It found and I fixed **six** genuine stale claims, including four the first version missed.
+
+⚠️ **Four things building it taught, all of them my own errors:**
+
+1. **My `files:` allowlist was a blind spot.** A planted false claim — *"sigild has exactly
+   three direct dependencies"* — went undetected purely because `docs/README.md` was not on
+   that check's list. That is the same shape as a suite that runs in no workflow. Removed;
+   it now scans every `.md`, which widened ADR-link coverage from 10 references to 46 and
+   immediately surfaced two more real findings.
+2. **History is not drift.** ADR 0032 says the desktop has "ten `#[tauri::command]`s" and
+   then names those ten — true at Phase 32, and "correcting" it to 41 would **falsify a
+   dated, accepted record**. Same for `sigild_schema_version now reports 3`. Both are now
+   excluded **by category** (`docs/decisions/**`, and the schema check deleted outright),
+   with the cost written into the file rather than hidden: a wrong count in a *new* ADR is
+   not caught.
+3. **The guard counted itself.** It greps for the entry-id golden vector to count assertion
+   sites — and it *contains* that vector as a string literal, so it reported 4 where reality
+   was 3, making a false doc claim look correct. `portability-guard.mjs` hit the identical
+   trap. **A source guard necessarily quotes what it hunts for.**
+4. **My patterns were narrower than the prose they audited.** A verifier found six stale
+   counts the first version sailed past — *"(still **forty**)"* had no attribute form after
+   the number; *"the SIXTEEN Node suites below"* matched no pattern; the spec-file counts
+   were not checked at all. **A guard reporting a clean bill it has not earned is worse than
+   no guard**, which is the same lesson as the always-red `cargo-audit` job, inverted.
+
+⭐ **And the honest limit, stated in the file's own header:** it checks numbers, not prose.
+The most dangerous documentation failure this project has had — `threat-model.md` row V
+asserting that a substituted key envelope "fails to open", when a freshly minted one opened
+perfectly — is **invisible** to it. It buys the cheap class so that human review can spend
+itself on the expensive one. It is not a substitute for reading.
+
+⚠️ **Two claims I removed rather than corrected:** the docs said "54 tests in 11 spec files"
+and "18 tests in 7 spec files". The FILE counts are now guarded; the TEST counts are not, and
+a number that changes every phase and is verified by nobody is a stale claim waiting to
+happen. The docs should not assert what nothing checks.
+
+### Round 3 — the half-fix, and four residuals I closed by hand
+
+The commutativity fix passed its own mutation tests and **was still wrong**. An
+independent verifier found that values converged while **key order did not**:
+`mergeVaults` built `{ ...prev }` and appended the other side's new keys, so
+`merge(a,b)` and `merge(b,a)` serialized to different bytes whenever two tombstones —
+or two vaults — carried **disjoint** unknown keys. The doc comment beside it said
+*"byte for byte **with no exception**"*.
+
+⭐ **The property test could not have caught it.** It compared through `canonJson`,
+which **sorts keys and therefore normalises away the very property being claimed**.
+That is the same shape as every other failure in this project: the measurement was
+broken, not the code — except here the measurement was broken *in the direction of the
+claim*, which is the worst version.
+
+It was also **wider than reported**: `addEntry` appends `issuer` last, so *every
+ordinary entry* already serialized differently from Rust. The fix establishes Rust's
+wire order **empirically** (seal in JS, let the real binary re-serialize, read the
+bytes back) rather than inferring it, and the new **`BYTES`** section of
+`merge-interop.mjs` compares JS output against that binary byte for byte. Mutation M2
+is the proof it was needed: sorting *everything* but abandoning serde declaration order
+leaves the property test **green** and turns `BYTES` red.
+
+**Four things I closed myself after the round:**
+
+1. **The guard's comment stripper hid the bypass from the guard.** `stripComments`
+   blanked any line matching `/^\s*(\/\/|\/\*|\*(\s|\/|$))/` — meant for `*`
+   continuation lines of a `/* … */` block, but that is also a Rust deref assignment.
+   The unspaced `*e = TotpEntry { … }` was fixed; I verified the **spaced** `* e = …`
+   still survived (guard exit 0, zero FAILs) while `cargo fmt --check` caught it.
+   ⚠️ Relying on rustfmt to reformat a bypass into a shape the guard happens to catch
+   is a coincidence, not a control. Replaced the heuristic with **real block-comment
+   state tracking**; the spaced form now produces two independent FAILs. `//` is still
+   matched only at line start, deliberately — blanking from any `//` would eat the
+   `https://` in a URL and silently shrink what every check inspects.
+2. **`canon_vault` in Rust is the same trap**, still present. It round-trips through
+   `serde_json::Value` (a `BTreeMap`) so it sorts every key. Rust is safe only by
+   accident of that; a future hand-rolled serializer would reintroduce the blind spot
+   with the test still green. Documented in place as **NOT a byte oracle**.
+3. **A live duration claim was ~3x off** — `merge-interop.mjs` said "the longest suite
+   (~9-11 minutes)"; measured five times standalone at **200-201 s**. Corrected.
+4. **A new Rust↔JS mirror now exists** (`VAULT_FIELD_ORDER` / `ENTRY_FIELD_ORDER` /
+   `TOMBSTONE_FIELD_ORDER` vs the serde declaration order) and was in no mirror list.
+   Added to CLAUDE.md's, and it is guarded — `merge-guard.mjs` §6c parses the Rust
+   struct order and compares, mutation-proven in both directions.
+
+**Determinism, which was the point of the round:** three consecutive `./scripts/gate.sh`
+runs, all `ALL GREEN`, with **byte-identical result lines**; `merge-interop.mjs` five
+times standalone, 5/5 clean, `TRANSPORT OK: 0 retries` every time.
+
+### The "after" measurement, against the "before" recorded above
+
+Same scenario, same real binaries, same real `sigild`:
+
+```
+A pushed 'github'; B (never pulled) pushed 'gitlab'   -- this DESTROYED github before Phase 61
+=== device A: totp sync m ===
+    merged 2 op(s) into .../A/v.sigil (2 entries now, 0 skipped)
+    pushed the merged vault as op #3
+=== device A now holds ===          === device B now holds ===
+      gitlab  id=c873878f                 gitlab  id=c873878f
+      github  id=f6237661                 github  id=f6237661
+=== both still generate the RFC 6238 vector ===
+    A github -> 287082          B github -> 287082
+```
+
+Both accounts on both devices, identical entry ids, and the SECRET survived — not just
+the label.
+
+⚠️ **My first attempt at this measurement was invalid, again, and in a new way.** I wrote
+`sigil totp sync … >/dev/null 2>&1 || sigil pull …` — a fallback with both streams
+suppressed. `totp sync` takes the vault id as a POSITIONAL argument, so my invocation
+failed, the `||` silently ran `pull` (which writes to a separate directory and does not
+touch the vault), and A's vault was unchanged — showing one entry. **That looks exactly
+like the merge not working.** Third time this session that a suppressed-output shortcut
+produced a confident wrong reading. ⭐ **A `||` fallback with output discarded cannot tell
+you which branch ran, and therefore cannot tell you anything.**

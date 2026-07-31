@@ -1633,3 +1633,309 @@ fn a_desktop_inside_its_grace_period_is_warned_before_any_write_is_refused() {
          writes are still being served.\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ⭐⭐ PHASE 61 — THE MULTI-DEVICE MERGE, against a real sigild and the real
+// `sigil` binary.
+//
+// ⛔ THE DEFECT. `pull_and_adopt` used to take the NEWEST op and
+// `write_private_bytes(path, &pulled.container)` — writing it straight over the
+// local vault. So: this desktop adds an account and pushes; the CLI, which never
+// pulled, adds a different one and pushes; the CLI's snapshot is now the tip, it
+// has never seen the desktop's account, and one adopt destroys it. Both devices
+// report success.
+//
+// ⭐ WHY THIS TEST IS HERE AND NOT ONLY IN THE LIBRARY. The desktop was once the
+// ONLY client whose key-substitution defence had no test (Phase 51 fixed that).
+// `docs/engineering-lessons.md` entry 10 is the general form: a fix guarded in
+// the shared library and unguarded at the call site is deletable with the whole
+// gate green. Reverting `pull_and_adopt` to write the pulled container must turn
+// THIS test red.
+// ---------------------------------------------------------------------------
+#[test]
+fn two_devices_that_each_added_offline_keep_both_accounts_after_a_merge() {
+    const MERGE_VAULT: &str = "merge-two-devices";
+    let h = Harness::start();
+    println!("\n=== sigild up at {} (the multi-device merge)", h.server);
+
+    let desktop_dir = h.tmp.join("m-desktop/.sigil");
+    let cli_home = h.tmp.join("m-cli");
+    std::fs::create_dir_all(&cli_home).expect("cli home");
+
+    // --- both devices enroll and publish hybrid keys ----------------------
+    let desktop = DeviceConfig::new(&h.server, &desktop_dir);
+    let desktop_id = desktop
+        .enroll(TOKEN_DESKTOP, "merge desktop")
+        .expect("desktop enroll");
+    desktop.publish_hybrid().expect("desktop hybrid");
+
+    let cli_id = device_id_in(&h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &["device", "enroll", "--token", TOKEN_CLI, "--label", "cli"],
+    ));
+    h.cli(&cli_home, CLI_PASSWORD, &["device", "hybrid-publish"]);
+
+    // --- the desktop creates a SHARED vault holding the RFC seed ----------
+    let desktop_vault = desktop_dir.join("totp-vault.sigil");
+    let mut session = VaultSession::create(&desktop_vault, DESKTOP_PASSWORD.as_bytes())
+        .expect("create")
+        .with_params(FAST);
+    session
+        .add_secret_base32(
+            "shared-base",
+            Some("Phase61".into()),
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("add base");
+    session
+        .convert_to_shared(&desktop, MERGE_VAULT)
+        .expect("convert to shared");
+    drop(session);
+    desktop
+        .push_vault_file(MERGE_VAULT, &desktop_vault)
+        .expect("push the base");
+
+    // --- share it with the CLI so both devices hold the SAME vault key ----
+    let (safety, _state) = desktop
+        .peer_safety_number(&cli_id)
+        .expect("read the CLI's safety number");
+    desktop
+        .share_vault(MERGE_VAULT, &cli_id, "write", Some(&safety))
+        .expect("share");
+    h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &["vault", "accept", "--vault", MERGE_VAULT],
+    );
+    let cli_vault = cli_home.join("cli-vault.sigil");
+    h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &[
+            "totp",
+            "sync",
+            MERGE_VAULT,
+            "--vault-id",
+            MERGE_VAULT,
+            "--vault",
+            cli_vault.to_str().expect("path"),
+        ],
+    );
+    say(&format!(
+        "desktop {desktop_id} and CLI {cli_id} both hold the vault key for {MERGE_VAULT}"
+    ));
+
+    // =====================================================================
+    // ⛔ THE PARTITION. Each device adds a DIFFERENT account, neither pulls.
+    // =====================================================================
+    let mut local = VaultSession::unlock_shared(&desktop_vault, &desktop, MERGE_VAULT)
+        .expect("unlock shared")
+        .with_params(FAST);
+    local
+        .add_secret_base32(
+            "only-on-desktop",
+            None,
+            RFC_SEED_B32,
+            "sha1",
+            Some(8),
+            Some(PINNED_PERIOD),
+        )
+        .expect("desktop-only account");
+    drop(local);
+    desktop
+        .push_vault_file(MERGE_VAULT, &desktop_vault)
+        .expect("desktop push");
+
+    // The CLI, which never pulled the line above, adds its own and pushes.
+    // Its snapshot becomes THE TIP and has never seen `only-on-desktop`.
+    h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &[
+            "totp",
+            "add",
+            "only-on-cli",
+            "--secret",
+            RFC_SEED_B32,
+            "--digits",
+            "8",
+            "--period",
+            "30",
+            "--vault-id",
+            MERGE_VAULT,
+            "--vault",
+            cli_vault.to_str().expect("path"),
+        ],
+    );
+    // ⚠️ `sigil push`, NOT `sigil totp sync`. This is the whole point of the
+    // partition and a MUTATION EXPOSED THAT IT WAS WRONG HERE: `totp sync` MERGES
+    // before it pushes, so its snapshot already contained the desktop's account
+    // and the tip was the union — which meant reverting `pull_and_adopt` to adopt
+    // the tip left this test GREEN. `push` uploads the CLI's own container
+    // verbatim, so the tip genuinely has never seen `only-on-desktop`.
+    h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &[
+            "push",
+            "--vault",
+            MERGE_VAULT,
+            "--in",
+            cli_vault.to_str().expect("path"),
+        ],
+    );
+    say("both devices pushed WITHOUT pulling first — the tip has never seen the desktop's account");
+
+    // ⭐ ASSERT THE SETUP, so a future change cannot silently un-partition it and
+    // leave this test proving nothing. The tip must NOT contain the desktop's
+    // account; if it does, adopting the tip would pass and the test is a lie.
+    {
+        let ops = desktop
+            .pull_vault_ops(MERGE_VAULT, 0)
+            .expect("read the raw op-log");
+        let tip = ops.iter().max_by_key(|o| o.seq).expect("at least one op");
+        let key = desktop
+            .vault_key(MERGE_VAULT)
+            .expect("keyring")
+            .expect("key");
+        let tip_vault = sigil_cli::open_vault(&key, &tip.blob).expect("open the tip");
+        assert!(
+            !tip_vault
+                .entries
+                .iter()
+                .any(|e| e.label == "only-on-desktop"),
+            "THE SETUP IS BROKEN: the tip already holds the desktop's account, so adopting \
+             it wholesale would pass and this test would prove nothing"
+        );
+        say(&format!(
+            "the tip (op #{}) holds {:?} — adopting it wholesale is the defect",
+            tip.seq,
+            tip_vault
+                .entries
+                .iter()
+                .map(|e| &e.label)
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    // =====================================================================
+    // ⭐ THE ASSERTION. The desktop merges and must hold ALL THREE.
+    // =====================================================================
+    let adopted = desktop_dir.join("merged.sigil");
+    let (merged, seq) = pull_and_adopt(&desktop, MERGE_VAULT, &adopted, 0)
+        .expect("pull and merge")
+        .expect("the server has ops");
+    assert!(seq >= 3, "expected at least 3 ops, saw tip {seq}");
+    assert_0600(&adopted);
+
+    let views = merged.entries_at(59).expect("codes at T=59");
+    let mut labels: Vec<&str> = views.iter().map(|v| v.label.as_str()).collect();
+    labels.sort_unstable();
+    assert_eq!(
+        labels,
+        vec!["only-on-cli", "only-on-desktop", "shared-base"],
+        "⛔ THE MERGE LOST AN ACCOUNT — adopting the tip wholesale is the defect this fixes"
+    );
+
+    // ⭐ The SECRETS survived, not merely the labels: every one of these carries
+    // the RFC 6238 App B seed, so at T=59 the 30s entry reads the vector and the
+    // pinned-period ones read it at ANY instant.
+    let cli_view = views
+        .iter()
+        .find(|v| v.label == "only-on-cli")
+        .expect("the CLI's account");
+    assert_eq!(
+        cli_view.code, RFC_CODE,
+        "the CLI's account crossed the merge without its secret"
+    );
+    let now_views = merged.entries_at(now_unix()).expect("codes now");
+    let own = now_views
+        .iter()
+        .find(|v| v.label == "only-on-desktop")
+        .expect("the desktop's own account");
+    assert_eq!(
+        own.code, RFC_CODE,
+        "the desktop's OWN account crossed the merge without its secret"
+    );
+    // Every view carries a stable identity a UI can remove by.
+    assert!(
+        views.iter().all(|v| v.uuid.len() == 36),
+        "every EntryView must carry a stable id: {:?}",
+        views.iter().map(|v| v.uuid.clone()).collect::<Vec<_>>()
+    );
+    say("(a) the desktop merged 3 ops and holds ALL THREE accounts, with correct codes");
+
+    // =====================================================================
+    // DELETE — a removal must survive meeting a snapshot that still holds it.
+    // =====================================================================
+    let mut after = VaultSession::unlock_shared(&adopted, &desktop, MERGE_VAULT)
+        .expect("reopen merged")
+        .with_params(FAST);
+    after.remove("only-on-cli").expect("remove");
+    assert_eq!(after.len(), 2);
+    drop(after);
+    desktop
+        .push_vault_file(MERGE_VAULT, &adopted)
+        .expect("push the delete");
+
+    // The CLI still HOLDS `only-on-cli` and has not pulled. It syncs, which both
+    // merges the delete in AND pushes its post-merge snapshot back.
+    let cli_after = h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &[
+            "totp",
+            "sync",
+            MERGE_VAULT,
+            "--vault-id",
+            MERGE_VAULT,
+            "--vault",
+            cli_vault.to_str().expect("path"),
+        ],
+    );
+    let cli_list = h.cli(
+        &cli_home,
+        CLI_PASSWORD,
+        &[
+            "totp",
+            "list",
+            "--vault-id",
+            MERGE_VAULT,
+            "--vault",
+            cli_vault.to_str().expect("path"),
+        ],
+    );
+    assert!(
+        !cli_list.contains("only-on-cli"),
+        "the delete did not reach the CLI — a tombstone must beat a stale snapshot.\n\
+         sync said: {cli_after}\nlist said: {cli_list}"
+    );
+
+    // ⭐ And it must STAY deleted after the CLI's own snapshot comes back round.
+    let re = desktop_dir.join("merged2.sigil");
+    let (final_vault, _) = pull_and_adopt(&desktop, MERGE_VAULT, &re, 0)
+        .expect("second merge")
+        .expect("ops");
+    let final_labels: Vec<String> = final_vault
+        .entries_at(59)
+        .expect("codes")
+        .into_iter()
+        .map(|v| v.label)
+        .collect();
+    assert!(
+        !final_labels.contains(&"only-on-cli".to_string()),
+        "⛔ RESURRECTION: the deleted account came back through an older snapshot: {final_labels:?}"
+    );
+    assert_eq!(final_labels.len(), 2, "{final_labels:?}");
+    say("(b) a delete converges and does NOT resurrect through an older snapshot");
+
+    println!(
+        "\nPASS — two devices each added an account offline; after syncing BOTH hold BOTH, \
+         the secrets survived (RFC 6238 {RFC_CODE}), and a delete converges without \
+         resurrecting.\n"
+    );
+}

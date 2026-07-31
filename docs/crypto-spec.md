@@ -1264,6 +1264,114 @@ op-log later with no new format. The CLI supplies the wall clock and the entropy
 the core supplies only the OTP math. See
 [ADR 0023](decisions/0023-totp-hotp-primitive-and-cli-vault.md).
 
+## TOTP entry identity — the `sigil-totp-entry-id-v1` derivation
+
+See [ADR 0049](decisions/0049-entry-identity-and-the-mergeable-vault.md) for why
+this exists. In one sentence: a vault merges by a per-entry `uuid`, entries
+written before that field existed have none, and **two devices holding copies of
+the same old vault must invent the same id without communicating** — otherwise the
+first merge duplicates every account and a delete can never suppress the other
+device's copy.
+
+⚠️ **This is not new cryptography.** It is one domain-separated, length-prefixed
+SHA-256 transcript formatted as a UUID. It reads no clock and draws no randomness,
+so it stays wasm-pure and `no_std` like the rest of the core
+([ADR 0007](decisions/0007-caller-supplied-entropy-in-core.md)).
+
+⚠️ **It is an IDENTIFIER, not a secret and not a key** — but it *is* computed over
+the secret, so a derived id is a **commitment to the entry's full content**.
+Anyone holding a candidate `(issuer, label, secret, algorithm, digits, period)` can
+confirm it against an id they can see. Ids live only inside the sealed vault, so
+this is not a new exposure; it is why the derivation is used **only** to bootstrap
+a legacy entry's id and to answer the import question, and **never** as the id of a
+newly created entry — those are random v4.
+
+### The transcript
+
+```text
+digest = SHA-256( "sigil-totp-entry-id-v1\n"
+                ‖ u32_be(len(issuer))    ‖ issuer        // "" when absent
+                ‖ u32_be(len(label))     ‖ label
+                ‖ u32_be(len(secret))    ‖ secret        // DECODED key bytes
+                ‖ u32_be(len(algorithm)) ‖ algorithm     // lowercase
+                ‖ u32_be(4) ‖ u32_be(digits)
+                ‖ u32_be(4) ‖ u32_be(period)
+                ‖ u32_be(4) ‖ u32_be(disambiguator) )
+
+id     = uuid_v8(digest[0..16])
+```
+
+- **The domain separator ends with a newline**, matching every other domain string
+  in this crate.
+- **Every field is length-prefixed**, so `issuer="ab", label="c"` cannot collide
+  with `issuer="a", label="bc"` — the same framing discipline as the hybrid AAD and
+  the safety-number digest. A test asserts exactly that pair differs.
+- **`secret` is the DECODED key bytes**, not the base64 the vault stores. ⚠️ A
+  secret that is not valid base64 falls back to the raw stored string's UTF-8
+  bytes, so the function is **total**: a corrupt entry must not be able to abort a
+  merge. Both language paths do the same.
+- **An absent `issuer` is the empty string**, which is a stable documented choice
+  rather than an accident of the caller.
+- **`disambiguator` is `0` for every ordinary call.** It exists only so a vault
+  already containing two byte-identical legacy entries (nothing in this repo writes
+  one — `add` has always rejected duplicates — but a hand-edited or hand-merged file
+  can contain one) can be given distinct **and still deterministic** ids, by
+  incrementing until the id is unused, instead of collapsing two entries into one.
+
+### `uuid_v8` — the formatting
+
+Take `digest[0..16]`, then force the RFC 9562 version and variant bits and print
+lowercase hex in `8-4-4-4-12` form:
+
+```text
+b[6] = (b[6] & 0x0f) | 0x80     // version 8 — "custom / implementation-defined"
+b[8] = (b[8] & 0x3f) | 0x80     // RFC 4122 / 9562 variant
+```
+
+⭐ **Version 8 and not version 5, deliberately.** RFC 9562 §5.5 defines version 5
+as *"name-based, **SHA-1**"*. This is SHA-256, so stamping a `5` would encode a
+false statement about the algorithm into a wire format that other software may one
+day read. Version 8 is the standard's slot for exactly this.
+
+### Golden vector
+
+Independently derived from the transcript above (in Python, not by running the
+implementation) and asserted in **three** places — `libsigil/core/src/entry_id.rs`,
+`sigil-wasm/src/lib.rs` and `sigil-wasm/test/merge-interop.mjs` — so the transcript cannot be changed quietly
+on one side:
+
+| field | value |
+|---|---|
+| `issuer` | `GitHub` |
+| `label` | `alice@example.com` |
+| `secret` | `12345678901234567890` (the RFC 4226 test key, as raw bytes) |
+| `algorithm` | `sha1` |
+| `digits` | `6` |
+| `period` | `30` |
+| `disambiguator` | `0` |
+
+```text
+SHA-256(...)[0..16] = 41828256 7397 90c1 bf67 e6b85ff84173
+                                    ^^ byte 6 = 0x90 -> 0x80   (version 8)
+                                         ^^ byte 8 = 0xbf -> 0xbf (variant bits already 10)
+
+id = 41828256-7397-80c1-bf67-e6b85ff84173
+```
+
+### Where it lives, and why it is NOT mirrored
+
+⭐ The derivation is in **`sigil-core`** (`libsigil/core/src/entry_id.rs`). The CLI
+and the native desktop call it directly; the browsers reach **the same bytes**
+through a one-line `wasm_bindgen` shell. It is deliberately **not** a Rust/JS
+mirrored pair like the `TotpVault` schema ([ADR 0024](decisions/0024-wasm-totp-vault-and-cross-client-totp.md))
+or the safety-number digest ([ADR 0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)),
+for the same reason [ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
+refused a JavaScript copy of the KDF ratchet: **a drift here would be invisible.**
+It produces a vault that opens correctly on every client and merely duplicates or
+mis-suppresses some entries — no error, no exception, nothing to notice.
+`sigil-wasm/test/merge-guard.mjs` fails the build if a JS client reimplements it
+locally.
+
 ## Migration plan (intended)
 
 1. **Today** — all new data at suite `0x12`.

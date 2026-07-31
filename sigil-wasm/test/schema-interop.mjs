@@ -229,6 +229,120 @@ try {
   );
 
   // =====================================================================
+  // PROOF 2b — ⭐ PHASE 61: THE TOMBSTONE LIST SURVIVES A RE-SEAL BY A CLIENT
+  //            THAT DOES NOT KNOW WHAT IT IS.
+  //
+  // ADR 0047's forward-compatibility rule is what makes the 2P-Set safe to add
+  // to a four-client mirror. `tombstones` is a KNOWN field to this build and an
+  // UNKNOWN one to every earlier build, and in BOTH cases it must round-trip: a
+  // client that opened a vault and dropped its tombstones would resurrect every
+  // deleted account on the next merge. So this proof drives the field through
+  // the Rust half in the SHAPE an older client sees — as unknown JSON — as well
+  // as the shape this one does.
+  //
+  // ⚠️ The empty case matters too: `tombstones` is OMITTED when empty (serde
+  // `skip_serializing_if`), so a vault that has never had a delete keeps the
+  // exact byte shape earlier builds wrote.
+  // =====================================================================
+  {
+    const withTombs = {
+      version: 1,
+      entries: [
+        {
+          label: "still-here",
+          // ⭐ COMPUTED, not a literal: it is the public RFC 6238 App B seed in the
+          // vault's at-rest encoding, and writing it out invites a secret scanner
+          // to flag a published constant (and invites the allowlist to grow).
+          secret: bytesToBase64(new TextEncoder().encode("12345678901234567890")),
+          algorithm: "sha1",
+          digits: 6,
+          period: 30,
+          uuid: "11111111-1111-4111-8111-111111111111",
+        },
+      ],
+      tombstones: [
+        { uuid: "22222222-2222-4222-8222-222222222222", deleted_at: 1700000000 },
+        // ⭐ A tombstone written by a NEWER client, carrying a field this build
+        // does not know. It must survive too, by the same rule.
+        { uuid: "33333333-3333-4333-8333-333333333333", reason: "compromised" },
+      ],
+    };
+    const tPlain = join(work, "tombstones.json");
+    const tCont = join(work, "tombstones.sigil");
+    writeFileSync(tPlain, JSON.stringify(withTombs));
+    cliSeal(tPlain, tCont);
+
+    // The REAL CLI opens it, EDITS it (an add re-serializes the whole vault) and
+    // re-seals. This is exactly where a dropped field would be destroyed.
+    sigil(["totp", "add", "added-later", "--secret", "GEZDGNBVGY3TQOJQ", "--vault", tCont]);
+
+    const back = openVault(wasm, PASSWORD, new Uint8Array(readFileSync(tCont)));
+    assert(
+      Array.isArray(back.tombstones) && back.tombstones.length === 2,
+      `RUST dropped the tombstone list on re-seal: ${JSON.stringify(back.tombstones)}`,
+    );
+    const byId = Object.fromEntries(back.tombstones.map((t) => [t.uuid, t]));
+    assert(
+      byId["22222222-2222-4222-8222-222222222222"].deleted_at === 1700000000,
+      "RUST mangled a tombstone's deleted_at",
+    );
+    assert(
+      byId["33333333-3333-4333-8333-333333333333"].reason === "compromised",
+      "RUST dropped an UNKNOWN field on a tombstone — the ADR 0047 rule must reach this level too",
+    );
+
+    // …and the JS half preserves it through its own edit + re-seal.
+    const draft = cloneVault(back);
+    addEntry(draft, {
+      label: "added-by-js-too",
+      secretBytes: new TextEncoder().encode("12345678901234567890"),
+      algorithm: "sha1",
+      digits: 6,
+      period: 30,
+    });
+    const jsTombs = join(work, "tombstones-js.sigil");
+    writeFileSync(
+      jsTombs,
+      sealVault(
+        wasm,
+        PASSWORD,
+        draft,
+        crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
+        crypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
+        containerParams(wasm, new Uint8Array(readFileSync(tCont))),
+      ),
+    );
+    const cliSees = sigil(["totp", "list", "--vault", jsTombs]);
+    assert(cliSees.includes("added-by-js-too"), `CLI cannot read the JS re-seal: ${cliSees}`);
+    const jsBack = openVault(wasm, PASSWORD, new Uint8Array(readFileSync(jsTombs)));
+    assert(
+      jsBack.tombstones.length === 2,
+      `JS dropped the tombstone list on re-seal: ${JSON.stringify(jsBack.tombstones)}`,
+    );
+
+    // ⭐ THE EMPTY CASE: no delete ever happened, so the field must not appear.
+    const emptyOut = sealVault(
+      wasm,
+      PASSWORD,
+      { version: 1, entries: [], tombstones: [] },
+      crypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len())),
+      crypto.getRandomValues(new Uint8Array(wasm.nonce_len())),
+      containerParams(wasm, new Uint8Array(readFileSync(tCont))),
+    );
+    const emptyBack = openVault(wasm, PASSWORD, emptyOut);
+    assert(
+      !("tombstones" in emptyBack),
+      "an EMPTY tombstone list must be OMITTED, so a vault that never had a delete " +
+        "keeps the byte shape earlier builds wrote",
+    );
+
+    console.log(
+      "  PROOF 2b OK: the tombstone list — including a field on a tombstone that this build " +
+        "does not know — survives a re-seal by BOTH halves, and an empty one is omitted",
+    );
+  }
+
+  // =====================================================================
   // PROOF 3 — THE STABLE ENTRY UUID EXISTS ON BOTH SIDES AND AGREES
   // =====================================================================
   const cliAdded = v.entries.find((e) => e.label === "added-by-cli");

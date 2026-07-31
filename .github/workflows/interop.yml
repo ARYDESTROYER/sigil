@@ -112,26 +112,26 @@ jobs:
       - name: Build the real sigil CLI
         run: cargo build --manifest-path cli/Cargo.toml --bin sigil
 
-      - name: 1/16 wasm seal/open round-trip
+      - name: 1/19 wasm seal/open round-trip
         run: node sigil-wasm/test/roundtrip.mjs
-      - name: 2/16 SIGILcli container interop with the real CLI
+      - name: 2/19 SIGILcli container interop with the real CLI
         run: node sigil-wasm/test/interop.mjs
-      - name: 3/16 SIGILhyb hybrid public-key interop
+      - name: 3/19 SIGILhyb hybrid public-key interop
         run: node sigil-wasm/test/hybrid-interop.mjs
-      - name: 4/16 E2EE sync loop against a live sigild
+      - name: 4/19 E2EE sync loop against a live sigild
         run: node sigil-wasm/test/sync-interop.mjs
-      - name: 5/16 cross-client TOTP through the opaque op-log
+      - name: 5/19 cross-client TOTP through the opaque op-log
         run: node sigil-wasm/test/totp-interop.mjs
-      - name: 6/16 TOTP migration codec agrees Rust and JS
+      - name: 6/19 TOTP migration codec agrees Rust and JS
         run: node sigil-wasm/test/migration-interop.mjs
-      - name: 7/16 device auth contract v3
+      - name: 7/19 device auth contract v3
         run: node sigil-wasm/test/device-auth-interop.mjs
-      - name: 8/16 vault sharing, browser and CLI, both directions
+      - name: 8/19 vault sharing, browser and CLI, both directions
         run: node sigil-wasm/test/sharing-interop.mjs
       # The most important one: proves a hostile server swapping a recipient's
       # hybrid public key is DETECTED and REFUSED, and that the Rust and JS
       # safety numbers agree.
-      - name: 9/16 key pinning blocks the substitution attack
+      - name: 9/19 key pinning blocks the substitution attack
         run: node sigil-wasm/test/pinning-interop.mjs
       # Phase 52. A browser-style JS client speaks the ACCOUNT model against a
       # live sigild, and it is the SAME account the real `sigil` CLI joins: the
@@ -139,20 +139,20 @@ jobs:
       # AND writes the vault (the orphaning defect this phase exists to fix), a
       # separate account is 403, and the invite negatives (reuse, foreign handle,
       # quota) all hold.
-      - name: 10/16 the account model, browser client and CLI in one account
+      - name: 10/19 the account model, browser client and CLI in one account
         run: node sigil-wasm/test/accounts-interop.mjs
       # Phase 54. The ONLY automated guard on the Rust <-> JS recovery codec: the
       # Crockford base32 encoding and the HKDF derivation are MIRRORED in
       # libsigil/core/src/recovery.rs and sigil-wasm, and a mirror that drifts
       # does not fail loudly — it silently produces a kit that cannot restore.
-      - name: 11/16 the recovery kit agrees across Rust and JS
+      - name: 11/19 the recovery kit agrees across Rust and JS
         run: node sigil-wasm/test/recovery-interop.mjs
       # Phase 56. The ONLY thing in the repo that parses sigild's real entitlement
       # bytes with the JS reader: the browser suites use a test double, so without
       # this a divergence between sigild's entitlementJSON / paymentRequiredResponse
       # and the JS parser would go red in NO job — and the failure mode is a client
       # telling a paying customer the wrong thing about their own subscription.
-      - name: 12/16 the entitlement reader agrees with a real sigild
+      - name: 12/19 the entitlement reader agrees with a real sigild
         run: node sigil-wasm/test/entitlement-interop.mjs
       # Phase 59. The ONLY guard on two mirrors that were silently LOSSY: the
       # TotpVault/TotpEntry schema (serde dropped unknown fields; the JS clients
@@ -160,7 +160,7 @@ jobs:
       # framing (both codecs discarded batch_size/batch_index/batch_id, so the
       # first QR of a multi-QR export imported a fraction and reported success).
       # Neither drift fails loudly — it just loses a user's accounts.
-      - name: 13/16 the vault schema and migration batching agree across Rust and JS
+      - name: 13/19 the vault schema and migration batching agree across Rust and JS
         run: node sigil-wasm/test/schema-interop.mjs
       # Phase 59. The ONLY exercise of the passkey user-verification check.
       # Chrome's CDP virtual authenticator cannot produce a "completed but
@@ -168,7 +168,7 @@ jobs:
       # branch at all — and an unenforced UV means sealing the hardware slot with
       # CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to
       # prevent.
-      - name: 14/16 a passkey ceremony without user verification is refused
+      - name: 14/19 a passkey ceremony without user verification is refused
         run: node sigil-wasm/test/passkey-uv-interop.mjs
       # Phase 59. A SOURCE-STRUCTURE guard, not a behavioural one: every product
       # re-seal site must ratchet its Argon2 parameters. Behavioural coverage for
@@ -176,7 +176,7 @@ jobs:
       # through two browsers; a verifier proved that mutating five of the six left
       # webapp 50/50 and extension 14/14 green, so this buys the regression guard
       # for the failure that actually happens — a NEW call site that forgets.
-      - name: 15/16 every product re-seal ratchets its Argon2 parameters
+      - name: 15/19 every product re-seal ratchets its Argon2 parameters
         run: node sigil-wasm/test/seal-params-guard.mjs
       # The suites are written on macOS and run here on Linux, and until
       # 2026-07-30 nothing checked that the two agreed: six suites hardcoded
@@ -185,8 +185,25 @@ jobs:
       # jobs were red for several phases while the macOS gate printed ALL GREEN.
       # A source check, NOT a Linux run — it guards the two idioms that have
       # actually bitten and cannot prove portability on its own.
-      - name: 16/16 no known macOS-only idiom in the suites
+      - name: 16/19 no known macOS-only idiom in the suites
         run: node sigil-wasm/test/portability-guard.mjs
+      # ⭐⭐ Phase 61. THE HEADLINE PROOF for the multi-device merge: two devices
+      # each add an account while offline, both sync, and BOTH hold BOTH with
+      # correct codes. Before this, every client adopted `ops[ops.length - 1]`
+      # wholesale, so the account added on the device that had not pulled first
+      # was destroyed while both devices reported success. Drives a REAL sigild
+      # and the REAL `sigil` binary, so the Rust and JS merges must also converge
+      # to identical content — a drifted mirror fails here and nowhere else.
+      - name: 17/19 the multi-device merge loses nothing, and deletes converge
+        run: node sigil-wasm/test/merge-interop.mjs
+      # Phase 61. A SOURCE-STRUCTURE guard beside the merge's behavioural proofs:
+      # no shipping client may adopt the tip, every removal must tombstone, every
+      # import must de-dup by CONTENT not label, and the identity derivation must
+      # not be reimplemented in JS. It covers the failure that recurs — a NEW
+      # adoption site written later that forgets — not the correctness of the
+      # merge itself, which is what the suites above are for.
+      - name: 18/19 no shipping client adopts the tip, and every removal tombstones
+        run: node sigil-wasm/test/merge-guard.mjs
 
       - name: Assert the libsigil core stays getrandom-free
         run: |
@@ -301,3 +318,12 @@ jobs:
         env:
           GO: go
         run: ./cli/tests/e2e-recovery.sh
+      # ⭐ The COUNTABLE documentation claims must match the tree. This repo has
+      # shipped false doc claims repeatedly — `sigild` "performs no cryptography"
+      # while 15 files imported crypto, a threat-model row asserting a defence
+      # that did not exist, a fixed 1226-byte envelope that had become
+      # variable-length, a Tauri command count that drifted three times, and four
+      # already-fixed items still listed as open. This catches the countable
+      # class; it cannot check prose, and says so in its own header.
+      - name: 19/19 documentation counts match the code
+        run: node sigil-wasm/test/docs-claims-guard.mjs

@@ -446,6 +446,19 @@ fn remove(label: String, state: State<'_, AppState>) -> CmdResult<()> {
     with_session(&state, |s| s.remove(&label).map_err(|e| msg(e.to_string())))
 }
 
+/// Remove the account with this IDENTITY, recording a tombstone.
+///
+/// ⭐ Phase 61: this is what the UI calls. Labels are no longer unique (`work` at
+/// two issuers is two accounts), so removing by label can be AMBIGUOUS — the
+/// library refuses rather than guessing, and guessing is how a user deletes the
+/// wrong account.
+#[tauri::command]
+fn remove_by_id(uuid: String, state: State<'_, AppState>) -> CmdResult<()> {
+    with_session(&state, |s| {
+        s.remove_by_id(uuid.trim()).map_err(|e| msg(e.to_string()))
+    })
+}
+
 /// Export as `otpauth://` URIs. **Reveals the secrets in the clear** — the UI
 /// must show [`EXPORT_WARNING`], which is returned alongside the payload so it
 /// cannot be dropped by accident.
@@ -537,6 +550,23 @@ struct ServerProbe {
     reachable: bool,
     hybrid_published: bool,
     detail: String,
+}
+
+/// The outcome of a push.
+///
+/// ⛔ `size_warning` is the TOMBSTONE GROWTH LIMIT surfacing. A vault is a
+/// 2P-Set whose remove-set never shrinks, nothing prunes a tombstone and there
+/// is no compaction command, so a long-lived vault walks towards sigild's 64 KiB
+/// op cap and then simply stops syncing (413). The warning has to reach the
+/// human while the push still WORKS — meeting this first at the 413 means sync
+/// is already gone — which is why the push result carries it rather than the
+/// error path alone.
+#[derive(Serialize)]
+struct PushOutcome {
+    /// The op-log sequence the server assigned.
+    seq: u64,
+    /// A size warning at ≥75% of the server's op cap, else `None`.
+    size_warning: Option<String>,
 }
 
 /// The outcome of a pull.
@@ -643,17 +673,38 @@ fn convert_to_shared(vault_id: String, state: State<'_, AppState>) -> CmdResult<
 /// Push the OPEN vault's sealed container to the op-log. The server stores
 /// opaque bytes; it never sees a password, a key or a code.
 #[tauri::command]
-fn push(vault_id: String, state: State<'_, AppState>) -> CmdResult<u64> {
+fn push(vault_id: String, state: State<'_, AppState>) -> CmdResult<PushOutcome> {
     let config = sync_config(&state)?;
     let path = with_session(&state, |s| Ok(s.path().to_path_buf()))?;
+    // ⛔ Computed BEFORE the push and returned whether or not the push succeeds
+    // in the caller's eyes: the size problem belongs to the VAULT, not to this
+    // one request, and the 413 that ends sync gives no second chance to say so.
+    let size_warning = sigil_desktop_core::op_body_size_warning_for(&path);
     // An op-log append is THE gated write (ADR 0043 §2): this is where a lapsed
     // account learns it has lapsed, and where the UI learns to say so.
-    track_write(&state, config.push_vault_file(vault_id.trim(), &path))
+    match track_write(&state, config.push_vault_file(vault_id.trim(), &path)) {
+        Ok(seq) => Ok(PushOutcome { seq, size_warning }),
+        Err(mut e) => {
+            // ⚠️ The warning must survive the FAILURE path too — a 413 IS the
+            // failure it predicts, and "push failed" alone tells the user
+            // nothing about why or what to do about it.
+            if let Some(w) = size_warning {
+                e.message = format!("{} ⚠️ {w}", e.message);
+            }
+            Err(e)
+        }
+    }
 }
 
-/// Pull the latest sealed container for `vault_id` and adopt it as the local
-/// vault. It is opened with this device's vault key BEFORE anything is written,
-/// so a container this device cannot read can never clobber a good vault.
+/// Pull EVERY sealed snapshot for `vault_id` and MERGE them into the local vault.
+///
+/// ⛔ It used to adopt the newest op wholesale, so an account added on another
+/// device that had not pulled first was destroyed by one click, with both
+/// devices reporting success. The merge is `sigil_cli::merge_ops_into`, reached
+/// through `pull_and_adopt` — nothing under `desktop/` decides it (ADR 0037).
+///
+/// The merged vault is re-sealed BEFORE anything is written, so a container this
+/// device cannot read can never clobber a good vault.
 #[tauri::command]
 fn pull(vault_id: String, state: State<'_, AppState>) -> CmdResult<PullOutcome> {
     let config = sync_config(&state)?;
@@ -1349,6 +1400,7 @@ fn main() {
             add_uri,
             import,
             remove,
+            remove_by_id,
             export_uris,
             export_migration,
             set_server,

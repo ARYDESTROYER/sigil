@@ -153,3 +153,25 @@ also exported for callers that decode a payload themselves.
   have not answered.
 - **The browser export still reveals secrets in the clear**, unchanged and by
   design.
+
+---
+
+## Addendum (2026-07-31, Phase 61) — the JS import mirrors the content-fingerprint rule
+
+Recorded by [0049](0049-entry-identity-and-the-mergeable-vault.md); the defect and
+the reasoning are in the matching addendum to
+[0025](0025-totp-import-export.md) and are not repeated here.
+
+`sigil-wasm/totp-vault.mjs`'s add/import path now de-duplicates on
+`entryFingerprint` (content) instead of on `label`, mirroring
+`cli/src/lib.rs::entry_fingerprint`, so `work@github` and `work@gitlab` both
+survive a browser import exactly as they now do in the CLI.
+
+⭐ **This is one of the few mirrors that CANNOT drift**, unlike the migration codec
+this ADR is otherwise about: the fingerprint is computed by `sigil-core` through a
+one-line wasm shell, not reimplemented in JavaScript. `sigil-wasm/test/merge-guard.mjs`
+additionally fails the build if a JS client reintroduces a label-keyed
+de-duplication or reimplements the derivation locally.
+
+⚠️ **Unchanged:** the hand-rolled protobuf codec **is** still mirrored and must
+still stay byte-compatible, and an export still reveals secrets in the clear.

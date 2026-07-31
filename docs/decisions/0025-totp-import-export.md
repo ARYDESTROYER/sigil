@@ -158,3 +158,35 @@ plain export can represent everything.
   not. The note says so rather than implying otherwise.
 - **`export` still prints secrets in the clear** — unchanged, by design, behind the
   same loud warning.
+
+---
+
+## Addendum (2026-07-31, Phase 61) — import de-duplicates on CONTENT, not on the label
+
+Recorded by [0049](0049-entry-identity-and-the-mergeable-vault.md).
+
+⛔ **The defect.** `add` and `import` skipped an entry whose **`label`** already
+existed. So a user with `work@github` and `work@gitlab`, or with the same
+`alice@example.com` address at two different issuers — the ordinary case for anyone
+holding a work and a personal login — had the second account **silently dropped by
+an import that reported success**. Same failure class as the two truthfulness
+defects in this ADR's previous addendum, in the one feature whose entire purpose is
+not losing accounts.
+
+**The fix.** The comparison is now `entry_fingerprint` — a content fingerprint over
+`(issuer, label, secret, algorithm, digits, period)`, exactly what makes two rows
+the same account. `work@github` and `work@gitlab` differ in `secret` and `issuer`,
+so both survive; re-importing the same Google Authenticator export is still
+idempotent, because the entries genuinely are identical.
+
+⭐ **Why the fingerprint and NOT the merge identity**, which is the trap here: a
+freshly imported entry carries **no id at all**, while the copy already in the
+vault carries a **random** one. Comparing identities would never match, so every
+re-import would duplicate every account in the file. Import asks *"have I already
+got this account?"* (content); the merge asks *"which entry is this?"* (`uuid`).
+Conflating the two is a bug this code has already had.
+
+⚠️ **Unchanged, and still true:** the `otpauth://` and migration formats carry no
+entry id, so a round-trip through either **mints fresh ids** — an imported entry is
+a different entry in a different vault. `export` still prints secrets in the clear
+behind the same loud warning.

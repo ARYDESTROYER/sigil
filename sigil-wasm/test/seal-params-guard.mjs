@@ -45,8 +45,18 @@ const PRODUCTS = [
 /** Functions that write a `SIGILcli` container and therefore take Argon2 params. */
 const SEALERS = ["sealVault", "sealDeviceIdentity", "sealHwSlot"];
 
-/** The helper that reads the existing header and ratchets. */
-const RATCHET = "sealParams";
+/**
+ * The helper that reads the existing header and ratchets.
+ *
+ * ⚠️ TWO accepted spellings, and both are equally strong. `sealParams(m, key)`
+ * reads the container currently in storage under `key`; `ratchetParams(m, bytes,
+ * ARGON2)` — which `sealParams` itself calls — is used where the source container
+ * is already in hand (the recovery-restore path re-seals a MERGE of the server's
+ * ops, so the header to ratchet against is the server tip's, not storage's).
+ * What the guard actually forbids is a re-seal whose parameters were not read
+ * from a real header at all, and both of these read one.
+ */
+const RATCHETS = ["sealParams", "ratchetParams"];
 
 let failures = 0;
 const fail = (m) => {
@@ -100,8 +110,8 @@ for (const rel of PRODUCTS) {
 
   // The ratchet helper itself must exist; without it every call below is
   // trivially unratcheted and the guard would be reporting on nothing.
-  if (!src.includes(`${RATCHET}(`)) {
-    fail(`${rel}: no ${RATCHET}(...) helper — the ratchet is gone entirely`);
+  if (!RATCHETS.some((r) => src.includes(`${r}(`))) {
+    fail(`${rel}: no ${RATCHETS.join("/")}(...) helper — the ratchet is gone entirely`);
     continue;
   }
 
@@ -109,9 +119,9 @@ for (const rel of PRODUCTS) {
     for (const call of callArguments(src, sealer)) {
       checked += 1;
       const line = lineOf(src, call.index);
-      if (!call.args.includes(`${RATCHET}(`)) {
+      if (!RATCHETS.some((r) => call.args.includes(`${r}(`))) {
         fail(
-          `${rel}:${line} — ${sealer}(...) does not pass ${RATCHET}(...). ` +
+          `${rel}:${line} — ${sealer}(...) does not pass ${RATCHETS.join("/")}(...). ` +
             `A re-seal that ignores the stored header silently DOWNGRADES the ` +
             `work factor of a vault written by a stronger client.`,
         );

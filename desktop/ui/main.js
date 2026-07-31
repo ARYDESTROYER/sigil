@@ -146,7 +146,10 @@ async function refresh() {
     del.textContent = "Remove";
     del.addEventListener("click", async () => {
       if (!window.confirm(`Remove "${row.label}" from the vault?`)) return;
-      await call("remove", { label: row.label });
+      // ⭐ Phase 61: remove by IDENTITY. Labels are no longer unique (`work` at
+      // two issuers is two accounts), so removing by label can be ambiguous —
+      // and the row the user clicked is the one they mean.
+      await call("remove_by_id", { uuid: row.uuid });
       toast(`removed ${row.label}`);
       refresh();
     });
@@ -201,9 +204,13 @@ $("import-form").addEventListener("submit", async (e) => {
   // migration-aware importer. Both paths live in the Rust core.
   const r = await call("import", { text });
   $("import-text").value = "";
+  // ⭐ NAME the accounts that were skipped as already-present. A bare count is
+  // what let the label-keyed de-dup silently drop a user's second `work` account.
+  const dupNames = r.skipped_duplicate_names ?? [];
   const base =
-    `imported ${r.imported} (skipped: ${r.skipped_duplicate} duplicate, ` +
-    `${r.skipped_hotp} HOTP, ${r.skipped_invalid} invalid)`;
+    `imported ${r.imported} (skipped: ${r.skipped_duplicate} already in this vault` +
+    (dupNames.length ? ` [${dupNames.join("; ")}]` : "") +
+    `, ${r.skipped_hotp} HOTP, ${r.skipped_invalid} invalid)`;
   // ⛔ A multi-QR Google Authenticator export arrives one QR at a time. Saying
   // "imported 12" and nothing else is how a user deletes the old app with two
   // thirds of their accounts still only there.
@@ -458,8 +465,17 @@ $("convert-btn").addEventListener("click", async () => {
 $("push-btn").addEventListener("click", async () => {
   const id = vaultId();
   if (!id) return;
-  const seq = await call("push", { vaultId: id });
-  toast(`pushed the sealed container as seq ${seq} (the server cannot read it)`);
+  const res = await call("push", { vaultId: id });
+  // ⛔ `size_warning` is the TOMBSTONE GROWTH LIMIT: the remove-set never
+  // shrinks, nothing prunes a tombstone, and past the server's 64 KiB op cap a
+  // push is a 413 with no way back. Say it while the push still works.
+  toast(
+    `pushed the sealed container as seq ${res.seq} (the server cannot read it)` +
+      (res.size_warning ? ` — ⚠️ ${res.size_warning}` : ""),
+    // Deliberately raised as the PROMINENT variant (7s, highlighted): a 3.5s
+    // toast is how a warning about permanent loss of sync gets missed.
+    Boolean(res.size_warning),
+  );
   // A served write clears a stale refusal banner (and a refused one raises it,
   // from `call`'s error path). ⭐ Then ASK: a write served INSIDE GRACE looks
   // identical to a healthy one from here, so only the subscription read can

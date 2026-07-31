@@ -306,6 +306,27 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// ⛔ THE TOMBSTONE GROWTH LIMIT, for the sealed container at `path`.
+///
+/// A vault is a 2P-Set: the remove-set NEVER shrinks, nothing anywhere prunes a
+/// tombstone, and there is no compaction command. `sigild` caps one op body at
+/// `sigil_cli::MAX_OP_BODY_BYTES` (64 KiB) and answers **413** above it, at
+/// which point the vault can no longer be synced and there is no supported way
+/// to shrink it. This returns the warning to show the human WHILE THE PUSH STILL
+/// WORKS, or `None` below 75% of the cap.
+///
+/// ⭐ REUSE, DO NOT REIMPLEMENT (ADR 0037): the thresholds and the wording are
+/// `sigil_cli::op_body_size_warning`. Nothing under `desktop/` decides them.
+///
+/// ⚠️ TOTAL — an unreadable file yields `None` rather than an error. The push
+/// that follows will report the real I/O problem; a size warning must never be
+/// the thing that fails a push.
+#[must_use]
+pub fn op_body_size_warning_for(path: &std::path::Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    sigil_cli::op_body_size_warning(usize::try_from(len).unwrap_or(usize::MAX))
+}
+
 /// The default vault path: `$HOME/.sigil/totp-vault.sigil`, falling back to
 /// `./totp-vault.sigil` when `$HOME` is unset.
 ///
@@ -330,7 +351,10 @@ pub fn default_vault_path() -> PathBuf {
 /// The raw secret is deliberately absent — a list view can never leak it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryView {
-    /// Account label (unique within a vault).
+    /// ⭐ The entry's stable IDENTITY (Phase 61) — what a UI must remove by.
+    /// Labels are NOT unique: `work` at two issuers is two accounts.
+    pub uuid: String,
+    /// Account label. ⚠️ NOT unique within a vault.
     pub label: String,
     /// Optional issuer / service name.
     pub issuer: Option<String>,
@@ -352,8 +376,14 @@ pub struct EntryView {
 pub struct ImportSummary {
     /// Entries added to the vault.
     pub imported: usize,
-    /// Entries skipped because that label was already present.
+    /// Entries skipped because that ACCOUNT was already present (compared by
+    /// content, not by label — Phase 61).
     pub skipped_duplicate: usize,
+    /// ⭐ WHICH accounts those were, `"Issuer: label"`. A bare count is exactly
+    /// what let the label-keyed de-dup silently drop a user's second `work`
+    /// account with nothing to name it. Kept BESIDE the count so every existing
+    /// caller compiles unchanged.
+    pub skipped_duplicate_names: Vec<String>,
     /// Entries skipped because they were counter-based (HOTP); the vault is
     /// TOTP-only and its schema is not extended.
     pub skipped_hotp: usize,
@@ -544,6 +574,7 @@ impl VaultSession {
             .map(|e| {
                 let (code, seconds_remaining) = e.code_at(unix_time)?;
                 Ok(EntryView {
+                    uuid: sigil_cli::entry_identity(e),
                     label: e.label.clone(),
                     issuer: e.issuer.clone(),
                     algorithm: e.algorithm.clone(),
@@ -632,8 +663,26 @@ impl VaultSession {
         }
 
         for entry in staged {
-            if self.vault.find(&entry.label).is_some() {
+            // ⭐⭐ Phase 61 (CRITICAL 2): the skip test is the CONTENT FINGERPRINT,
+            // not the label. It used to be `self.vault.find(&entry.label)`, so a
+            // Google Authenticator export holding `work` at GitHub AND `work` at
+            // GitLab imported ONE of them and silently dropped the other — two
+            // different accounts, in the feature whose whole purpose is not
+            // losing accounts. REUSE, DO NOT REIMPLEMENT: the fingerprint is
+            // `sigil_cli::entry_fingerprint` (ADR 0037).
+            let fp = sigil_cli::entry_fingerprint(&entry);
+            if self
+                .vault
+                .entries
+                .iter()
+                .any(|e| sigil_cli::entry_fingerprint(e) == fp)
+            {
                 summary.skipped_duplicate += 1;
+                // ⭐ NAME it. A bare count is what let the defect above hide.
+                summary.skipped_duplicate_names.push(match &entry.issuer {
+                    Some(i) => format!("{i}: {}", entry.label),
+                    None => entry.label.clone(),
+                });
                 continue;
             }
             match self.vault.add(entry) {
@@ -658,12 +707,32 @@ impl VaultSession {
         self.import_text(&text)
     }
 
-    /// Remove the account labelled `label`.
+    /// Remove the account labelled `label`, recording a TOMBSTONE.
+    ///
+    /// ⭐ Phase 61: `remove_at`, not `remove`, so the removal carries this
+    /// machine's clock — `sigil-core` reads none (ADR 0007). The tombstone is
+    /// what stops the entry coming straight back the next time this vault meets
+    /// a snapshot that still holds it.
+    ///
+    /// ⚠️ Labels are no longer unique, so an AMBIGUOUS label is REFUSED (the
+    /// library names the candidates) rather than silently removing the first
+    /// match. Use [`VaultSession::remove_by_id`] to name one exactly.
     ///
     /// # Errors
-    /// - [`DesktopError::Vault`] if no such account exists.
+    /// - [`DesktopError::Vault`] if no such account exists, or more than one does.
     pub fn remove(&mut self, label: &str) -> Result<()> {
-        self.vault.remove(label)?;
+        self.vault.remove_at(label, Some(now_unix()))?;
+        self.save()
+    }
+
+    /// Remove the account whose identity is `id` (or a unique prefix of it),
+    /// recording a TOMBSTONE. This is what a UI should call: it is unambiguous
+    /// even when two accounts share a label.
+    ///
+    /// # Errors
+    /// - [`DesktopError::Vault`] if nothing matches or the prefix is ambiguous.
+    pub fn remove_by_id(&mut self, id: &str) -> Result<()> {
+        self.vault.remove_by_uuid(id, Some(now_unix()))?;
         self.save()
     }
 

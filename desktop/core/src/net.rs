@@ -655,7 +655,12 @@ impl DeviceConfig {
     /// PULL the LATEST sealed container for `vault_id` (ops with `seq > since`),
     /// or `Ok(None)` when there is nothing new.
     ///
-    /// Each op is a whole vault snapshot, so only the highest sequence matters.
+    /// ⚠️ Each op is a whole vault snapshot and this returns only the HIGHEST
+    /// sequence, so it is a **tip read, not a sync**. It is retained for the
+    /// callers that genuinely want the tip (a reachability probe, a diagnostic).
+    /// ⛔ Do NOT adopt what it returns — that was the last-writer-wins defect.
+    /// [`pull_and_adopt`] folds every op through
+    /// [`sigil_cli::merge_ops_into`] instead.
     ///
     /// # Errors
     /// Same as [`DeviceConfig::push_vault`].
@@ -671,6 +676,23 @@ impl DeviceConfig {
                 seq: op.seq,
                 container: op.blob,
             }))
+    }
+
+    /// PULL EVERY op for `vault_id` with `seq > since`, oldest first.
+    ///
+    /// ⭐ This is what a merge needs and [`DeviceConfig::pull_vault`] cannot give:
+    /// the op-log already stores every snapshot, and reading one row of it was
+    /// the entire bug.
+    ///
+    /// # Errors
+    /// Same as [`DeviceConfig::push_vault`].
+    pub fn pull_vault_ops(&self, vault_id: &str, since: u64) -> Result<Vec<sigil_cli::PulledOp>> {
+        let identity = self.identity()?;
+        let auth = Self::sync_auth(&identity);
+        let mut ops = pull_ops_auth(&self.server, vault_id, since, &auth)
+            .map_err(|e| net_error(e, &self.server, "pulling the sealed vault"))?;
+        ops.sort_by_key(|op| op.seq);
+        Ok(ops)
     }
 
     // -- sharing ----------------------------------------------------------
@@ -1328,18 +1350,38 @@ impl VaultSession {
     }
 }
 
-/// PULL the latest sealed container for `vault_id` and ADOPT it as the local
-/// vault at `path`, returning the freshly opened session and the op-log sequence
-/// it came from (or `Ok(None)` when the server had nothing newer).
+/// PULL every sealed snapshot for `vault_id` and **MERGE** them into the local
+/// vault at `path`, returning the freshly opened session and the highest op-log
+/// sequence seen (or `Ok(None)` when the server had nothing newer).
 ///
-/// The container is opened with this device's vault key BEFORE anything is
-/// written, so a container this device cannot read — or one the server mangled —
-/// can never clobber a good local vault.
+/// ⛔⛔ THE DEFECT THIS FIXES. This used to take the NEWEST op and
+/// `write_private_bytes(path, &pulled.container)` — writing it straight over the
+/// local vault. So: this desktop adds `github` and pushes; a phone that never
+/// pulled adds `gitlab` and pushes; the phone's snapshot is now the tip, it has
+/// never seen `github`, and one adopt destroys it — with both devices reporting
+/// success. For an authenticator a lost 2FA secret can mean a permanently lost
+/// account.
+///
+/// ⭐ The op-log already holds EVERY snapshot, so the fix costs nothing on the
+/// wire: fold them all through [`sigil_cli::merge_ops_into`], which unions the
+/// entries and lets a tombstone suppress anything genuinely deleted. It also
+/// recovers data the old behaviour already shadowed, since the entry is still
+/// sitting in an earlier op.
+///
+/// ⭐ REUSE, DO NOT REIMPLEMENT (ADR 0037): the merge, the identity derivation
+/// and the tombstone rules all live in the `sigil-cli` library. Nothing under
+/// `desktop/` decides any of them.
+///
+/// The merged vault is opened in memory and re-sealed BEFORE anything is
+/// written, and the write is still a temp file + rename, so a container this
+/// device cannot read — or one the server mangled — can never clobber a good
+/// local vault. An op that will not open under this device's key is SKIPPED, not
+/// fatal.
 ///
 /// # Errors
 /// - [`DesktopError::NotShared`] when this device holds no key for that vault.
-/// - The [`DeviceConfig::pull_vault`] errors, plus [`DesktopError::Vault`] when
-///   the pulled container does not open under this device's key.
+/// - The [`DeviceConfig::pull_vault_ops`] errors, plus [`DesktopError::Vault`]
+///   when the merged vault cannot be re-sealed.
 pub fn pull_and_adopt(
     config: &DeviceConfig,
     vault_id: &str,
@@ -1350,16 +1392,35 @@ pub fn pull_and_adopt(
         .vault_key(vault_id)?
         .ok_or_else(|| DesktopError::NotShared(vault_id.to_string()))?;
 
-    let Some(pulled) = config.pull_vault(vault_id, since)? else {
+    let ops = config.pull_vault_ops(vault_id, since)?;
+    if ops.is_empty() {
         return Ok(None);
+    }
+    let tip = ops.iter().map(|op| op.seq).max().unwrap_or(0);
+
+    // The LOCAL vault is one of the inputs, not a thing to be overwritten. A
+    // vault file that is absent or unreadable under this key contributes nothing
+    // rather than aborting the merge — that is exactly the fresh-device case.
+    let local = match VaultSession::unlock(path, &key) {
+        Ok(session) => session.vault().clone(),
+        Err(_) => sigil_cli::TotpVault::default(),
     };
 
-    // Prove it opens under THIS device's key before it touches the disk.
-    sigil_cli::open_vault(&key, &pulled.container)?;
-    write_private_bytes(path, &pulled.container)?;
+    let (merged, report) = sigil_cli::merge_ops_into(&local, &key, &ops);
+    if report.applied == 0 {
+        // Nothing on the server opened under this device's key. Do NOT write.
+        return Err(DesktopError::Vault(format!(
+            "pulled {} op(s) for {vault_id}, but none of them opened with this device's vault key",
+            ops.len()
+        )));
+    }
+
+    // Re-seal in memory FIRST (it can fail), then write via temp file + rename.
+    let container = sigil_cli::seal_vault(&key, &merged, sigil_core::Argon2Params::RECOMMENDED)?;
+    write_private_bytes(path, &container)?;
 
     let session = VaultSession::unlock(path, &key)?;
-    Ok(Some((session, pulled.seq)))
+    Ok(Some((session, tip)))
 }
 
 /// Create the state directory `0700` if it is not there yet. It holds the device

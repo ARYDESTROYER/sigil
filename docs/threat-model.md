@@ -833,6 +833,91 @@ in [`crypto-spec.md`](crypto-spec.md).
   recording: the model was written around confidentiality, and an availability
   attack delivered through the confidentiality mechanism had no row.
 
+## Hostile server against a merging vault — tombstones (see [ADR 0049](decisions/0049-entry-identity-and-the-mergeable-vault.md))
+
+**A new adversary class, added in Phase 61 with the merge itself.** Before it, a
+client adopted the newest snapshot wholesale, so a server that wanted to suppress a
+2FA account merely had to serve a snapshot without it. The merge is a strict
+improvement — but it gives the server a **new object to manipulate**, the
+**tombstone**, and a tombstone's whole job is to make an entry disappear. It is an
+**integrity and availability** class, not a confidentiality one.
+
+**Capability.** `sigild` stores, orders and serves the ops. It chooses **which**
+ops a client sees, **in what order**, and **how many times**. It cannot read them
+([ADR 0003](decisions/0003-dev-gated-opaque-op-log.md)) — every op is a sealed
+`SIGILcli` container — so everything below is done blind, by position, size and
+timing, never by content.
+
+### What a hostile server CAN do
+
+- ⛔ **Withhold ops — the strongest attack, and it is not new.** Serving a client a
+  subset of the log hides whatever was in the omitted ops: an added account looks
+  like it was never added. **Withholding a snapshot that contains a tombstone
+  resurrects a deleted entry** on that client, which is worse than it sounds if the
+  deletion was a response to a compromise — the user believes an account is gone
+  and their authenticator still shows it. ⚠️ **A withheld op is indistinguishable
+  from an op that was never pushed**, which is what makes this hard to detect and
+  impossible to fix client-side today.
+- ⛔ **Replay ops.** Re-serving an old snapshot is *harmless to convergence* (the
+  merge is idempotent, so folding the same op twice changes nothing) but it is
+  **not harmless in combination with withholding**: replaying a pre-delete snapshot
+  while withholding the post-delete one is exactly the resurrection above.
+- ⚠️ **Grow the vault toward the size cap.** Anyone with write access — including
+  the server, which can synthesise blobs freely — can append snapshots carrying
+  tombstones for ids that never existed. They are cheap, they are **carried
+  forever** (nothing prunes a tombstone, ADR 0049 limit 1), and enough of them push
+  the sealed vault past `sigild`'s own **64 KiB** op cap, after which the user's
+  `push` answers **413** and **there is no supported way to shrink it**. ⚠️ Note the
+  shape: the server is the entity enforcing the cap *and* an entity able to fill it.
+  The clients warn from 75 % of the cap; that is a warning, not a defence.
+- ⚠️ **Learn the coarse shape of the vault.** Op sizes and push timings leak roughly
+  how many entries a vault holds and when it changed — **pre-existing**, unchanged
+  by this work, and now slightly more informative because a delete produces a push
+  that is *larger* than the one before it.
+
+### What a hostile server CANNOT do
+
+- ⭐ **It cannot forge a tombstone for an entry whose id it does not know**, because
+  ids live **only inside the sealed vault**. A minted id is 16 random bytes; a
+  derived id is a SHA-256 commitment to content the server has never seen. It can
+  append tombstones for ids it invents, and they will name nothing.
+- ⭐ **It cannot reorder its way to a different result.** The merge is
+  **commutative, associative and idempotent on every field, including the unknown
+  ones** — so the order the server serves ops in does not change the vault a client
+  ends up with. Only the *set* it serves matters, which reduces the entire attack
+  surface to withholding. ⚠️ That property was **not** unconditionally true when
+  first claimed: tombstone-level unknown fields merged first-seen-wins, and it was
+  fixed rather than qualified (ADR 0049 §3).
+- ⭐ **It cannot read or modify an entry.** Everything is sealed client-side; the
+  server relays ciphertext it cannot open, and a modified blob simply fails to
+  decrypt.
+- ⭐ **It cannot make a delete "stick" against a device that never saw it.** Delete
+  is expressed as data (a tombstone) that must be *delivered*, not as an instruction
+  the server executes.
+
+### What is NOT defended
+
+- ⛔ **There is no proof of completeness.** A client cannot tell "you have the whole
+  log" from "you have the part I chose to give you". The op-log's hash chain
+  ([ADR 0016](decisions/0016-tamper-evident-oplog-hash-chain.md)) is
+  tamper-**evident** for ops a client is *shown* — it detects alteration,
+  insertion, deletion and reordering **within the served range** — but a server that
+  simply serves a **shorter prefix** produces a perfectly valid chain. Truncation is
+  the gap, and it is unaddressed.
+- ⛔ **There is no compaction, so the growth vector has no bound** other than the
+  413 that ends syncing. See ADR 0049 limitation 1.
+- ⚠️ **A mixed-version fleet weakens this further.** A client older than
+  [ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
+  **strips tombstones it does not understand** and pushes the stripped snapshot
+  back, resurrecting deletions with no attacker involved at all. A hostile server
+  does not need to withhold anything if one device in the account is old enough to
+  do the withholding for it.
+- ⚠️ **`deleted_at` is attacker-influenced and deliberately inert.** It is written by
+  whichever client performed the delete and merged by `min`, so a wrong or hostile
+  clock can only make a delete look **earlier**, never postpone it. **Nothing reads
+  it today**; a future compaction that keys on it would be trusting a timestamp an
+  adversary can lower, and must be designed with that in mind.
+
 ## Billing / payment surface (opt-in, dev-gated — see [ADR 0034](decisions/0034-billing-provider-seam.md))
 
 The billing layer adds an endpoint that is, by necessity, **authenticated by

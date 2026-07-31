@@ -2625,6 +2625,19 @@ pub struct TotpVault {
     pub min_reader_version: Option<u8>,
     /// The stored TOTP entries.
     pub entries: Vec<TotpEntry>,
+    /// ⭐ The REMOVE half of the vault's 2P-Set (Phase 61).
+    ///
+    /// A vault syncs as a sequence of whole SNAPSHOTS through an append-only
+    /// op-log, and [`merge_vaults`] takes the UNION of every snapshot it can
+    /// open. A union alone would resurrect every deleted entry the moment any
+    /// device that still holds it pushes, so a delete has to be recorded
+    /// positively. This is that record: an entry whose [`TotpEntry::uuid`]
+    /// appears here is suppressed no matter how many snapshots still contain it.
+    ///
+    /// OMITTED entirely when empty, so a vault that has never had a delete is
+    /// byte-identical to what earlier builds wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<Tombstone>,
     /// ⭐ Every OTHER top-level JSON field, preserved verbatim (Phase 59).
     ///
     /// `#[serde(flatten)]` collects fields this build does not know about and
@@ -2641,12 +2654,49 @@ pub struct TotpVault {
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+/// One removed entry, recorded so the removal survives a merge with a snapshot
+/// that still contains it (Phase 61).
+///
+/// It carries the entry's `uuid` and nothing else that could identify the
+/// account. ⚠️ For an entry created by this build the uuid is 128 random bits, so
+/// a tombstone commits to **nothing** — not the label, not the issuer, not the
+/// secret. For a LEGACY entry whose id was derived from its content
+/// ([`sigil_core::entry_id`]) the tombstone is a commitment to that content, and
+/// is therefore a confirmation oracle for anyone who can already open the vault
+/// *and* guess the entry exactly. That is documented, bounded to entries written
+/// before this build, and is the price of making a delete converge across the
+/// migration boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    /// The [`TotpEntry::uuid`] of the entry that was removed.
+    pub uuid: String,
+    /// Unix seconds when the removal happened, from the CALLER's clock
+    /// (`sigil-core` reads none, ADR 0007). ⭐ Informational: no merge decision
+    /// branches on it — [`merge_vaults`] only keeps the smaller of two values, so
+    /// a wrong or hostile clock cannot un-delete anything.
+    ///
+    /// ⭐ SO WHY WRITE IT AT ALL? It is the field a FUTURE compaction keys on.
+    /// The remove-set never shrinks and nothing prunes it (see the tombstone
+    /// growth limit above [`op_body_size_warning`]); the only safe prune rule is
+    /// "drop tombstones older than a retention window every device has certainly
+    /// synced within", and that needs a timestamp. Writing it today makes today's
+    /// vaults compactable later. ⚠️ Nothing reads it yet — do not add a merge
+    /// rule that does without revisiting the no-clock argument on [`merge_vaults`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<u64>,
+    /// Every OTHER JSON field on this tombstone, preserved verbatim (same rule as
+    /// [`TotpEntry::extra`]).
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
 impl Default for TotpVault {
     fn default() -> Self {
         TotpVault {
             version: TOTP_VAULT_VERSION,
             min_reader_version: None,
             entries: Vec::new(),
+            tombstones: Vec::new(),
             extra: std::collections::BTreeMap::new(),
         }
     }
@@ -3018,21 +3068,582 @@ pub fn entry_to_otpauth_uri(entry: &TotpEntry) -> Result<String, CliError> {
     Ok(uri)
 }
 
+// ---------------------------------------------------------------------------
+// ⭐⭐ ENTRY IDENTITY AND VAULT MERGE (Phase 61) — the fix for last-writer-wins.
+//
+// ⛔ THE DEFECT. A vault syncs as whole sealed SNAPSHOTS through an append-only
+// op-log, and every client ADOPTED THE NEWEST ONE WHOLESALE. So: device A adds
+// `github` and pushes; device B, which never pulled, adds `gitlab` and pushes.
+// B's snapshot is now the tip, it has never seen `github`, and the moment any
+// client adopts the tip that account is GONE. Both devices reported success.
+// Reproduced end to end against a real sigild before this was written.
+//
+// ⭐ THE SHAPE OF THE FIX. A vault is a **2P-Set** (two-phase set) of entries
+// keyed by `uuid`: `entries` is the add-set, `tombstones` is the remove-set, and
+// `merge_vaults` is their union with the remove-set winning. That is the simplest
+// CRDT that exists — commutative, associative and idempotent — so devices
+// converge regardless of pull order, duplicate delivery or how many devices are
+// involved. Boring on purpose.
+//
+// ⭐ NO CLOCK IS IN THE CORRECTNESS PATH. There is no Lamport counter, no vector
+// clock, no per-entry revision and no timestamp tiebreak, because ENTRIES ARE
+// IMMUTABLE: `add`, `import` and `remove` are the complete mutation surface
+// across all four clients — there is no rename, no edit and no in-place field
+// change anywhere. A uuid therefore names one fixed (label, issuer, secret,
+// algorithm, digits, period) forever, so "which version of entry U wins" is a
+// question that cannot be asked.
+//
+// ⛔⛔ THE ONE WAY THIS DESIGN GOES WRONG LATER: someone adds an EDIT. If a
+// rename, a period change or an in-place secret update is ever added, this merge
+// will silently keep whichever copy sorts higher. **An edit must be implemented
+// as delete + add with a fresh uuid, or this merge is wrong.** The same warning
+// is on the JS mirror, beside `uuid`.
+// ---------------------------------------------------------------------------
+
+/// The deterministic, content-derived id of `entry` — the id it gets when it has
+/// no [`TotpEntry::uuid`] of its own.
+///
+/// ⭐ The derivation is [`sigil_core::entry_id`] and is **NOT mirrored**: the CLI
+/// and the desktop call it directly and the browsers reach the same bytes through
+/// a one-line wasm shell. A drift here would be invisible — it produces a vault
+/// that opens fine everywhere and merely duplicates or mis-suppresses entries.
+///
+/// The stored `secret` is base64; the transcript commits to the DECODED key
+/// bytes. ⚠️ A secret that is not valid base64 falls back to the raw stored
+/// string's UTF-8 bytes, so this function is TOTAL — a corrupt entry must not be
+/// able to abort a merge. The JS mirror does exactly the same.
+#[must_use]
+pub fn entry_content_id(entry: &TotpEntry, disambiguator: u32) -> String {
+    let secret = entry
+        .secret_bytes()
+        .unwrap_or_else(|_| entry.secret.as_bytes().to_vec());
+    sigil_core::entry_id(
+        entry.issuer.as_deref().unwrap_or(""),
+        &entry.label,
+        &secret,
+        &entry.algorithm,
+        entry.digits,
+        entry.period,
+        disambiguator,
+    )
+}
+
+/// The identity this entry is MERGED by: its own `uuid` when it has one,
+/// otherwise its content-derived id ([`entry_content_id`]).
+///
+/// ⭐ This answers **"which entry is this?"** and nothing else. It is deliberately
+/// NOT the question the import path asks — see [`entry_fingerprint`].
+#[must_use]
+pub fn entry_identity(entry: &TotpEntry) -> String {
+    match &entry.uuid {
+        Some(u) if !u.is_empty() => u.clone(),
+        _ => entry_content_id(entry, 0),
+    }
+}
+
+/// The content FINGERPRINT of an entry — [`entry_content_id`] with the
+/// disambiguator fixed at `0`, **ignoring any `uuid` the entry carries**.
+///
+/// ⭐⭐ TWO DIFFERENT JOBS, TWO DIFFERENT MECHANISMS, and conflating them is a
+/// real bug this code has already had. [`entry_identity`] answers *"which entry
+/// is this?"* (a uuid); this answers *"have I already got this account?"* (its
+/// content). Import and `add` must ask the SECOND question: a freshly imported
+/// entry carries no id at all, while the copy already in the vault carries a
+/// RANDOM one, so comparing identities would never match and re-importing the
+/// same Google Authenticator export would duplicate every account in it.
+///
+/// It commits to `(issuer, label, secret, algorithm, digits, period)` — exactly
+/// what makes two rows the same account.
+#[must_use]
+pub fn entry_fingerprint(entry: &TotpEntry) -> String {
+    entry_content_id(entry, 0)
+}
+
+/// Canonical JSON for one entry — used ONLY as a deterministic tiebreak when two
+/// snapshots claim the same id with different content, so that two devices
+/// merging in different orders still agree byte for byte.
+///
+/// ⚠️ It goes through `serde_json::to_value` on purpose: `serde_json::Map` is a
+/// `BTreeMap` by default, so the keys come out SORTED — which is what the JS
+/// mirror's `sortKeysDeep` produces. If the two sides ordered keys differently
+/// they could pick DIFFERENT winners for the same conflict and never converge.
+fn canonical_entry(entry: &TotpEntry) -> String {
+    serde_json::to_value(entry)
+        .ok()
+        .and_then(|v| serde_json::to_string(&v).ok())
+        .unwrap_or_default()
+}
+
+/// Canonical JSON for one arbitrary (unknown, forward-compatibility) value — the
+/// ordering key used to combine `extra` maps commutatively, at both the vault and
+/// the tombstone level.
+///
+/// ⚠️ Keys come out SORTED because `serde_json::Value`'s map is a `BTreeMap`.
+/// The JS mirror must sort too (`sortKeysDeep`), or the two clients could pick
+/// different winners for the same unknown key and never converge.
+fn canonical_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// ⭐ Give every entry a stable id, deterministically and idempotently.
+///
+/// Runs on every read path, before anything else touches the vault. For each
+/// entry with no `uuid`, the id is DERIVED from the entry's content, so two
+/// devices holding copies of the same pre-Phase-61 vault arrive at the **same**
+/// ids without either knowing the other exists — which is the whole reason the
+/// migration id is derived rather than random. A random id here would duplicate
+/// every account in every existing multi-device vault on first sync, and would
+/// make a delete performed on one device unable to ever suppress the other's copy.
+///
+/// A within-vault collision (two byte-identical legacy entries, which nothing in
+/// this repo writes but a hand-edited file can contain) is disambiguated with an
+/// incrementing counter folded into the transcript — still deterministic, so the
+/// two devices still agree.
+///
+/// It does **not** reorder, filter, rebuild or otherwise touch the entries; it
+/// only fills in a missing field.
+pub fn normalize_vault(vault: &mut TotpVault) {
+    let mut seen: std::collections::BTreeSet<String> = vault
+        .entries
+        .iter()
+        .filter_map(|e| e.uuid.clone())
+        .filter(|u| !u.is_empty())
+        .collect();
+    for entry in &mut vault.entries {
+        if entry.uuid.as_deref().is_some_and(|u| !u.is_empty()) {
+            continue;
+        }
+        let mut n = 0u32;
+        let mut id = entry_content_id(entry, n);
+        while seen.contains(&id) {
+            n += 1;
+            id = entry_content_id(entry, n);
+        }
+        seen.insert(id.clone());
+        entry.uuid = Some(id);
+    }
+}
+
+/// Put a normalized vault into its canonical form: entries sorted by
+/// `(issuer, label, uuid)` and tombstones by `uuid`.
+///
+/// ⭐ This is what makes convergence a TESTABLE EQUALITY rather than a claim: two
+/// devices that have seen the same set of snapshots serialize to byte-identical
+/// plaintext. The cost is that a first merge reorders a hand-arranged vault once.
+fn canonicalize_vault(vault: &mut TotpVault) {
+    // ⭐ Sort by `uuid` ALONE, and deliberately not by (issuer, label, uuid).
+    // A uuid is ASCII hex, so Rust's byte-wise `Ord` and JavaScript's UTF-16
+    // comparison agree EXACTLY. Sorting on user text would not: the two languages
+    // order some non-ASCII strings differently, and the two clients would then
+    // produce different canonical bytes for the same set and never agree that they
+    // had converged. Display order is each client's own business.
+    vault.entries.sort_by_key(entry_identity);
+    vault.tombstones.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+    vault.tombstones.dedup_by(|a, b| a.uuid == b.uuid);
+}
+
+/// What a merge did, for the caller to report to a human.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeReport {
+    /// Entries present in the merged vault that were not in `local`.
+    pub added: usize,
+    /// Entries dropped because a tombstone names them.
+    pub removed: usize,
+    /// Tombstones in the merged vault that were not in `local`.
+    pub tombstones_added: usize,
+    /// `true` when the merged vault differs from `local` (canonically).
+    pub changed: bool,
+    /// Ids claimed by two DIFFERENT entries. Nothing is dropped — the
+    /// deterministic winner is kept and this names the id so a human can look.
+    pub conflicts: Vec<String>,
+}
+
+/// ⭐ Join two vault snapshots. Commutative, associative and idempotent.
+///
+/// ```text
+///   entries    = (local.entries ∪ remote.entries)  keyed by identity
+///   tombstones = (local.tombstones ∪ remote.tombstones)  keyed by uuid
+///   result     = entries MINUS every id named by a tombstone      // DELETE WINS
+/// ```
+///
+/// **Delete wins unconditionally**, and that is safe here precisely because a
+/// genuine re-add draws a FRESH random uuid — so a "re-add" of the same id is not
+/// a user action at all, it is a stale snapshot or a hostile writer, and it should
+/// lose. This dodges the textbook 2P-Set flaw ("a removed element can never come
+/// back") by construction rather than papering over it.
+///
+/// A `deleted_at` is merged by taking the SMALLER value, so a later view of a
+/// delete never postpones it; nothing else reads the field.
+///
+/// Two entries claiming the same id with different content keep the
+/// lexicographically greater canonical JSON — **deterministic and
+/// order-independent**, unlike "local wins", which would break convergence.
+///
+/// ⭐⭐ EVERY FIELD USES AN ORDER-INDEPENDENT RULE, INCLUDING THE UNKNOWN ONES.
+/// The four combining rules are `max` (version, `min_reader_version`, unknown
+/// `extra` at BOTH the vault and the TOMBSTONE level, and the entry tiebreak),
+/// `min` (`deleted_at`) and set union (entries, tombstones) — all commutative and
+/// associative, so `merge(a,b) == merge(b,a)` byte for byte with no exception.
+///
+/// ⭐ AND THE SAME BYTES AS THE JS MIRROR. Byte-equality here is nearly free —
+/// `extra` is a [`std::collections::BTreeMap`], so serde writes it sorted no
+/// matter what order the keys were inserted in. JavaScript has no such default:
+/// its objects are INSERTION-ordered, and `sigil-wasm/totp-vault.mjs` had to
+/// grow an explicit canonical writer (`vaultToJson`) to match this function
+/// byte for byte. That writer hard-codes the field order of [`TotpVault`],
+/// [`TotpEntry`] and [`Tombstone`] as declared **in this file**, so ⚠️ ADDING A
+/// FIELD TO ONE OF THOSE STRUCTS — or reordering one — SILENTLY DESYNCHRONISES
+/// THE TWO CLIENTS' BYTES unless the JS arrays are updated in the same change.
+/// The BYTES section of `sigil-wasm/test/merge-interop.mjs` compares this
+/// binary's actual output against the JS writer's and is the guard.
+///
+/// ⚠️ THAT WAS NOT ALWAYS TRUE, and the exception was real: tombstone-level
+/// unknown fields used to merge FIRST-SEEN-WINS (`extra.entry(k).or_insert(…)`
+/// here, `{ ...t, ...prev }` in the JS mirror), so two vaults whose tombstones
+/// shared a uuid but carried different values for an unknown key did NOT
+/// converge — while the doc comment claimed unqualified commutativity. It is
+/// fixed rather than merely documented, because a forward-compatibility field
+/// (ADR 0047) is exactly the kind of thing a future version writes and a current
+/// one must carry through a merge unchanged, in either order.
+/// The property test `merge_is_order_independent_over_generated_vaults` fails if
+/// this regresses.
+#[must_use]
+pub fn merge_vaults(local: &TotpVault, remote: &TotpVault) -> (TotpVault, MergeReport) {
+    let mut a = local.clone();
+    let mut b = remote.clone();
+    normalize_vault(&mut a);
+    normalize_vault(&mut b);
+    canonicalize_vault(&mut a);
+    canonicalize_vault(&mut b);
+
+    // 1) Remove-set: union by uuid, keeping the smaller deleted_at.
+    let mut tombs: std::collections::BTreeMap<String, Tombstone> =
+        std::collections::BTreeMap::new();
+    for t in a.tombstones.iter().chain(b.tombstones.iter()) {
+        match tombs.get_mut(&t.uuid) {
+            None => {
+                tombs.insert(t.uuid.clone(), t.clone());
+            }
+            Some(existing) => {
+                existing.deleted_at = match (existing.deleted_at, t.deleted_at) {
+                    (Some(x), Some(y)) => Some(x.min(y)),
+                    (Some(x), None) => Some(x),
+                    (None, y) => y,
+                };
+                // ⭐ The SAME commutative rule the vault level uses: keep the
+                // lexicographically greater canonical JSON. ⚠️ This was
+                // `extra.entry(k).or_insert_with(…)` — FIRST-SEEN-WINS — which
+                // made `merge(a,b) != merge(b,a)` whenever two tombstones shared
+                // a uuid and disagreed about an unknown key, contradicting this
+                // function's own commutativity claim. `max` is the only rule
+                // here that is both deterministic and order-independent.
+                for (k, v) in &t.extra {
+                    let replace = match existing.extra.get(k) {
+                        None => true,
+                        Some(cur) => canonical_json(v) > canonical_json(cur),
+                    };
+                    if replace {
+                        existing.extra.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Add-set: union by identity.
+    let mut adds: std::collections::BTreeMap<String, TotpEntry> = std::collections::BTreeMap::new();
+    let mut conflicts: Vec<String> = Vec::new();
+    for e in a.entries.iter().chain(b.entries.iter()) {
+        let id = entry_identity(e);
+        match adds.get(&id) {
+            None => {
+                adds.insert(id, e.clone());
+            }
+            Some(existing) if existing == e => {}
+            Some(existing) => {
+                if !conflicts.contains(&id) {
+                    conflicts.push(id.clone());
+                }
+                // Deterministic, order-independent tiebreak. NOT "the newest" —
+                // there is no trustworthy newest on an untrusted op-log.
+                if canonical_entry(e) > canonical_entry(existing) {
+                    adds.insert(id, e.clone());
+                }
+            }
+        }
+    }
+
+    // 3) Delete wins.
+    let removed = adds.keys().filter(|id| tombs.contains_key(*id)).count();
+    let entries: Vec<TotpEntry> = adds
+        .into_iter()
+        .filter(|(id, _)| !tombs.contains_key(id))
+        .map(|(_, e)| e)
+        .collect();
+
+    // 4) Unknown top-level fields and min_reader_version: deterministic, and it
+    //    FAILS CLOSED (the higher demand wins) so a merge can never make a vault
+    //    look more readable than either input claimed.
+    let mut extra = a.extra.clone();
+    for (k, v) in &b.extra {
+        match extra.get(k) {
+            None => {
+                extra.insert(k.clone(), v.clone());
+            }
+            Some(existing) => {
+                if canonical_json(v) > canonical_json(existing) {
+                    extra.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    let min_reader_version = match (a.min_reader_version, b.min_reader_version) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+
+    let mut merged = TotpVault {
+        version: a.version.max(b.version),
+        min_reader_version,
+        entries,
+        tombstones: tombs.into_values().collect(),
+        extra,
+    };
+    canonicalize_vault(&mut merged);
+
+    let local_ids: std::collections::BTreeSet<String> =
+        a.entries.iter().map(entry_identity).collect();
+    let local_tombs: std::collections::BTreeSet<&String> =
+        a.tombstones.iter().map(|t| &t.uuid).collect();
+    let report = MergeReport {
+        added: merged
+            .entries
+            .iter()
+            .filter(|e| !local_ids.contains(&entry_identity(e)))
+            .count(),
+        removed,
+        tombstones_added: merged
+            .tombstones
+            .iter()
+            .filter(|t| !local_tombs.contains(&t.uuid))
+            .count(),
+        changed: merged != a,
+        conflicts,
+    };
+    (merged, report)
+}
+
+/// What a fold over a run of op-log snapshots did.
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    /// Ops whose container this secret opened and which were merged in.
+    pub applied: usize,
+    /// Ops that could not be opened, with the reason. ⚠️ Never fatal and never
+    /// silent: an op sealed under a superseded password or from before a
+    /// `vault rekey` is skipped and NAMED. Nothing is destroyed — it stays in the
+    /// log — but the merged snapshot is then not a superset of the log.
+    pub skipped: Vec<(u64, String)>,
+    /// The highest sequence number seen (a cursor for the next call).
+    pub tip: u64,
+    /// The accumulated effect of every merge.
+    pub merge: MergeReport,
+}
+
+/// ⭐ Fold EVERY op in `ops` into `local`, instead of adopting the newest one.
+///
+/// This is the entire fix, and it costs nothing on the wire: the op-log already
+/// stores every snapshot, append-only, and the clients were reading one row of a
+/// table that had the answer in it the whole time. A free consequence is that it
+/// **retroactively recovers data the old behaviour already shadowed** — an entry
+/// that only ever reached op 1 comes back.
+///
+/// An op that will not open under `secret` is skipped and named, never fatal.
+#[must_use]
+pub fn merge_ops_into(
+    local: &TotpVault,
+    secret: &[u8],
+    ops: &[PulledOp],
+) -> (TotpVault, SyncReport) {
+    let mut acc = local.clone();
+    let mut report = SyncReport::default();
+    for op in ops {
+        report.tip = report.tip.max(op.seq);
+        match open_vault(secret, &op.blob) {
+            Ok(v) => {
+                let (merged, m) = merge_vaults(&acc, &v);
+                acc = merged;
+                report.applied += 1;
+                report.merge.added += m.added;
+                report.merge.removed += m.removed;
+                report.merge.tombstones_added += m.tombstones_added;
+                report.merge.changed |= m.changed;
+                for c in m.conflicts {
+                    if !report.merge.conflicts.contains(&c) {
+                        report.merge.conflicts.push(c);
+                    }
+                }
+            }
+            Err(e) => report.skipped.push((op.seq, e.to_string())),
+        }
+    }
+    // Normalizing + canonicalizing `local` alone (no ops at all) can still change
+    // it, so recompute `changed` against the input rather than trusting the last
+    // per-op verdict.
+    let mut base = local.clone();
+    normalize_vault(&mut base);
+    canonicalize_vault(&mut base);
+    report.merge.changed = acc != base || acc != *local;
+    (acc, report)
+}
+
+// ---------------------------------------------------------------------------
+// ⛔⛔ THE TOMBSTONE GROWTH LIMIT — the honest record of an UNSOLVED problem.
+//
+// A vault is a 2P-Set, and the remove-set NEVER SHRINKS. Every `sigil totp
+// remove` appends a tombstone (~55-95 bytes of JSON: a uuid, an optional
+// `deleted_at`, punctuation) that must be carried forever, because dropping it
+// resurrects the entry on the next merge with any device that still holds a
+// snapshot from before the delete. There is NO COMPACTION PATH in this repo:
+// `sigil totp compact` does not exist, and nothing anywhere prunes a tombstone.
+//
+// ⛔ THE HARD STOP. `sigild` caps a single op body at 64 KiB
+// (`maxOpsBodyBytes`, sigild/internal/api/middleware.go) and answers **413**
+// above it. The op body is the SEALED CONTAINER, so the ceiling is on
+// ciphertext: roughly the JSON plaintext plus the ~100-byte `SIGILcli` header
+// and the AEAD tag. Past the cap `push` fails and THERE IS NO SUPPORTED WAY TO
+// SHRINK IT — a user who discovers this at the 413 has already lost the ability
+// to sync, which is precisely the outcome this phase exists to prevent.
+//
+// ⭐ WHAT IS ACTUALLY BUILT HERE: a WARNING, not a fix. Every client that seals
+// a vault for push calls [`op_body_size_warning`] first and tells the human
+// while there is still room to act (export, or start a fresh vault id). That is
+// strictly less than compaction and is not pretended to be more.
+//
+// ⭐ WHY `Tombstone::deleted_at` EXISTS AT ALL, given that no merge decision
+// branches on it: it is the field a future compaction keys on. The only safe
+// prune rule is "drop tombstones older than a retention window every device is
+// guaranteed to have synced within", and that needs a timestamp. It is written
+// today so that the vaults being written today are compactable later; it is
+// merged by `min` so a wrong or hostile clock can only make a delete look
+// EARLIER, never postpone it. Nothing reads it yet. Do not add a merge rule that
+// does without revisiting the "no clock in the correctness path" argument above.
+// ---------------------------------------------------------------------------
+
+/// The largest op body `sigild` accepts: **64 KiB**.
+///
+/// ⚠️ MIRRORED — NOT SHARED — from `maxOpsBodyBytes` in
+/// `sigild/internal/api/middleware.go`, and from `MAX_OP_BODY_BYTES` in
+/// `sigil-wasm/totp-vault.mjs`. A drift does not fail loudly; it just makes the
+/// warning fire at the wrong size. `sigil-wasm/test/merge-guard.mjs` asserts all
+/// three agree.
+pub const MAX_OP_BODY_BYTES: usize = 64 << 10;
+
+/// The size at which a client must start warning: **75%** of
+/// [`MAX_OP_BODY_BYTES`] (48 KiB).
+///
+/// Chosen so the warning arrives while a vault still has room for hundreds more
+/// tombstones, not on the last one.
+pub const OP_BODY_WARN_BYTES: usize = MAX_OP_BODY_BYTES / 4 * 3;
+
+/// A human-readable warning when a sealed container is close to — or past — the
+/// server's 64 KiB op-body cap, or `None` when it is comfortably below.
+///
+/// ⭐ Callers must print this BEFORE pushing, so the human hears about it while
+/// the push still works. The `>= MAX` case is worded differently on purpose: at
+/// that point the next `push` is a `413` and the advice changes from "plan" to
+/// "this will now fail".
+#[must_use]
+pub fn op_body_size_warning(container_len: usize) -> Option<String> {
+    if container_len >= MAX_OP_BODY_BYTES {
+        return Some(format!(
+            "this vault seals to {container_len} bytes, over the server's {MAX_OP_BODY_BYTES}-byte \
+             op limit — `push`/`sync` will be REFUSED with HTTP 413. Tombstones (one per removed \
+             entry) are never pruned and there is no compaction command; export with `sigil totp \
+             export` and start a fresh vault id"
+        ));
+    }
+    if container_len >= OP_BODY_WARN_BYTES {
+        let pct = container_len * 100 / MAX_OP_BODY_BYTES;
+        return Some(format!(
+            "this vault seals to {container_len} bytes — {pct}% of the server's \
+             {MAX_OP_BODY_BYTES}-byte op limit. Tombstones (one per removed entry) are never \
+             pruned and there is no compaction command, so this only grows; past the limit \
+             `push`/`sync` is refused with HTTP 413"
+        ));
+    }
+    None
+}
+
 impl TotpVault {
     /// Find an entry by exact label.
+    ///
+    /// ⚠️ Labels are **no longer unique** (that is the fix for the Google
+    /// Authenticator import defect: `work` at two different issuers is two
+    /// accounts). This returns the FIRST match; use [`TotpVault::find_all`] when
+    /// ambiguity matters, and [`TotpVault::find_by_uuid`] when it must not.
     #[must_use]
     pub fn find(&self, label: &str) -> Option<&TotpEntry> {
         self.entries.iter().find(|e| e.label == label)
     }
 
-    /// Add `entry`, rejecting a duplicate label.
+    /// Every entry with exactly this label.
+    #[must_use]
+    pub fn find_all(&self, label: &str) -> Vec<&TotpEntry> {
+        self.entries.iter().filter(|e| e.label == label).collect()
+    }
+
+    /// Find an entry by its identity, or by a unique PREFIX of it (so a human can
+    /// type the first few characters of a uuid).
+    #[must_use]
+    pub fn find_by_uuid(&self, id: &str) -> Option<&TotpEntry> {
+        if id.is_empty() {
+            return None;
+        }
+        let exact = self.entries.iter().find(|e| entry_identity(e) == id);
+        if exact.is_some() {
+            return exact;
+        }
+        let mut it = self
+            .entries
+            .iter()
+            .filter(|e| entry_identity(e).starts_with(id));
+        match (it.next(), it.next()) {
+            (Some(e), None) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Add `entry`, rejecting an account already in the vault.
+    ///
+    /// ⚠️ It no longer rejects a duplicate LABEL. `work` at GitHub and `work` at
+    /// GitLab are two accounts — refusing the second was exactly the Google
+    /// Authenticator import defect this fixes.
+    ///
+    /// ⭐ The comparison is [`entry_fingerprint`] (the entry's CONTENT), not
+    /// [`entry_identity`]. A candidate typically carries no `uuid` while the copy
+    /// already in the vault carries a random one, so comparing identities would
+    /// never match and adding the same account twice would silently succeed.
+    /// A duplicate `uuid` is refused too, since two entries sharing an id is a
+    /// merge conflict waiting to happen.
     ///
     /// # Errors
-    /// - [`CliError::Totp`] if an entry with the same label already exists.
+    /// - [`CliError::Totp`] if that account (or that id) is already present.
     pub fn add(&mut self, entry: TotpEntry) -> Result<(), CliError> {
-        if self.find(&entry.label).is_some() {
+        let fp = entry_fingerprint(&entry);
+        let id = entry_identity(&entry);
+        if self
+            .entries
+            .iter()
+            .any(|e| entry_fingerprint(e) == fp || entry_identity(e) == id)
+        {
             return Err(CliError::Totp(format!(
-                "an entry labelled {:?} already exists",
+                "this account is already in the vault ({}{})",
+                entry
+                    .issuer
+                    .as_deref()
+                    .map(|i| format!("{i}: "))
+                    .unwrap_or_default(),
                 entry.label
             )));
         }
@@ -3040,15 +3651,109 @@ impl TotpVault {
         Ok(())
     }
 
-    /// Remove the entry with `label`, returning it.
+    /// Remove the entry with `label` **and record a tombstone**, returning it.
+    ///
+    /// [`TotpVault::remove_at`] with no timestamp. `sigil-core` reads no clock, so
+    /// a caller that has one should pass it.
     ///
     /// # Errors
-    /// - [`CliError::Totp`] if no entry has that label.
+    /// - [`CliError::Totp`] if no entry has that label, or if more than one does.
     pub fn remove(&mut self, label: &str) -> Result<TotpEntry, CliError> {
-        match self.entries.iter().position(|e| e.label == label) {
-            Some(i) => Ok(self.entries.remove(i)),
-            None => Err(CliError::Totp(format!("no entry labelled {label:?}"))),
+        self.remove_at(label, None)
+    }
+
+    /// Remove the entry with `label`, recording a tombstone stamped `deleted_at`.
+    ///
+    /// ⚠️ An AMBIGUOUS label is refused, naming the candidates, rather than
+    /// silently removing the first match — silently picking one is how a user
+    /// deletes the wrong account.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] if no entry has that label, or if more than one does.
+    pub fn remove_at(
+        &mut self,
+        label: &str,
+        deleted_at: Option<u64>,
+    ) -> Result<TotpEntry, CliError> {
+        let matches: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.label == label)
+            .map(|(i, _)| i)
+            .collect();
+        match matches.len() {
+            0 => Err(CliError::Totp(format!("no entry labelled {label:?}"))),
+            1 => self.remove_index(matches[0], deleted_at),
+            _ => Err(CliError::Totp(format!(
+                "{} entries are labelled {label:?} — name one with --id <prefix>:\n{}",
+                matches.len(),
+                self.candidate_lines(&matches)
+            ))),
         }
+    }
+
+    /// Remove the entry whose identity is `id` (or a unique prefix of it),
+    /// recording a tombstone.
+    ///
+    /// # Errors
+    /// - [`CliError::Totp`] if nothing matches, or the prefix is ambiguous.
+    pub fn remove_by_uuid(
+        &mut self,
+        id: &str,
+        deleted_at: Option<u64>,
+    ) -> Result<TotpEntry, CliError> {
+        let want = self
+            .find_by_uuid(id)
+            .map(entry_identity)
+            .ok_or_else(|| CliError::Totp(format!("no entry with id {id:?}")))?;
+        let index = self
+            .entries
+            .iter()
+            .position(|e| entry_identity(e) == want)
+            .ok_or_else(|| CliError::Totp(format!("no entry with id {id:?}")))?;
+        self.remove_index(index, deleted_at)
+    }
+
+    /// The shared tail of both removes: drop the entry AND record the tombstone.
+    /// ⭐ These two must never come apart — a removal that writes no tombstone is
+    /// exactly the pre-Phase-61 behaviour, and a merge will resurrect it.
+    fn remove_index(
+        &mut self,
+        index: usize,
+        deleted_at: Option<u64>,
+    ) -> Result<TotpEntry, CliError> {
+        let entry = self.entries.remove(index);
+        let uuid = entry_identity(&entry);
+        if !self.tombstones.iter().any(|t| t.uuid == uuid) {
+            self.tombstones.push(Tombstone {
+                uuid,
+                deleted_at,
+                extra: std::collections::BTreeMap::new(),
+            });
+        }
+        Ok(entry)
+    }
+
+    /// `issuer: label  (id abcd1234)` lines for an ambiguity message.
+    fn candidate_lines(&self, indices: &[usize]) -> String {
+        indices
+            .iter()
+            .map(|i| {
+                let e = &self.entries[*i];
+                let id = entry_identity(e);
+                format!(
+                    "  {}{}  (id {})",
+                    e.issuer
+                        .as_deref()
+                        .map(|s| format!("{s}: "))
+                        .unwrap_or_default(),
+                    e.label,
+                    &id[..8.min(id.len())]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -3118,9 +3823,13 @@ pub fn seal_vault(
 ///   inner version is unsupported.
 pub fn open_vault(password: &[u8], container: &[u8]) -> Result<TotpVault, CliError> {
     let plaintext = open_container(password, container)?;
-    let vault: TotpVault = serde_json::from_slice(&plaintext)
+    let mut vault: TotpVault = serde_json::from_slice(&plaintext)
         .map_err(|e| CliError::Totp(format!("decrypted vault is not valid JSON: {e}")))?;
     check_vault_readable(&vault)?;
+    // ⭐ Phase 61: every read path assigns a stable id to any entry that has none,
+    // deterministically, so two devices holding the same legacy vault agree on
+    // those ids without communicating. See `normalize_vault`.
+    normalize_vault(&mut vault);
     Ok(vault)
 }
 
@@ -7563,13 +8272,15 @@ mod tests {
             )
             .expect("add");
 
-        // Duplicate label rejected.
-        assert!(matches!(
-            vault.add(
-                new_totp_entry("acct", None, &secret, OtpAlgorithm::Sha1, 6, 30).expect("entry")
-            ),
-            Err(CliError::Totp(_))
-        ));
+        // ⭐ Phase 61: a duplicate LABEL is now ALLOWED (the same label at a
+        // different issuer is a different account — that was the Google
+        // Authenticator import defect). A duplicate IDENTITY is still rejected.
+        vault
+            .add(new_totp_entry("acct", None, &secret, OtpAlgorithm::Sha1, 6, 30).expect("entry"))
+            .expect("same label, different issuer -> a different account");
+        let dup = vault.entries[0].clone();
+        assert!(matches!(vault.add(dup), Err(CliError::Totp(_))));
+        vault.entries.truncate(1);
 
         let sealed = seal_vault(PASSWORD, &vault, FAST).expect("seal vault");
         // It really is a normal SIGILcli container.
@@ -7672,6 +8383,598 @@ mod tests {
             .expect("entry");
         let json = String::from_utf8(serde_json::to_vec(&bare).unwrap()).unwrap();
         assert!(!json.contains("uuid"), "{json}");
+    }
+
+    // -- Phase 61: entry identity and the 2P-Set merge ----------------------
+
+    fn e(label: &str, issuer: Option<&str>, secret: &[u8], uuid: Option<&str>) -> TotpEntry {
+        new_totp_entry_with_uuid(
+            label,
+            issuer.map(str::to_string),
+            secret,
+            OtpAlgorithm::Sha1,
+            6,
+            30,
+            uuid.map(str::to_string),
+        )
+        .expect("entry")
+    }
+
+    fn v(entries: Vec<TotpEntry>) -> TotpVault {
+        TotpVault {
+            entries,
+            ..TotpVault::default()
+        }
+    }
+
+    fn labels(vault: &TotpVault) -> Vec<String> {
+        let mut l: Vec<String> = vault.entries.iter().map(|x| x.label.clone()).collect();
+        l.sort();
+        l
+    }
+
+    #[test]
+    fn the_headline_two_devices_each_add_offline_and_nothing_is_lost() {
+        // The exact CRITICAL-1 sequence: both devices start from `base`, each
+        // adds a different account without pulling, and their snapshots meet.
+        let base = e(
+            "base",
+            None,
+            b"b",
+            Some("00000000-0000-4000-8000-000000000000"),
+        );
+        let a = v(vec![
+            base.clone(),
+            e(
+                "alpha",
+                None,
+                b"a",
+                Some("11111111-1111-4111-8111-111111111111"),
+            ),
+        ]);
+        let b = v(vec![
+            base,
+            e(
+                "bravo",
+                None,
+                b"c",
+                Some("22222222-2222-4222-8222-222222222222"),
+            ),
+        ]);
+        let (merged, report) = merge_vaults(&a, &b);
+        assert_eq!(labels(&merged), vec!["alpha", "base", "bravo"]);
+        assert_eq!(report.added, 1);
+        // …and it converges: the other device computes byte-identical plaintext.
+        let (other, _) = merge_vaults(&b, &a);
+        assert_eq!(
+            serde_json::to_string(&merged).unwrap(),
+            serde_json::to_string(&other).unwrap(),
+            "merge must be commutative down to the bytes"
+        );
+    }
+
+    #[test]
+    fn merge_is_idempotent_and_associative() {
+        let x = v(vec![e(
+            "x",
+            None,
+            b"1",
+            Some("aaaaaaaa-0000-4000-8000-000000000000"),
+        )]);
+        let y = v(vec![e(
+            "y",
+            None,
+            b"2",
+            Some("bbbbbbbb-0000-4000-8000-000000000000"),
+        )]);
+        let z = v(vec![e(
+            "z",
+            None,
+            b"3",
+            Some("cccccccc-0000-4000-8000-000000000000"),
+        )]);
+        let (xy, _) = merge_vaults(&x, &y);
+        let (xy_z, _) = merge_vaults(&xy, &z);
+        let (yz, _) = merge_vaults(&y, &z);
+        let (x_yz, _) = merge_vaults(&x, &yz);
+        assert_eq!(xy_z, x_yz, "associative");
+        let (again, report) = merge_vaults(&xy_z, &xy_z);
+        assert_eq!(again, xy_z, "idempotent");
+        assert!(!report.changed);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ⭐⭐ THE ALGEBRA, AS A PROPERTY OVER GENERATED INPUTS.
+    //
+    // ⛔ WHY THIS EXISTS. `merge_vaults`'s doc comment claims "commutative,
+    // associative and idempotent" WITHOUT QUALIFICATION, and the claim had a
+    // real, reproduced exception: tombstone-level unknown (`extra`) fields
+    // merged FIRST-SEEN-WINS (`extra.entry(k).or_insert_with(…)`), so two vaults
+    // whose tombstones shared a uuid but disagreed about an unknown key gave
+    // `merge(a,b) != merge(b,a)` and never converged. Every hand-written example
+    // test stayed green, because none of them put an unknown field on a
+    // tombstone — which is exactly what a FUTURE version of this client will do
+    // (ADR 0047 forward compatibility) and what this one must carry through.
+    //
+    // ⭐ The fix was to make the claim TRUE (the same lexicographic-max rule the
+    // vault level already used) rather than to qualify it, and this is the test
+    // that keeps it true: it exercises the field kinds a hand-written example
+    // forgets, in every order.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A tiny deterministic PRNG. ⚠️ Hand-rolled xorshift64* rather than a crate:
+    /// no new dependency is allowed here, and this is a test fixture generator,
+    /// not cryptography.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[usize::try_from(self.below(xs.len() as u64)).unwrap()]
+        }
+    }
+
+    /// A random vault drawn from a SMALL shared pool of ids, so two independently
+    /// generated vaults genuinely overlap — the only way a conflict, a
+    /// same-uuid tombstone pair or a same-key `extra` disagreement is ever hit.
+    fn arbitrary_vault(rng: &mut Rng) -> TotpVault {
+        // ⚠️ A tiny pool ON PURPOSE. With unique ids everywhere the union is
+        // trivially commutative and this test would prove nothing.
+        const IDS: [&str; 4] = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "44444444-4444-4444-8444-444444444444",
+        ];
+        const SECRETS: [&[u8]; 3] = [b"aaaaaaaaaaaaaaaaaaaa", b"bbbbbbbbbbbbbbbbbbbb", b"cc"];
+        const LABELS: [&str; 3] = ["alpha", "bravo", "charlie"];
+        const ISSUERS: [Option<&str>; 3] = [None, Some("GitHub"), Some("GitLab")];
+        // The unknown-field VALUES that a future version might write. Two
+        // different values under the SAME key is the whole point.
+        let unknown_values = [
+            serde_json::json!("left"),
+            serde_json::json!("right"),
+            serde_json::json!({ "z": 1, "a": 2 }),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(7),
+        ];
+
+        let mut entries = Vec::new();
+        for id in IDS {
+            if rng.below(3) == 0 {
+                continue;
+            }
+            let mut entry = e(
+                rng.pick(&LABELS),
+                *rng.pick(&ISSUERS),
+                rng.pick(&SECRETS),
+                Some(id),
+            );
+            // Some entries carry NO uuid at all (a pre-Phase-61 row), so the
+            // derived-identity path is in the property too.
+            if rng.below(5) == 0 {
+                entry.uuid = None;
+            }
+            if rng.below(3) == 0 {
+                entry.extra.insert(
+                    "future_entry_field".to_string(),
+                    rng.pick(&unknown_values).clone(),
+                );
+            }
+            entries.push(entry);
+        }
+
+        let mut tombstones = Vec::new();
+        for id in IDS {
+            if rng.below(3) != 0 {
+                continue;
+            }
+            let mut t = Tombstone {
+                uuid: id.to_string(),
+                deleted_at: if rng.below(4) == 0 {
+                    None
+                } else {
+                    Some(1_700_000_000 + rng.below(1000))
+                },
+                extra: std::collections::BTreeMap::new(),
+            };
+            // ⭐ THE FIELD KIND THE REGRESSION LIVED IN. Two tombstones for the
+            // same uuid carrying DIFFERENT values under the same unknown key is
+            // precisely the input that made the merge order-dependent.
+            if rng.below(2) == 0 {
+                t.extra.insert(
+                    "future_tombstone_field".to_string(),
+                    rng.pick(&unknown_values).clone(),
+                );
+            }
+            if rng.below(4) == 0 {
+                t.extra
+                    .insert("reason".to_string(), rng.pick(&unknown_values).clone());
+            }
+            tombstones.push(t);
+        }
+
+        let mut extra = std::collections::BTreeMap::new();
+        if rng.below(2) == 0 {
+            extra.insert(
+                "future_vault_field".to_string(),
+                rng.pick(&unknown_values).clone(),
+            );
+        }
+
+        TotpVault {
+            version: 1,
+            min_reader_version: if rng.below(4) == 0 { Some(1) } else { None },
+            entries,
+            tombstones,
+            extra,
+        }
+    }
+
+    /// ⚠️ THIS SORTS EVERY KEY, SO IT IS **NOT** A BYTE-ORDER ORACLE.
+    ///
+    /// `serde_json::to_value` round-trips through a `BTreeMap`, so this returns
+    /// key-sorted JSON no matter what order the fields were in. That makes it a
+    /// fine oracle for "did the merge select the same VALUES", and useless for
+    /// "did it produce the same BYTES".
+    ///
+    /// ⛔ That distinction is not academic: comparing through a canonicalizing
+    /// helper is exactly how the JS mirror shipped a merge that was commutative
+    /// in value and NOT in key order, with a property test that could not see
+    /// it. Rust happens to be safe here because `serde_json::Value` sorts on the
+    /// way out anyway — but a future change that hand-rolls serialization would
+    /// reintroduce the same blind spot, and this test would still pass.
+    ///
+    /// The byte-level oracle is `vaultToJson` on the JS side, asserted
+    /// cross-language against this binary in `sigil-wasm/test/merge-interop.mjs`
+    /// (the `BYTES` section).
+    fn canon_vault(v: &TotpVault) -> String {
+        serde_json::to_string(&serde_json::to_value(v).expect("value")).expect("json")
+    }
+
+    #[test]
+    fn merge_is_order_independent_over_generated_vaults() {
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let mut saw_tombstone_extra_conflict = 0usize;
+        for round in 0..600u32 {
+            let a = arbitrary_vault(&mut rng);
+            let b = arbitrary_vault(&mut rng);
+
+            // Did this round actually contain the input the regression needs? A
+            // property test that never generates the interesting case is a
+            // no-op, so it is COUNTED and asserted at the end.
+            for ta in &a.tombstones {
+                for tb in &b.tombstones {
+                    if ta.uuid == tb.uuid && ta.extra != tb.extra {
+                        saw_tombstone_extra_conflict += 1;
+                    }
+                }
+            }
+
+            let (ab, _) = merge_vaults(&a, &b);
+            let (ba, _) = merge_vaults(&b, &a);
+            assert_eq!(
+                canon_vault(&ab),
+                canon_vault(&ba),
+                "round {round}: merge is NOT commutative.\n  a={}\n  b={}",
+                canon_vault(&a),
+                canon_vault(&b)
+            );
+
+            // Idempotent: joining a value with itself changes nothing.
+            let (again, _) = merge_vaults(&ab, &ab);
+            assert_eq!(
+                canon_vault(&again),
+                canon_vault(&ab),
+                "round {round}: merge is NOT idempotent"
+            );
+
+            // Associative, which is what makes a THIRD device joining late
+            // converge no matter which pair merged first.
+            let c = arbitrary_vault(&mut rng);
+            let (bc, _) = merge_vaults(&b, &c);
+            let (ab_c, _) = merge_vaults(&ab, &c);
+            let (a_bc, _) = merge_vaults(&a, &bc);
+            assert_eq!(
+                canon_vault(&ab_c),
+                canon_vault(&a_bc),
+                "round {round}: merge is NOT associative"
+            );
+        }
+        assert!(
+            saw_tombstone_extra_conflict >= 20,
+            "the generator never produced two tombstones sharing a uuid with DIFFERENT unknown \
+             fields ({saw_tombstone_extra_conflict} times) — this property would then pass \
+             without exercising the case it exists for"
+        );
+    }
+
+    /// The minimal, hand-written witness of the regression, so a failure names it
+    /// rather than dumping a generated pair.
+    #[test]
+    fn tombstone_unknown_fields_merge_commutatively() {
+        let tomb = |value: serde_json::Value| {
+            let mut extra = std::collections::BTreeMap::new();
+            extra.insert("future_tombstone_field".to_string(), value);
+            TotpVault {
+                tombstones: vec![Tombstone {
+                    uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                    deleted_at: Some(1_700_000_000),
+                    extra,
+                }],
+                ..TotpVault::default()
+            }
+        };
+        let left = tomb(serde_json::json!("aaa"));
+        let right = tomb(serde_json::json!("zzz"));
+        let (ab, _) = merge_vaults(&left, &right);
+        let (ba, _) = merge_vaults(&right, &left);
+        assert_eq!(
+            canon_vault(&ab),
+            canon_vault(&ba),
+            "⛔ tombstone `extra` merged FIRST-SEEN-WINS, so two devices that merged in \
+             different orders hold different bytes forever"
+        );
+        // …and the surviving value is the deterministic MAX, not "whichever
+        // arrived first" — the same rule the vault level uses.
+        assert_eq!(
+            ab.tombstones[0].extra["future_tombstone_field"],
+            serde_json::json!("zzz")
+        );
+    }
+
+    #[test]
+    fn a_delete_survives_a_stale_snapshot_that_still_holds_the_entry() {
+        let alpha = e(
+            "alpha",
+            None,
+            b"a",
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        let stale = v(vec![alpha.clone()]);
+        let mut deleted = stale.clone();
+        deleted.remove_at("alpha", Some(1_700_000_000)).expect("rm");
+        assert_eq!(deleted.tombstones.len(), 1);
+
+        let (merged, report) = merge_vaults(&deleted, &stale);
+        assert!(merged.entries.is_empty(), "the tombstone must win");
+        assert_eq!(report.removed, 1);
+        // …and in the other direction, which is the case that matters: a device
+        // that still holds the entry merges the delete in.
+        let (other, _) = merge_vaults(&stale, &deleted);
+        assert!(other.entries.is_empty());
+        assert_eq!(merged, other);
+    }
+
+    #[test]
+    fn a_tombstone_does_not_poison_a_genuine_re_add() {
+        // A re-add draws a FRESH uuid, so it is a different element and delete-wins
+        // cannot eat it. This is what makes "tombstone always wins" safe.
+        let mut vault = v(vec![e(
+            "alpha",
+            None,
+            b"a",
+            Some("11111111-1111-4111-8111-111111111111"),
+        )]);
+        vault.remove_at("alpha", Some(1)).expect("rm");
+        vault
+            .add(e(
+                "alpha",
+                None,
+                b"a",
+                Some("99999999-9999-4999-8999-999999999999"),
+            ))
+            .expect("re-add");
+        let (merged, _) = merge_vaults(&vault, &vault);
+        assert_eq!(labels(&merged), vec!["alpha"]);
+        assert_eq!(merged.tombstones.len(), 1);
+    }
+
+    #[test]
+    fn two_devices_normalizing_the_same_legacy_vault_do_not_duplicate() {
+        // ⭐ The migration-safety property. A RANDOM id here would double every
+        // account in every existing multi-device vault on first sync.
+        let legacy = v(vec![
+            e("alpha", Some("GitHub"), b"a", None),
+            e("bravo", None, b"b", None),
+        ]);
+        let mut a = legacy.clone();
+        let mut b = legacy.clone();
+        normalize_vault(&mut a);
+        normalize_vault(&mut b);
+        assert_eq!(a, b, "the derived ids must agree across devices");
+        let (merged, _) = merge_vaults(&a, &b);
+        assert_eq!(merged.entries.len(), 2, "2 entries, not 4");
+        // …and a delete on one device suppresses the other's still-legacy copy.
+        a.remove_at("alpha", Some(5)).expect("rm");
+        let (after, _) = merge_vaults(&legacy, &a);
+        assert_eq!(labels(&after), vec!["bravo"]);
+    }
+
+    #[test]
+    fn normalize_is_idempotent_and_disambiguates_an_identical_pair() {
+        let mut vault = v(vec![
+            e("dup", None, b"same", None),
+            e("dup", None, b"same", None),
+        ]);
+        normalize_vault(&mut vault);
+        let ids: Vec<String> = vault.entries.iter().map(entry_identity).collect();
+        assert_ne!(ids[0], ids[1], "a hand-edited duplicate must not collapse");
+        let before = vault.clone();
+        normalize_vault(&mut vault);
+        assert_eq!(before, vault, "idempotent");
+    }
+
+    #[test]
+    fn work_at_two_issuers_is_two_entries() {
+        // CRITICAL 2. Identity is content, not the label.
+        let mut vault = TotpVault::default();
+        vault
+            .add(e("work", Some("GitHub"), b"gh", None))
+            .expect("a");
+        vault
+            .add(e("work", Some("GitLab"), b"gl", None))
+            .expect("b");
+        assert_eq!(vault.entries.len(), 2);
+        // …but the byte-identical account twice is still refused.
+        assert!(vault.add(e("work", Some("GitHub"), b"gh", None)).is_err());
+        // …and an ambiguous removal refuses instead of guessing.
+        let err = vault.remove_at("work", None).unwrap_err().to_string();
+        assert!(err.contains("--id"), "{err}");
+        assert_eq!(vault.entries.len(), 2, "nothing was removed");
+    }
+
+    #[test]
+    fn re_adding_an_account_that_already_has_a_random_id_is_still_refused() {
+        // ⛔ THE BUG THIS PINS, which the first cut of Phase 61 actually had: the
+        // de-dup compared `entry_identity` on both sides. A candidate coming from
+        // an import carries NO uuid (so its identity is its content) while the
+        // copy in the vault carries a RANDOM one — the two could never be equal,
+        // so re-importing the same Google Authenticator export duplicated every
+        // account in it. The comparison must be `entry_fingerprint` (content).
+        let mut vault = TotpVault::default();
+        let stored = new_totp_entry(
+            "work",
+            Some("GitHub".into()),
+            b"gh",
+            OtpAlgorithm::Sha1,
+            6,
+            30,
+        )
+        .expect("entry");
+        assert!(stored.uuid.is_some(), "a new entry draws a random id");
+        vault.add(stored).expect("first add");
+
+        // The SAME account arriving from an import, with no id of its own.
+        let imported = e("work", Some("GitHub"), b"gh", None);
+        assert_ne!(
+            entry_identity(&imported),
+            entry_identity(&vault.entries[0]),
+            "identities differ — which is exactly why they cannot be the comparison"
+        );
+        assert_eq!(
+            entry_fingerprint(&imported),
+            entry_fingerprint(&vault.entries[0]),
+            "…while the fingerprints agree, because it is the same account"
+        );
+        assert!(vault.add(imported).is_err(), "a re-import must be a no-op");
+        assert_eq!(vault.entries.len(), 1);
+
+        // …and a genuinely different account with the same label still lands.
+        vault
+            .add(e("work", Some("GitLab"), b"gl", None))
+            .expect("a different account");
+        assert_eq!(vault.entries.len(), 2);
+    }
+
+    #[test]
+    fn the_same_id_with_different_content_keeps_a_deterministic_winner() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let a = v(vec![e("alpha", None, b"one", Some(id))]);
+        let b = v(vec![e("alpha", None, b"two", Some(id))]);
+        let (ab, ra) = merge_vaults(&a, &b);
+        let (ba, _) = merge_vaults(&b, &a);
+        assert_eq!(ab, ba, "order must not decide the winner");
+        assert_eq!(ra.conflicts, vec![id.to_string()]);
+    }
+
+    #[test]
+    fn merge_preserves_unknown_fields_at_both_levels() {
+        // ADR 0047 forward-compatibility must survive the NEW code path too.
+        let a: TotpVault = serde_json::from_str(
+            r#"{"version":1,"entries":[{"label":"a","secret":"aaaa","algorithm":"sha1",
+                "digits":6,"period":30,"uuid":"11111111-1111-4111-8111-111111111111",
+                "icon":"github"}],"future_top":{"k":1}}"#,
+        )
+        .expect("a");
+        let b: TotpVault = serde_json::from_str(
+            r#"{"version":1,"entries":[{"label":"b","secret":"bbbb","algorithm":"sha1",
+                "digits":6,"period":30,"uuid":"22222222-2222-4222-8222-222222222222"}],
+                "other_top":"x"}"#,
+        )
+        .expect("b");
+        let (merged, _) = merge_vaults(&a, &b);
+        let out: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&merged).unwrap()).unwrap();
+        assert_eq!(out["future_top"], serde_json::json!({"k": 1}));
+        assert_eq!(out["other_top"], serde_json::json!("x"));
+        assert_eq!(out["entries"][0]["icon"], serde_json::json!("github"));
+    }
+
+    #[test]
+    fn a_merged_vault_still_writes_the_old_byte_shape_when_nothing_was_deleted() {
+        let (merged, _) = merge_vaults(&TotpVault::default(), &TotpVault::default());
+        let json = String::from_utf8(serde_json::to_vec(&merged).unwrap()).unwrap();
+        assert_eq!(json, r#"{"version":1,"entries":[]}"#);
+        assert!(!json.contains("tombstones"));
+    }
+
+    #[test]
+    fn merge_ops_folds_every_op_not_just_the_tip() {
+        let secret = b"pw".as_slice();
+        let params = Argon2Params {
+            m_cost: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let base = v(vec![e(
+            "base",
+            None,
+            b"b",
+            Some("00000000-0000-4000-8000-000000000000"),
+        )]);
+        let mut a = base.clone();
+        a.add(e(
+            "alpha",
+            None,
+            b"a",
+            Some("11111111-1111-4111-8111-111111111111"),
+        ))
+        .expect("a");
+        let mut b = base.clone();
+        b.add(e(
+            "bravo",
+            None,
+            b"c",
+            Some("22222222-2222-4222-8222-222222222222"),
+        ))
+        .expect("b");
+        let ops = vec![
+            PulledOp {
+                seq: 1,
+                blob: seal_vault(secret, &a, params).expect("seal a"),
+            },
+            // The TIP, which has never seen `alpha`.
+            PulledOp {
+                seq: 2,
+                blob: seal_vault(secret, &b, params).expect("seal b"),
+            },
+        ];
+        let (merged, report) = merge_ops_into(&base, secret, &ops);
+        assert_eq!(labels(&merged), vec!["alpha", "base", "bravo"]);
+        assert_eq!(report.applied, 2);
+        assert_eq!(report.tip, 2);
+        assert!(report.skipped.is_empty());
+
+        // An op sealed under a DIFFERENT key is skipped and NAMED, never fatal.
+        let mut ops2 = ops.clone();
+        ops2.push(PulledOp {
+            seq: 3,
+            blob: seal_vault(b"other", &a, params).expect("seal"),
+        });
+        let (merged2, report2) = merge_ops_into(&base, secret, &ops2);
+        assert_eq!(labels(&merged2), vec!["alpha", "base", "bravo"]);
+        assert_eq!(report2.skipped.len(), 1);
+        assert_eq!(report2.skipped[0].0, 3);
     }
 
     #[test]

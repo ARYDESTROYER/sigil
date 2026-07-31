@@ -196,6 +196,27 @@ export function recovery_derive_mlkem_seed(seed: Uint8Array): Uint8Array;
 /** Render a 56-character kit code as 7 groups of 8, hyphen-joined, for printing. */
 export function recovery_format(code: string): string;
 
+/**
+ * ⭐ The CONTENT-DERIVED id of a TOTP entry (Phase 61) — one domain-separated,
+ * length-prefixed SHA-256 transcript formatted as an RFC 9562 v8 UUID.
+ *
+ * Single-sourced in `sigil-core` and NOT mirrored in JS: a drift here would be
+ * invisible (a vault that opens correctly everywhere and silently duplicates or
+ * mis-suppresses entries when two devices merge).
+ *
+ * `issuer` is `""` when absent, `secret` is the DECODED key bytes, `algorithm` is
+ * lowercase, and `disambiguator` is `0` for every ordinary call.
+ */
+export function entry_id(
+  issuer: string,
+  label: string,
+  secret: Uint8Array,
+  algorithm: string,
+  digits: number,
+  period: number,
+  disambiguator: number,
+): string;
+
 
 /** The XChaCha20-Poly1305 nonce length in bytes (24). */
 export function nonce_len(): number;
@@ -233,6 +254,7 @@ export interface SigilWasm {
   recovery_derive_x25519_secret: typeof recovery_derive_x25519_secret;
   recovery_derive_mlkem_seed: typeof recovery_derive_mlkem_seed;
   recovery_format: typeof recovery_format;
+  entry_id: typeof entry_id;
   nonce_len: typeof nonce_len;
   recommended_salt_len: typeof recommended_salt_len;
   version: typeof version;
@@ -274,8 +296,47 @@ export interface TotpVault {
    */
   min_reader_version?: number;
   entries: TotpEntry[];
+  /**
+   * ⭐ The REMOVE half of the vault's 2P-Set (Phase 61). An entry whose identity
+   * appears here is suppressed no matter how many snapshots still contain it.
+   * OMITTED when empty, so a vault that has never had a delete keeps the exact
+   * byte shape earlier builds wrote.
+   */
+  tombstones?: Tombstone[];
   /** ⭐ Unknown top-level fields, preserved verbatim. Use `cloneVault`. */
   [unknownField: string]: unknown;
+}
+
+/** One removed entry, recorded so the removal survives a merge (Phase 61). */
+export interface Tombstone {
+  /** The removed entry's identity. */
+  uuid: string;
+  /** Unix seconds, from the CALLER's clock. Informational — no merge branches on it. */
+  deleted_at?: number;
+  [unknownField: string]: unknown;
+}
+
+/** What `mergeVaults` did, for a caller to report to a human. */
+export interface MergeResult {
+  vault: TotpVault;
+  added: number;
+  removed: number;
+  tombstonesAdded: number;
+  changed: boolean;
+  conflicts: string[];
+}
+
+/** What `mergeOpsInto` did over a run of op-log snapshots. */
+export interface MergeOpsResult {
+  vault: TotpVault;
+  applied: number;
+  /** Ops that would not open under this secret — skipped and NAMED, never fatal. */
+  skipped: { seq: number; reason: string }[];
+  tip: number;
+  added: number;
+  removed: number;
+  changed: boolean;
+  conflicts: string[];
 }
 
 export interface AddEntryInput {
@@ -300,6 +361,20 @@ export function bytesToBase64(bytes: Uint8Array | ArrayLike<number>): string;
 export function base32Decode(input: string): Uint8Array;
 export function newVault(): TotpVault;
 export function addEntry(vault: TotpVault, input: AddEntryInput): TotpVault;
+
+/**
+ * ⛔ THE TOMBSTONE GROWTH LIMIT. A vault is a 2P-Set: its remove-set NEVER
+ * shrinks, nothing anywhere prunes a tombstone, and there is no compaction
+ * command. `sigild` caps one op body at `MAX_OP_BODY_BYTES` (64 KiB) and answers
+ * 413 above it, at which point there is no supported way to shrink the vault.
+ *
+ * ⭐ Call `opBodySizeWarning(container.length)` BEFORE every push and show the
+ * string: a user who first meets this AT the 413 has already lost sync.
+ * Returns `null` below `OP_BODY_WARN_BYTES` (75% of the cap).
+ */
+export const MAX_OP_BODY_BYTES: number;
+export const OP_BODY_WARN_BYTES: number;
+export function opBodySizeWarning(containerLen: number): string | null;
 /**
  * ⭐ Clone a vault for editing WITHOUT dropping fields this build does not know.
  * Use instead of `{ version: v.version, entries: [...v.entries] }`.
@@ -328,6 +403,56 @@ export function ratchetParams(
 ): Argon2Params;
 export function formatEntryUuid(random16: Uint8Array | ArrayLike<number>): string;
 export function randomEntryUuid(): string;
+
+// ── entry identity and the 2P-Set merge (Phase 61) ──────────────────────────
+
+/** The content-derived id of an entry — reaches `sigil_core::entry_id`. */
+export function entryContentId(
+  wasm: Pick<SigilWasm, "entry_id">,
+  entry: TotpEntry,
+  disambiguator?: number,
+): string;
+/** The identity an entry is MERGED by: its `uuid`, else its content-derived id. */
+export function entryIdentity(wasm: Pick<SigilWasm, "entry_id">, entry: TotpEntry): string;
+/**
+ * The content FINGERPRINT, ignoring any `uuid`. ⭐ This — not `entryIdentity` —
+ * is what ADD and IMPORT must compare: a candidate carries no id while the copy
+ * in the vault carries a random one.
+ */
+export function entryFingerprint(wasm: Pick<SigilWasm, "entry_id">, entry: TotpEntry): string;
+/** Give every entry a stable id, deterministically and idempotently. Mutates. */
+export function normalizeVault(wasm: Pick<SigilWasm, "entry_id">, vault: TotpVault): TotpVault;
+/** Serialize a vault as it is stored, with an empty `tombstones` omitted. */
+export function vaultToJson(vault: TotpVault): string;
+/** ⭐ Join two snapshots. Commutative, associative, idempotent; delete wins. */
+export function mergeVaults(
+  wasm: Pick<SigilWasm, "entry_id">,
+  local: TotpVault,
+  remote: TotpVault,
+): MergeResult;
+/**
+ * ⭐ Fold EVERY op into `local` instead of adopting the newest — the fix for
+ * last-writer-wins. An op that will not open is skipped and NAMED, never fatal.
+ */
+export function mergeOpsInto(
+  wasm: Pick<SigilWasm, "entry_id" | "open_container">,
+  secret: string | Uint8Array,
+  local: TotpVault,
+  ops: { seq: number; container: Uint8Array }[],
+): MergeOpsResult;
+/** Remove an entry AND record a tombstone. Refuses an ambiguous label. */
+export function removeEntry(
+  wasm: Pick<SigilWasm, "entry_id">,
+  vault: TotpVault,
+  selector: { uuid?: string; label?: string },
+  deletedAtUnix?: number,
+): TotpEntry;
+/** `addEntry` that refuses an account already present, compared by FINGERPRINT. */
+export function addEntryChecked(
+  wasm: Pick<SigilWasm, "entry_id">,
+  vault: TotpVault,
+  input: AddEntryInput,
+): boolean;
 export function openVault(
   wasm: Pick<SigilWasm, "open_container">,
   password: string | Uint8Array,

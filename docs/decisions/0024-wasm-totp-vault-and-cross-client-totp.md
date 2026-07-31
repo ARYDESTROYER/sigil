@@ -158,3 +158,42 @@ fix and the whole gate stayed green.
 
 ⚠️ **`extra` preserves bytes, not semantics.** An old client can round-trip a field
 it does not understand while behaving inconsistently with it.
+
+---
+
+## Addendum (2026-07-31, Phase 61) — the schema gained a remove-set, and `uuid` became load-bearing
+
+Recorded by [0049](0049-entry-identity-and-the-mergeable-vault.md). The mirrored
+`TotpVault` / `TotpEntry` JSON changes in two ways, both **purely additive**:
+
+1. **`tombstones`** — a top-level array, the remove-set of the 2P-Set that makes a
+   vault mergeable. `Tombstone { uuid, deleted_at?, …unknown }`. ⚠️ **It is
+   OMITTED when empty** on both sides, so a client that has never deleted anything
+   writes byte-for-byte the shape it always did.
+2. **`uuid` stopped being dead weight.** This ADR's previous addendum said
+   *"nothing keys off it yet — every lookup is still by `label`, deliberately"*.
+   That is now false, and deliberately so: **the merge keys on `uuid`**, and an
+   entry that predates the field gets a **deterministic, content-derived** id so
+   that two devices holding the same old vault agree without communicating.
+
+⭐ **The mirror did NOT grow a third copy of anything hard.** The id derivation
+lives in `sigil-core` (`entry_id.rs`) and the browsers reach the same bytes through
+a one-line wasm shell — it is **not** mirrored, because unlike a format constant a
+drift in a decision procedure fails *silently*, producing a vault that opens
+everywhere and merely duplicates or mis-suppresses entries. What **is** mirrored is
+the merge itself (`merge_vaults` ↔ `mergeVaults`), and both sides must sort JSON
+keys identically (`serde_json::Value` is a `BTreeMap`; JS uses an explicit
+`sortKeysDeep`) or the two clients could pick different winners for the same
+conflict and never converge.
+
+⚠️ **`version` is still 1 and `min_reader_version` is still unset**, so a v1 reader
+opens a merged vault. With this ADR's `extra` preservation it round-trips
+`tombstones` it does not understand; **a client older than
+[0047](0047-container-parameter-ceiling-and-no-downgrade-ratchet.md) strips them**,
+resurrecting every entry they suppressed. See limitation 4 of
+[0049](0049-entry-identity-and-the-mergeable-vault.md).
+
+⛔ **The schema is now correct only while entries are IMMUTABLE.** There is no
+revision field and no clock, by design. **An edit must be implemented as delete +
+add with a fresh `uuid`** — `sigil-wasm/test/merge-guard.mjs` fails the build if a
+shipping client grows one.

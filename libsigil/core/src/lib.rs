@@ -71,6 +71,7 @@
 extern crate alloc;
 
 mod aead;
+mod entry_id;
 mod envelope;
 mod hybrid;
 mod hybrid_auth;
@@ -85,6 +86,7 @@ mod recovery;
 mod sig;
 mod totp;
 pub use aead::{open, seal, AeadError, KEY_LEN, NONCE_LEN, TAG_LEN};
+pub use entry_id::{entry_id, format_entry_uuid_v8};
 pub use envelope::{Envelope, EnvelopeError};
 pub use hybrid::{
     hybrid_decapsulate, hybrid_encapsulate, HybridEncapsulation, HybridError,

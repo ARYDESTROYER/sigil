@@ -1064,7 +1064,7 @@ cryptography of its own; see the status note above). The pieces in this repo:
   server-facing half in `desktop/core/src/net.rs` (below) — and is
   `#![forbid(unsafe_code)]`; **`sigil-desktop`** (`desktop/src-tauri`) is a thin
   shell holding an `AppState { session: Mutex<Option<VaultSession>>, sync:
-  Mutex<Option<DeviceConfig>> }` and **forty `#[tauri::command]`s** — the ten
+  Mutex<Option<DeviceConfig>> }` and **41 `#[tauri::command]`s** — the ten
   offline ones (`status`, `unlock`, `lock`, `list`, `add_secret`, `add_uri`,
   `import`, `remove`, `export_uris`, `export_migration`), **eleven added in
   Phase 49** (`unlock_shared`, `set_server`, `sync_status`, `enroll`,
@@ -1265,7 +1265,7 @@ cryptography of its own; see the status note above). The pieces in this repo:
      no sync, no background worker; dev / UNAUDITED; not published to any store.
    desktop (Tauri v2): the FIRST NATIVE client — sigil-core linked as a plain Rust
      dependency, NO wasm. sigil-desktop-core (headless logic, all the tests) +
-     sigil-desktop (shell: 40 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
+     sigil-desktop (shell: 41 #[tauri::command]s) + framework-free ui/. Re-uses cli/'s
      SIGILcli container + TotpVault schema + migration codec, and shares the CLI's
      $HOME/.sigil/totp-vault.sigil, so desktop and `sigil totp` drive ONE vault file.
      Sealed-only vault persistence, in-memory password; webview does no crypto

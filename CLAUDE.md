@@ -1224,11 +1224,130 @@ public, make no security claims, until the audit completes and trademark clears.
   when the field is absent — replacing the blanket `version != 1 ⇒ refuse` that made
   every addition a four-client flag day; and a stable per-entry **`uuid`**
   (`format_entry_uuid` / `random_entry_uuid` / `new_totp_entry_with_uuid`, RFC 4122 v4
-  from CALLER-supplied entropy per ADR 0007). ⚠️ **NOTHING KEYS OFF THE uuid YET** —
-  every lookup is still by `label`, deliberately. ⚠️ `extra` preserves **BYTES, NOT
-  SEMANTICS**, and any code that rebuilds a vault field-by-field throws it away again.
-  A test pins that `TotpVault::default()` still serializes to exactly
-  `{"version":1,"entries":[]}`.
+  from CALLER-supplied entropy per ADR 0007). ⚠️ ~~**NOTHING KEYS OFF THE uuid YET**~~
+  — **RETIRED by Phase 61 (ADR 0049): the `uuid` IS the merge identity now.** ⚠️ `extra`
+  preserves **BYTES, NOT SEMANTICS**, and any code that rebuilds a vault field-by-field
+  throws it away again. A test pins that `TotpVault::default()` still serializes to
+  exactly `{"version":1,"entries":[]}`.
+  ⭐⭐ **PHASE 61 (ADR 0049) MADE THE VAULT MERGEABLE — the fix for a REPRODUCED
+  MULTI-DEVICE DATA LOSS.** ⛔ **THE DEFECT:** a vault syncs as whole sealed SNAPSHOTS
+  and every client **ADOPTED THE NEWEST ONE WHOLESALE** (`pull_and_adopt` overwrote the
+  local vault; the browsers took `ops[ops.length - 1]`). Device A adds `github` and
+  pushes; device B, which never pulled, adds `gitlab` and pushes; B's snapshot is the
+  tip, and the moment anything adopts it **`github` is GONE** — **both pushes reported
+  success**. Reproduced end to end with the REAL binary against a REAL sigild before a
+  line was written. ⭐ **A PRECISION THAT SHAPED THE FIX:** the op-log is NOT lossy and
+  `sigil pull` is NOT lossy (it writes every op to its own file) — **the loss is at
+  ADOPTION**, so the merge belongs in the CLIENT, which is also the only place it CAN
+  live, since sigild cannot read the blob. **THE SHAPE:** a vault is a **2P-Set** —
+  `entries` is the add-set keyed by identity, `tombstones` the remove-set keyed by
+  uuid, and `merge_vaults` is their union with **DELETE WINNING**. ⭐ **Tombstone-wins
+  is safe BY CONSTRUCTION, not by policy:** a genuine re-add **mints a FRESH uuid**, so
+  a "re-add" of a tombstoned id is never a user action — it is a stale snapshot or a
+  hostile writer, and it should lose. That dodges the textbook 2P-Set flaw instead of
+  papering over it. **IDENTITY = the `uuid`: MINTED v4** for new entries, **DERIVED v8
+  over content** (`sigil_core::entry_id`, `libsigil/core/src/entry_id.rs`) for legacy
+  ones — ⭐ **determinism matters ONLY for legacy entries, and it is load-bearing**:
+  two devices holding the same pre-Phase-61 vault must invent the SAME id with no
+  communication, or the first merge **duplicates every account** and **a delete can
+  never suppress the other device's copy**. Transcript + golden vector
+  (`41828256-7397-80c1-bf67-e6b85ff84173`) in `docs/crypto-spec.md`; **v8 not v5
+  because RFC 9562 §5.5 defines v5 as name-based SHA-**1**, and this is SHA-256** —
+  stamping a 5 would encode a false statement in a wire format. ⭐ **The derivation is
+  NOT MIRRORED** (unlike the schema and the safety number): it lives in `sigil-core`,
+  the CLI + desktop call it directly and the browsers reach the same bytes through a
+  one-line wasm shell, **because a drift here is INVISIBLE** — it yields a vault that
+  opens fine everywhere and merely duplicates or mis-suppresses entries. ⚠️ **A
+  content FINGERPRINT (`entry_fingerprint`) is NOT an identity** and is used ONLY by
+  `add`/`import`: those must ask *"have I got this account?"* (content), because an
+  imported entry carries **no id** while the stored copy carries a **random** one, so
+  comparing identities would duplicate every account on every re-import. That also
+  fixed a second real defect — **import de-duplicated on `label`**, so `work@github`
+  and `work@gitlab` (or one address at two issuers) had the second **silently dropped
+  by an import that reported success**. ⭐⭐ **THE ENTIRE FIX IS THAT CLIENTS FOLD
+  EVERY OP INSTEAD OF THE TIP** (`vault = local ⊕ op₁ ⊕ … ⊕ opₙ`, starting from
+  **`local`** so unpushed work survives) — and **it costs NOTHING on the wire, because
+  the append-only op-log ALREADY STORED EVERY SNAPSHOT**. No route, field, version or
+  server change: **sigild changed by ZERO lines.** ⭐ **Therefore it is RETROACTIVE** —
+  a vault whose accounts were shadowed on a real server before this existed is
+  **repaired** the first time an updated client syncs. ⚠️ It cannot recover what was
+  only ever local, or a vault never synced. ⭐ **NO CLOCK IS IN THE CORRECTNESS PATH**
+  (no Lamport counter, no vector clock, no revision, no timestamp tiebreak) **because
+  ENTRIES ARE IMMUTABLE** — `add`/`import`/`remove` is the complete mutation surface on
+  all four clients. ⚠️ **Use "CRDT" carefully:** the ENTRY SET is a 2P-Set with a
+  convergent merge, but this is **not** a general CRDT for a mutable record, and an
+  unqualified "the vault is a CRDT" was an **over-claim a verifier caught in a shipped
+  code comment**. ⚠️ **AND THE COMMUTATIVITY CLAIM WAS ONCE FALSE:** tombstone-level
+  unknown `extra` fields merged **FIRST-SEEN-WINS**, so two vaults whose tombstones
+  shared a uuid with different unknown values **did not converge** while the doc
+  comment beside them claimed unqualified commutativity. **Fixed, not qualified** (a
+  forward-compat field is exactly what a future version writes and a current one must
+  carry through a merge in either order); both mirrors now use one canonical-JSON max
+  rule, and BOTH must **sort keys** (`serde_json::Value` is a `BTreeMap`; JS uses
+  `sortKeysDeep`) or they pick different winners and never converge.
+  ⚠️ **AND THE FIRST FIX WAS ONLY HALF OF IT.** Values converged; **KEY ORDER did
+  not** — `mergeVaults` built `{ ...prev }` and appended the other side's new keys,
+  so `merge(a,b)` and `merge(b,a)` serialized to **different bytes** whenever two
+  tombstones (or two vaults) carried **disjoint** unknown keys — while the comment
+  beside it said "byte for byte **with no exception**". It was **wider than that**:
+  `addEntry` appends `issuer` LAST, so *every ordinary entry* already serialized
+  differently from Rust. ⭐ **The test could not have caught it** — the property test
+  compared through `canonJson`, which **sorts keys and therefore normalises away the
+  very property being claimed**. (The Rust side's `canon_vault` has the same shape and
+  is now documented as **NOT a byte oracle**; Rust is safe only because
+  `serde_json::Value` sorts on the way out anyway.) ⭐ **A NEW MIRROR EXISTS BECAUSE OF
+  THIS: `VAULT_FIELD_ORDER` / `ENTRY_FIELD_ORDER` / `TOMBSTONE_FIELD_ORDER` in
+  `sigil-wasm/totp-vault.mjs` must equal the serde declaration order of `TotpVault` /
+  `TotpEntry` / `Tombstone` in `cli/src/lib.rs`** — the same category as the canonical
+  v3 message and the safety-number digest, and it is **guarded** (`merge-guard.mjs`
+  §6c parses the Rust struct order and compares; mutation-proven in both directions).
+  The byte-level oracle is the **`BYTES`** section of `merge-interop.mjs`, which
+  compares JS output against the **real `sigil` binary**'s re-seal, byte for byte.
+  ⚠️ "Serialize identically" means **through `vaultToJson`** — the returned object
+  still carries insertion order, so a bare `JSON.stringify(merged)` is **order-dependent
+  and NOT commutative**. That qualification is load-bearing, not a hedge.
+  ⛔⛔ **THE TWO LIMITS THAT MUST BE SAID AS LOUDLY AS THE FEATURE.** **(1) TOMBSTONES
+  GROW WITHOUT BOUND.** The remove-set NEVER shrinks; every removal appends ~55–95
+  bytes carried **forever** (dropping one resurrects the entry on the next merge with
+  any device holding a pre-delete snapshot). **`sigil totp compact` DOES NOT EXIST** and
+  nothing anywhere prunes a tombstone. sigild caps one op body at **64 KiB**
+  (`maxOpsBodyBytes`) and answers **413** above it — past that **`push` fails with no
+  supported way to shrink the vault**, i.e. the user meets it at the moment they lose
+  syncing. What is built is a **WARNING, not a fix**: `op_body_size_warning` /
+  `opBodySizeWarning` (mirrored trio + a desktop delegate) fires from **75 %** (48 KiB)
+  on all four clients, and `explain_sync_error` gained a **413 arm** saying nothing is
+  lost locally, codes still work, and the only way out is export→fresh vault id (which
+  **prints secrets in the clear**). `Tombstone::deleted_at` is written, merged by
+  **min** (a hostile clock can only make a delete look EARLIER) and **read by nothing**
+  — it exists so a FUTURE compaction has a field to key on. **(2) CORRECT ONLY WHILE
+  ENTRIES ARE IMMUTABLE.** If a rename/edit/in-place update is ever added this merge
+  **silently keeps whichever copy sorts higher**. **An edit MUST be delete + add with a
+  fresh uuid, or the merge needs a revision rule FIRST.** Guarded by
+  **`sigil-wasm/test/merge-guard.mjs` (51 structural checks**, measured): no in-place
+  write to a content field (**exact per-file counts with written justifications, so a
+  MISSING hit also fails**), no edit-shaped declaration, the `sigil totp` subcommand set
+  stays `{add,code,export,import,list,remove,sync}`, and the in-code immutability
+  warning cannot be deleted. ⚠️ **It is a SOURCE check, NOT a proof** — it cannot catch
+  an edit routed through an unknown helper or an entry rebuilt field-by-field under the
+  same uuid; structural enforcement was **rejected** because `TotpEntry` is a MIRRORED
+  schema whose JS half is a plain object literal no language feature can seal, so it
+  would cover 1 of 2 implementations and 2 of 4 clients **while reading as if it covered
+  all of them**. ⚠️ **Other limits:** a same-id conflict is resolved by a **RULE**
+  (greater canonical JSON), not by intent; a **v1 reader still opens a merged vault**
+  (`version` stays 1, `min_reader_version` unset) and an **ADR-0047-or-newer** build
+  round-trips tombstones it does not understand, but a build **older than ADR 0047
+  STRIPS them** and a pre-Phase-61 delete records **no tombstone at all** — so *"this
+  snapshot came from a build that cannot delete"* is a real, silent state; a first merge
+  **reorders** a hand-arranged vault (canonical sort is by `uuid` **alone**, because it
+  is ASCII hex and Rust's byte `Ord` and JS's UTF-16 compare agree exactly — sorting on
+  user text would not); the browser + desktop size warnings are **structurally** but not
+  **behaviourally** tested; and the 64 KiB cap is now a **fourth hand-written copy**
+  (guarded across Go/Rust/JS). Proofs: **`sigil-wasm/test/merge-interop.mjs`** (16
+  blocks, real sigild + real `sigil` binary, incl. a **600-pair property test** that
+  FAILS if fewer than 20 rounds hit the interesting same-uuid conflict, a **THREE-DEV**
+  block whose late joiner holds **unpushed** local work, and a **750-tombstone SIZE**
+  block; ⚠️ **SLOW, ~10–15 min**) and `merge-guard.mjs`. Desktop gained exactly **one**
+  command (`remove_by_id` → **41**) and one changed return type (`PushOutcome`).
   Also **`sigil device enroll|list|revoke|grant`** — the CLIENT half of sigild's
   multi-device auth model (**contract v3**, ADR 0031; Phase 42), so the CLI is the
   FIRST client that speaks v3: `device enroll --token <t> [--label <name>] [--key
@@ -1974,9 +2093,11 @@ public, make no security claims, until the audit completes and trademark clears.
   constants, **plus the whole server-facing half in `desktop/core/src/net.rs`**
   (below); **`sigil-desktop`** (`desktop/src-tauri`) is a **thin shell** — a window,
   an `AppState { session: Mutex<Option<VaultSession>>, sync: Mutex<Option<DeviceConfig>> }`,
-  and **forty `#[tauri::command]`s** (count verified against
+  and **41 `#[tauri::command]`s** (count verified against
   `desktop/src-tauri/src/main.rs` — every one registered in `generate_handler!`; this
-  line said "twenty-one", then "thirty-one", each stale within a phase or two): the ten
+  line said "twenty-one", then "thirty-one", then "forty", each stale within a phase
+  or two, which is why `sigil-wasm/test/docs-claims-guard.mjs` now checks it
+  mechanically): the ten
   offline ones (`status`, `unlock`,
   `lock`, `list`, `add_secret`, `add_uri`, `import`, `remove`, `export_uris`,
   `export_migration`), **ELEVEN added in Phase 49** (`unlock_shared`, `set_server`,
@@ -2146,7 +2267,7 @@ public, make no security claims, until the audit completes and trademark clears.
   path under `desktop/`.** Do NOT store real 2FA
   secrets. ADR 0032, ADR 0037, ADR 0038, ADR 0042, ADR 0043.
   ⭐ **Phase 59 (ADR 0047) reached the desktop by the same REUSE rule, and added no
-  commands** (still **forty**): `ImportSummary` gained **`partial_batches`** (one note
+  commands** (still **41**): `ImportSummary` gained **`partial_batches`** (one note
   per multi-QR Google Authenticator batch seen) and **`batches_outstanding`**, plus
   `is_complete()`; the `import` command passes both across the IPC and `desktop/ui/main.js`
   keys its **"⚠️ INCOMPLETE"** framing off **`batches_outstanding`**, NOT off
@@ -2330,27 +2451,30 @@ grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # sigil-wasm — separate crate, wasm-bindgen binding over the core. Native fmt/
 # clippy/test exercise the *_inner helpers (34 tests); build-wasm.sh emits
-# pkg-web/pkg-node (needs wasm-pack); then the SIXTEEN Node suites below must all PASS.
+# pkg-web/pkg-node (needs wasm-pack); then the NINETEEN Node suites below must all PASS.
 cargo fmt   --manifest-path sigil-wasm/Cargo.toml --all -- --check
 cargo clippy --manifest-path sigil-wasm/Cargo.toml --all-targets -- -D warnings
 cargo test  --manifest-path sigil-wasm/Cargo.toml
 ./sigil-wasm/build-wasm.sh                          # → pkg-web/ + pkg-node/ (gitignored)
-node sigil-wasm/test/roundtrip.mjs                  # 1/16 seal/open in a JS runtime; prints PASS, exits 0
-node sigil-wasm/test/interop.mjs                    # 2/16 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/hybrid-interop.mjs             # 3/16 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
-node sigil-wasm/test/sync-interop.mjs               # 4/16 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
-node sigil-wasm/test/totp-interop.mjs               # 5/16 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
-node sigil-wasm/test/migration-interop.mjs          # 6/16 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
-node sigil-wasm/test/device-auth-interop.mjs        # 7/16 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
-node sigil-wasm/test/sharing-interop.mjs            # 8/16 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
-node sigil-wasm/test/pinning-interop.mjs            # 9/16 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
-node sigil-wasm/test/accounts-interop.mjs            # 10/16 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
-node sigil-wasm/test/recovery-interop.mjs           # 11/16 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
-node sigil-wasm/test/entitlement-interop.mjs         # 12/16 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
-node sigil-wasm/test/schema-interop.mjs             # 13/16 (Phase 59) the ONLY guard on TWO Rust<->JS mirrors that were silently LOSSY: the TotpVault/TotpEntry schema (serde DROPPED unknown fields; the JS clients rebuilt `{version, entries}` by hand, so an OLD client that merely opened and re-sealed a vault DELETED a newer client's data on a sync path where the OLDEST WRITER WINS) and the Google Authenticator BATCH FRAMING (both codecs discarded batch_size/batch_index/batch_id, so the first QR of a three-QR export imported a THIRD of the accounts and reported success). Drives the REAL `sigil` binary as the Rust half; 10 proofs, incl. min_reader_version failing closed, entry uuids, the period refusal + --skip-unsupported, the hostile-Argon2-header refusal on BOTH sides, and the JS ratchet vs the CLI's own rekey. Needs no server; PASS
-node sigil-wasm/test/passkey-uv-interop.mjs         # 14/16 (Phase 59) the ONLY exercise of the passkey USER-VERIFICATION check. Chrome's CDP virtual authenticator CANNOT produce a "completed but unverified" assertion, so the Playwright passkey suite cannot reach this branch at all, at any size — and an unenforced UV means sealing the hardware slot with CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to prevent. Drives the SHIPPED evaluatePrf over a stubbed navigator.credentials (⚠️ a double MORE PERMISSIVE than any real authenticator — the point); 4 proofs; PASS
-node sigil-wasm/test/seal-params-guard.mjs          # 15/16 (Phase 59) a SOURCE-STRUCTURE guard, not a behavioural one: every product re-seal site must ratchet its Argon2 parameters. A verifier proved mutating five of the six sites left webapp 50/50 and extension 14/14 GREEN, so this buys the regression guard for the failure that actually happens — a NEW call site that forgets. Checks 6 sealing sites across 2 product sources and FAILS if it finds ZERO; PASS
-node sigil-wasm/test/portability-guard.mjs          # 16/16 ⚠️ NOT Phase 59 feature work — it belongs to the 2026-07-30 CI-portability repair that shares this working tree. The suites are WRITTEN on macOS and RUN on ubuntu-latest, and nothing checked the two agreed: six suites hardcoded /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used `stat -f … || stat -c …`, which GNU stat does NOT fail on — so those jobs were RED for several phases while the macOS gate printed ALL GREEN. A SOURCE check, NOT a Linux run: it guards the two idioms that have actually bitten and CANNOT prove portability. PASS
+node sigil-wasm/test/roundtrip.mjs                  # 1/19 seal/open in a JS runtime; prints PASS, exits 0
+node sigil-wasm/test/interop.mjs                    # 2/19 wasm<->CLI SIGILcli interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/hybrid-interop.mjs             # 3/19 wasm<->CLI SIGILhyb hybrid public-key interop (builds the real CLI, both directions); PASS
+node sigil-wasm/test/sync-interop.mjs               # 4/19 wasm<->CLI opaque op-log sync (live sigild + real CLI, both directions); PASS
+node sigil-wasm/test/totp-interop.mjs               # 5/19 cross-client TOTP: CLI adds -> op-log -> browser code == RFC vector (wasm KAT + live sigild); PASS
+node sigil-wasm/test/migration-interop.mjs          # 6/19 CLI<->JS TOTP migration codec agreement (GOLDEN + RUST->JS + JS->RUST; builds the real CLI); PASS
+node sigil-wasm/test/device-auth-interop.mjs        # 7/19 JS client vs LIVE sigild with SIGILD_DEVICE_AUTH=1: enroll, sealed identity, claim/grant/revoke, tamper/stale/token-reuse; PASS
+node sigil-wasm/test/sharing-interop.mjs            # 8/19 cross-client VAULT SHARING both ways (live sigild + real CLI): JS shares -> CLI accepts -> 94287082; CLI shares -> JS accepts -> 94287082; 403 negatives; PASS
+node sigil-wasm/test/pinning-interop.mjs            # 9/19 KEY PINNING vs a SIMULATED MALICIOUS SERVER (a rewriting proxy in front of a live sigild swaps B's hybrid public key): CLI REFUSES + the stored envelope stays byte-identical and does NOT open with the attacker's secret; Rust<->JS safety numbers agree (per-device + order-independent pairwise + the shared KAT); rotation makes new content unreadable to the removed device while C still reads it; repin refuses without --yes and with a WRONG safety number; PASS
+node sigil-wasm/test/accounts-interop.mjs            # 10/19 the ACCOUNT model from a BROWSER-STYLE JS client vs a LIVE sigild (device auth on): a JS device founds an account and mints an invite; the REAL `sigil` CLI redeems that JS-minted invite with the ORDINARY `device enroll --token` and lands in the SAME account; a second JS device joins too; a REVOKED device's sibling still reads and writes its vault; a separately-founded account is 403 and sees only itself; a redeemed invite is 401, a foreign invite handle 404, the open-invite quota 409, an unsigned account call 401; and a mint body carrying account_id/subject is IGNORED (no request names an account); PASS
+node sigil-wasm/test/recovery-interop.mjs           # 11/19 the RECOVERY KIT codec + derivation, Rust <-> JS: the 56-char Crockford code round-trips, the shared known-answer vector (seed 0x42*32) yields identical ed25519/x25519/ML-KEM public material on both sides, U is REJECTED (never folded) while O/I/L fold, and a flipped version byte reports BAD CHECKSUM (not "unsupported version") because the checksum covers it; PASS
+node sigil-wasm/test/entitlement-interop.mjs         # 12/19 the ENTITLEMENT reader vs a LIVE sigild with SIGILD_ENTITLEMENT_ENFORCE=1: the ONLY thing in the repo that parses the REAL server's warning headers, the additive `entitlement` block on GET /v1/billing/subscription and the machine-readable 402 with the JS reader (the browser suites use a DOUBLE), so a divergence between sigild's entitlementJSON / paymentRequiredResponse and entitlement.mjs would otherwise go red in NO job; PASS
+node sigil-wasm/test/schema-interop.mjs             # 13/19 (Phase 59) the ONLY guard on TWO Rust<->JS mirrors that were silently LOSSY: the TotpVault/TotpEntry schema (serde DROPPED unknown fields; the JS clients rebuilt `{version, entries}` by hand, so an OLD client that merely opened and re-sealed a vault DELETED a newer client's data on a sync path where the OLDEST WRITER WINS) and the Google Authenticator BATCH FRAMING (both codecs discarded batch_size/batch_index/batch_id, so the first QR of a three-QR export imported a THIRD of the accounts and reported success). Drives the REAL `sigil` binary as the Rust half; 10 proofs, incl. min_reader_version failing closed, entry uuids, the period refusal + --skip-unsupported, the hostile-Argon2-header refusal on BOTH sides, and the JS ratchet vs the CLI's own rekey. Needs no server; PASS
+node sigil-wasm/test/passkey-uv-interop.mjs         # 14/19 (Phase 59) the ONLY exercise of the passkey USER-VERIFICATION check. Chrome's CDP virtual authenticator CANNOT produce a "completed but unverified" assertion, so the Playwright passkey suite cannot reach this branch at all, at any size — and an unenforced UV means sealing the hardware slot with CTAP's OTHER hmac-secret key, i.e. the exact lockout ADR 0046 exists to prevent. Drives the SHIPPED evaluatePrf over a stubbed navigator.credentials (⚠️ a double MORE PERMISSIVE than any real authenticator — the point); 4 proofs; PASS
+node sigil-wasm/test/seal-params-guard.mjs          # 15/19 (Phase 59) a SOURCE-STRUCTURE guard, not a behavioural one: every product re-seal site must ratchet its Argon2 parameters. A verifier proved mutating five of the six sites left webapp 50/50 and extension 14/14 GREEN, so this buys the regression guard for the failure that actually happens — a NEW call site that forgets. Checks 6 sealing sites across 2 product sources and FAILS if it finds ZERO; PASS
+node sigil-wasm/test/portability-guard.mjs          # 16/19 ⚠️ NOT Phase 59 feature work — it belongs to the 2026-07-30 CI-portability repair that shares this working tree. The suites are WRITTEN on macOS and RUN on ubuntu-latest, and nothing checked the two agreed: six suites hardcoded /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used `stat -f … || stat -c …`, which GNU stat does NOT fail on — so those jobs were RED for several phases while the macOS gate printed ALL GREEN. A SOURCE check, NOT a Linux run: it guards the two idioms that have actually bitten and CANNOT prove portability. PASS
+node sigil-wasm/test/merge-interop.mjs               # 17/19 (Phase 61) the ONLY cross-language proof that a vault MERGES instead of overwriting. Real sigild + the REAL `sigil` binary + JS clients, 16 blocks: the HEADLINE reproduction (two devices, neither pulls, BOTH accounts survive — this was a reproduced data LOSS), convergence/idempotence/associativity, delete + re-add, the LEGACY derived-id path, import de-dup on CONTENT (`work@github` and `work@gitlab` both live), the entry-id KAT, a PROPERTY block (600 generated vault pairs, order-independence asserted byte-for-byte and FAILING if fewer than 20 rounds hit the interesting same-uuid conflict), TOMB-XTRA (Rust and JS must pick the SAME winner for a conflicting unknown tombstone field), THREE-DEV (a device joining LATE with UNPUSHED local work of its own — the only account in the repo that exists nowhere but one client's memory when a three-branch log is folded) and SIZE (a 750-tombstone vault warns without failing). ⚠️ SLOW (~10-15 min: every sync runs Argon2id at RECOMMENDED); PASS
+node sigil-wasm/test/merge-guard.mjs                 # 18/19 (Phase 61) a SOURCE-STRUCTURE guard on the property the merge RESTS on: entries are IMMUTABLE. 51 checks across the shipping clients — no in-place write to a content field (exact per-file counts with written justifications, so a MISSING hit fails too), no edit-shaped declaration (`rename*`/`edit[Ee]ntry*`/`set(Label|Secret|…)`), the `sigil totp` subcommand set stays {add,code,export,import,list,remove,sync}, the in-code immutability warning cannot be deleted, every adoption path merges, every removal tombstones, every import de-dups by content, the id derivation is NOT reimplemented in JS, and the 64 KiB op cap agrees across Go/Rust/JS. ⚠️ It CANNOT catch an edit routed through an unknown helper; PASS
+node sigil-wasm/test/docs-claims-guard.mjs           # 19/19 the COUNTABLE claims in every .md (except docs/decisions/, whose ADRs are dated records) must match the tree: the desktop Tauri command count (drifted 21 -> 31 -> 40 -> 41), sigild's direct dependency count, the node interop + shell e2e suite counts, no dangling/gapped ADR reference, and getrandom==0. ⚠️ It checks NUMBERS, not PROSE — the threat-model row that asserted a defence which did not exist is invisible to it. ⛔ NOT YET RUN BY ANY WORKFLOW; PASS
 # ⚠️ sigil-wasm/test/fake-sigild.mjs is a SERVER DOUBLE for the BROWSER suites, NOT a
 # test — running it in a `test/*.mjs` loop HANGS. It sends NO CORS header unless a
 # caller passes an explicit allowlist, deliberately matching real sigild (an earlier
@@ -2396,7 +2520,7 @@ corepack pnpm --filter @sigil/wasm build        # -> web/packages/sigil-wasm/pkg
 corepack pnpm --filter webapp typecheck
 corepack pnpm --filter webapp lint
 corepack pnpm --filter webapp build             # ONE benign warning: "async/await … asyncWebAssembly"
-corepack pnpm --filter webapp exec playwright test   # headless chromium: 54 tests in 11 spec files, PASS
+corepack pnpm --filter webapp exec playwright test   # headless chromium: 12 spec files, PASS
 # ⛔ It serves on http://localhost:3210, NOT 127.0.0.1 — Chrome refuses WebAuthn on an IP
 # literal, so every passkey spec (ADR 0046) fails there for a reason unrelated to the code.
 # `workers: 2` and `reuseExistingServer: false` are also deliberate (see the config's comments).
@@ -2415,7 +2539,7 @@ corepack pnpm --filter webapp exec playwright test   # headless chromium: 54 tes
 # the extension can be loaded unpacked or tested). NOT wired into CI.
 corepack pnpm -C extension install
 ./extension/build.sh                          # -> extension/vendor/ (gitignored)
-corepack pnpm -C extension test               # `pretest` re-runs build.sh; 18 tests in 7 spec files, PASS
+corepack pnpm -C extension test               # `pretest` re-runs build.sh; 8 spec files, PASS
 # ⚠️ Use `pnpm test`, NOT `pnpm -C extension exec playwright test`: only the former
 # runs the `pretest` vendor hook, so the latter can test a STALE extension/vendor/.
 # The suite loads the REAL unpacked extension in a full Chromium (channel:
@@ -2499,7 +2623,11 @@ list of `.github/workflows/` (ten files):
   fmt/clippy/test** — which had no CI gate either, and which includes the golden
   `SIGILcli` / `SIGILhyb` header tests guarding the constants that MUST stay
   byte-identical with `cli/src/lib.rs` — builds the bindings and the real `sigil`
-  binary, runs **ALL SIXTEEN** Node interop suites (roundtrip, interop, hybrid-interop,
+  binary, runs **EIGHTEEN of the NINETEEN** Node interop suites — ⛔ **every one
+  except `docs-claims-guard.mjs`, which as of Phase 61 is run by NO workflow**
+  (`grep -rl docs-claims-guard .github/workflows/` returns nothing); it is the exact
+  shape of drift this repo has shipped three times before, and it is
+  `scripts/gate.sh`'s CI-drift check that flags it — (roundtrip, interop, hybrid-interop,
   sync-interop, totp-interop, migration-interop, device-auth-interop, sharing-interop,
   pinning-interop, accounts-interop, recovery-interop, **entitlement-interop** —
   the twelfth, added in Phase 56, and the **only** thing that parses a real `sigild`'s

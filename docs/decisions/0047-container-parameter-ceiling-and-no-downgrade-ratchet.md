@@ -439,3 +439,57 @@ commit that added that document.
   [0020](0020-shared-client-container-format.md) (the header layout, unchanged).
 - Adversaries: [`../threat-model.md`](../threat-model.md) — the writer of a
   hostile container, relayed by a server that cannot filter it.
+
+---
+
+## Addendum (2026-07-31, Phase 61) — limitation 7 is retired: the `uuid` is now the merge identity
+
+Recorded by [0049](0049-entry-identity-and-the-mergeable-vault.md).
+
+§3 of this ADR added a per-entry `uuid` and then explicitly declined to use it:
+
+> ⚠️ **Nothing keys off it yet.** Every lookup is still by `label`, deliberately:
+> changing entry identity is a semantics decision, not a forward-compatibility one.
+> This only makes that change possible later.
+
+and limitation 7 recorded the cost:
+
+> ⚠️ **The entry `uuid` is dead weight today.** It is written, mirrored, tested and
+> used by nothing; identity is still the label.
+
+**That deferral was the right call, and it is now spent.** [ADR
+0049](0049-entry-identity-and-the-mergeable-vault.md) makes the `uuid` the identity
+a vault merges on, which fixes a **reproduced multi-device data loss** — device B,
+which had never pulled, pushed a snapshot that became the tip, and every client
+adopting that tip destroyed device A's account. ⭐ **Limitation 7 is retired**, and
+the field's second use — answering *"have I already got this account?"* at import —
+is deliberately **not** the `uuid` but a content fingerprint, for reasons in ADR
+0049 §2.
+
+⭐ **This decision's forward-compatibility work is what made that cheap, and it is
+the first real test of it.** §3's preserved-unknown-fields rule and the separate
+`min_reader_version` meant the schema could gain a whole top-level `tombstones`
+array with **no flag day, no version bump and no data loss** — a client that does
+not understand tombstones carries them through an edit unchanged instead of
+stripping them and pushing the stripped copy back. That is precisely the scenario
+§3 was written for.
+
+⚠️ **Two of this ADR's limitations are now sharper rather than retired:**
+
+- **Limitation 6** (*"`extra` preserves fields, not semantics"*) is now
+  load-bearing in a new way. A pre-Phase-61 client preserves `tombstones` it does
+  not understand — so the *bytes* survive — but it will happily display an entry
+  that a tombstone deletes, and a removal it performs itself records **no
+  tombstone at all** and is therefore undone by the next merge. ⛔ And a client
+  older than **this** ADR strips the array entirely, resurrecting everything it
+  suppressed. *"This snapshot came from a build that cannot delete"* is a real,
+  silent state; see limitation 4 of ADR 0049.
+- **Limitation 10** (ids are not stable across export/import) is unchanged and now
+  matters more, since ids are load-bearing rather than decorative.
+
+⭐ **The `no_downgrade` reasoning was reused rather than re-argued.** ADR 0049 keeps
+the entry-id derivation in `sigil-core` and reaches it from JavaScript through a
+one-line wasm shell, for the same reason §2 refused a JS copy of the ratchet: **a
+drift is invisible.** A weakened container still opens; a divergent id still opens
+too, and merely duplicates or mis-suppresses entries. Neither has anything to
+notice.

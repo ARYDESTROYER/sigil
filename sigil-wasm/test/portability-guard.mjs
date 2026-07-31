@@ -33,6 +33,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+/** This file's own basename — it necessarily contains the banned literal. */
+const SELF = fileURLToPath(import.meta.url).split("/").pop();
 const ROOT = resolve(HERE, "../..");
 
 let failures = 0;
@@ -40,6 +42,41 @@ const fail = (m) => {
   failures += 1;
   console.error(`FAIL: ${m}`);
 };
+
+
+/**
+ * Blank comments so a prose MENTION of a defect is not mistaken for the defect.
+ *
+ * ⚠️ Needed immediately: widening the literal check below flagged
+ * `passkey-uv-interop.mjs`, whose only hit is a COMMENT comparing its own bug to
+ * "the `/opt/homebrew/bin/go` hardcode". Guards that scan for a string will find
+ * it in the paragraph explaining why it is banned — this file, and merge-guard,
+ * both hit that.
+ *
+ * Block state is TRACKED rather than pattern-matched: `merge-guard.mjs` used to
+ * blank any line starting `*`, which is a JSDoc continuation AND a Rust deref
+ * assignment, and it deleted a real bypass before any check could see it. `//`
+ * is matched only at line start so a `https://` inside code survives.
+ */
+function stripComments(src) {
+  const out = [];
+  let inBlock = false;
+  for (const line of src.split("\n")) {
+    if (inBlock) {
+      if (line.includes("*/")) inBlock = false;
+      out.push("");
+      continue;
+    }
+    const t = line.trimStart();
+    if (t.startsWith("//")) out.push("");
+    else if (t.startsWith("/*")) {
+      if (!line.includes("*/")) inBlock = true;
+      out.push("");
+    } else if (t.startsWith("*")) out.push("");
+    else out.push(line);
+  }
+  return out.join("\n");
+}
 
 console.log("portability-guard: the suites must run on Linux, not just on this Mac\n");
 
@@ -58,8 +95,32 @@ if (suites.length === 0) fail("found NO node suites — this guard's paths are s
 
 let goUsers = 0;
 for (const f of suites) {
-  if (f.endsWith("-guard.mjs")) continue; // see the note on `suites` above
   const src = readFileSync(join(testDir, f), "utf8");
+
+  // ⚠️ THE LITERAL CHECK RUNS ON *EVERY* SUITE, INCLUDING GUARDS.
+  //
+  // This used to sit BELOW the `usesGo` early-continue, so a file that shelled
+  // out to Go without ever naming `goBin` or `resolveGo` was never inspected.
+  // `docs-claims-guard.mjs` did exactly that — it embedded
+  // "/opt/homebrew/bin/go" inside a template literal — and shipped, and broke
+  // CI, hours after this guard was written to prevent precisely that. The
+  // detection was narrower than the defect it was built for.
+  //
+  // Guards are exempt from the *import* rule below (a source guard quotes what
+  // it hunts for) but NOT from this one: a guard that cannot run on Linux is
+  // a guard that does not run.
+  // ⚠️ `go-helper.mjs` is where the path legitimately lives, and SELF is this
+  // guard, whose CHECK EXPRESSION contains the literal in live code — not in a
+  // comment, so stripComments cannot save it. Third time a guard in this repo
+  // has flagged itself; a source guard always contains what it hunts for.
+  if (stripComments(src).includes("/opt/homebrew/bin/go") && f !== "go-helper.mjs" && f !== SELF) {
+    fail(
+      `${f} contains a literal "/opt/homebrew/bin/go". That path does not exist ` +
+        `on a Linux runner; go-helper.mjs is the only place it belongs.`,
+    );
+  }
+
+  if (f.endsWith("-guard.mjs")) continue; // see the note on `suites` above
   const usesGo = /\bgoBin\b/.test(src) || /resolveGo\s*\(/.test(src);
   if (!usesGo) continue;
   goUsers += 1;
@@ -71,7 +132,7 @@ for (const f of suites) {
         `hardcoding /opt/homebrew/bin/go and failing on every Linux runner.`,
     );
   }
-  if (src.includes("/opt/homebrew/bin/go")) {
+  if (stripComments(src).includes("/opt/homebrew/bin/go")) {
     fail(
       `${f} still contains a literal "/opt/homebrew/bin/go". That path does not ` +
         `exist on a Linux runner; go-helper.mjs is the only place it belongs.`,

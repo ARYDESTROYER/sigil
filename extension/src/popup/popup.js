@@ -163,6 +163,24 @@ let ticker;
 const $ = (id) => document.getElementById(id);
 const err = (e) => (e instanceof Error ? e.message : String(e));
 
+/**
+ * ⭐ THE ONE SENTENCE ABOUT RECOVERY, SO IT CANNOT DRIFT INTO A LIE AGAIN.
+ *
+ * The account panel used to state, in the product, that "this extension cannot
+ * print one" — advice that was correct until Phase 56 and has been false ever
+ * since. A stale capability claim is worse than no claim when the capability in
+ * question is the only thing standing between the user and permanent loss of
+ * every account in the vault: it does not merely fail to help, it actively
+ * routes them past the fix.
+ *
+ * What is still TRUE, and must stay in this string: a kit cannot be created
+ * AFTER access is lost. That is a property of the design (ADR 0042), not a
+ * limitation of this client.
+ */
+const RECOVERY_ADVICE =
+  "A kit cannot be created after the fact — but this extension CAN print one " +
+  "right now: open “Recovery kit (dev)” below and choose “Generate a kit”.";
+
 /** Current unix seconds — the pinned test clock if set, else the wall clock. */
 function nowSeconds() {
   return pinnedTime !== null ? pinnedTime : Math.floor(Date.now() / 1000);
@@ -329,12 +347,19 @@ function renderAccount() {
   const revoked = account.revoked_device_count
     ? ` (${account.revoked_device_count} revoked — revoked devices do not use a seat)`
     : "";
+  // ⛔ THIS SENTENCE USED TO BE FALSE, AND FALSE IN THE MOST DAMAGING DIRECTION.
+  // It read "…and this extension cannot print one", which was true before Phase
+  // 56 and has been wrong ever since: `recovery-generate` is right there in the
+  // Recovery kit panel below, calling `generateRecoveryKit`. Telling a user that
+  // the ONE control which prevents permanent, unrecoverable account loss does
+  // not exist — inside the product, three sections above the button — steers
+  // them away from it. See RECOVERY_ADVICE in this file: one string, used
+  // everywhere the subject comes up, so the two cannot drift again.
   state.textContent =
     `Account ${account.account_id} — ${account.device_count} of ${account.device_limit} ` +
     `devices in use${revoked}. An account is reachable only through a member ` +
     `device's private key, so losing every device is unrecoverable UNLESS a ` +
-    `recovery kit was printed in advance (\`sigil recovery generate\` — one cannot ` +
-    `be created after the fact, and this extension cannot print one). Membership ` +
+    `recovery kit was printed in advance. ${RECOVERY_ADVICE} Membership ` +
     `is flat (any member may invite, and may revoke any other member).`;
 
   const id = $("sync-vault").value.trim();
@@ -583,8 +608,68 @@ function row(entry) {
   rm.className = "rm";
   rm.dataset.testid = "remove";
   rm.textContent = "Remove";
-  rm.setAttribute("aria-label", `Remove ${entry.label}`);
-  rm.addEventListener("click", async () => {
+  rm.setAttribute("aria-label", `Remove ${who_(entry)}`);
+
+  // ⛔⛔ THE DELETE CONFIRMATION — the mirror of the webapp's (authenticator.tsx,
+  // AccountRow). It is not politeness; it is the only thing between a misclick
+  // and permanent, unrecoverable loss of a second factor, and losing a second
+  // factor can mean losing the account it protects.
+  //
+  //  1. The button sits inches from the CODE the user came to read, in a popup
+  //     whose rows re-render every second. Misclicks are the expected case.
+  //  2. ⭐ Phase 61 RAISED the stakes: a removal writes a TOMBSTONE that
+  //     propagates to every device and is specifically protected against
+  //     resurrection (ADR 0049 §3 — delete wins). It used to be that a stale
+  //     snapshot might bring the entry back by accident; now it provably will
+  //     not.
+  //
+  // ⭐ A CONFIRM, NOT AN UNDO, and the reason is the merge: an undo would have to
+  // write the tombstone and retract it — the exact resurrection ADR 0049 exists
+  // to prevent, and unretractable the moment another device merges it — or hold
+  // the delete pending in memory, where CLOSING THE POPUP (which happens
+  // constantly, that is what popups do) silently discards the user's intent. The
+  // tombstone is written at commit and never before.
+  const confirmBox = document.createElement("div");
+  confirmBox.className = "rmconfirm";
+  confirmBox.dataset.testid = "remove-confirm";
+  confirmBox.setAttribute("role", "alert");
+  confirmBox.hidden = true;
+
+  const confirmText = document.createElement("p");
+  confirmText.dataset.testid = "remove-confirm-warning";
+  confirmText.textContent =
+    `Delete ${who_(entry)}? This permanently deletes the second-factor secret ` +
+    `from this vault, and the deletion is synced to every other device holding ` +
+    `it. It cannot be undone from here — if you no longer have this secret ` +
+    `anywhere else, you may lose access to the account it protects.`;
+
+  const yes = document.createElement("button");
+  yes.type = "button";
+  yes.className = "rm danger";
+  yes.dataset.testid = "remove-confirm-yes";
+  yes.textContent = "Delete permanently";
+
+  const no = document.createElement("button");
+  no.type = "button";
+  no.className = "rm";
+  no.dataset.testid = "remove-confirm-cancel";
+  no.textContent = "Keep it";
+
+  const closeConfirm = () => {
+    confirmBox.hidden = true;
+    rm.hidden = false;
+  };
+
+  // ⛔ This opens the gate. It MUST NOT remove: `removeEntry` writes the
+  // propagating tombstone described above.
+  rm.addEventListener("click", () => {
+    confirmBox.hidden = false;
+    rm.hidden = true;
+    yes.focus();
+  });
+  no.addEventListener("click", closeConfirm);
+  yes.addEventListener("click", async () => {
+    closeConfirm();
     try {
       // ⭐ Phase 61: remove by IDENTITY and RECORD A TOMBSTONE. Filtering by
       // label removed every account sharing that label, and — worse — wrote no
@@ -599,8 +684,14 @@ function row(entry) {
     }
   });
 
-  li.append(who, code, left, rm);
+  confirmBox.append(confirmText, yes, no);
+  li.append(who, code, left, rm, confirmBox);
   return li;
+}
+
+/** "issuer, label" when there is an issuer, else just the label. */
+function who_(entry) {
+  return entry.issuer ? `${entry.issuer}, ${entry.label}` : entry.label;
 }
 
 /** Recompute every visible code + countdown from the current clock. */

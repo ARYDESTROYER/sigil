@@ -204,6 +204,15 @@ jobs:
       # merge itself, which is what the suites above are for.
       - name: 18/19 no shipping client adopts the tip, and every removal tombstones
         run: node sigil-wasm/test/merge-guard.mjs
+      # ⭐ The COUNTABLE documentation claims must match the tree. This repo has
+      # shipped false doc claims repeatedly — `sigild` "performs no cryptography"
+      # while 15 files imported crypto, a threat-model row asserting a defence
+      # that did not exist, a fixed 1226-byte envelope that had become
+      # variable-length, a Tauri command count that drifted three times, and four
+      # already-fixed items still listed as open. This catches the countable
+      # class; it cannot check prose, and says so in its own header.
+      - name: 19/19 documentation counts match the code
+        run: node sigil-wasm/test/docs-claims-guard.mjs
 
       - name: Assert the libsigil core stays getrandom-free
         run: |
@@ -318,12 +327,3 @@ jobs:
         env:
           GO: go
         run: ./cli/tests/e2e-recovery.sh
-      # ⭐ The COUNTABLE documentation claims must match the tree. This repo has
-      # shipped false doc claims repeatedly — `sigild` "performs no cryptography"
-      # while 15 files imported crypto, a threat-model row asserting a defence
-      # that did not exist, a fixed 1226-byte envelope that had become
-      # variable-length, a Tauri command count that drifted three times, and four
-      # already-fixed items still listed as open. This catches the countable
-      # class; it cannot check prose, and says so in its own header.
-      - name: 19/19 documentation counts match the code
-        run: node sigil-wasm/test/docs-claims-guard.mjs

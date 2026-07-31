@@ -184,6 +184,8 @@ button.ghost {
 .accounts li {
   display: flex;
   align-items: center;
+  /* wrap so the delete confirmation can take a full-width line of its own */
+  flex-wrap: wrap;
   gap: 8px;
   padding: 7px 0;
   border-bottom: 1px solid var(--line);
@@ -238,6 +240,26 @@ button.ghost {
   padding: 1px 6px;
   font-size: 11px;
   color: var(--dim);
+}
+/* The delete confirmation (see `row()` in popup.js): spans the whole row so the
+   account it names, and the warning, are impossible to miss. */
+.rmconfirm {
+  flex: 0 0 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border: 1px solid var(--danger);
+  border-radius: 5px;
+}
+.rmconfirm p {
+  margin: 0 0 6px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.rmconfirm .danger {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .panel {

@@ -10515,3 +10515,64 @@ touch the vault), and A's vault was unchanged — showing one entry. **That look
 like the merge not working.** Third time this session that a suppressed-output shortcut
 produced a confident wrong reading. ⭐ **A `||` fallback with output discarded cannot tell
 you which branch ran, and therefore cannot tell you anything.**
+
+---
+
+## 2026-07-31 — I broke CI with the guard I built to stop exactly this
+
+`interop` went red on `ca243bd`. The failing step was **`19/19 documentation counts match
+the code`** — the check I added hours earlier — and it failed for **the defect that check's
+sibling exists to prevent**:
+
+```
+    at sh (…/sigil-wasm/test/docs-claims-guard.mjs:40:21)
+    at …/docs-claims-guard.mjs:157:5
+```
+
+Line 157 is the sigild dependency check, and I had written
+
+```js
+sh(`/opt/homebrew/bin/go -C sigild list -m …`)
+```
+
+**A hardcoded Homebrew path**, in a new file, on the same day I replaced six of them with a
+shared `resolveGo()` and wrote `portability-guard.mjs` to make it impossible. Fixed to use
+`resolveGo()`.
+
+### Two further mistakes in the same edit
+
+**The step was in the WRONG JOB.** My insertion appended after "the last `18/19` step",
+which I did not check the *job* of — it landed in `e2e-recovery`, not `interop`. Moved, and
+confirmed by parsing the YAML and printing which job owns each step rather than reading the
+diff.
+
+**`portability-guard` could not have caught it.** Its literal check sat *below* an early
+`continue` gated on `usesGo = /\bgoBin\b/ || /resolveGo\s*\(/`. My file shelled out to Go
+through a template literal and named neither, so it was never inspected. ⭐ **The detection
+was narrower than the defect it was built for** — the same failure as the docs guard whose
+patterns were narrower than the prose it audited. The literal check now runs on **every**
+suite, before any early exit.
+
+### And then the widened check produced two false positives, in a row
+
+1. **`passkey-uv-interop.mjs`** — flagged for a *comment* that compares its own bug to "the
+   `/opt/homebrew/bin/go` hardcode". A guard scanning for a string will find it in the
+   paragraph explaining why it is banned. Fixed with block-state comment stripping (the same
+   shape `merge-guard` needed, and deliberately not the `^\s*\*` heuristic that hid a real
+   bypass there).
+2. **The guard flagged ITSELF** — the literal is in its own check *expression*, which is
+   live code, so stripping comments could not save it. **Third time a guard in this repo has
+   flagged itself.** Now excluded by its own basename, with the rule written down: *a source
+   guard always contains what it hunts for.*
+
+### Verified where it actually failed
+
+Both guards now pass **on real Linux** in the `scripts/linux-verify/` container, not merely
+on this Mac — which is the whole point, since macOS is where the bug was invisible.
+
+⭐ **The lesson, and it is not "be more careful".** I have now written three guards
+(`portability`, `docs-claims`, `merge`) and **all three initially failed on their own
+subject matter**: the portability guard was not portable-safe against itself, the docs guard
+made false claims about the docs, and the merge guard's comment stripper hid a merge bypass.
+**A guard is code, and it gets no exemption from the failure mode it was built to catch.**
+Write the mutation test for the guard before trusting the guard.

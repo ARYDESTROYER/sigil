@@ -35,6 +35,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
+import { resolveGo } from "./go-helper.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const sh = (cmd) => execSync(cmd, { cwd: ROOT, encoding: "utf8" }).trim();
@@ -154,7 +155,7 @@ claim({
 claim({
   label: "sigild direct Go dependencies",
   truth: Number(
-    sh(`/opt/homebrew/bin/go -C sigild list -m -f '{{if not .Indirect}}{{.Path}}{{end}}' all 2>/dev/null | grep -v 'sigild$' | grep -c .`),
+    sh(`${resolveGo()} -C sigild list -m -f '{{if not .Indirect}}{{.Path}}{{end}}' all 2>/dev/null | grep -v 'sigild$' | grep -c .`),
   ),
   how: "go list -m, non-indirect, excluding the module itself",
   patterns: [new RegExp(`exactly (\\d+|${wordsAlt}) direct`, "gi")],

@@ -88,6 +88,24 @@ function msg(e: unknown): string {
 }
 
 /**
+ * ⭐ THE ONE SENTENCE ABOUT RECOVERY, SO IT CANNOT DRIFT INTO A LIE AGAIN.
+ *
+ * The account panel used to state, in the product, that "this app cannot print
+ * one" — correct until Phase 56, false ever since (RecoveryPanel is rendered on
+ * the same screen). A stale capability claim is worse than no claim when the
+ * capability is the only thing standing between the user and permanent,
+ * irreversible loss of every account in the vault: it does not merely fail to
+ * help, it routes them past the fix.
+ *
+ * What remains TRUE and must stay in this string: a kit cannot be created AFTER
+ * access is lost. That is a property of the design (ADR 0042), not of this
+ * client.
+ */
+const RECOVERY_ADVICE =
+  "A kit cannot be created after the fact — but this app CAN print one right " +
+  "now: open “Recovery kit (dev)” below and choose “Generate a kit”.";
+
+/**
  * A unix-seconds clock. Honors `?t=<unix>` to PIN the clock for deterministic
  * tests (no ticking); otherwise ticks live once per second.
  */
@@ -2003,6 +2021,30 @@ function AccountRow({
   now: number;
   onRemove: () => void;
 }) {
+  // ⛔⛔ THE DELETE CONFIRMATION. It is not politeness; it is the only thing
+  // between a misclick and permanent, unrecoverable loss of a second factor —
+  // and losing a second factor can mean losing the account it protects.
+  //
+  // Two facts made a bare one-click Remove indefensible here:
+  //
+  //  1. The button sits inches from the CODE the user came to read, on a row
+  //     that RE-RENDERS EVERY SECOND. Misclicks are the expected case, not the
+  //     exotic one.
+  //  2. ⭐ Phase 61 RAISED the stakes. A removal now writes a TOMBSTONE that
+  //     propagates to every device and is specifically protected against
+  //     resurrection (ADR 0049 §3: delete wins, and a stale snapshot re-adding
+  //     the id LOSES). Before, a stale snapshot might have brought the entry
+  //     back by accident; now it provably will not.
+  //
+  // ⭐ WHY A CONFIRM AND NOT AN UNDO. An undo would have to either (a) write the
+  // tombstone and retract it — exactly the resurrection ADR 0049 is built to
+  // prevent, and unretractable once any other device has merged it — or (b) hold
+  // the delete pending in memory, where closing the tab silently discards the
+  // user's intent. A gate BEFORE the irreversible act is the only version that
+  // does not fight the merge. The tombstone is written at commit and never
+  // before.
+  const [confirming, setConfirming] = useState(false);
+
   let code = "------";
   let error = "";
   try {
@@ -2015,6 +2057,61 @@ function AccountRow({
   const codeLabel = error
     ? `${who}: code unavailable`
     : `${who}: code ${code.split("").join(" ")}, ${remaining} seconds remaining`;
+
+  if (confirming) {
+    return (
+      <li
+        data-testid="account-row"
+        className="rounded-lg border border-red-400 p-3 sm:p-4 dark:border-red-700"
+      >
+        <div
+          data-testid="remove-confirm"
+          role="alert"
+          className="space-y-2 text-sm text-red-900 dark:text-red-200"
+        >
+          <p className="font-semibold">
+            Delete{" "}
+            <span data-testid="remove-confirm-who" className="font-mono">
+              {who}
+            </span>
+            ?
+          </p>
+          {/* NAMES the account, and states the two things that make this
+              different from an ordinary delete: it is permanent, and it
+              propagates. */}
+          <p data-testid="remove-confirm-warning" className="text-xs">
+            This permanently deletes the second-factor secret for{" "}
+            <strong>{who}</strong> from this vault, and the deletion is synced to
+            every other device holding it. It cannot be undone from here — if you
+            no longer have this secret anywhere else, you may lose access to the
+            account it protects.
+          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              data-testid="remove-confirm-yes"
+              className={btnCls}
+              type="button"
+              autoFocus
+              onClick={() => {
+                setConfirming(false);
+                onRemove();
+              }}
+            >
+              Delete permanently
+            </button>
+            <button
+              data-testid="remove-confirm-cancel"
+              className={btnGhost}
+              type="button"
+              onClick={() => setConfirming(false)}
+            >
+              Keep it
+            </button>
+          </div>
+        </div>
+      </li>
+    );
+  }
 
   return (
     <li
@@ -2045,12 +2142,14 @@ function AccountRow({
       >
         {error ? "err" : code}
       </div>
+      {/* ⛔ This opens the confirmation. It MUST NOT call onRemove directly:
+          onRemove writes a propagating tombstone (see the block comment above). */}
       <button
         data-testid="account-remove"
         aria-label={`Remove ${who}`}
         className={btnGhost}
         type="button"
-        onClick={onRemove}
+        onClick={() => setConfirming(true)}
       >
         Remove
       </button>
@@ -2586,13 +2685,21 @@ function AccountBlock({
               <span className="font-mono">{vaultId.trim()}</span> and can decrypt it.
             </p>
           )}
-          <p className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+          {/* ⛔ THIS USED TO SAY "and this app cannot print one". That was true
+              before Phase 56 and has been FALSE ever since — RecoveryPanel is
+              rendered further down this very screen and calls
+              generateRecoveryKit. A stale capability claim about the ONE control
+              that prevents permanent account loss does not merely fail to help;
+              it routes the user past the fix. RECOVERY_ADVICE is the single
+              string, so the two cannot drift apart again. */}
+          <p
+            data-testid="account-recovery-advice"
+            className="mt-2 text-xs text-neutral-600 dark:text-neutral-400"
+          >
             An account is reachable only through a member device&rsquo;s private key,
             so losing every device is unrecoverable <em>unless a recovery kit was
-            printed in advance</em> (<code>sigil recovery generate</code>) — one
-            cannot be created after the fact, and this app cannot print one.
-            Membership is flat — any member may invite, and may revoke any other
-            member.
+            printed in advance</em>. {RECOVERY_ADVICE} Membership is flat — any
+            member may invite, and may revoke any other member.
           </p>
         </>
       )}

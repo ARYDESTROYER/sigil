@@ -2157,6 +2157,10 @@ struct VaultFlags {
     /// client already holds. Off by default, because a silent replacement is
     /// how a hostile deposit takes a vault away from a device that had it.
     replace: bool,
+    /// `rekey` only: the explicit acknowledgement that this is a ONE-WAY DOOR
+    /// which REPLACES the vault password with a key file on disk. See
+    /// [`cmd_vault_rekey`] — without it the command explains and refuses.
+    yes: bool,
 }
 
 fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
@@ -2201,6 +2205,7 @@ fn parse_vault_flags(args: Vec<String>) -> Result<VaultFlags, String> {
             "--from" => set_once(&mut f.from, &mut it, "--from")?,
             "--publish" => f.publish = true,
             "--replace" => f.replace = true,
+            "--yes" => f.yes = true,
             "--drop-all-others" => f.drop_all_others = true,
             other => return Err(format!("unexpected argument {other:?}; try `sigil --help`")),
         }
@@ -2367,7 +2372,7 @@ fn explain_sharing_error(e: CliError, what: &str) -> String {
 /// the server (and, as a side effect, claims the vault ID for this device).
 fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
     if !f.to.is_empty() || f.addressee.is_some() || !f.drop.is_empty() || f.drop_all_others {
-        return Err("vault rekey takes --vault/--file/--keyring/--publish (plus --key/--hybrid-key/--server) only".to_string());
+        return Err("vault rekey takes --vault/--file/--keyring/--publish/--yes (plus --key/--hybrid-key/--server) only".to_string());
     }
     let vault_id = f
         .vault
@@ -2375,6 +2380,47 @@ fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
         .ok_or_else(|| "missing required --vault <id>".to_string())?;
     let file = resolve_vault_path(f.file.clone());
     let keyring = resolve_keyring_path(f.keyring.clone());
+
+    // ⛔⛔ THE ONE-WAY DOOR, STATED BEFORE IT IS OPENED.
+    //
+    // Reproduced on a real state directory: this command used to re-seal the
+    // vault under a random key and print "re-sealed under a fresh random vault
+    // key … now opened with --vault-id <id>". What it did NOT say is the part
+    // that matters — the human password STOPS WORKING, permanently, and the only
+    // thing that opens the vault afterwards is 32 bytes sitting in
+    // `vault-keys.json` in the clear (0600, but plaintext on disk). The next
+    // ordinary `sigil totp list` then failed with:
+    //
+    //     sigil: error: could not open record: Aead(Authentication)
+    //
+    // which reads like a wrong password, not like a conversion the user
+    // performed a minute earlier. And a user who deletes, misses in a backup, or
+    // reinstalls over `~/.sigil/vault-keys.json` has lost the vault outright,
+    // while still carefully remembering a password that is now worth nothing.
+    //
+    // ⭐ Deliberately a REFUSAL, not a prompt: it must behave the same way in a
+    // script as it does at a terminal, and the operator has to type the
+    // acknowledgement. The desktop and browser clients gate the same conversion
+    // in their own UIs.
+    if !f.yes {
+        return Err(format!(
+            "`vault rekey` is a ONE-WAY DOOR and needs --yes.\n\n  \
+             It re-seals {file} under a fresh RANDOM 32-byte vault key and records that key in\n  \
+             {keyring} (mode 0600, but the key is stored in the CLEAR).\n\n  \
+             AFTER THIS:\n    \
+             * SIGIL_PASSWORD NO LONGER OPENS THIS VAULT. Not \"also\" — instead. There is no\n      \
+               way back: the password is not kept, wrapped or recoverable from the file.\n    \
+             * Every command must name the vault: `sigil totp list --vault-id {vault_id}`,\n      \
+               `sigil totp code <label> --vault-id {vault_id}`, and so on.\n    \
+             * That key file becomes the ONLY thing that opens the vault. Lose it — a wiped\n      \
+               home directory, a backup that skipped dotfiles, a fresh install — and the vault\n      \
+               is unreadable by you and by us, password or not.\n\n  \
+             Do it only if you are converting this vault for device-to-device SHARING, and back\n  \
+             up {keyring} first. Then re-run with --yes.",
+            file = file.display(),
+            keyring = keyring.display(),
+        ));
+    }
 
     // Open the EXISTING password-sealed vault. This fails loudly if the file is
     // already key-sealed (wrong secret), which is the right outcome: rekey is
@@ -2390,7 +2436,9 @@ fn cmd_vault_rekey(f: &VaultFlags) -> Result<(), String> {
         "vault {vault_id} re-sealed under a fresh random vault key\n  \
          file:        {file} (mode 0600, now opened with --vault-id {vault_id})\n  \
          keyring:     {keyring} (mode 0600)\n  \
-         key sha256:  {fp} (fingerprint only — the key is never printed)",
+         key sha256:  {fp} (fingerprint only — the key is never printed)\n  \
+         ⚠️ SIGIL_PASSWORD NO LONGER OPENS THIS VAULT. {keyring} is now the only thing that does —\n     \
+         back it up. Use `--vault-id {vault_id}` on every `sigil totp` command from here on.",
         file = file.display(),
         keyring = keyring.display(),
         fp = vault_key_fingerprint(&key),
@@ -2870,7 +2918,60 @@ fn load_vault_required(path: &std::path::Path, password: &[u8]) -> Result<TotpVa
             format!("could not read vault {:?}: {e}", path)
         }
     })?;
-    open_vault(password, &bytes).map_err(|e| e.to_string())
+    open_vault(password, &bytes).map_err(|e| format!("{e}{}", rekey_hint(path, password)))
+}
+
+/// The extra sentence appended when opening a vault fails and the cause may be
+/// that this vault was converted by `sigil vault rekey`.
+///
+/// ⛔ WHY THIS EXISTS. `vault rekey` replaces the password with a random key, so
+/// the very next ordinary `sigil totp list` fails with the bare
+///
+///     sigil: error: could not open record: Aead(Authentication)
+///
+/// which is byte-identical to what a WRONG PASSWORD produces. A user who
+/// converted a vault last month has no way to tell the two apart, and the
+/// obvious reaction — "I must have mistyped" — is the wrong one. The command's
+/// own `--yes` gate now says this up front; this catches the case where the
+/// conversion has already happened and the user has forgotten.
+///
+/// It fires only when (a) the failing secret was NOT one of the keys in the
+/// keyring — i.e. the caller was almost certainly using a password — and (b) the
+/// keyring actually names some vaults. Otherwise it stays silent rather than
+/// guessing.
+fn rekey_hint(_path: &std::path::Path, tried: &[u8]) -> String {
+    let keyring = resolve_keyring_path(None);
+    let Ok(ring) = load_keyring(&keyring) else {
+        return String::new();
+    };
+    let mut ids: Vec<&String> = ring.keys.keys().collect();
+    ids.sort();
+    if ids.is_empty() {
+        return String::new();
+    }
+    // If the caller ALREADY passed a vault key (via --vault-id) then the
+    // conversion is not the story — some other thing is wrong — so say nothing
+    // rather than sending them down the wrong path.
+    if ids
+        .iter()
+        .filter_map(|id| keyring_get(&keyring, id).ok().flatten())
+        .any(|k| k.as_slice() == tried)
+    {
+        return String::new();
+    }
+    format!(
+        "\n  -> if this vault was converted with `sigil vault rekey`, SIGIL_PASSWORD no longer \
+         opens it: the key lives in {keyring}. Retry naming the vault, e.g. \
+         `--vault-id {first}` (this keyring holds: {ids}). \
+         Otherwise the password is simply wrong — nothing has been changed or lost.",
+        keyring = keyring.display(),
+        first = ids[0],
+        ids = ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Seal `vault` under `password` and write it to `path` with mode 0600, creating
@@ -3269,10 +3370,25 @@ fn cmd_totp_remove(args: Vec<String>) -> Result<(), String> {
         (None, None) => return Err("missing <label> (or --id <prefix>)".to_string()),
     };
     save_vault(&vault_path, &password, &vault)?;
+    // ⛔ SAY WHAT JUST HAPPENED. There is deliberately no confirmation PROMPT
+    // here — unlike the GUI clients, where Remove is a button inches from the
+    // code the user came to read, a `sigil totp remove <label>` invocation is
+    // already a deliberate, typed statement of intent, and a prompt would break
+    // every script and non-interactive run. What was missing was the
+    // CONSEQUENCE: since Phase 61 a removal writes a TOMBSTONE that propagates
+    // to every device and is specifically protected against resurrection (ADR
+    // 0049 §3), so this is not a local edit that a later sync might undo.
+    let who = match removed.issuer.as_deref() {
+        Some(i) if !i.is_empty() => format!("{i}, {}", removed.label),
+        _ => removed.label.clone(),
+    };
     println!(
-        "removed {:?} from vault {}",
-        removed.label,
-        vault_path.display()
+        "removed {who} from vault {path}\n  \
+         ⚠️ PERMANENT: the second-factor secret is gone from this vault, and the \
+         removal is recorded as a tombstone that propagates to every other device \
+         holding it. If you have this secret nowhere else, you may have lost \
+         access to the account it protects.",
+        path = vault_path.display()
     );
     Ok(())
 }

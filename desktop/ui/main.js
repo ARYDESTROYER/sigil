@@ -145,7 +145,24 @@ async function refresh() {
     del.className = "link";
     del.textContent = "Remove";
     del.addEventListener("click", async () => {
-      if (!window.confirm(`Remove "${row.label}" from the vault?`)) return;
+      // ⛔ The desktop already gated this, but the prompt named only the LABEL —
+      // and labels stopped being unique in Phase 61 (`work` at two issuers is
+      // two accounts), so "Remove work?" could not tell the user WHICH account
+      // they were about to destroy. It also did not say that the deletion is
+      // permanent or that it propagates: a removal now writes a TOMBSTONE that
+      // every other device merges and that is specifically protected against
+      // resurrection (ADR 0049 §3).
+      const who = row.issuer ? `${row.issuer}, ${row.label}` : row.label;
+      if (
+        !window.confirm(
+          `Delete ${who}?\n\n` +
+            "This permanently deletes the second-factor secret from this vault, " +
+            "and the deletion is synced to every other device holding it. It " +
+            "cannot be undone from here — if you no longer have this secret " +
+            "anywhere else, you may lose access to the account it protects."
+        )
+      )
+        return;
       // ⭐ Phase 61: remove by IDENTITY. Labels are no longer unique (`work` at
       // two issuers is two accounts), so removing by label can be ambiguous —
       // and the row the user clicked is the one they mean.

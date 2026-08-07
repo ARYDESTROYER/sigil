@@ -184,6 +184,16 @@ export default function Authenticator() {
   // unmounted before anyone read it — which is precisely how the orphaned
   // device identity became silent.
   const [notice, setNotice] = useState<string>("");
+  // ⛔⛔ THE VAULT-SIZE WARNING, RAISED AT THE MOMENT THE VAULT GROWS — not at the
+  // moment sync breaks. `opBodySizeWarning` was previously wired only to Push and
+  // to the server's 413, so a user who imported a large Google Authenticator
+  // export learned their vault no longer syncs at the moment they lost syncing,
+  // long after the choice that caused it and with no supported way to shrink it
+  // (tombstones are never pruned; there is no `compact`). It is set by `persist`,
+  // which is the single place this app seals the vault, so EVERY growth path —
+  // form add, otpauth paste, migration import, QR scan, merge adoption — reaches
+  // it without any of them having to remember to.
+  const [sizeWarn, setSizeWarn] = useState<string>("");
 
   const now = useUnixClock();
 
@@ -198,6 +208,21 @@ export default function Authenticator() {
     };
     setAnnounce(messages[phase]);
   }, [phase]);
+
+  // ⭐ The same warning, recomputed when a vault is OPENED rather than written —
+  // otherwise a vault that was already oversized (imported on another client and
+  // pulled here) stays silent until the user happens to add something. `persist`
+  // covers every write; this covers every unlock.
+  useEffect(() => {
+    if (!wasm || !vault) {
+      setSizeWarn("");
+      return;
+    }
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (!stored) return;
+    setSizeWarn(wasm.opBodySizeWarning(wasm.base64ToBytes(stored).length) ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wasm, vault]);
 
   // Load the wasm in the browser only, then decide the initial phase from
   // whether a sealed vault already exists in localStorage.
@@ -279,6 +304,13 @@ export default function Authenticator() {
       sealParams(m, STORAGE_KEY),
     );
     window.localStorage.setItem(STORAGE_KEY, m.bytesToBase64(container));
+    // ⭐ Keyed off the SAME `MAX_OP_BODY_BYTES` the push path and the CLI use —
+    // `opBodySizeWarning` is the one implementation, so the import-time warning
+    // and the push-time warning can never disagree about the threshold. Measured
+    // motivation: a 512-entry import (the provisioning ceiling) seals to ~86 KB
+    // against sigild's 64 KiB op cap, i.e. the ceiling permits a vault that
+    // cannot sync. This is what tells the user while they still have a choice.
+    setSizeWarn(m.opBodySizeWarning(container.length) ?? "");
   }
 
   // Apply a mutation to a fresh clone of the vault, re-seal + persist, and swap
@@ -1170,6 +1202,21 @@ export default function Authenticator() {
       <p data-testid="live-region" role="status" aria-live="polite" className="sr-only">
         {announce}
       </p>
+      {sizeWarn && (
+        // ⛔ A vault that has outgrown the server's 64 KiB op body cannot be
+        // shrunk from here — tombstones are never pruned and there is no
+        // compaction command — so this is deliberately a persistent, top-level
+        // alert rather than a transient toast attached to whichever import
+        // caused it. It says the same thing the CLI and the Push path say,
+        // because it IS the same function.
+        <div
+          data-testid="vault-size-warning"
+          role="alert"
+          className="mb-4 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {sizeWarn}
+        </div>
+      )}
       {notice && (
         <div
           data-testid="global-notice"
@@ -1964,7 +2011,12 @@ function VaultView({
         </ul>
       )}
 
-      <AddAccountPanel onAdd={onAdd} onImportOtpauth={onImportOtpauth} onImportMigration={onImportMigration} />
+      <AddAccountPanel
+        wasm={wasm}
+        onAdd={onAdd}
+        onImportOtpauth={onImportOtpauth}
+        onImportMigration={onImportMigration}
+      />
       <ExportPanel wasm={wasm} vault={vault} />
       <PasskeyPanel
         wasm={wasm}
@@ -2122,10 +2174,22 @@ function AccountRow({
     );
   }
 
+  // ⛔⛔ THE READ-PATH FROZEN-ENTRY WARNING (Phase 63). The ingest ceiling is
+  // deliberately NOT retroactive, and it deliberately does not cover a Phase 61
+  // vault MERGE (see the block comment on `mergeVaults` in totp-vault.mjs for why
+  // gating a merge would be the worse bug), so an entry whose code never rotates
+  // can still land in this list. Until this existed the row rendered it with an
+  // ordinary countdown ring — the product telling the user their second factor is
+  // fine when it is a static secret wearing a rotating costume.
+  //
+  // ⛔ IT REPORTS AND NEVER CORRECTS: the entry is still shown, still generates,
+  // and is not altered in any way (ADR 0049 — entries are immutable).
+  const frozen = wasm.frozenPeriodWarning(entry.period);
+
   return (
     <li
       data-testid="account-row"
-      className="flex items-center gap-3 rounded-lg border border-neutral-300 p-3 sm:gap-4 sm:p-4 dark:border-neutral-700"
+      className="flex flex-wrap items-center gap-3 rounded-lg border border-neutral-300 p-3 sm:gap-4 sm:p-4 dark:border-neutral-700"
     >
       <CountdownRing remaining={remaining} period={entry.period} />
       <div className="min-w-0 flex-1">
@@ -2162,6 +2226,15 @@ function AccountRow({
       >
         Remove
       </button>
+      {frozen && (
+        <p
+          data-testid="frozen-warning"
+          role="alert"
+          className="w-full rounded border border-amber-500 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {frozen}
+        </p>
+      )}
     </li>
   );
 }
@@ -2215,10 +2288,12 @@ function CountdownRing({ remaining, period }: { remaining: number; period: numbe
 // ── Add account (form + otpauth paste + migration import) ────────────────────
 
 function AddAccountPanel({
+  wasm,
   onAdd,
   onImportOtpauth,
   onImportMigration,
 }: {
+  wasm: Wasm;
   onAdd: (input: AddInput) => void;
   onImportOtpauth: (uri: string) => void;
   onImportMigration: (uri: string) => {
@@ -2247,6 +2322,120 @@ function AddAccountPanel({
   const [importResult, setImportResult] = useState("");
   const [migrationError, setMigrationError] = useState("");
 
+  // ── QR scanning (Phase 63) ────────────────────────────────────────────────
+  // `null` = still probing. The probe is a RUNTIME question: `BarcodeDetector`
+  // is absent in Firefox, in Safari and on Linux Chromium, and it is also
+  // secure-context gated, so this cannot be decided at build time.
+  const [qrSupported, setQrSupported] = useState<boolean | null>(null);
+  const [qrError, setQrError] = useState("");
+  // ⭐ What was scanned, held for the user to CONFIRM. A scanner that wrote on
+  // decode would mean pasting a screenshot from a hostile page silently creates
+  // an account (ADR 0050's reasoning, pointed the other way).
+  const [qrPending, setQrPending] = useState<null | {
+    kind: "otpauth" | "migration";
+    text: string;
+    summary: string;
+  }>(null);
+
+  useEffect(() => {
+    let live = true;
+    wasm
+      .qrSupport()
+      .then((s) => {
+        if (live) setQrSupported(s);
+      })
+      .catch(() => {
+        if (live) setQrSupported(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [wasm]);
+
+  // ⭐ THE PASTE LISTENER IS ON `document`, AND THAT IS NOT A DETAIL.
+  //
+  // A `paste` event is dispatched at the FOCUSED element (or `document.body`
+  // when nothing focusable has focus) and then BUBBLES UP. It never travels
+  // DOWN into an unfocused subtree. So a handler on this panel's own <section>
+  // — which is not focusable — receives nothing when a user simply presses
+  // ⌘V, which is the entire motion this feature is built around.
+  //
+  // ⚠️ This was a REAL DEFECT in the first cut of this phase, and it is the
+  // house failure mode exactly: a spec that dispatched the event directly on
+  // the panel passed, while the shipping path was dead for every real user.
+  // Measured: with focus on `body` or on an unrelated input, a panel-level
+  // listener fired 0 times and a document-level listener fired every time.
+  //
+  // ⚠️ Listening this widely is safe ONLY because `imageFromEvent` returns null
+  // for a text paste — so pasting an `otpauth://` URI into the field below is
+  // completely unaffected, and we never read the clipboard, only this event.
+  useEffect(() => {
+    if (qrSupported !== true) return;
+    const onPaste = (ev: ClipboardEvent) => {
+      const blob = wasm.imageFromEvent(ev);
+      if (!blob) return; // a text paste: leave it entirely alone
+      ev.preventDefault();
+      void scanImageRef.current?.(blob);
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [qrSupported, wasm]);
+
+  // Turn an image into a CONFIRMABLE summary. Nothing is written here.
+  const scanImage = useCallback(
+    async (blob: Blob | null) => {
+      setQrError("");
+      setQrPending(null);
+      if (!blob) return;
+      try {
+        const found = await wasm.scanProvisioningImage(blob);
+        // Parse it to build the summary. This runs the SAME provisioning gate the
+        // paste field runs, so a hostile QR is refused here — before anything is
+        // shown as addable, and long before anything is stored.
+        let summary: string;
+        if (found.kind === "otpauth") {
+          const e = wasm.parseOtpauthUri(found.text);
+          summary =
+            `${e.issuer ? `${e.issuer}: ` : ""}${e.label} — ` +
+            `${e.algorithm.toUpperCase()}, ${e.digits} digits, every ${e.period}s`;
+        } else {
+          const batch = wasm.decodeMigrationUri(found.text);
+          const n = batch.entries.length;
+          summary = `a Google Authenticator export carrying ${n} account${n === 1 ? "" : "s"}`;
+        }
+        setQrPending({ kind: found.kind, text: found.text, summary });
+      } catch (e) {
+        setQrError(wasm.explainQrError(e) || msg(e));
+      }
+    },
+    [wasm],
+  );
+
+  // The document listener above is registered once and must always call the
+  // CURRENT scanImage, without tearing down and re-adding on every render.
+  const scanImageRef = useRef<typeof scanImage | null>(null);
+  scanImageRef.current = scanImage;
+
+  function confirmQr() {
+    if (!qrPending) return;
+    setQrError("");
+    try {
+      if (qrPending.kind === "otpauth") {
+        onImportOtpauth(qrPending.text);
+        setImportResult("Added the scanned account.");
+      } else {
+        const { imported, skipped } = onImportMigration(qrPending.text);
+        setImportResult(
+          `Imported ${imported} account${imported === 1 ? "" : "s"}` +
+            (skipped ? `, skipped ${skipped} already in this vault or unsupported.` : "."),
+        );
+      }
+      setQrPending(null);
+    } catch (e) {
+      setQrError(msg(e));
+    }
+  }
+
   function submitForm(ev: React.FormEvent) {
     ev.preventDefault();
     setAddError("");
@@ -2257,6 +2446,34 @@ function AddAccountPanel({
         // clear "invalid base32" message before touching the vault.
         return base32Local(secret);
       })();
+      // ⭐⭐ THE PROVISIONING GATE, ON THE ADD-BY-FORM DOOR TOO (Phase 63 fix).
+      //
+      // ⛔ This form reproduced the exact defect the phase exists to close: the
+      // period box was `type=number min=1` with NO max, so typing 4294967295 here
+      // created a "one-time" password whose code never changes, rendered with an
+      // ordinary-looking countdown. `digits` was already bounded (it is a
+      // <select>); `period` was not.
+      //
+      // ⭐ WHY THIS DOES NOT CONTRADICT THE CLI'S DELIBERATE `--period` EXEMPTION.
+      // That exemption is for a flag an operator typed into a shell, where the
+      // value is in their history and the repo's cross-process clock-pinning
+      // artifice depends on it. A GUI form is a different trust surface: it is
+      // where a phishing page's "helpful setup instructions" land, nobody reviews
+      // it afterwards, and nothing in this repository needs an unbounded period
+      // in a browser. The boundary the CLI draws is about a shell, not about
+      // "an entry is being created".
+      //
+      // ⭐ Routed through the SAME `validateProvisioning` (hence the same
+      // MAX_PERIOD / MAX_SECRET_BYTES / MAX_LABEL_CHARS) that the URI, migration
+      // and QR doors use. A fourth hand-written `600` would be a mirror nobody
+      // guards. The `max` attribute on the input below is UX; THIS is the control.
+      wasm.validateProvisioning(
+        label.trim(),
+        issuer.trim() || null,
+        secretBytes.length,
+        digits,
+        period,
+      );
       onAdd({
         label: label.trim(),
         issuer: issuer.trim() || undefined,
@@ -2327,7 +2544,15 @@ function AddAccountPanel({
     <Card>
       <h3 className="mb-4 text-base font-semibold">Add an account</h3>
 
-      <form onSubmit={submitForm} className="space-y-3">
+      {/* ⭐ `noValidate` ON PURPOSE. With native constraint validation on, the
+          browser silently swallows an out-of-range period behind a generic
+          tooltip and `submitForm` never runs — so the user is refused without
+          being told WHY, and the refusal is the browser's rather than ours.
+          Turning it off makes ONE control authoritative (`validateProvisioning`,
+          the same one the URI/migration/QR doors use) and lets it explain that a
+          code that long does not rotate. The `min`/`max` attributes stay as
+          affordances. */}
+      <form onSubmit={submitForm} className="space-y-3" noValidate>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className="block text-sm">
             <span className="mb-1 block font-medium">Label</span>
@@ -2392,11 +2617,16 @@ function AddAccountPanel({
           </label>
           <label className="block text-sm">
             <span className="mb-1 block font-medium">Period (s)</span>
+            {/* `max` comes from the SAME constant the gate uses — never a
+                literal. It is only UX (a native tooltip); `submitForm`'s
+                `validateProvisioning` call is the actual control, because an
+                attribute is trivially bypassed and a form is not a boundary. */}
             <input
               data-testid="add-period"
               className={inputCls}
               type="number"
               min={1}
+              max={wasm.MAX_PERIOD}
               value={period}
               onChange={(e) => setPeriod(Number(e.target.value))}
             />
@@ -2411,6 +2641,109 @@ function AddAccountPanel({
           Add account
         </button>
       </form>
+
+      <hr className="my-5 border-neutral-200 dark:border-neutral-800" />
+
+      {/* ── Scan a QR code (Phase 63) ─────────────────────────────────────── */}
+      <section
+        className="space-y-2"
+        data-testid="qr-panel"
+        /* Paste is handled at the DOCUMENT level (see the effect above) — a
+           paste event never travels down into an unfocused subtree, so a
+           handler here would be dead for a real user. Drop still belongs here:
+           a drop IS targeted at the element it lands on. */
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          const blob = wasm.imageFromEvent(e.nativeEvent as unknown as DragEvent);
+          if (blob) {
+            e.preventDefault();
+            void scanImage(blob);
+          }
+        }}
+      >
+        <h3 className="text-sm font-medium">Scan a QR code</h3>
+        {qrSupported === null && (
+          <p data-testid="qr-probing" className="text-sm text-neutral-600 dark:text-neutral-400">
+            Checking whether this browser can read QR codes…
+          </p>
+        )}
+        {/*
+          ⛔ THE UNSUPPORTED BRANCH IS A REAL PRODUCT STATE, NOT AN ERROR PATH.
+          There is deliberately NO disabled button here: a control that exists and
+          fails is a claim that is not true, and Phase 62 existed to remove two of
+          those. Firefox, Safari and Linux Chromium land here.
+        */}
+        {qrSupported === false && (
+          <p
+            data-testid="qr-unsupported"
+            className="rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200"
+          >
+            This page cannot read QR codes. Either the browser does not support it (Chrome and
+            Edge do; Firefox and Safari do not), or this page was not loaded over a secure
+            origin — the API is unavailable on a plain <code>http://</code> address other than{" "}
+            <code>localhost</code>. Paste the <code>otpauth://</code> setup link below instead;
+            it does exactly the same job.
+          </p>
+        )}
+        {qrSupported === true && (
+          <>
+            <p className="text-sm text-neutral-600 dark:text-neutral-400">
+              Take a screenshot of the QR code and paste it here (or drop an image, or choose a
+              file). Nothing is added until you confirm it.
+            </p>
+            {/* The label is REQUIRED, not decoration: a bare file input is a
+                critical axe `label` violation, and a screen-reader user gets an
+                unnamed control. Caught by tests/a11y.spec.ts. */}
+            <label className="block text-sm">
+              <span className="mb-1 block font-medium">Choose a QR code image</span>
+              <input
+                data-testid="qr-file-input"
+                type="file"
+                accept="image/*"
+                className="block w-full text-sm"
+                onChange={(e) => {
+                  const f = e.target.files?.[0] ?? null;
+                  e.target.value = "";
+                  void scanImage(f);
+                }}
+              />
+            </label>
+          </>
+        )}
+        {qrPending && (
+          <div
+            data-testid="qr-preview"
+            className="rounded border border-neutral-300 p-2 text-sm dark:border-neutral-700"
+          >
+            <p className="mb-2">
+              Found: <span data-testid="qr-summary">{qrPending.summary}</span>
+            </p>
+            <div className="flex gap-2">
+              <button
+                data-testid="qr-confirm"
+                className={btnCls}
+                type="button"
+                onClick={confirmQr}
+              >
+                Add this account
+              </button>
+              <button
+                data-testid="qr-cancel"
+                className={btnGhost}
+                type="button"
+                onClick={() => setQrPending(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+        {qrError && (
+          <p data-testid="qr-error" className="text-sm text-red-600 dark:text-red-400">
+            {qrError}
+          </p>
+        )}
+      </section>
 
       <hr className="my-5 border-neutral-200 dark:border-neutral-800" />
 

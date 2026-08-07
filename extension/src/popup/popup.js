@@ -47,6 +47,14 @@ import {
   buildOtpauthUri,
   decodeMigrationUri,
   encodeMigrationUri,
+  // ⭐ Phase 63: the untrusted-text gate and its constants. `validateProvisioning`
+  // is what the add-by-form door now runs (see the `add-form` handler);
+  // `MAX_PERIOD` sets the input's `max` attribute so no fourth literal exists.
+  // `frozenPeriodWarning` is the READ-path counterpart — an entry that got in
+  // before the gate, or through a vault MERGE, must not wear a normal countdown.
+  validateProvisioning,
+  frozenPeriodWarning,
+  MAX_PERIOD,
 } from "../../vendor/totp-migration.mjs";
 import { pushContainer, pullContainers } from "../../vendor/sync.mjs";
 import {
@@ -115,6 +123,15 @@ import {
 // ⛔ CLOCK SKEW — a DIAGNOSTIC, never a correction. Nothing here feeds the clock
 // `nowSeconds()` gives the wasm to generate codes.
 import { fetchClockSkew, describeClockSkew } from "../../vendor/clock-skew.mjs";
+// QR scanning (Phase 63) — the platform's own BarcodeDetector, no dependency.
+// It produces a bounded STRING and hands it to the parsers above, which is where
+// the provisioning gate lives; it adds no crypto and no second parser.
+import {
+  qrSupport,
+  scanProvisioningImage,
+  imageFromEvent,
+  explainQrError,
+} from "../../vendor/qr-scan.mjs";
 
 /** chrome.storage.local key holding ONLY the sealed container, base64. */
 const STORAGE_KEY = "sigil.extension.vault.v1";
@@ -225,6 +242,23 @@ async function persist(v, secret = null) {
   const nonce = crypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
   const container = sealVault(wasm, secret ?? sealSecret, v, salt, nonce, await sealParams(STORAGE_KEY));
   await chrome.storage.local.set({ [STORAGE_KEY]: bytesToBase64(container) });
+  // ⭐ WARN AT THE MOMENT THE VAULT GROWS, not at the moment sync breaks.
+  // `opBodySizeWarning` was previously wired only to Push and to the server's
+  // 413, so a user who imported a large Google Authenticator export learned
+  // their vault no longer syncs long after the choice that caused it — and there
+  // is no supported way to shrink it (tombstones are never pruned, and there is
+  // no `compact`). Keyed off the SAME `MAX_OP_BODY_BYTES` as the push path and
+  // the CLI, because it is the same function. Measured motivation: a 512-entry
+  // import (the provisioning ceiling) seals to ~86 KB against a 64 KiB cap.
+  showSizeWarning(opBodySizeWarning(container.length));
+}
+
+/** Render (or clear) the persistent vault-size alert. */
+function showSizeWarning(text) {
+  const el = $("size-warning");
+  if (!el) return;
+  el.textContent = text ?? "";
+  el.hidden = !text;
 }
 
 /**
@@ -697,6 +731,24 @@ function row(entry) {
 
   confirmBox.append(confirmText, yes, no);
   li.append(who, code, left, rm, confirmBox);
+
+  // ⛔⛔ THE READ-PATH FROZEN-ENTRY WARNING (Phase 63). The ingest ceiling is
+  // deliberately NOT retroactive and deliberately does not cover a Phase 61
+  // vault MERGE (see `mergeVaults` in totp-vault.mjs), so an entry whose code
+  // never rotates can still be sitting in this list — and until now it wore an
+  // ordinary countdown, which is the product telling the user their second
+  // factor is fine when it is a static secret in a rotating costume.
+  //
+  // ⛔ IT REPORTS AND NEVER CORRECTS: nothing here alters or hides the entry.
+  const frozen = frozenPeriodWarning(entry.period);
+  if (frozen) {
+    const warn = document.createElement("p");
+    warn.className = "frozen";
+    warn.dataset.testid = "frozen-warning";
+    warn.setAttribute("role", "alert");
+    warn.textContent = frozen;
+    li.append(warn);
+  }
   return li;
 }
 
@@ -877,6 +929,10 @@ $("unlock-form").addEventListener("submit", async (ev) => {
     password = pw;
     sealSecret = secret;
     activeVaultId = vid;
+    // ⭐ Also on OPEN, not only on write: a vault that was already oversized
+    // (imported on another client and pulled here) would otherwise stay silent
+    // until the user happened to add something.
+    showSizeWarning(opBodySizeWarning(container.length));
     renderSharing();
     $("unlock-pw").value = "";
     unlocked();
@@ -904,11 +960,38 @@ $("destroy").addEventListener("click", async () => {
   say("Sealed vault deleted.");
 });
 
+// ⭐ The `max` affordance comes from the SAME constant the gate uses. Written in
+// JS rather than in the markup so `600` exists in exactly one place.
+$("add-period").max = String(MAX_PERIOD);
+
 $("add-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   try {
     const label = $("add-label").value.trim();
     const issuer = $("add-issuer").value.trim();
+    // ⭐⭐ THE PROVISIONING GATE, ON THE ADD-BY-FORM DOOR TOO (Phase 63 fix).
+    //
+    // ⛔ This form reproduced the exact defect the phase exists to close: the
+    // period box was `type=number min="1"` with NO max, so 4294967295 created a
+    // "one-time" password whose code never changes, shown with an ordinary
+    // countdown.
+    //
+    // ⭐ WHY THIS DOES NOT CONTRADICT THE CLI'S DELIBERATE `--period` EXEMPTION:
+    // that exemption is for a flag an operator typed into a shell, where the
+    // value sits in their history. A GUI form is a different trust surface — it
+    // is where a phishing page's "helpful setup instructions" land, nobody
+    // reviews it afterwards, and nothing here needs an unbounded period.
+    //
+    // ⭐ Routed through the SAME `validateProvisioning` as the URI / migration /
+    // QR doors, so there is no fourth copy of the bounds. The `max` attribute
+    // above is UX; THIS is the control.
+    validateProvisioning(
+      label,
+      issuer || null,
+      base32Decode($("add-secret").value).length,
+      Number($("add-digits").value),
+      Number($("add-period").value),
+    );
     await withVault((d) => {
       // ⭐ Phase 61: refuses an account already in the vault by CONTENT, not by
       // label — so `work` at two different issuers is two accounts.
@@ -929,6 +1012,128 @@ $("add-form").addEventListener("submit", async (ev) => {
     say(err(e), "error");
   }
 });
+
+// ── Scan a QR code (Phase 63) ───────────────────────────────────────────────
+//
+// ⭐ NOTHING IS WRITTEN UNTIL THE USER CONFIRMS. A scanner that added on decode
+// would mean pasting a screenshot from a hostile page silently creates an
+// account. ADR 0050 established that one click must not destroy an account; the
+// same reasoning forbids one glance creating one.
+//
+// ⛔ The unsupported branch is a REAL RENDERED STATE, not a disabled button: a
+// control that exists and fails is a claim that is not true.
+let qrPending = null;
+
+function qrSay(message) {
+  const el = $("qr-error");
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+function qrShowPending(pending) {
+  qrPending = pending;
+  $("qr-summary").textContent = pending ? pending.summary : "";
+  $("qr-preview").hidden = !pending;
+}
+
+async function qrScanBlob(blob) {
+  qrSay("");
+  qrShowPending(null);
+  if (!blob) return;
+  try {
+    const found = await scanProvisioningImage(blob);
+    // Parsing here runs the SAME provisioning gate the paste field runs, so a
+    // hostile QR is refused before anything is even offered as addable.
+    let summary;
+    if (found.kind === "otpauth") {
+      const e = parseOtpauthUri(found.text);
+      summary =
+        `${e.issuer ? e.issuer + ": " : ""}${e.label} — ` +
+        `${e.algorithm.toUpperCase()}, ${e.digits} digits, every ${e.period}s`;
+    } else {
+      const batch = decodeMigrationUri(found.text);
+      const n = batch.entries.length;
+      summary = `a Google Authenticator export carrying ${n} account${n === 1 ? "" : "s"}`;
+    }
+    qrShowPending({ kind: found.kind, text: found.text, summary });
+  } catch (e) {
+    qrSay(explainQrError(e));
+  }
+}
+
+$("qr-file-input").addEventListener("change", async (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = "";
+  await qrScanBlob(file || null);
+});
+
+// ⭐ ON `document`, NOT ON THE SECTION — a paste event is dispatched at the
+// FOCUSED element and BUBBLES UP; it never travels down into an unfocused
+// subtree. A listener on the panel receives nothing when the user just presses
+// ⌘V, which is the whole motion. (Measured: panel listener 0 hits, document
+// listener every time.) Safe to listen this widely only because
+// `imageFromEvent` returns null for a TEXT paste, so pasting an otpauth:// URI
+// into the field below is untouched.
+document.addEventListener("paste", async (ev) => {
+  const blob = imageFromEvent(ev);
+  if (!blob) return;
+  ev.preventDefault();
+  await qrScanBlob(blob);
+});
+
+$("qr-cancel").addEventListener("click", () => {
+  qrSay("");
+  qrShowPending(null);
+});
+
+$("qr-confirm").addEventListener("click", async () => {
+  if (!qrPending) return;
+  const pending = qrPending;
+  try {
+    if (pending.kind === "otpauth") {
+      const entry = parseOtpauthUri(pending.text);
+      let res;
+      await withVault((d) => {
+        res = mergeEntries(d, [entry]);
+        if (res.added === 0) throw new Error("this exact account is already in the vault");
+      });
+      qrShowPending(null);
+      say(`Added ${entry.label}.`);
+    } else {
+      const batch = decodeMigrationUri(pending.text);
+      let added = 0;
+      await withVault((d) => {
+        added = mergeEntries(d, batch.entries).added;
+      });
+      qrShowPending(null);
+      const base = `Imported ${added} of ${batch.entries.length} account(s).`;
+      if (batch.batchNote && !batch.finalBatch) {
+        say(
+          `${base} ⚠️ THIS IMPORT IS INCOMPLETE — ${batch.batchNote}. Import the remaining ` +
+            `QR code(s) before deleting anything from the old app.`,
+          "error",
+        );
+      } else {
+        say(batch.batchNote ? `${base} ${batch.batchNote}.` : base);
+      }
+    }
+  } catch (e) {
+    qrSay(err(e));
+  }
+});
+
+// The probe is a RUNTIME question — BarcodeDetector is absent in Firefox, in
+// Safari and on Linux Chromium, and it is secure-context gated.
+qrSupport()
+  .then((supported) => {
+    $("qr-probing").hidden = true;
+    $("qr-supported").hidden = !supported;
+    $("qr-unsupported").hidden = supported;
+  })
+  .catch(() => {
+    $("qr-probing").hidden = true;
+    $("qr-unsupported").hidden = false;
+  });
 
 $("uri-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

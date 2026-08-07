@@ -547,6 +547,35 @@ export function vaultToJson(vault) {
  * field (ADR 0047) is exactly what a future version writes and a current one
  * must carry through a merge in either order.
  *
+ * ⚠️⚠️ THE MERGE IS AN INGEST DOOR AND IT IS DELIBERATELY NOT GATED — read this
+ * before "fixing" it. Phase 63's provisioning ceiling (`validateProvisioning` in
+ * `totp-migration.mjs`) runs at `parseOtpauthUri` and `migrationOtpToEntry`, i.e.
+ * wherever an entry is BUILT FROM UNTRUSTED TEXT. An entry arriving through this
+ * function was built somewhere else and is adopted UNCHECKED: a co-owner of a
+ * shared vault can push a snapshot containing a `period` of 4294967295, and it
+ * lands.
+ *
+ * ⭐ THAT IS INSIDE THE STATED TRUST MODEL, NOT A HOLE IN IT. Reaching this
+ * function at all requires holding the vault key (ADR 0035/0038) — a peer you
+ * deliberately shared with, whose key you pinned and whose safety number you were
+ * shown. A peer who can write entries can already write anything into a vault you
+ * chose to share; a period ceiling is not what stands between you and them.
+ *
+ * ⛔ AND GATING IT WOULD BE THE WORSE BUG, in the precise direction Phase 61
+ * exists to avoid: **refusing to merge an entry is refusing to READ it**. Drop an
+ * entry here and the next re-seal writes a vault without it, that vault is pushed,
+ * and the account is gone from every device — data loss caused by a validator,
+ * which is exactly the shape of the defect ADR 0049 was written to repair. The
+ * ingest ceiling bounds what a STRANGER MAY CREATE; it must never decide what a
+ * user may KEEP.
+ *
+ * ⭐ SO THE DOOR IS DISCLOSED RATHER THAN CLOSED, and the mitigation is on the
+ * READ path where it cannot destroy anything: `frozenPeriodWarning` (mirrored in
+ * Rust as `frozen_period_warning`) is rendered beside any such entry by every
+ * client, so a merged non-rotating entry is visible as one instead of wearing an
+ * ordinary countdown. `provisioning-interop.mjs` pins BOTH halves of this
+ * decision — that the merge still adopts the entry, and that the warning fires.
+ *
  * Mirrors `cli/src/lib.rs::merge_vaults`.
  */
 export function mergeVaults(wasm, local, remote) {

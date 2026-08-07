@@ -126,3 +126,15 @@ export * from "../../../sigil-wasm/entitlement.mjs";
 // ⚠️ Re-exported HERE **and** declared in index.d.ts — two separate holes, see
 // the note above `passkey.mjs`.
 export * from "../../../sigil-wasm/clock-skew.mjs";
+// QR SCANNING (Phase 63): reading an `otpauth://` setup code out of a pasted /
+// dropped / picked IMAGE, over the platform's own `BarcodeDetector`. Adds no
+// dependency and no parser — it produces a bounded STRING and hands it to the
+// provisioning parsers above, which is where the Phase 63 gate lives.
+//
+// ⛔ `BarcodeDetector` is absent in Firefox, in Safari and on Linux Chromium, so
+// `qrSupport()` is a RUNTIME probe and the unsupported branch is a real product
+// state the UI must render honestly.
+//
+// ⚠️ Re-exported HERE **and** declared in index.d.ts — two separate holes, see
+// the note above `passkey.mjs`.
+export * from "../../../sigil-wasm/qr-scan.mjs";

@@ -773,6 +773,55 @@ function webappDeleteGate(src) {
   return { ok: true, why: `${calls.length} \`onRemove()\` call(s), all inside the confirm button` };
 }
 
+// ── The desktop's GUI add-form must run the ADR 0051 ingest ceiling ─────────
+//
+// ⛔ WHY: the desktop's add-form shipped UNGATED while ADR 0051 asserted that
+// GUI forms are gated — the phase's own stated policy, false about two of three
+// GUI clients, found by an independent verifier rather than by the build. The
+// webapp and the extension are covered by product-level Playwright specs; the
+// desktop's window is rendered by no test (ADR 0050 limit 5), so this is the
+// only thing standing between that door and a silent regression.
+//
+// ⚠️ It is a SOURCE check. It proves the Tauri command calls the gate; it proves
+// NOTHING about whether the window shows the refusal.
+{
+  const rel = "desktop/src-tauri/src/main.rs";
+  const src = read(rel);
+  if (src === null) {
+    fail(`${rel}: cannot read — if the Tauri shell moved, this guard must move with it`);
+  } else {
+    checks += 1;
+    const body = fnBody(src, "fn add_secret(");
+    if (body === null) {
+      fail(
+        `${rel}: no \`fn add_secret(\` found. Either the GUI add-form command was renamed ` +
+          `(this guard must be renamed with it) or it is gone — do not assume the latter.`,
+      );
+    } else if (!/check_form_provisioning\s*\(/.test(body)) {
+      fail(
+        `${rel}: the \`add_secret\` command does NOT call \`check_form_provisioning(\`. ` +
+          `⛔ That is the desktop's GUI add-form, and without the gate it can create an ` +
+          `entry whose code NEVER ROTATES (ADR 0051) — a second factor that looks fine and ` +
+          `stays valid forever. The library call \`add_secret_base32\` is deliberately ` +
+          `ungated (the clock-pinning artifice depends on it), so this command is the ONLY ` +
+          `place the form is bounded.`,
+      );
+    } else {
+      console.log(`  ok  ${rel}: the GUI add-form runs the ADR 0051 ingest ceiling`);
+    }
+  }
+}
+
+/** Body of a Rust/JS function whose signature starts with `sig`, brace-matched. */
+function fnBody(src, sig) {
+  const i = src.indexOf(sig);
+  if (i === -1) return null;
+  const open = src.indexOf("{", i);
+  if (open === -1) return null;
+  const close = matchBrace(blank(src, { strings: true }), open);
+  return close === -1 ? null : src.slice(open, close + 1);
+}
+
 const DELETE_GATES = [
   { rel: "web/apps/webapp/app/authenticator.tsx", gate: webappDeleteGate, what: "the webapp's account row" },
   { rel: "extension/src/popup/popup.js", gate: extensionDeleteGate, what: "the extension popup's account row" },

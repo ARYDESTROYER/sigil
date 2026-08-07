@@ -262,6 +262,21 @@ button.ghost {
   font-weight: 600;
 }
 
+/* The read-path frozen-entry warning (Phase 63, see `row()` in popup.js). Spans
+   the whole row for the same reason the delete confirmation does: it contradicts
+   the countdown sitting next to it, so it must not read as a footnote. */
+.frozen {
+  flex: 0 0 100%;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border: 1px solid var(--danger);
+  border-radius: 5px;
+}
+
 .panel {
   margin-top: 10px;
   padding: 6px 8px;

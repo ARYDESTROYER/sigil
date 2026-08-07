@@ -405,6 +405,26 @@ fn add_secret(
 ) -> CmdResult<()> {
     with_session(&state, |s| {
         let issuer = issuer.filter(|i| !i.trim().is_empty());
+        // ⛔ THE GUI FORM'S DOOR, AND THE ONLY GATE ON IT (ADR 0051).
+        //
+        // ADR 0051 exempts `sigil totp add --period N` — a value a person typed
+        // into a shell, where it lands in a history someone can review. A GUI
+        // form is a different case: it is where a phishing page's "helpful setup
+        // instructions" land. The webapp and the extension gate theirs; this one
+        // did not, so the ADR asserted a policy it implemented in two of three
+        // GUI clients. Found by an independent verifier, not by the build.
+        //
+        // It sits HERE rather than in `add_secret_base32` because that function
+        // is the core's programmatic API and is used by `cli_interop.rs` /
+        // `server_interop.rs` to pin a TOTP counter across processes with a
+        // deliberately enormous period; those are integration tests and cannot
+        // reach a private bypass. Gating the library would have broken the
+        // repo's own documented artifice to close a door that is not the defect.
+        //
+        // Reached through the `sigil-cli` library (ADR 0037): no fourth copy of
+        // the bounds, no second error vocabulary.
+        VaultSession::check_form_provisioning(&label, issuer.as_deref(), &secret, digits, period)
+            .map_err(|e| msg(e.to_string()))?;
         s.add_secret_base32(
             label.trim(),
             issuer,

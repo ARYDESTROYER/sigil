@@ -69,9 +69,9 @@ use sigil_cli::migration::{
     ImportedOtp,
 };
 use sigil_cli::{
-    base32_decode, entry_to_otpauth_uri, new_totp_entry, open_vault, parse_otpauth_uri, seal_vault,
-    totp_algorithm_from_str, CliError, TotpEntry, TotpVault, TOTP_DEFAULT_DIGITS,
-    TOTP_DEFAULT_PERIOD,
+    base32_decode, check_provisioning, entry_to_otpauth_uri, new_totp_entry, open_vault,
+    parse_otpauth_uri, seal_vault, totp_algorithm_from_str, CliError, TotpEntry, TotpVault,
+    TOTP_DEFAULT_DIGITS, TOTP_DEFAULT_PERIOD,
 };
 use sigil_core::Argon2Params;
 
@@ -368,6 +368,26 @@ pub struct EntryView {
     pub code: String,
     /// Whole seconds left before `code` rolls over.
     pub seconds_remaining: u64,
+    /// ⛔⛔ Set when this entry's time step is so long the code does not rotate on
+    /// any human timescale — `None` for an ordinary account.
+    ///
+    /// ⭐ THE READ-PATH COUNTERPART TO PHASE 63's INGEST CEILING, and the reason
+    /// it exists at all is that the ceiling is deliberately NOT retroactive
+    /// (ADR 0047's rule: bound what a stranger may CREATE, never what a user
+    /// already HAS). Three routes put such an entry in front of this window and
+    /// none of them is the gate: a vault sealed before Phase 63; `sigil totp add
+    /// --period N`, which is deliberately exempt because the operator typed the
+    /// number; and a Phase 61 vault MERGE from a co-owner, which is deliberately
+    /// left ungated because refusing to merge an entry is refusing to READ it
+    /// (see `sigil_cli::merge_vaults`). Rendering such an entry with an ordinary
+    /// countdown tells the user their second factor is fine when a single
+    /// observation of that code stays valid forever.
+    ///
+    /// ⛔ IT REPORTS AND NEVER CORRECTS: the entry is still listed, still
+    /// generates, and is not altered (entries are immutable, ADR 0049). Nothing
+    /// here is a second implementation — the text is
+    /// [`sigil_cli::frozen_period_warning`], the same string the CLI prints.
+    pub frozen_warning: Option<String>,
 }
 
 /// The outcome of an import run.
@@ -582,6 +602,11 @@ impl VaultSession {
                     period: e.period,
                     code,
                     seconds_remaining,
+                    // REUSE, DO NOT REIMPLEMENT (ADR 0037): the wording and the
+                    // threshold are the CLI library's, so this window and
+                    // `sigil totp code` can never disagree about what "does not
+                    // rotate" means.
+                    frozen_warning: sigil_cli::frozen_period_warning(e.period),
                 })
             })
             .collect()
@@ -593,6 +618,43 @@ impl VaultSession {
     /// Same as [`VaultSession::entries_at`].
     pub fn entries_now(&self) -> Result<Vec<EntryView>> {
         self.entries_at(now_unix())
+    }
+
+    /// Run the ADR 0051 ingest ceiling for a value typed into a **GUI form**.
+    ///
+    /// ⛔ WHY THIS EXISTS SEPARATELY FROM [`Self::add_secret_base32`]. ADR 0051
+    /// exempts `sigil totp add --period N` — a value a person typed into a shell,
+    /// where it lands in a history someone can review — and treats a GUI form
+    /// differently, because that is where a phishing page's "helpful setup
+    /// instructions" land. The webapp and the extension gate their add-forms;
+    /// the desktop's did not, so the ADR asserted a policy it implemented in two
+    /// of three GUI clients. Found by an independent verifier, not by the build.
+    ///
+    /// It is NOT inside `add_secret_base32` because that is the core's
+    /// programmatic API, used by `cli_interop.rs` and `server_interop.rs` to pin
+    /// a TOTP counter across processes with a deliberately enormous period.
+    /// Those are INTEGRATION tests, external to this crate, so they cannot reach
+    /// a private bypass — gating the library would have broken this repo's own
+    /// documented artifice to close a door that is not the defect.
+    ///
+    /// Delegates to `sigil_cli::check_provisioning` (ADR 0037): no fourth copy of
+    /// the bounds, no second error vocabulary.
+    pub fn check_form_provisioning(
+        label: &str,
+        issuer: Option<&str>,
+        secret_base32: &str,
+        digits: Option<u32>,
+        period: Option<u32>,
+    ) -> Result<()> {
+        let raw = base32_decode(secret_base32.trim())?;
+        check_provisioning(
+            label.trim(),
+            issuer,
+            raw.len(),
+            digits.unwrap_or(TOTP_DEFAULT_DIGITS),
+            period.unwrap_or(TOTP_DEFAULT_PERIOD),
+        )?;
+        Ok(())
     }
 
     /// Add an account from a base32 secret (the form printed next to a QR code).
@@ -614,14 +676,27 @@ impl VaultSession {
     ) -> Result<()> {
         let raw = base32_decode(secret_base32)?;
         let algo = totp_algorithm_from_str(algorithm)?;
-        let entry = new_totp_entry(
-            label,
-            issuer,
-            &raw,
-            algo,
-            digits.unwrap_or(TOTP_DEFAULT_DIGITS),
-            period.unwrap_or(TOTP_DEFAULT_PERIOD),
-        )?;
+        let digits = digits.unwrap_or(TOTP_DEFAULT_DIGITS);
+        let period = period.unwrap_or(TOTP_DEFAULT_PERIOD);
+        // ⚠️ NO INGEST GATE HERE, AND THAT IS DELIBERATE — see `add_secret` in
+        // `desktop/src-tauri/src/main.rs`, which is where the GUI form's door is
+        // gated (ADR 0051).
+        //
+        // This is the desktop core's PROGRAMMATIC API, the exact analogue of
+        // `sigil totp add --secret … --period N`, which ADR 0051 leaves exempt on
+        // the reasoning that a value a person typed deliberately is not a
+        // stranger's payload. Gating it here instead would also break this
+        // repo's documented clock-pinning artifice — `cli_interop.rs` uses
+        // `PINNED_PERIOD = u32::MAX` and `server_interop.rs` uses
+        // `1_600_000_000` so a TOTP counter stays constant across processes —
+        // and those files are INTEGRATION tests, external to this crate, so they
+        // cannot reach a private constructor to work around it.
+        //
+        // ⛔ The consequence, stated rather than discovered later: a programmatic
+        // caller of this function can still create a frozen entry. The GUI form
+        // cannot, `add_uri` cannot (it runs `parse_otpauth_uri`), and import
+        // cannot.
+        let entry = new_totp_entry(label, issuer, &raw, algo, digits, period)?;
         self.vault.add(entry)?;
         self.save()
     }
@@ -1030,6 +1105,70 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_whose_code_never_rotates_is_reported_as_such_and_still_generates() {
+        // ⛔ BOTH HALVES, because either alone is the wrong product. The ingest
+        // ceiling is deliberately NOT retroactive and deliberately does not cover
+        // a Phase 61 vault MERGE, so an entry like this can be in front of a
+        // user — and rendering it with an ordinary countdown asserts that their
+        // second factor is fine when a single observation of it stays valid
+        // forever. Refusing to render it would delete a working account.
+        let mut s = new_session("frozen");
+        // ⭐ THE FIXTURE ARRIVES THE WAY A FROZEN ENTRY ACTUALLY CAN, which is
+        // no longer the add-form: `add_secret_base32` now runs the ADR 0051
+        // ingest ceiling and refuses this outright. The remaining doors are a
+        // LEGACY vault sealed before the ceiling existed, and a Phase 61 MERGE
+        // from a co-owner — both deliberately ungated, because refusing them
+        // would be refusing to READ, i.e. deleting a working account.
+        //
+        // ⚠️ This test previously built its fixture through the add-form, so
+        // closing that door broke it. That is the correct direction: the test
+        // was reaching through a door the product now refuses, and the warning
+        // it checks exists precisely BECAUSE the other two doors stay open.
+        {
+            let raw = base32_decode(RFC_SEED_B32).expect("decode");
+            let entry = new_totp_entry(
+                "frozen",
+                None,
+                &raw,
+                totp_algorithm_from_str("sha1").expect("algo"),
+                6,
+                u32::MAX,
+            )
+            .expect("build a frozen entry directly, as a merge or a legacy vault would");
+            s.vault
+                .add(entry)
+                .expect("adopt it unchecked, exactly as a merge does");
+        }
+        s.add_secret_base32("ordinary", None, RFC_SEED_B32, "sha1", Some(6), Some(30))
+            .expect("add ordinary");
+
+        let views = s.entries_at(59).expect("views");
+        let frozen = views
+            .iter()
+            .find(|v| v.label == "frozen")
+            .expect("frozen row");
+        let ordinary = views
+            .iter()
+            .find(|v| v.label == "ordinary")
+            .expect("ordinary row");
+
+        let warning = frozen
+            .frozen_warning
+            .as_deref()
+            .expect("a non-rotating entry must be reported as one");
+        assert!(
+            warning.contains("does not rotate"),
+            "the warning must say what is wrong: {warning}"
+        );
+        // ⛔ REPORTS, NEVER CORRECTS: it is still listed and still generates.
+        assert!(!frozen.code.is_empty());
+        assert_eq!(frozen.period, u32::MAX, "the entry is immutable (ADR 0049)");
+        // ...and an ordinary account is untouched, so the warning is not noise.
+        assert_eq!(ordinary.frozen_warning, None);
+        assert_eq!(ordinary.code, "287082", "RFC 6238 App B, T=59");
+    }
+
+    #[test]
     fn otpauth_uri_import_and_export_round_trip() {
         let mut s = new_session("uri");
         let label = s
@@ -1221,5 +1360,46 @@ mod tests {
         // Well after 2020 and before 2100 — proves we read the host clock.
         let t = now_unix();
         assert!(t > 1_577_836_800 && t < 4_102_444_800, "got {t}");
+    }
+    #[test]
+    fn the_gui_form_gate_refuses_a_frozen_period_while_the_library_call_still_allows_it() {
+        // ⛔ THE DEFECT THIS PINS: the desktop's GUI add-form had no ingest gate,
+        // so it could create the exact frozen entry ADR 0051 exists to prevent —
+        // while that ADR claimed GUI forms were gated. Two of three were. Found
+        // by an independent verifier, not by the build.
+        let err = VaultSession::check_form_provisioning(
+            "frozen",
+            None,
+            RFC_SEED_B32,
+            Some(6),
+            Some(u32::MAX),
+        )
+        .expect_err("a period of u32::MAX must be refused at the GUI form");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("600") && msg.to_lowercase().contains("rotate"),
+            "the refusal must NAME the ceiling and say why a code that long is not a \
+             one-time password; got: {msg}"
+        );
+
+        // ⭐ ANTI-OVERFIT: exactly the ceiling is still accepted.
+        VaultSession::check_form_provisioning("ok", None, RFC_SEED_B32, Some(6), Some(600))
+            .expect("period 600 is exactly the ceiling and must be ACCEPTED");
+
+        // ⭐ AND THE LIBRARY CALL IS DELIBERATELY STILL OPEN — this is the
+        // asymmetry ADR 0051 chose, and the reason this repo's clock-pinning
+        // artifice (PINNED_PERIOD = u32::MAX in cli_interop.rs) still works.
+        // If a later "hardening" moves the gate into add_secret_base32, this
+        // assertion fails and forces the argument to be re-made.
+        let mut s = new_session("gui-gate-asymmetry");
+        s.add_secret_base32(
+            "pinned",
+            None,
+            RFC_SEED_B32,
+            "sha1",
+            Some(6),
+            Some(u32::MAX),
+        )
+        .expect("the PROGRAMMATIC api stays ungated on purpose");
     }
 }

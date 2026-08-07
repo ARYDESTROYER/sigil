@@ -386,6 +386,15 @@ pub fn decode_migration_payload(buf: &[u8]) -> Result<MigrationBatch, CliError> 
         let wire = (tag & 0x07) as u8;
         match (field, wire) {
             (1, WIRE_LEN) => {
+                // ⭐ THE COUNT CEILING, CHECKED BEFORE THE PUSH (Phase 63). A
+                // migration URI is a stranger's bytes and nothing in the wire
+                // format bounds how many accounts it declares, so this loop was
+                // an unbounded allocation driven entirely by attacker input.
+                // Refusing here means we never build the list we would then
+                // throw away. See `sigil_core::MAX_PROVISIONING_ENTRIES` for why
+                // the number is 512.
+                sigil_core::validate_provisioning_count(out.otps.len() + 1)
+                    .map_err(|e| CliError::Totp(e.to_string()))?;
                 let msg = read_len_delimited(buf, &mut pos)?;
                 out.otps.push(decode_otp_parameters(msg)?);
             }
@@ -588,6 +597,20 @@ pub fn migration_otp_to_entry(otp: &MigrationOtp) -> Result<ImportedOtp, CliErro
     } else {
         Some(otp.issuer.clone())
     };
+
+    // ⭐ THE SAME UNTRUSTED-TEXT GATE AS THE URI DOOR (Phase 63). A migration
+    // payload is a stranger's bytes too — and it is the door that carries MANY
+    // accounts at once, so a hostile name/issuer here is replicated across every
+    // client through the op-log. `period` is not attacker-chosen on this path
+    // (the wire format has no period field; it is always 30 s), but the label,
+    // the issuer and the secret length all are.
+    crate::check_provisioning(
+        &otp.name,
+        issuer.as_deref(),
+        otp.secret.len(),
+        digits,
+        TOTP_DEFAULT_PERIOD,
+    )?;
 
     let entry = new_totp_entry(
         &otp.name,

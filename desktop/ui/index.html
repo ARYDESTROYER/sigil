@@ -121,6 +121,12 @@
             </span>
             <span>
               <label for="period">Period (s)</label>
+              <!-- ⚠️ NO hardcoded `max` here, deliberately. The authoritative bound is
+                   `check_provisioning` in the Rust core (ADR 0051), reached through the
+                   sigil-cli library. The webapp and the extension can set `max` from the
+                   shared constant because they import it; this UI cannot without a new
+                   IPC round trip, and a literal `600` typed here would be a FOURTH copy
+                   of a bound that nothing guards. The refusal names the ceiling. -->
               <input id="period" type="number" min="1" value="30" />
             </span>
           </div>

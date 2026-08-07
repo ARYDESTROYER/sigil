@@ -175,6 +175,27 @@ async function refresh() {
     });
 
     li.append(name, codeWrap, del);
+
+    // ⛔⛔ THE READ-PATH FROZEN-ENTRY WARNING (Phase 63). Phase 63 bounded what a
+    // stranger's `otpauth://` URI, migration payload or QR code may ASK FOR, but
+    // deliberately did not make that ceiling retroactive and deliberately left
+    // the Phase 61 vault MERGE ungated (refusing to merge an entry is refusing to
+    // READ it — the data-loss direction ADR 0049 exists to repair). So an entry
+    // whose code never rotates can still be in this list, and rendering it with
+    // an ordinary countdown bar tells the user their second factor is fine when a
+    // single observation of that code stays valid forever.
+    //
+    // ⛔ IT REPORTS AND NEVER CORRECTS: the row is still shown and still counts
+    // down; the text names the only remedy, which is to re-enrol with the service.
+    // The wording comes from the native core (`sigil_cli::frozen_period_warning`),
+    // so this window and `sigil totp code` say the same thing.
+    if (row.frozen_warning) {
+      const warn = document.createElement("p");
+      warn.className = "warn";
+      warn.setAttribute("role", "alert");
+      warn.textContent = row.frozen_warning;
+      li.append(warn);
+    }
     ul.append(li);
   }
 }

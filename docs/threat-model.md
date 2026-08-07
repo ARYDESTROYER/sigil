@@ -833,6 +833,101 @@ in [`crypto-spec.md`](crypto-spec.md).
   recording: the model was written around confidentiality, and an availability
   attack delivered through the confidentiality mechanism had no row.
 
+## Writer of a hostile provisioning payload (see [ADR 0051](decisions/0051-provisioning-bounds-and-qr-ingest.md))
+
+**A new adversary class, added in Phase 63 because a live instance of it was
+reproduced.** It is not an attack on the vault, on a key, or on the server. It is
+an attack on **what the user believes about their own second factor**, and its
+entry point is the one surface this product cannot avoid exposing: the text a
+stranger's enrolment page hands you.
+
+**Capability.** Get one string in front of a user's authenticator. Anything that
+puts an `otpauth://` URI, an `otpauth-migration://` blob or a **QR code** in front
+of them qualifies: a phishing "enable 2FA" page, a support email, a forum post, a
+QR sticker, a screenshot pasted from a chat. **No account, no device, no vault
+key, no server access is required.** This is the widest-reach adversary in this
+document and the cheapest to be.
+
+### The attack — a static secret in a rotating costume
+
+A TOTP counter is `floor(unix_time / period)`. `period` was an unbounded `u32`, so
+`otpauth://totp/Evil:victim?secret=…&period=4294967295` produced an entry whose
+counter is `0` until roughly the year 2106. Measured on the shipped code:
+**755224 at t=59, at t=1.9×10⁹ and at t=4×10⁹** — one code, forever.
+
+⛔ **The harm is the disguise, not the freeze.** The entry rendered with a label,
+an issuer and an **ordinary countdown**, indistinguishable from a real second
+factor. The user believes they enabled 2FA. What they enabled is a static secret:
+one shoulder-surf, one screenshot, one intercepted login stays valid indefinitely.
+An obviously-broken entry costs a retry; an entry that **lies about rotating**
+costs the protection the user thinks they have.
+
+Adjacent capabilities in the same class: a label carrying `U+202E` RIGHT-TO-LEFT
+OVERRIDE renders inside our own trusted UI as a *different issuer's name*; a
+multi-kilobyte label or secret is sealed into the vault, pushed through the op-log
+and re-rendered on every client forever; and a migration payload declaring
+unbounded accounts was an allocation driven entirely by attacker input.
+
+### ⭐ Why the QR door changed the risk
+
+> **Every existing door to this defect had a human reading the URI. A QR is opaque
+> to humans by construction, so it removes the last reviewer.**
+
+Pasting a URI at least *permits* someone to notice `period=4294967295`. A
+possibility is not a control, but it was the only thing there. A QR code has no
+human-readable surface at all — point a camera at a phishing page's code, or paste
+a screenshot someone sent you, and the payload reaches the parser with **no
+opportunity for review at any point**. This is why the parser was hardened
+**before** the scanner shipped: adding a frictionless ingest door on top of an
+unbounded parser is adding a delivery mechanism to a known defect.
+
+**Defense.** One gate, `sigil_core::validate_provisioning()`, mirrored once in JS,
+reached by every ingest door in every client — `period ≤ 600`, `secret ≤ 1024 B`,
+label and issuer `≤ 256` code points, no C0/C1 controls and no bidi
+overrides/isolates (**ordinary RTL script untouched**), `digits ∈ 6..=10`, and
+`≤ 512` accounts per payload checked **inside the decode loop**. Construction and
+evidence in [`crypto-spec.md`](crypto-spec.md). The QR path adds **no second
+parser and no second set of bounds** — it turns an image into a bounded string and
+hands it to the gate — and it **never writes to the vault**, returning a payload
+the user must confirm.
+
+**What is NOT defended, and must be read with the section above:**
+
+- ⛔ **The bounds are INGEST-ONLY and deliberately NOT retroactive.** A vault that
+  already holds an out-of-bounds entry **still opens and still generates its
+  codes**, and nothing sweeps or repairs it. Refusing to *read* would delete a
+  working account — and under
+  [ADR 0049](decisions/0049-entry-identity-and-the-mergeable-vault.md) the
+  deletion would propagate to every device. The mitigation is a **read-path
+  warning on all four clients that reports and never corrects**.
+- ⛔ **The Phase 61 vault MERGE is an ingest door and is deliberately not gated.**
+  A co-owner of a shared vault can push a snapshot containing an out-of-bounds
+  entry and it is adopted. That is inside the stated trust model — reaching the
+  merge requires the vault key ([0035](decisions/0035-device-to-device-vault-sharing.md)
+  / [0038](decisions/0038-key-pinning-safety-numbers-and-vault-rotation.md)), and a
+  peer who can write entries can already write anything — and gating it would be
+  the worse bug. Pinned by tests in both languages so it must be re-argued.
+- ⚠️ **`sigil totp add --period N` is deliberately ungated**, so a CLI user can
+  still create a frozen entry on purpose. The boundary is *provenance* — text that
+  came from somewhere else — not *creation*.
+- ⚠️ **512 accounts per payload can still produce a vault too large to sync**
+  (`sigild` caps an op body at 64 KiB). All four clients now warn at import time,
+  but the ceiling **bounds one payload, it does not promise the vault fits**, and
+  there is still no `compact`.
+- ⛔ **`BarcodeDetector` is secure-context gated, which is a product state and not
+  only a testing note.** Measured in one browser, one session: `about:blank` and
+  `http://<LAN-IP>:port` → **absent**; `http://localhost`, `http://127.0.0.1` and
+  `file:///` → **present**. So **a page served over plain HTTP from anything other
+  than localhost gets no scanner at all** — exactly the shape of pointing a phone
+  at a dev laptop. Firefox and Safari do not implement it, and neither does Linux
+  Chromium, so **no CI runner exercises the supported branch**; CI exercises the
+  *unsupported* branch, which is a real assertion rather than a skip.
+- ⚠️ **These are display and resource controls, not cryptographic ones.** They stop
+  a stranger installing something that *looks* like a second factor and bound what
+  one payload can cost. They say nothing about the secret itself, and there is
+  deliberately **no floor** — a weak credential is the service's choice, and
+  refusing it would lock the user out.
+
 ## Hostile server against a merging vault — tombstones (see [ADR 0049](decisions/0049-entry-identity-and-the-mergeable-vault.md))
 
 **A new adversary class, added in Phase 61 with the merge itself.** Before it, a

@@ -1802,3 +1802,121 @@ export function explainPasskeyStatus(
   err: unknown,
   options?: { atUnlock?: boolean },
 ): string;
+
+// ── the untrusted-text provisioning gate (Phase 63) ─────────────────────────
+//
+// MIRRORED from `libsigil/core/src/totp.rs`. Enforced at INGEST ONLY — a URI, a
+// migration payload or a scanned QR — and never on the read path, so an entry
+// already in a vault keeps generating codes forever.
+
+/** Largest time step a provisioning URI may request. Mirrors sigil_core::MAX_PERIOD. */
+export const MAX_PERIOD: number;
+/** Largest decoded secret a provisioning URI may carry. */
+export const MAX_SECRET_BYTES: number;
+/** Largest label/issuer, in code points. */
+export const MAX_LABEL_CHARS: number;
+/**
+ * Largest number of accounts ONE bulk-import payload may carry.
+ *
+ * ⭐ The other bounds are all PER ENTRY, so a payload of a million individually
+ * legal accounts satisfied every one of them. This is the only bound on the
+ * decode loop itself.
+ */
+export const MAX_PROVISIONING_ENTRIES: number;
+
+/**
+ * Refuse a bulk-import payload carrying more than `MAX_PROVISIONING_ENTRIES`
+ * accounts; throws on refusal.
+ *
+ * ⭐ Called INSIDE the decode loop, not after it — checking the finished list
+ * would allocate everything a hostile payload asked for and only then decide not
+ * to keep it, which is the allocation this bound exists to prevent.
+ *
+ * @param count accounts decoded so far, including the one about to be pushed
+ */
+export function validateProvisioningCount(count: number): void;
+
+/**
+ * True for a code point that must never appear in a label or issuer: C0/C1
+ * controls, and the bidi OVERRIDE/ISOLATE characters that let a label render as
+ * a different issuer's name. Ordinary RTL script is NOT affected.
+ */
+export function isUnsafeDisplayChar(codePoint: number): boolean;
+
+/**
+ * Check a provisioning request built from UNTRUSTED TEXT; throws on refusal.
+ *
+ * ⚠️ The thrown message names a BOUND and a COUNT, never the offending string.
+ */
+export function validateProvisioning(
+  label: string,
+  issuer: string | null | undefined,
+  secretLen: number,
+  digits: number,
+  period: number,
+): void;
+
+/**
+ * The warning to render beside an entry whose time step is so long its code does
+ * not rotate — or `null` for an ordinary entry. Mirrors
+ * `cli/src/lib.rs::frozen_period_warning`, keyed off the SAME `MAX_PERIOD`.
+ *
+ * ⭐ The READ-path counterpart to the ingest ceiling, which is deliberately NOT
+ * retroactive and deliberately does NOT cover a Phase 61 vault merge. ⛔ It
+ * reports and never corrects: nothing is altered, hidden or refused.
+ */
+export function frozenPeriodWarning(period: number): string | null;
+
+// ── QR scanning (Phase 63) ──────────────────────────────────────────────────
+
+export const MAX_IMAGE_BYTES: number;
+export const MAX_IMAGE_PIXELS: number;
+export const MAX_QR_TEXT_LENGTH: number;
+
+export const QR_UNSUPPORTED: string;
+export const QR_TOO_LARGE: string;
+export const QR_NOT_FOUND: string;
+export const QR_AMBIGUOUS: string;
+export const QR_NOT_PROVISIONING: string;
+export const QR_TOO_LONG: string;
+
+/** A QR was read, but what it contained is not something Sigil will act on. */
+export class QrScanError extends Error {
+  constructor(message: string, code: string);
+  code: string;
+}
+
+/**
+ * Can this browser read a QR code at all?
+ *
+ * ⚠️ TWO-PART AND ASYNC: the constructor existing is not enough, the browser
+ * must also support the `qr_code` format. ⛔ False in Firefox, in Safari and on
+ * Linux Chromium — the unsupported branch is a real product state.
+ */
+export function qrSupport(): Promise<boolean>;
+
+/** Decode EXACTLY ONE QR out of an image; refuses zero and refuses several. */
+export function decodeQrImage(blob: Blob): Promise<string>;
+
+/** Classify a decoded payload; refuses anything that is not an otpauth setup code. */
+export function classifyQrPayload(text: string): {
+  kind: "otpauth" | "migration";
+  text: string;
+};
+
+/**
+ * Blob in, classified provisioning payload out.
+ *
+ * ⭐ Does NOT touch the vault: the caller must show the user what was found and
+ * have them confirm. A scan must never silently create an account.
+ */
+export function scanProvisioningImage(blob: Blob): Promise<{
+  kind: "otpauth" | "migration";
+  text: string;
+}>;
+
+/** The first image on a `paste` or `drop` event, or null. Needs no permission. */
+export function imageFromEvent(event: ClipboardEvent | DragEvent): Blob | null;
+
+/** Render a scan failure for a user. Never includes the scanned payload. */
+export function explainQrError(err: unknown): string;

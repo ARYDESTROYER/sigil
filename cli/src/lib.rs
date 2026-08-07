@@ -3013,7 +3013,73 @@ pub fn parse_otpauth_uri(uri: &str) -> Result<TotpEntry, CliError> {
         ));
     }
 
+    // ⭐ THE UNTRUSTED-TEXT GATE (Phase 63). Everything above merely *parsed* the
+    // URI; this is where we decide whether a stranger is allowed to ask for it.
+    // Every ingest door funnels through `check_provisioning`, so a new one
+    // cannot quietly get a weaker rule. See `sigil_core::validate_provisioning`.
+    check_provisioning(&label, issuer.as_deref(), secret.len(), digits, period)?;
+
     new_totp_entry(&label, issuer, &secret, algorithm, digits, period)
+}
+
+/// Apply [`sigil_core::validate_provisioning`] to a request built from UNTRUSTED
+/// TEXT, mapping the refusal onto this crate's error type.
+///
+/// ⚠️ **This is an INGEST-ONLY check, and that asymmetry is deliberate** (ADR
+/// 0047's rule, reused): it bounds what a stranger may CREATE and never what a
+/// user already HAS. Nothing on the read path calls it, so an entry already in
+/// someone's vault keeps generating codes — refusing to render it would delete
+/// a working account to punish the user for a value we let in.
+///
+/// ⚠️ It is deliberately NOT called from [`new_totp_entry`]. That constructor is
+/// also reached by `sigil totp add --secret … --period N`, where the number came
+/// from the operator's own keyboard. The trust boundary this gate draws is *the
+/// text came from somewhere else* — a URI, a migration blob, a scanned QR — not
+/// *an entry is being created*.
+///
+/// # Errors
+/// - [`CliError::Totp`] naming the bound that was exceeded.
+pub fn check_provisioning(
+    label: &str,
+    issuer: Option<&str>,
+    secret_len: usize,
+    digits: u32,
+    period: u32,
+) -> Result<(), CliError> {
+    sigil_core::validate_provisioning(label, issuer, secret_len, digits, period)
+        .map_err(|e| CliError::Totp(e.to_string()))
+}
+
+/// The warning a user must see for an entry whose time step is so long the code
+/// does not meaningfully rotate — or `None` for an ordinary entry.
+///
+/// ⭐ THIS IS THE READ-PATH COUNTERPART TO THE INGEST CEILING, AND IT EXISTS
+/// BECAUSE THE CEILING IS DELIBERATELY NOT RETROACTIVE. Phase 63 stopped a
+/// stranger's URI from CREATING a frozen entry, but it refuses to stop rendering
+/// one that is already in a vault — deleting a user's account to punish them for
+/// a value we let in would be the worse harm (ADR 0047's rule). The consequence
+/// is that a vault poisoned before this release still holds an entry whose "code"
+/// never changes, and until now the product displayed it with an ordinary-looking
+/// countdown, i.e. told the user their 2FA was fine when it was not.
+///
+/// ⛔ IT REPORTS AND NEVER CORRECTS. Nothing here changes the code, the period or
+/// the entry; an immutable entry stays immutable (ADR 0049). The only remedy is
+/// for the user to remove it and re-enrol with the service, which is what the
+/// text says.
+///
+/// ⚠️ Deliberately keyed off [`sigil_core::MAX_PERIOD`], the SAME constant the
+/// ingest gate uses, so the two can never disagree about what "too long" means.
+#[must_use]
+pub fn frozen_period_warning(period: u32) -> Option<String> {
+    if period <= sigil_core::MAX_PERIOD {
+        return None;
+    }
+    Some(format!(
+        "⚠️  this entry's time step is {period}s, so its code does not rotate on any \
+         human timescale — a single observation of it stays valid. Sigil no longer \
+         accepts an entry like this, but it will not delete one you already have. \
+         Remove it and re-enrol with the service to get a real rotating code."
+    ))
 }
 
 /// Percent-encode `s` for an `otpauth://` URI, escaping everything outside the
@@ -3307,6 +3373,36 @@ pub struct MergeReport {
 /// one must carry through a merge unchanged, in either order.
 /// The property test `merge_is_order_independent_over_generated_vaults` fails if
 /// this regresses.
+///
+/// ⚠️⚠️ **THE MERGE IS AN INGEST DOOR AND IT IS DELIBERATELY NOT GATED** — read
+/// this before "fixing" it. Phase 63's provisioning ceiling
+/// ([`check_provisioning`], over [`sigil_core::validate_provisioning`]) runs at
+/// [`parse_otpauth_uri`] and [`migration_otp_to_entry`], i.e. wherever an entry
+/// is BUILT FROM UNTRUSTED TEXT. An entry arriving through this function was
+/// built somewhere else and is adopted UNCHECKED: a co-owner of a shared vault
+/// can push a snapshot containing a `period` of 4294967295, and it lands.
+///
+/// ⭐ THAT IS INSIDE THE STATED TRUST MODEL, NOT A HOLE IN IT. Reaching this
+/// function at all requires holding the vault key (ADR 0035/0038) — a peer you
+/// deliberately shared with, whose key you pinned and whose safety number you
+/// were shown. A peer who can write entries can already write anything into a
+/// vault you chose to share; a period ceiling is not what stands between you.
+///
+/// ⛔ AND GATING IT WOULD BE THE WORSE BUG, in the precise direction Phase 61
+/// exists to avoid: **refusing to merge an entry is refusing to READ it**. Drop
+/// an entry here and the next re-seal writes a vault without it, that vault is
+/// pushed, and the account is gone from every device — data loss caused by a
+/// validator, which is the exact shape of the defect ADR 0049 repaired. The
+/// ingest ceiling bounds what a STRANGER MAY CREATE; it must never decide what a
+/// user may KEEP.
+///
+/// ⭐ SO THE DOOR IS DISCLOSED RATHER THAN CLOSED, and the mitigation lives on the
+/// READ path where it cannot destroy anything: [`frozen_period_warning`]
+/// (mirrored in JS as `frozenPeriodWarning`) is printed beside any such entry by
+/// every client, so a merged non-rotating entry is visible as one instead of
+/// wearing an ordinary countdown. `sigil-wasm/test/provisioning-interop.mjs`
+/// pins BOTH halves of this decision — that the merge still adopts the entry,
+/// and that the warning fires.
 #[must_use]
 pub fn merge_vaults(local: &TotpVault, remote: &TotpVault) -> (TotpVault, MergeReport) {
     let mut a = local.clone();
@@ -9182,6 +9278,49 @@ mod tests {
         assert_eq!(out["future_top"], serde_json::json!({"k": 1}));
         assert_eq!(out["other_top"], serde_json::json!("x"));
         assert_eq!(out["entries"][0]["icon"], serde_json::json!("github"));
+    }
+
+    #[test]
+    fn a_merge_adopts_a_peers_out_of_bounds_entry_and_the_read_path_warns_about_it() {
+        // ⭐⭐ THIS PINS A DECISION, NOT A DEFENCE, and it is written to go RED if
+        // someone later "hardens" the merge. Phase 63's provisioning ceiling runs
+        // where an entry is built from UNTRUSTED TEXT (`parse_otpauth_uri`,
+        // `migration_otp_to_entry`). An entry arriving through a Phase 61 vault
+        // MERGE — a co-owner of a shared vault pushing a snapshot — is adopted
+        // UNCHECKED. That is inside the stated trust model (reaching this function
+        // requires holding the vault key), and gating it would be the WORSE bug:
+        // refusing to merge an entry is refusing to READ it, after which the next
+        // re-seal pushes a vault without it. Data loss caused by a validator is
+        // the exact shape ADR 0049 was written to repair.
+        //
+        // So both halves are asserted, because either alone is the wrong product:
+        // the entry MUST survive the merge unchanged, and the READ path MUST say
+        // it does not rotate.
+        let mine = TotpVault::default();
+        let peers: TotpVault = serde_json::from_str(
+            r#"{"version":1,"entries":[{"label":"from-a-peer","secret":"aaaa",
+                "algorithm":"sha1","digits":6,"period":4294967295,
+                "uuid":"11111111-2222-4333-8444-555555555555"}]}"#,
+        )
+        .expect("peer vault");
+        let (merged, _) = merge_vaults(&mine, &peers);
+        let adopted = merged
+            .entries
+            .iter()
+            .find(|e| e.uuid.as_deref() == Some("11111111-2222-4333-8444-555555555555"))
+            .expect(
+                "the merge DROPPED a peer's out-of-bounds entry. That is data loss, not a \
+                 defence — see the doc comment on `merge_vaults`. If this was deliberate, \
+                 the decision recorded there has changed and must be re-argued.",
+            );
+        assert_eq!(
+            adopted.period, 4_294_967_295,
+            "the merge rewrote the peer's period — entries are immutable (ADR 0049)"
+        );
+        assert!(
+            frozen_period_warning(adopted.period).is_some(),
+            "the adopted entry would render with NO warning — the door is open AND silent"
+        );
     }
 
     #[test]

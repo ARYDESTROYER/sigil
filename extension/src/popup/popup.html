@@ -113,6 +113,13 @@
 
     <!-- ── unlocked ───────────────────────────────────────────────────────── -->
     <section id="view-unlocked" hidden data-testid="view-unlocked">
+      <!-- ⛔ The vault-size warning (Phase 63). A vault that has outgrown the
+           server's 64 KiB op body cannot be shrunk from here — tombstones are
+           never pruned and there is no compaction command — so it is a
+           persistent alert at the top of the vault, not a toast attached to
+           whichever import caused it. Set by `persist()`, which is the single
+           place this popup seals the vault, so every growth path reaches it. -->
+      <p id="size-warning" class="warn" role="alert" hidden data-testid="vault-size-warning"></p>
       <ul id="accounts" class="accounts" data-testid="accounts"></ul>
       <p id="empty" class="hint" data-testid="empty">
         No accounts yet. Add one below.
@@ -121,7 +128,13 @@
       <details class="panel">
         <summary data-testid="add-toggle">Add an account</summary>
 
-        <form id="add-form" autocomplete="off">
+        <!-- ⭐ `novalidate` ON PURPOSE. With native constraint validation on, an
+             out-of-range period is swallowed behind a generic browser tooltip and
+             the submit handler never runs — the user is refused without being told
+             WHY. Turning it off makes ONE control authoritative
+             (`validateProvisioning`, the same one the URI / migration / QR doors
+             use) and lets it say that a code that long does not rotate. -->
+        <form id="add-form" autocomplete="off" novalidate>
           <h3>From a secret</h3>
           <label for="add-label">Label</label>
           <input id="add-label" required data-testid="add-label" />
@@ -144,11 +157,60 @@
             </span>
             <span>
               <label for="add-period">Period</label>
+              <!-- ⚠️ NO `max` LITERAL HERE. `popup.js` sets it from the vendored
+                   `MAX_PERIOD`, the same constant the provisioning gate uses — a
+                   hand-written 600 in markup would be a fourth copy nobody
+                   guards. The attribute is only an affordance; the control is
+                   `validateProvisioning` in the submit handler. -->
               <input id="add-period" type="number" min="1" value="30" data-testid="add-period" />
             </span>
           </div>
           <button type="submit" class="primary" data-testid="add-submit">Add account</button>
         </form>
+
+        <!-- Scan a QR code (Phase 63). Image only: a screenshot pasted or a file
+             picked. ⛔ NO CAMERA in the popup — a permission prompt is browser
+             chrome, and taking focus destroys a popup, so the camera would be a
+             button that closes the window. -->
+        <section id="qr-section" data-testid="qr-panel">
+          <h3>Scan a QR code</h3>
+          <p id="qr-probing" class="dim" data-testid="qr-probing">
+            Checking whether this browser can read QR codes…
+          </p>
+          <p
+            id="qr-unsupported"
+            class="warn"
+            role="alert"
+            data-testid="qr-unsupported"
+            hidden
+          >
+            This page cannot read QR codes. Either the browser does not support
+            it (Chrome and Edge do; Firefox and Safari do not), or the page was
+            not loaded over a secure origin. Paste the <code>otpauth://</code>
+            setup link below instead; it does exactly the same job.
+          </p>
+          <div id="qr-supported" hidden>
+            <p class="dim">
+              Take a screenshot of the QR code and paste it here, or choose an
+              image file. Nothing is added until you confirm it.
+            </p>
+            <label for="qr-file-input">Choose a QR code image</label>
+            <input
+              id="qr-file-input"
+              type="file"
+              accept="image/*"
+              data-testid="qr-file-input"
+            />
+          </div>
+          <div id="qr-preview" data-testid="qr-preview" hidden>
+            <p>Found: <span id="qr-summary" data-testid="qr-summary"></span></p>
+            <button type="button" class="primary" data-testid="qr-confirm" id="qr-confirm">
+              Add this account
+            </button>
+            <button type="button" data-testid="qr-cancel" id="qr-cancel">Cancel</button>
+          </div>
+          <p id="qr-error" class="warn" role="alert" data-testid="qr-error" hidden></p>
+        </section>
 
         <form id="uri-form" autocomplete="off">
           <h3>From an <code>otpauth://</code> URI</h3>

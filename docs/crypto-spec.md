@@ -1281,6 +1281,73 @@ op-log later with no new format. The CLI supplies the wall clock and the entropy
 the core supplies only the OTP math. See
 [ADR 0023](decisions/0023-totp-hotp-primitive-and-cli-vault.md).
 
+### Bounds on a provisioning payload — the untrusted-text gate
+
+See [ADR 0051](decisions/0051-provisioning-bounds-and-qr-ingest.md). This is
+**not cryptography** and is recorded here because it sits directly on the OTP
+primitive and decides what parameters that primitive is ever asked to compute
+with.
+
+An `otpauth://` URI, a Google Authenticator `otpauth-migration://` blob and a
+scanned QR code are all **text supplied by a stranger**. Until Phase 63 the only
+bounds on that text were `digits ∈ 6..=10` and `period != 0`, which left `period`
+a bare `u32`.
+
+⛔ **`period = 2³²−1` produces a code that never changes.** The TOTP counter is
+`floor(unix_time / period)`, so the counter stays `0` until roughly the year 2106.
+Measured on the shipped code, the entry produced **755224 at t=59, at t=1.9×10⁹
+and at t=4×10⁹** — and rendered with an **ordinary countdown**, so the user
+believes they hold a rotating second factor when they hold a static secret. A
+single observation of that code stays valid indefinitely.
+
+`sigil_core::validate_provisioning()` is the single source of the rule
+(`libsigil/core/src/totp.rs`), mirrored once in
+`sigil-wasm/totp-migration.mjs::validateProvisioning`:
+
+| Constant | Value | What it bounds |
+|---|---|---|
+| `MAX_PERIOD` | 600 s | The time step. 5× the largest value seen in the wild; still rotates 144×/day. |
+| `MAX_SECRET_BYTES` | 1024 | Storage and sync size — **not** security; HMAC accepts any key length. |
+| `MAX_LABEL_CHARS` | 256 code points | Label and issuer, separately. |
+| `is_unsafe_display_char` | `U+0000..=U+001F`, `U+007F..=U+009F`, `U+202A..=U+202E`, `U+2066..=U+2069` | Controls and **bidirectional overrides/isolates**, which reorder surrounding text so one account renders as another issuer's name. ⭐ Ordinary RTL **script** is untouched. |
+| `MIN_DIGITS`/`MAX_DIGITS` | 6..=10 | Pre-existing; moved inside the one gate. |
+| `MAX_PROVISIONING_ENTRIES` | 512 per payload | Chosen against `sigild`'s 64 KiB op cap: a realistic entry serializes to ~182 bytes, so a vault stops being pushable near 360 entries. Checked **inside** the decode loop, so a hostile payload's accounts are never allocated. |
+
+⭐⭐ **The ceiling is INGEST-ONLY, and this is the load-bearing property.** It runs
+at the two sites where an entry is *built from untrusted text*
+(`parse_otpauth_uri` / `parseOtpauthUri`, `migration_otp_to_entry` /
+`migrationOtpToEntry`) and **nowhere on the read path**. A vault that already
+holds an out-of-bounds entry **still opens and still generates that entry's
+codes**. Refusing to *add* is a different act from refusing to *read*: the second
+would delete a working account to punish the user for a value we let in, and under
+[ADR 0049](decisions/0049-entry-identity-and-the-mergeable-vault.md) the deletion
+would **propagate to every device**.
+
+⭐ **A ceiling only — there is deliberately no floor.** No minimum secret length,
+no minimum period. A weak credential is chosen by the *service*; refusing it locks
+the user out of an account they must use. The interop suite pins a two-character
+secret as **accepted** so a later "hardening" must argue for itself. This is the
+same call [ADR 0047](decisions/0047-container-parameter-ceiling-and-no-downgrade-ratchet.md)
+made for Argon2id work factors.
+
+**The read-path counterpart.** `sigil_cli::frozen_period_warning` /
+`frozenPeriodWarning`, keyed off the **same** `MAX_PERIOD`, is rendered beside such
+an entry by all four clients. ⛔ It **reports and never corrects** — nothing
+changes, hides or refuses the entry; the text names the only remedy, which is to
+re-enrol with the service.
+
+⚠️ **Two doors are deliberately left open and are documented rather than closed:**
+`sigil totp add --period N` (a number the operator typed is not a stranger's
+payload), and the Phase 61 **vault merge** (refusing to merge an entry is refusing
+to read it). Both are pinned by tests so a later change must re-argue them.
+
+⚠️ **The gate is a MIRROR and a drift is invisible** — a divergence between the
+Rust and JS rules produces entries that look completely ordinary on every client.
+`sigil-wasm/test/provisioning-interop.mjs` drives the **real `sigil` binary** and
+the JS module over one shared vector table **and pins 600 / 1024 / 256 against
+golden literals**, because a cross-language equality check passes a coordinated
+retune.
+
 ## TOTP entry identity — the `sigil-totp-entry-id-v1` derivation
 
 See [ADR 0049](decisions/0049-entry-identity-and-the-mergeable-vault.md) for why

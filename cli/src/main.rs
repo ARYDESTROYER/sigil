@@ -3018,6 +3018,28 @@ fn rekey_hint(_path: &std::path::Path, tried: &[u8]) -> String {
 
 /// Seal `vault` under `password` and write it to `path` with mode 0600, creating
 /// the parent directory (mode 0700) if needed.
+/// Print the sealed-vault size warning for the vault at `path`, if there is one.
+///
+/// ⭐ CALLED AT THE MOMENT THE VAULT GROWS, not only before a push. Until Phase
+/// 63 [`sigil_cli::op_body_size_warning`] was reached only from `sigil totp sync`
+/// and from the server's `413`, so a user who imported a large Google
+/// Authenticator export learned their vault no longer syncs at the moment they
+/// lost syncing — long after the choice that caused it, and with no supported way
+/// to shrink it (tombstones are never pruned and there is no `compact`). It is
+/// the SAME function the push path uses, so the two thresholds cannot drift.
+///
+/// The vault file IS the sealed container, so its length on disk is exactly the
+/// op body that would be pushed. Goes to stderr so a piped stdout is unaffected.
+fn warn_vault_size(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    if let Some(w) = sigil_cli::op_body_size_warning(len) {
+        eprintln!("sigil: ⚠️  {w}");
+    }
+}
+
 fn save_vault(path: &std::path::Path, password: &[u8], vault: &TotpVault) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
@@ -3311,6 +3333,7 @@ fn cmd_totp_add(args: Vec<String>) -> Result<(), String> {
     vault.add(entry).map_err(|e| e.to_string())?;
     save_vault(&vault_path, &password, &vault)?;
     println!("added {label:?} to vault {}", vault_path.display());
+    warn_vault_size(&vault_path);
     Ok(())
 }
 
@@ -3347,6 +3370,11 @@ fn cmd_totp_list(args: Vec<String>) -> Result<(), String> {
             period = e.period,
             id = &id[..8.min(id.len())],
         );
+        // The listing is where a user reviews what they hold, so a non-rotating
+        // entry has to be visible here too, not only when its code is asked for.
+        if let Some(w) = sigil_cli::frozen_period_warning(e.period) {
+            eprintln!("    {w}");
+        }
     }
     Ok(())
 }
@@ -3412,6 +3440,12 @@ fn cmd_totp_code(args: Vec<String>) -> Result<(), String> {
     };
     let (code, remaining) = entry.code_at(now).map_err(|e| e.to_string())?;
     println!("{code}  (valid for {remaining}s)");
+    // ⭐ A frozen entry printed a normal-looking countdown and said nothing. The
+    // warning goes to STDERR so `sigil totp code x | pbcopy` still pipes exactly
+    // the code, while a human at a terminal cannot miss it.
+    if let Some(w) = sigil_cli::frozen_period_warning(entry.period) {
+        eprintln!("{w}");
+    }
     Ok(())
 }
 
@@ -3804,6 +3838,13 @@ fn cmd_totp_import(args: Vec<String>) -> Result<(), String> {
 
     if imported > 0 {
         save_vault(&vault_path, &password, &vault)?;
+        // ⭐ WARN AT THE MOMENT THE VAULT GROWS. A bulk import is the one motion
+        // that can take a vault past the server's 64 KiB op body in a single
+        // step: the Phase 63 provisioning ceiling permits 512 accounts in one
+        // payload, and 512 realistic entries seal to ~86 KB. Saying so here —
+        // while the user still has the old app and a choice — is the difference
+        // between a plan and a 413.
+        warn_vault_size(&vault_path);
     }
     println!(
         "imported {imported} into {} ({} duplicate, {} HOTP, {} invalid skipped)",

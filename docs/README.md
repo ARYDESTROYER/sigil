@@ -52,7 +52,13 @@ product** that they could print the recovery kit that prevents permanent account
 loss, and a clock diagnostic that is ⛔ **a reading and never a correction**; it is
 also the one recent phase where **`sigild` was modified**, by exactly one additive
 line, and it says so rather than reaching for the usual *"`sigild` gained
-nothing"*).
+nothing"*) and
+[0051](decisions/0051-provisioning-bounds-and-qr-ingest.md) (a provisioning URI
+from a stranger could install an entry whose code **never changes**, rendered with
+an ordinary countdown — a static secret in a rotating costume — and it is the ADR
+to read for the rule this project keeps reusing: ⭐ **refusing to ADD is a
+different act from refusing to READ**, so the ceiling is ingest-only, has
+deliberately **no floor**, and leaves the vault merge ungated on purpose).
 
 **What is real, and what is not.** The cryptography is real and
 **unaudited**. `sigild` is a working dev server whose stateful surface is
@@ -109,7 +115,18 @@ hostile server can lie about, and the desktop's clock UI is **by-eye only** whil
 the browsers' clock specs run against a **test double**; and two clients had been
 telling users **in the product** that they *"cannot print"* a recovery kit — false
 since Phase 56 — which is worth reading as a warning about how this project's
-in-product claims drift, not only its documents. Each
+in-product claims drift, not only its documents. Since Phase 63
+([0051](decisions/0051-provisioning-bounds-and-qr-ingest.md)), add three about
+what a **stranger's provisioning payload** can still do: the new bounds are
+**ingest-only and not retroactive**, so a vault poisoned before this release keeps
+its non-rotating entry (all four clients now *warn* about it, and ⛔ the warning
+**reports and never corrects**); the **vault merge is deliberately not gated**, so
+a co-owner of a shared vault can introduce such an entry; and `sigil totp
+--period N` is deliberately exempt, so the CLI can still create one on purpose.
+Add one more that is about reach rather than about us: **QR scanning depends on
+`BarcodeDetector`**, which Firefox, Safari and Linux Chromium lack and which is
+**secure-context gated** — so a page served over plain HTTP from a LAN address
+gets no scanner, and **no CI runner exercises the supported branch**. Each
 ADR ends with its own limits, and they are meant to be read as
 findings-in-waiting rather than disclaimers.
 

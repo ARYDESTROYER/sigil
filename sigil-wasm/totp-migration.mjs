@@ -341,6 +341,12 @@ function decodeMigrationPayload(buf) {
     const field = tag >> 3;
     const wire = tag & 0x07;
     if (field === 1 && wire === WIRE_LEN) {
+      // ⭐ THE COUNT CEILING, CHECKED BEFORE THE PUSH (Phase 63). MIRRORS the
+      // same call in `cli/src/migration.rs`. Nothing in the wire format bounds
+      // how many accounts a payload declares, so this loop was an unbounded
+      // allocation driven entirely by attacker input. Refusing here means we
+      // never build the list we would then throw away.
+      validateProvisioningCount(out.otps.length + 1);
       out.otps.push(decodeOtpParameters(readLenDelimited(cur)));
     } else if (field === 2 && wire === WIRE_VARINT) {
       out.version = Number(readVarint(cur));
@@ -451,6 +457,195 @@ function encodeMigrationPayload(params) {
  *   - No period in the format → 30 s. `issuer` omitted when empty.
  * Returns a TotpEntry, or `null` for a HOTP entry the caller should skip.
  */
+// ─────────────────── the untrusted-text provisioning gate (Phase 63) ──────────
+//
+// ⭐ MIRRORED — NOT SHARED — from `libsigil/core/src/totp.rs`
+// (`validate_provisioning`, `MAX_PERIOD`, `MAX_SECRET_BYTES`, `MAX_LABEL_CHARS`,
+// `is_unsafe_display_char`) and `cli/src/lib.rs` (`check_provisioning`).
+// **These MUST stay byte-identical to the Rust rule.** A drift downward is
+// INVISIBLE: entries a stranger created would look ordinary on every client.
+// The guard is `sigil-wasm/test/provisioning-interop.mjs`, which drives the REAL
+// `sigil` binary and this module over ONE shared table of hostile vectors AND
+// pins the numbers against GOLDEN LITERALS — because a cross-language *equality*
+// check passes a coordinated rename (the Phase 57 `"recovery-kit"` lesson).
+//
+// ⚠️ INGEST ONLY, and the asymmetry is the point (ADR 0047's rule): this bounds
+// what a stranger may CREATE, never what a user already HAS. Nothing on the read
+// path calls it — `codeForEntry` still renders an entry with any period, forever
+// — because refusing to display an existing entry would delete a working account
+// to punish the user for a value we let in.
+//
+// ⚠️ `addEntry` is deliberately NOT gated. It is also reached by the "add by
+// form" UI, where the numbers came from the user's own keyboard. The boundary
+// drawn here is *the text came from somewhere else* — a URI, a migration blob, a
+// scanned QR — not *an entry is being created*. Same boundary as the CLI's
+// `--period` exemption.
+
+/** Largest time step a provisioning URI may request. MIRRORS sigil_core::MAX_PERIOD. */
+export const MAX_PERIOD = 600;
+/** Largest decoded secret a provisioning URI may carry. MIRRORS sigil_core::MAX_SECRET_BYTES. */
+export const MAX_SECRET_BYTES = 1024;
+/** Largest label/issuer, in code points. MIRRORS sigil_core::MAX_LABEL_CHARS. */
+export const MAX_LABEL_CHARS = 256;
+/**
+ * Largest number of accounts one bulk-import payload may carry.
+ * MIRRORS sigil_core::MAX_PROVISIONING_ENTRIES — see that constant for why 512
+ * (it sits just inside the point where the resulting vault stops fitting in
+ * sigild's 64 KiB op body, so it cannot refuse an import that would have worked).
+ */
+export const MAX_PROVISIONING_ENTRIES = 512;
+
+/**
+ * Refuse a bulk-import payload carrying more than [`MAX_PROVISIONING_ENTRIES`]
+ * accounts. MIRRORS `sigil_core::validate_provisioning_count`.
+ *
+ * ⭐ Call this INSIDE the decode loop, not after it — checking the finished list
+ * means allocating everything a hostile payload asked for and only then deciding
+ * not to keep it, which is the allocation this bound exists to prevent.
+ *
+ * @param {number} count accounts decoded so far, including the one about to be pushed
+ */
+export function validateProvisioningCount(count) {
+  if (count > MAX_PROVISIONING_ENTRIES) {
+    throw new Error(
+      `import carries more than ${MAX_PROVISIONING_ENTRIES} accounts (reached ${count})`,
+    );
+  }
+}
+
+/**
+ * True for a code point that must never appear in a label or issuer: C0/C1
+ * controls, and the bidirectional OVERRIDE/ISOLATE format characters that let a
+ * label render as a different issuer's name inside our own trusted UI.
+ *
+ * ⭐ Ordinary right-to-left SCRIPT is untouched — Arabic and Hebrew letters carry
+ * their own direction and need none of these. MIRRORS `is_unsafe_display_char`.
+ */
+export function isUnsafeDisplayChar(cp) {
+  return (
+    (cp >= 0x00 && cp <= 0x1f) ||
+    (cp >= 0x7f && cp <= 0x9f) ||
+    (cp >= 0x202a && cp <= 0x202e) ||
+    (cp >= 0x2066 && cp <= 0x2069)
+  );
+}
+
+function hasUnsafeDisplayChar(s) {
+  for (const ch of s) {
+    if (isUnsafeDisplayChar(ch.codePointAt(0))) return true;
+  }
+  return false;
+}
+
+function countChars(s) {
+  let n = 0;
+  // eslint-disable-next-line no-unused-vars
+  for (const _ of s) n += 1;
+  return n;
+}
+
+/**
+ * Check a provisioning request built from UNTRUSTED TEXT. Throws with the same
+ * classification the Rust side reports. MIRRORS `sigil_core::validate_provisioning`.
+ *
+ * ⚠️ The thrown message names a BOUND and a COUNT, never the offending string —
+ * echoing attacker-controlled text into a trusted surface is a free UI-spoofing
+ * primitive, which is the very thing the text rules exist to stop.
+ *
+ * @param {string} label
+ * @param {string|null|undefined} issuer
+ * @param {number} secretLen decoded secret length in BYTES
+ * @param {number} digits
+ * @param {number} period
+ */
+export function validateProvisioning(label, issuer, secretLen, digits, period) {
+  if (label.length === 0) throw new Error("label must not be empty");
+  const labelChars = countChars(label);
+  if (labelChars > MAX_LABEL_CHARS) {
+    throw new Error(`label is ${labelChars} characters, over the ${MAX_LABEL_CHARS} maximum`);
+  }
+  if (issuer !== null && issuer !== undefined) {
+    const issuerChars = countChars(issuer);
+    if (issuerChars > MAX_LABEL_CHARS) {
+      throw new Error(`issuer is ${issuerChars} characters, over the ${MAX_LABEL_CHARS} maximum`);
+    }
+    if (hasUnsafeDisplayChar(issuer)) {
+      throw new Error(
+        "label or issuer contains a control or text-direction-override character, " +
+          "which can make one account display as another",
+      );
+    }
+  }
+  if (hasUnsafeDisplayChar(label)) {
+    throw new Error(
+      "label or issuer contains a control or text-direction-override character, " +
+        "which can make one account display as another",
+    );
+  }
+  if (secretLen > MAX_SECRET_BYTES) {
+    throw new Error(`secret is ${secretLen} bytes, over the ${MAX_SECRET_BYTES}-byte maximum`);
+  }
+  if (!Number.isInteger(digits) || digits < 6 || digits > 10) {
+    throw new Error(`digits ${digits} out of range 6..=10`);
+  }
+  if (period === 0) throw new Error("period must be non-zero");
+  if (!Number.isInteger(period) || period < 0) {
+    throw new Error(`period ${period} must be a positive integer`);
+  }
+  if (period > MAX_PERIOD) {
+    throw new Error(
+      `period ${period}s exceeds the maximum of ${MAX_PERIOD}s: a code that long does not ` +
+        "rotate, so it is not a one-time password",
+    );
+  }
+}
+
+/**
+ * The warning a user must see for an entry whose time step is so long the code
+ * does not meaningfully rotate — or `null` for an ordinary entry.
+ *
+ * ⭐ MIRRORED — NOT SHARED — from `cli/src/lib.rs::frozen_period_warning`, and
+ * keyed off the SAME `MAX_PERIOD` the ingest gate uses so the two can never
+ * disagree about what "too long" means. `provisioning-interop.mjs` drives both
+ * halves over one table of periods.
+ *
+ * ⭐⭐ THIS IS THE READ-PATH COUNTERPART TO THE INGEST CEILING, AND IT EXISTS
+ * BECAUSE THE CEILING IS DELIBERATELY NOT RETROACTIVE (ADR 0047's rule: bound
+ * what a stranger may CREATE, never what a user already HAS). Three routes put
+ * an out-of-bounds entry in front of a browser and NONE of them is the ingest
+ * gate:
+ *
+ *   1. a vault sealed before this release, opened now;
+ *   2. `sigil totp add --secret … --period N`, which is deliberately exempt
+ *      because the operator typed the number themselves;
+ *   3. ⚠️ A PHASE 61 VAULT MERGE — a co-owner of a shared vault pushes a
+ *      snapshot and `mergeVaults` adopts every entry in it unchecked. See the
+ *      block comment on `mergeVaults` in `totp-vault.mjs` for why that door is
+ *      deliberately left open rather than gated.
+ *
+ * Until this existed the product rendered such an entry with an ordinary-looking
+ * countdown — i.e. told the user their second factor was fine when it was a
+ * static secret in a rotating costume, which is the exact defect Phase 63 opened
+ * with. The CLI has warned since Phase 63; this is the browser half.
+ *
+ * ⛔ IT REPORTS AND NEVER CORRECTS. Nothing here changes the code, the period or
+ * the entry — an entry is immutable (ADR 0049) — and nothing here refuses to
+ * display it. The only remedy is for the user to remove it and re-enrol with the
+ * service, which is what the text says.
+ *
+ * @param {number} period the entry's time step in seconds
+ * @returns {string|null}
+ */
+export function frozenPeriodWarning(period) {
+  if (!Number.isFinite(period) || period <= MAX_PERIOD) return null;
+  return (
+    `This entry's time step is ${period}s, so its code does not rotate on any human ` +
+    `timescale — a single observation of it stays valid. Sigil no longer accepts an entry ` +
+    `like this, but it will not delete one you already have. Remove it and re-enrol with ` +
+    `the service to get a real rotating code.`
+  );
+}
+
 function migrationOtpToEntry(otp) {
   if (otp.otpType === OTP_HOTP) return null;
   if (otp.otpType !== OTP_TOTP) {
@@ -484,6 +679,17 @@ function migrationOtpToEntry(otp) {
 
   if (otp.secret.length === 0) throw new Error("entry has an empty secret");
   if (otp.name.length === 0) throw new Error("entry has an empty name");
+
+  // ⭐ The untrusted-text gate, on the door that carries MANY accounts at once.
+  // `period` is not attacker-chosen here (the wire format has no period field),
+  // but the name, the issuer and the secret length all are.
+  validateProvisioning(
+    otp.name,
+    otp.issuer.length > 0 ? otp.issuer : null,
+    otp.secret.length,
+    digits,
+    TOTP_DEFAULT_PERIOD,
+  );
 
   const entry = {
     label: otp.name, // migration keeps the full name as the label (no split)
@@ -706,12 +912,10 @@ export function parseOtpauthUri(uri) {
   let issuer = issuerFromQuery ?? issuerFromLabel;
   if (issuer !== null && issuer.length === 0) issuer = null;
   if (label.length === 0) throw new Error("otpauth URI has an empty account label");
-  if (!Number.isInteger(digits) || digits < 6 || digits > 10) {
-    throw new Error(`digits ${digits} out of range 6..=10`);
-  }
-  if (!Number.isInteger(period) || period <= 0) {
-    throw new Error(`period ${period} must be a positive integer`);
-  }
+  // ⭐ THE UNTRUSTED-TEXT GATE (Phase 63). Everything above merely *parsed* the
+  // URI; this is where we decide whether a stranger may ask for it. A scanned QR
+  // reaches this exact line, which is why the gate lives here and not in the UI.
+  validateProvisioning(label, issuer, secretBytes.length, digits, period);
 
   const entry = {
     label,

@@ -10936,3 +10936,230 @@ rather than quietly scanning something else.
 advisory will fail this job until someone edits the line. That is the *loud* direction. A
 float goes stale **silently**, in whichever direction a third-party manifest happens to lag
 — which is what just happened.
+
+## 2026-08-07 — Phase 63: a stranger's setup code could install a second factor that never rotates
+
+**ADR:** [0051](docs/decisions/0051-provisioning-bounds-and-qr-ingest.md).
+**Server:** untouched — `git status --short sigild/` is empty. **Dependencies:**
+untouched — `git diff --stat` over every `Cargo.toml` / `package.json` / `go.mod`
+/ `go.sum` is empty, and both wasm-pure lockfiles are still `getrandom`==0.
+
+### The defect, reproduced before a line was written
+
+`otpauth://` is a format defined by a stranger's server and handed to us as text.
+The only bounds on it were `digits ∈ 6..=10` and `period != 0`, which left
+`period` a bare `u32`. A TOTP counter is `floor(unix_time / period)`, so:
+
+```
+otpauth://totp/Evil:victim?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Evil&period=4294967295
+```
+
+was **accepted and stored**, and produced **755224 at t=59, at t=1.9×10⁹ and at
+t=4×10⁹**. One code. Forever.
+
+⛔ **The harm is the disguise, not the freeze.** It rendered with a label, an
+issuer and an **ordinary-looking countdown** — indistinguishable from a working
+second factor. The user believes they enabled 2FA; what they have is a **static
+secret in a rotating costume**, where one shoulder-surf or one screenshot stays
+valid indefinitely. An obviously-broken entry costs a retry. An entry that lies
+about rotating costs the protection the user thinks they have, silently, for as
+long as the account exists.
+
+⚠️ **We already knew the trick worked.** `desktop/core/tests/cli_interop.rs` uses
+exactly this — a period so large the counter never advances — to pin a clock
+across two processes, and says so in a comment. We used it deliberately as a test
+artifice and never once asked what happened when a *stranger* asked for it.
+
+### ⭐ Why now, in one sentence
+
+> **Every existing door to this defect had a human reading the URI. A QR is opaque
+> to humans by construction, so it removes the last reviewer.**
+
+Pasting the URI at least *permits* someone to notice `period=4294967295`. Almost
+nobody would — but a possibility was the only thing there, and a possibility is
+not a control. A QR has no human-readable surface at all. So the ordering was
+deliberate: **the parser was hardened before the scanner shipped.** Adding a
+frictionless ingest door on top of an unbounded parser is adding a delivery
+mechanism to a known defect.
+
+### What was built
+
+Six bounds, single-sourced in `libsigil/core/src/totp.rs`
+(`validate_provisioning` / `validate_provisioning_count` /
+`is_unsafe_display_char` / `ProvisioningError`), mirrored once in
+`sigil-wasm/totp-migration.mjs`, reached by the CLI and desktop through
+`sigil_cli::check_provisioning` and by both browsers and the QR scanner through
+the JS copy: `period ≤ 600`, secret `≤ 1024 B`, label and issuer `≤ 256` code
+points, no C0/C1 controls and no bidi overrides/isolates (**ordinary RTL script
+untouched** — Arabic and Hebrew are pinned as *accepted*), `digits ∈ 6..=10`, and
+`≤ 512` accounts per payload checked **inside the decode loop**.
+
+⭐ **512 was chosen against this system's own limit, not against taste.** A
+realistic entry serializes to ~182 bytes and `sigild` caps an op body at 64 KiB,
+so a vault stops being pushable near 360 entries. 512 sits inside that band and
+far above any human 2FA collection, so it cannot refuse a real migration.
+
+⭐⭐ **The rule that made it safe, taken from ADR 0047: the ceiling is
+INGEST-ONLY. Refusing to ADD is a different act from refusing to READ.** It runs
+at the two sites where an entry is built from untrusted text and nowhere on the
+read path, so a vault already holding an out-of-bounds entry **still opens and
+still generates its codes**. The alternative would delete a working account to
+punish the user for a value we let in — and under ADR 0049 that deletion would
+**propagate to every device**. There is deliberately **no floor** either: a weak
+credential is the *service's* choice, and a two-character secret is pinned as
+accepted so a later "hardening" has to argue for itself.
+
+The read-path counterpart is `frozen_period_warning` / `frozenPeriodWarning`,
+keyed off the **same** `MAX_PERIOD`, rendered by **all four clients**. ⛔ It
+**reports and never corrects.**
+
+QR ingest is `sigil-wasm/qr-scan.mjs` — zero dependencies, no crypto, no state, a
+thin shell over the platform's `BarcodeDetector`. It is **a new SOURCE for a
+format we already parse, not a new format**: it produces a bounded string and
+hands it to the hardened parsers, so no second parser and no second set of bounds.
+The decoder was delegated on a measurement, not on taste — `rqrr` 0.10.1 took
+**94 seconds** on a 1.74-Mpx image tiled with finder patterns (smaller than a
+phone screenshot) against **11 ms** on a benign 1.17-Mpx one, all inside one
+non-interruptible call. It never touches the vault: it returns a payload the user
+must **confirm**.
+
+### ⚠️⚠️ The measurement error this phase made, and the agent that refused it
+
+This is the most instructive thing that happened, and it is recorded in full in
+[`docs/engineering-lessons.md`](docs/engineering-lessons.md) (table entry **#11**
+plus a new reasoning-error section).
+
+A capability probe for `BarcodeDetector` was run on **`about:blank`** and reported
+the API absent. `BarcodeDetector` is **secure-context gated**, and `about:blank` is
+not a secure context. The probe was correct about the page and **false about the
+browser**.
+
+The orchestrator acted on that premise: it **stopped a running workflow and
+instructed an agent to delete the QR work as unusable**. The agent **re-measured
+instead of obeying** — one browser, one session:
+
+```
+about:blank              isSecureContext=false   BarcodeDetector=undefined
+http://<LAN-IP>:port     isSecureContext=false   BarcodeDetector=undefined
+http://localhost:53838/  isSecureContext=true    BarcodeDetector=function  [… "qr_code" …]
+http://127.0.0.1:53838/  isSecureContext=true    BarcodeDetector=function  [… "qr_code" …]
+```
+
+The feature was correct and was kept.
+
+⭐ **The lesson is not "measure carefully"** — the probe *was* a real measurement
+on a real browser, which is exactly why its answer was persuasive. The lesson is
+that **an instruction from the orchestrator is a claim like any other, and an
+agent that verifies a premise instead of executing it is doing the job
+correctly.** Every other entry in the lessons document is about distrusting a
+green signal from our own tooling; this extends it one level up, because the
+briefing is our own tooling too.
+
+⭐ It also produced a real product finding, which is why the mistake was worth
+having: serving the app over plain HTTP from a **LAN address** — a phone pointed
+at a dev laptop, the obvious way someone would try to scan — silently loses the
+API. That is why `qrSupport()` is a **runtime** probe and why the user-facing
+message names the page's **origin** as a cause and not only the browser brand.
+
+### What verification found
+
+- **`docs-claims-guard.mjs` was RED before this doc pass, exactly as predicted** —
+  7 findings across 3 claims. Now **PASS**, with every count grepped rather than
+  guessed: node interop suites **21**, webapp Playwright **15 spec files / 78
+  tests**, extension **11 spec files / 39 tests**, desktop **26 unit + 9
+  integration = 35**, `sigil-wasm` native **41**, libsigil **165**, Tauri commands
+  still **42**, `sigild` direct Go dependencies still **1**.
+- ⚠️ **The briefing's own numbers were wrong and were not taken on trust.** It said
+  the webapp drifted 13 → **14** and the extension 9 → **10**. The tree says
+  **15** and **11**. Measured with `playwright test --list`, not inferred.
+- ⚠️ **I introduced a silent regression in the guard's coverage and caught it by
+  reading the output rather than the exit code.** Rewriting the prose *"the TWENTY
+  Node suites"* as *"TWENTY-ONE"* made the guard **pass** — while its agreeing-claim
+  count dropped **5 → 4**, because `twenty-one` is not in its word-number map, so
+  that sentence had silently left the guarded set. A green guard with one fewer
+  claim is the same failure mode this repo keeps shipping. Fixed by writing the
+  digit `21`; the count is back to **5**. **The doc was changed, not the guard.**
+- ✅ **The new suite is wired into CI** — `interop.yml` runs it as step **21/21**,
+  and `scripts/gate.sh`'s CI-drift check agrees. This repo has shipped un-run
+  suites three times, so this was checked directly rather than assumed.
+- ✅ Zero `MUTANT` markers remain anywhere in the tree; `extension/vendor/` really
+  does carry `qr-scan.mjs` (**nine** vendored helpers), so the extension QR specs
+  exercised current code and not a stale vendor.
+- ✅ `sigild` untouched, no dependency file touched, both lockfiles `getrandom`==0.
+  **`docs/api.md` therefore needed no edit** — nothing changed on the wire.
+
+### ⚠️ The fix agent's report overstated its own gate, in a small and instructive way
+
+The report opened with: *"RAN TWICE, IN FULL, WITH DOCKER UP. Both runs printed
+`gating: /Users/ary/Documents/GitHub/sigil (e68cfad)` — **the tree I meant**."*
+
+`gate.sh` line 25 is `git rev-parse --short HEAD`. **It prints the COMMIT.** All of
+Phase 63 is uncommitted, so that line prints `e68cfad` whether or not a single byte
+of this phase's work is present. It establishes the **path**, which is what it was
+added for (entry #6 in the lessons doc), and it says **nothing** about the contents
+of a dirty tree.
+
+⭐ **The report disproves its own reason for confidence three paragraphs later**: it
+notes (honestly, and to its credit) that it *edited `desktop/` during run #1, after
+that run's desktop stage had already passed* — i.e. the tree genuinely changed under
+a running gate while the identity line stayed byte-identical. The **action** taken
+was right (it re-ran the whole gate rather than patching run #1's numbers); the
+**stated justification** was not. The substance held; the evidence cited for it did
+not support it.
+
+**Open, and not fixed here** (this was a documentation pass; no source was
+touched): `gate.sh`'s identity line cannot distinguish two different dirty trees at
+the same commit. A `git status --short | wc -l` or a `git stash create` tree hash
+beside the sha would close it. Recorded so the next person does not re-derive it.
+
+### ⛔ Honest limits, as loud as the feature — all recorded in ADR 0051
+
+1. **`sigil totp add --period N` is deliberately ungated**, so a CLI user can still
+   create a frozen entry on purpose. The boundary drawn is *the text came from
+   somewhere else*, **not** *an entry is being created*.
+2. **The Phase 61 vault MERGE is an ingest door and is deliberately not gated.** A
+   co-owner of a shared vault can push a snapshot carrying such an entry and it is
+   adopted. That is inside the stated trust model (the merge requires the vault
+   key), and gating it would be the worse bug — **refusing to merge an entry is
+   refusing to READ it**, the data-loss direction ADR 0049 exists to repair. Pinned
+   by tests in **both** languages so a later "hardening" must re-argue it.
+3. **512 accounts can still produce a vault too large to sync.** The ceiling bounds
+   **one payload**; it does not promise the vault fits in the 64 KiB op body. All
+   four clients now warn at import time, but there is still **no `compact`**,
+   tombstones still grow without bound, and past the cap the only exit is export →
+   fresh vault id, which prints secrets in the clear.
+4. **The bounds are NOT retroactive**, by design. Nothing sweeps or repairs an
+   existing vault, and nothing will.
+5. **`BarcodeDetector` is secure-context gated** — a page served over plain HTTP
+   from anything but `localhost` gets **no scanner**. It is also absent in Firefox,
+   Safari and Linux Chromium, so ⛔ **no CI runner exercises the supported branch**;
+   CI exercises the *unsupported* one, which is the branch its users are in, so that
+   is a real assertion rather than a skip.
+6. **`noValidate` on both add-forms has a real UX cost**, not papered over: in the
+   extension an empty secret now reports *"base32 secret decoded to zero bytes"*
+   rather than the browser's own prompt, and with both label and secret empty the
+   secret message wins. It was accepted so that **one** control is authoritative —
+   native validation swallowed an out-of-range period behind a generic tooltip and
+   our handler never ran, refusing the user without telling them why.
+7. **The desktop's UI half is still by-eye.** `EntryView::frozen_warning` is
+   unit-tested; its rendering in `desktop/ui/main.js` is covered by no test, like
+   the clock panel and the delete-confirm dialog before it. The desktop remains the
+   least-verified client — narrowed, not fixed.
+8. **The browser specs run against `fake-sigild.mjs`, a DOUBLE.** They prove what
+   the browser does and nothing about what `sigild` would allow.
+9. **These are display and resource controls, not cryptographic ones.** They stop a
+   stranger installing something that *looks* like a second factor and bound what
+   one payload can cost. Pre-audit, **UNAUDITED**; do not store real 2FA secrets.
+
+### Docs updated in this same change
+
+ADR **0051** (new) + `docs/decisions/README.md` index row;
+`docs/engineering-lessons.md` (table entry **#11** — *"in eleven disguises"* — plus
+the new reasoning-error section on a wrong premise handed down as an instruction,
+and two additions to *What changed as a result*); `docs/crypto-spec.md` (a
+provisioning-bounds subsection under the HOTP/TOTP primitive);
+`docs/threat-model.md` (a **new adversary class**, *writer of a hostile
+provisioning payload* — the widest-reach and cheapest-to-be adversary in that
+document: no account, no device, no key, no server access);
+`docs/README.md` (reviewer entry point + sharp edges); `README.md`; `CLAUDE.md`.
+**`docs/api.md` deliberately unchanged** — nothing on the wire moved.

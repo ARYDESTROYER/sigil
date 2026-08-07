@@ -122,7 +122,11 @@ pub use recovery::{
 pub use sig::{
     public_key_from_seed, sign, verify, SigError, SIGNATURE_LEN, SIG_PUBLIC_KEY_LEN, SIG_SEED_LEN,
 };
-pub use totp::{format_code, hotp, totp, OtpAlgorithm, OtpError, MAX_DIGITS, MIN_DIGITS};
+pub use totp::{
+    format_code, hotp, is_unsafe_display_char, totp, validate_provisioning,
+    validate_provisioning_count, OtpAlgorithm, OtpError, ProvisioningError, MAX_DIGITS,
+    MAX_LABEL_CHARS, MAX_PERIOD, MAX_PROVISIONING_ENTRIES, MAX_SECRET_BYTES, MIN_DIGITS,
+};
 
 /// Envelope format version. Every encrypted record begins with this byte.
 /// See `docs/crypto-spec.md` for the full layout.

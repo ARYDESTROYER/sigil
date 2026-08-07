@@ -43,8 +43,11 @@ cp "$WASM_SRC/pkg-web/sigil_wasm.d.ts"    "$VENDOR/"
 #     "./sync.mjs", sharing.mjs imports both "./device-auth.mjs" and
 #     "./totp-vault.mjs", recovery.mjs imports "./device-auth.mjs" and
 #     "./sharing.mjs", and entitlement.mjs imports "./device-auth.mjs" — so all
-#     EIGHT must stay siblings. (clock-skew.mjs imports NOTHING: it reads one
-#     HTTP response header and does no crypto, no auth and no storage.)
+#     NINE must stay siblings. (clock-skew.mjs imports NOTHING: it reads one
+#     HTTP response header and does no crypto, no auth and no storage. qr-scan.mjs
+#     imports NOTHING either: it turns an image into a bounded STRING over the
+#     platform's own BarcodeDetector and hands that string to totp-migration.mjs's
+#     parsers, so it adds no crypto, no parser and no second set of bounds.)
 cp "$WASM_SRC/totp-vault.mjs"     "$VENDOR/"
 cp "$WASM_SRC/totp-migration.mjs" "$VENDOR/"
 cp "$WASM_SRC/sync.mjs"           "$VENDOR/"
@@ -53,6 +56,7 @@ cp "$WASM_SRC/sharing.mjs"        "$VENDOR/"
 cp "$WASM_SRC/recovery.mjs"       "$VENDOR/"
 cp "$WASM_SRC/entitlement.mjs"    "$VENDOR/"
 cp "$WASM_SRC/clock-skew.mjs"     "$VENDOR/"
+cp "$WASM_SRC/qr-scan.mjs"        "$VENDOR/"
 
 # A provenance stamp so a stale vendor/ is obvious.
 cat > "$VENDOR/BUILD-INFO.txt" <<EOF

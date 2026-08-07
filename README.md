@@ -576,7 +576,8 @@ audited; see the status note below.)
   ([ADR 0037](docs/decisions/0037-desktop-reuses-cli-library-for-protocol.md)), against a
   dev-gated loopback server. **Dev,
   UNAUDITED, unsigned, unnotarized and not distributed** — no installer was built, and
-  there is no QR scanning. Do not store real 2FA
+  **the desktop still has no QR scanning** (the browser clients gained it in Phase 63;
+  it is a browser API and does not exist here). Do not store real 2FA
   secrets.
 - **Across all four clients** (Phase 62,
   [ADR 0050](docs/decisions/0050-confirmations-honest-claims-and-the-clock-diagnostic.md)):
@@ -592,6 +593,32 @@ audited; see the status note below.)
   rather than claiming your clock is fine. And two clients that had been telling you, in
   the product, that they *"cannot print"* a recovery kit — false since Phase 56, with the
   button on the same screen — now say the true thing.
+- **A setup code from a stranger is now bounded** (Phase 63,
+  [ADR 0051](docs/decisions/0051-provisioning-bounds-and-qr-ingest.md)). An
+  `otpauth://` link asking for `period=4294967295` used to be **accepted and stored**, and
+  the result was a "one-time password" whose six digits **never change** — measured the
+  same at t=59, at t=1.9×10⁹ and at t=4×10⁹ — displayed with an ordinary countdown. That
+  is the dangerous part: the entry looks exactly like a working second factor, so you
+  believe you enabled 2FA while holding a **static secret in a rotating costume**, where a
+  single screenshot or shoulder-surf stays valid indefinitely. Six bounds now apply
+  wherever a code is read from text you did not write (`period ≤ 600 s`, secret ≤ 1 KiB,
+  labels and issuers ≤ 256 characters, no control or text-direction-override characters
+  that would make one account render as another — ordinary right-to-left script is
+  untouched — 6–10 digits, and ≤ 512 accounts in one bulk import). ⭐ **The bounds apply
+  when something is ADDED, never when something is READ:** a vault that already contains
+  such an entry still opens and still generates its codes, and now shows a warning saying
+  the code does not rotate — ⛔ **a warning, never a correction, and nothing is deleted or
+  changed.** There is also deliberately **no lower bound** — a short secret is the
+  service's choice, and refusing it would lock you out of an account you have to use.
+- **The webapp and the extension can now read a setup QR code** from a pasted screenshot,
+  a dropped file or a file picker (Phase 63; no camera, and the payload is shown for you
+  to **confirm** before anything is written). It is a thin shell over the browser's own
+  `BarcodeDetector`, which adds no dependency and keeps a hostile image inside the
+  browser's hardened decoder rather than one of ours. ⛔ **It does not work everywhere:**
+  Firefox and Safari do not implement that API, and it is **secure-context gated**, so a
+  page served over plain HTTP from anything other than `localhost` gets no scanner at all.
+  The product says exactly that, naming **both** causes, and tells you to paste the
+  `otpauth://` link instead — which does the same job.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   and the sprint plan (kept internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (ADRs) for load-bearing choices.

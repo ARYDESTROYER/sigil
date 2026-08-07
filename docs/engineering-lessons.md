@@ -12,7 +12,7 @@ end are in the repository.
 
 ---
 
-## The one failure mode this project has, in ten disguises
+## The one failure mode this project has, in eleven disguises
 
 > **Work that quietly does not run looks exactly like work that passes.**
 
@@ -31,6 +31,7 @@ algorithm — a *green signal that meant nothing*.
 | 8 | `cors.spec.ts` resolved Go via a hardcoded macOS path, so on CI it **`test.skip`ped itself** — leaving the only browser-level proof of a fix with zero coverage. Adding `actions/setup-go` did **not** fix it, because that sets `PATH` and never `$GO`. | A skipped file and a green job are indistinguishable. |
 | 9 | No test asserted the "browsers persist only sealed containers" invariant. A planted plaintext write of the device seed, hybrid secret and every vault key passed **19/19 and 12/12**. | The suites checked for one needle, not for the property. |
 | 10 | Two Phase 59 fixes were **guarded in the library and unguarded in the product**. A verifier reverted `cloneVault(vault)` in `authenticator.tsx` to the pre-fix `{ version, entries }` shape, and five of six `sealParams(...)` call sites to the bare constant — **webapp 50/50 and extension 14/14 stayed green** both times. Mutating the *same* logic inside `totp-vault.mjs` / `passkey.mjs` went red every time. | The module was covered, so the coverage *looked* real — while the fix in the shipping app was deletable without a single red light. |
+| 11 | A capability probe for `BarcodeDetector` was run on **`about:blank`** and reported the API absent. `BarcodeDetector` is **secure-context gated**: the *same* browser, in the *same* session, exposes it on `http://localhost` and hides it on `about:blank`. The probe was correct about the page and wrong about the browser. | A negative result from a real measurement, on a real browser, reads as a fact about the browser. |
 
 The common shape: **the measurement was broken, not the code.** In most of these
 the product was fine; what failed was the thing that was supposed to notice.
@@ -73,6 +74,52 @@ agent verifying *uncommitted* work.
 **Claims repeated without re-checking.** A doc pass reported that four test
 suites ran in no workflow; the same commit had already wired them. That stale
 claim was then repeated downstream before anyone verified it.
+
+**⭐ A wrong premise handed down as an instruction — and the agent that refused
+it.** This is the sharpest instance this document has, because it is the thesis
+happening to the person writing the thesis, and because it nearly deleted working
+code.
+
+Phase 63 added QR ingest over the platform's `BarcodeDetector`. A capability probe
+was run to decide whether that API exists in desktop Chromium. It was run on
+**`about:blank`**, which is **not a secure context**, and `BarcodeDetector` is
+secure-context gated. It reported `undefined`. The conclusion drawn — *"this
+browser cannot scan"* — was false about the browser and true only about that page.
+
+What happened next is the part worth keeping. The orchestrator **acted on the
+premise**: it stopped a running workflow and instructed an agent to **delete the
+QR work as unusable**. The agent **re-measured instead of obeying**, in one
+browser and one session:
+
+```
+about:blank              isSecureContext=false   BarcodeDetector=undefined
+http://<LAN-IP>:port     isSecureContext=false   BarcodeDetector=undefined
+http://localhost:53838/  isSecureContext=true    BarcodeDetector=function  [… "qr_code" …]
+http://127.0.0.1:53838/  isSecureContext=true    BarcodeDetector=function  [… "qr_code" …]
+```
+
+The feature was correct and was kept.
+
+⭐ **The lesson is not "measure carefully".** Everyone already believes that, and
+it would not have helped — the probe *was* a real measurement on a real browser,
+which is exactly why its answer was persuasive. The lesson is:
+
+> **An instruction from the orchestrator is a claim like any other. An agent that
+> verifies a premise instead of executing it is doing the job correctly, not
+> being insubordinate.**
+
+Every other entry in this document is about distrusting a green signal from our
+own tooling. This one extends it one level up: the *briefing* is our own tooling
+too. A directive that begins "X does not exist, therefore delete Y" is a claim
+plus a conclusion, and the claim is the cheaper of the two to check.
+
+⭐ It also produced a real product finding, which is why the mistake was worth
+having. `BarcodeDetector` being secure-context gated is not a testing curiosity:
+serving the app over plain HTTP from a LAN address — **a phone pointed at a dev
+laptop, the obvious way someone would try to scan a code** — silently loses the
+API. That is why `qrSupport()` is a runtime probe rather than a build-time one,
+and why the message the user sees names the page's **origin** as a cause and not
+only the browser brand.
 
 **Documentation that was true when written.** Several status blocks told a
 reader that `sigild` "performs no cryptography" and "holds no keys" while there
@@ -138,6 +185,17 @@ These are controls, not intentions:
   in the browser suites; the suites were swept for it.
 - **Claims are grepped against the code** before they are written down — env vars,
   metric names, route counts, test counts, command counts.
+- **A premise in an instruction is checked before it is acted on**, especially
+  when acting on it means deleting work. The cost of re-running a capability probe
+  on a correct origin is seconds; the cost of removing a working feature on a bad
+  one is the feature. Where a browser capability is involved, the probe must run
+  on a **representative origin** — a secure context, not `about:blank` — because a
+  negative on the wrong page is indistinguishable from a negative on the platform.
+- **A false in-product sentence is treated as a class, not an instance.** When a
+  finding named one client's stale claim in Phase 62, the identical sentence was
+  found in another by grepping for the claim rather than trusting the finding's
+  scope. Phase 63 applied that prospectively: the read-path warning went to all
+  four clients, including the one nobody had reported.
 
 ---
 

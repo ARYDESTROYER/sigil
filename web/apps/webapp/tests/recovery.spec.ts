@@ -105,6 +105,12 @@ test("generate a kit, cover a vault, then RESTORE on a clean profile", async ({
   await expect(page.getByTestId("recovery-sheet")).toContainText("RECOVERS KEYS, NOT DATA");
   // It DID cover something, so the "covers nothing" alarm must be absent.
   await expect(page.getByTestId("recovery-covers-nothing")).toHaveCount(0);
+  // ⭐ AND THE INDEX WAS HEALTHY, so the generate-time truncation warning must be
+  // ABSENT. This is the direction that keeps the other one worth reading: a
+  // warning that is always on is a warning people learn to skip, and it would
+  // send a user off to re-print a sheet that was fine. (The VISIBLE direction is
+  // pinned in the truncation spec below, which crowds the index BEFORE printing.)
+  await expect(page.getByTestId("recovery-index-truncated")).toHaveCount(0);
 
   // ⭐ THE CODE IS A CREDENTIAL: it must not be persisted anywhere, and the two
   // storage keys must still be the only two, both sealed containers.
@@ -269,21 +275,59 @@ test("a recovery whose index was TRUNCATED refuses instead of restoring a prefix
     timeout: T,
   });
 
-  await page.getByTestId("recovery-generate").click();
-  await expect(page.getByTestId("recovery-sheet")).toBeVisible({ timeout: T });
-  const formatted = ((await page.getByTestId("recovery-code").textContent()) ?? "").trim();
-  const kitDeviceId = ((await page.getByTestId("recovery-kit-id").textContent()) ?? "").trim();
-
-  // Give the kit a SECOND covered vault, then make the server's page hold one row.
+  // ⭐ CROWD THE INDEX BEFORE PRINTING. Generation is the ONE moment the user can
+  // still act on it — re-print, reduce coverage, copy the "covers" line
+  // carefully. By restore time the paper is fixed, so a kit whose index is
+  // ALREADY crowded has to say so on the sheet.
+  //
+  // A cap of ZERO makes the very first row overflow, so the flag is reachable
+  // without needing to know the kit's device id in advance — which is
+  // impossible, since the id does not exist until `generateRecoveryKit` enrols
+  // it. (The reachable real-world shape is a race against the grant that
+  // discloses the new id; that is driven against a REAL sigild in
+  // sigil-wasm/test/recovery-interop.mjs.)
   const tuned = fake as unknown as { indexPageCap: number };
   const previousCap = tuned.indexPageCap;
+  tuned.indexPageCap = 0;
+  await page.getByTestId("recovery-generate").click();
+  await expect(page.getByTestId("recovery-sheet")).toBeVisible({ timeout: T });
+  // ⛔ IT STILL PRINTS. Refusing because a stranger crowded a server listing
+  // would hand an availability attack the power to stop kits being made at all —
+  // a denial of the last line of defence (ADR 0040 limitation 1), strictly worse
+  // than the truncation it would be reacting to. It reports, and prints.
+  await expect(page.getByTestId("recovery-index-truncated")).toBeVisible({ timeout: T });
+  await expect(page.getByTestId("recovery-index-truncated")).toContainText("re-print");
+  tuned.indexPageCap = previousCap;
+
+  const formatted = ((await page.getByTestId("recovery-code").textContent()) ?? "").trim();
+  const kitDeviceId = ((await page.getByTestId("recovery-kit-id").textContent()) ?? "").trim();
+  expect(formatted.replace(/-/g, "")).toHaveLength(56);
+  expect(kitDeviceId).toMatch(/^dev_/);
+
+  // Give the kit a SECOND covered vault, then make the server's page hold one row.
+  // ⭐ TWO decoys, and the FIRST is deposited by a device that was never enrolled
+  // here — exactly the shape ADR 0052 §3 refuses, because the client rule is
+  // `accountDevices.has(sender)` and a foreign account's device is simply absent
+  // from `GET /v1/account`. ⚠️ The double mints every enrolled device into ONE
+  // account (its header says so), so a stranger cannot be expressed by enrolling
+  // one; planting the row is the only way to reach that refusal from a browser
+  // spec at all. The multi-account form is proven against a REAL sigild in
+  // sigil-wasm/test/recovery-interop.mjs.
+  const strangerKey = `stranger-vault\u0000${kitDeviceId}`;
   const decoyKey = `overflow-vault\u0000${kitDeviceId}`;
+  fake.state.envelopes.set(strangerKey, {
+    bytes: Buffer.alloc(1226),
+    sender: "dev_not_in_this_account",
+    createdAt: new Date().toISOString(),
+  });
   fake.state.envelopes.set(decoyKey, {
     bytes: Buffer.alloc(1226),
     sender: "dev_fake_1",
     createdAt: new Date().toISOString(),
   });
-  tuned.indexPageCap = 1;
+  // TWO rows visible (the real vault and the stranger's) and a third beyond the
+  // cap — so the listing is BOTH crowded and carrying an untrusted row.
+  tuned.indexPageCap = 2;
 
   try {
     const ctx = await browser.newContext();
@@ -302,9 +346,64 @@ test("a recovery whose index was TRUNCATED refuses instead of restoring a prefix
     });
     // NOTHING was adopted: a half-restored browser is worse than a clean refusal.
     expect(await p2.evaluate(() => Object.keys(window.localStorage))).toEqual([]);
+
+    // ⭐ AND THE WAY OUT. A refusal alone is not a recovery — it just moves the
+    // failure. The printed sheet already carries the covered vault ids, so
+    // naming them makes the restore ask each VAULT directly instead of asking
+    // the server what is waiting for this kit. That listing is what a flood can
+    // crowd; a vault addressed by id is not. Same profile, same crowded server,
+    // same kit — this time it lands in an unlocked vault with the RFC code.
+    await p2.getByTestId("restore-vaults").fill("truncation-vault");
+    await p2.getByTestId("restore-submit").click();
+    await expect(p2.getByTestId("vault-view")).toBeVisible({ timeout: T });
+    await expect(p2.getByTestId("account-code")).toHaveText(RFC_CODE, { timeout: T });
+
+    // ⛔⛔ AND IT MUST SAY SO. This is the scenario the whole fix exists to make
+    // honest — a sheet-driven restore off a crowded index — and it SUCCEEDS, so
+    // there is no error screen to carry the qualification. `restoreFromKit`
+    // computed exactly this warning and the app threw the return value away, so
+    // the user landed in an unlocked vault told NOTHING: the index it could not
+    // enumerate, the rows it ignored, the vaults it never saw.
+    //
+    // ⭐ The assertion is on the UNLOCKED screen deliberately. The panel that
+    // submitted this is unmounted by the phase flip the success causes, so a
+    // message rendered there would be destroyed at the instant it became true —
+    // which is why the state is held at the top level.
+    const notes = p2.getByTestId("restore-notes");
+    await expect(notes).toBeVisible({ timeout: T });
+    await expect(notes).toContainText("THIS MAY NOT BE EVERYTHING");
+    await expect(notes).toContainText("no way to ask for the rest");
+    // ⛔⛔ AND THE OTHER CAVEAT, which had NO test at all: a row the INDEX ALONE
+    // introduced, deposited by a device outside this account, is IGNORED — not
+    // fetched, not unwrapped, and above all not PINNED into the fresh trust
+    // store this restore just built. Deleting this whole note block from the app
+    // used to leave every browser test green.
+    await expect(notes).toContainText("OUTSIDE your account");
+    await expect(notes).toContainText("were ignored");
+    // ⭐ ONE SUMMARY, NEVER ONE LINE PER ROW: the ignored vault must not be
+    // itemised, because a flood rendered row by row buries the real result —
+    // which is exactly what a flood is for.
+    await expect(notes).not.toContainText("stranger-vault");
+    // ⚠️ NOT A TOAST. It has to still be there after the vault has rendered and
+    // any transient status has aged out — "this may not be everything" does not
+    // stop being true, and the user cannot act on it from this screen.
+    await expect(p2.getByTestId("vault-size-warning")).toHaveCount(0);
+    await expect(notes).toBeVisible();
+    // Dismissible, and only by the user.
+    await p2.getByTestId("restore-notes-dismiss").click();
+    await expect(notes).toHaveCount(0);
+
+    // ⚠️ HONEST SCOPE, so a later reader does not over-read this spec: the cap
+    // is shrunk rather than 500 envelopes being minted, and the real vault is
+    // still ON the single visible page — so `fromSheet` is EMPTY here and the
+    // envelope-sender path is NOT exercised in the browser. That path is proven
+    // against a REAL sigild in `sigil-wasm/test/recovery-interop.mjs`. What this
+    // pins is the truncation flag reaching the user, which is the half that was
+    // computed and discarded.
     await ctx.close();
   } finally {
     tuned.indexPageCap = previousCap;
     fake.state.envelopes.delete(decoyKey);
+    fake.state.envelopes.delete(strangerKey);
   }
 });

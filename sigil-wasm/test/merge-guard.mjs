@@ -1604,6 +1604,450 @@ for (const rel of ["cli/src/lib.rs", "sigil-wasm/totp-vault.mjs"]) {
   }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// 8. ⛔⛔ THE DESKTOP'S IPC HOP FOR THE SHEET'S VAULT IDS.
+//
+// `GET /v1/devices/{id}/keys` — how a restored recovery kit finds what it can
+// decrypt — is ONE page capped at 500 rows with NO CURSOR, and ANY account can
+// put rows in it (deposit an opaque envelope addressed to a device id it knows,
+// then grant that device read on a vault it claimed itself; there is no cap on
+// claiming). Measured: 520 vaults flooded in 0.6 s pushed the genuine row off
+// the page. The answer is the ids printed on the sheet's `covers` line, which
+// make a restore ask each VAULT directly — addressed BY VAULT ID, so a flood
+// cannot crowd them out.
+//
+// ⚠️ THIS IS THE ONE PRODUCT LAYER IN THE REPO WITH NO BEHAVIOURAL COVERAGE.
+// Both browsers drive the equivalent hop end to end in Playwright (their
+// recovery specs fill the vault-ids field and assert the vault opens). The
+// desktop cannot: `desktop/core/tests/server_interop.rs` calls
+// `DeviceConfig::recovery_restore` DIRECTLY — it pins the LIBRARY — and no test
+// anywhere renders `desktop/ui/`. So the hop
+//
+//     desktop/ui/main.js        call("recovery_restore", { …, vaultIds })
+//         ↓ Tauri IPC (camelCase JS key → snake_case Rust arg)
+//     desktop/src-tauri/…       vault_ids: Option<Vec<String>>
+//         ↓ unwrap_or_default()
+//     sigil-desktop-core        recovery_restore(…, &vaults)
+//
+// is deletable with the whole gate green. ⛔ AND ITS FAILURE IS INVISIBLE: a
+// dropped or mis-named argument deserializes to `None` SILENTLY, and its only
+// observable consequence is a refusal BYTE-IDENTICAL to the refusal a genuinely
+// truncated index produces. The user is told "this server's list is crowded" —
+// which is true — and never that the ids they typed off the paper were thrown
+// away in transit.
+//
+// ⛔⛔ AND THE FIRST VERSION OF THIS SECTION WAS BYPASSABLE BY THE EXACT FAILURE
+// IT EXISTS TO CATCH — the same lesson as section 3b, one phase later. It asked
+// whether the TOKEN appeared and was not a literal `null`/`undefined`/`[]`; it
+// never related the value PASSED to the value BOUND. Both of these printed
+// `ok  … 1 restore call site(s)` and exited 0 while sending an EMPTY list:
+//
+//     call("recovery_restore", { …, vaultIds: vaultIds.slice(0, 0) })   // ui
+//     .recovery_restore(&code, …, &vaults[..0])                          // cmd, and it COMPILES
+//
+// So the checks below demand the BARE identifier — no call, index, slice or
+// literal on either side — and both bypasses are encoded as self-test specimens,
+// because the old specimen set only ever mutated the BINDING and never a correct
+// binding passed through a truncating expression.
+//
+// ⚠️ A SOURCE CHECK, NOT A PROOF, exactly like the delete gates above: it shows
+// the ids are PASSED and ACCEPTED, not that the restore they drive is correct
+// (that is the library's tests). A refactor that hoists the field read into a
+// helper will false-alarm here by design — the alternative is a guard that
+// accepts any spelling, which is the no-op this file exists to avoid.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Index of the `)` matching the `(` at `open`, or -1. Braces have `matchBrace`. */
+function matchParen(code, open) {
+  let depth = 0;
+  for (let i = open; i < code.length; i += 1) {
+    if (code[i] === "(") depth += 1;
+    else if (code[i] === ")") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Split `(a, b(c, d), e)` into `["a", "b(c, d)", "e"]` — commas at NESTING DEPTH
+ * ZERO only, so an argument that is itself a call keeps its own commas.
+ *
+ * ⛔ THIS EXISTS BECAUSE THE FIRST VERSION OF SECTION 8 ASKED "does the name
+ * APPEAR in the argument list?", and `&vaults[..0]` contains `vaults`. Relating
+ * the value PASSED to the value BOUND needs the argument as a whole token, which
+ * needs a splitter.
+ *
+ * @param {string} withParens the slice INCLUDING the surrounding parentheses
+ */
+function splitTopLevelArgs(withParens) {
+  const inner = withParens.slice(1, -1);
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i += 1) {
+    const c = inner[i];
+    if (c === "(" || c === "[" || c === "{") depth += 1;
+    else if (c === ")" || c === "]" || c === "}") depth -= 1;
+    else if (c === "," && depth === 0) {
+      out.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(inner.slice(start));
+  return out.map((a) => a.trim()).filter((a) => a !== "");
+}
+
+/**
+ * The value an object literal binds to `key`, as SOURCE TEXT, or:
+ *   - `{ shorthand: true }` for `{ …, vaultIds, … }`;
+ *   - `null` when the key is not present at all.
+ *
+ * Only a key in KEY POSITION counts (immediately after `{` or `,`), so a
+ * mention of the name inside some other value is not mistaken for the property.
+ */
+function objectLiteralValue(args, key) {
+  const rx = new RegExp(`[{,]\\s*${key}\\s*(:)?`, "g");
+  let m;
+  while ((m = rx.exec(args)) !== null) {
+    if (m[1] === undefined) return { shorthand: true, text: key };
+    // Read to the matching top-level `,` or the closing `}`.
+    let depth = 0;
+    const from = m.index + m[0].length;
+    for (let i = from; i < args.length; i += 1) {
+      const c = args[i];
+      if (c === "(" || c === "[" || c === "{") depth += 1;
+      else if (c === ")" || c === "]") depth -= 1;
+      else if (c === "}") {
+        if (depth === 0) return { shorthand: false, text: args.slice(from, i).trim() };
+        depth -= 1;
+      } else if (c === "," && depth === 0) {
+        return { shorthand: false, text: args.slice(from, i).trim() };
+      }
+    }
+    return { shorthand: false, text: args.slice(from).trim() };
+  }
+  return null;
+}
+
+/** A bare JS/Rust identifier and nothing else — no call, index, slice or literal. */
+const BARE_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * DESKTOP UI — every `call("recovery_restore", { … })` must pass `vaultIds`,
+ * that value must not be a hardcoded absence, and it must be derived from the
+ * sheet's `recovery-restore-vaults` field rather than invented.
+ */
+function desktopRestoreVaultIdsUi(src) {
+  const code = blank(src, { strings: true });
+  const text = blank(src, { strings: false });
+  const sites = hits(text, /call\(\s*["']recovery_restore["']/);
+  // ⭐ ZERO IS A FAILURE. A rename would otherwise turn this whole section into
+  // a check of nothing that still prints green.
+  if (sites.length === 0) {
+    return {
+      ok: false,
+      why:
+        'no `call("recovery_restore", …)` site found at all. Either the restore moved (this ' +
+        "guard must move with it) or the desktop no longer restores from a kit",
+    };
+  }
+  for (const site of sites) {
+    const open = code.indexOf("{", site.index);
+    const close = open === -1 ? -1 : matchBrace(code, open);
+    if (open === -1 || close === -1 || open > matchParen(code, code.indexOf("(", site.index))) {
+      return { ok: false, why: `the call at line ${site.line} has no argument object to inspect` };
+    }
+    const args = text.slice(open, close + 1);
+    const passed = objectLiteralValue(args, "vaultIds");
+    if (passed === null) {
+      return {
+        ok: false,
+        why:
+          `the call at line ${site.line} does not pass \`vaultIds\`. The Tauri command takes ` +
+          "`vault_ids: Option<Vec<String>>`, so a missing key deserializes to `None` SILENTLY " +
+          "and the sheet's ids never reach the library — indistinguishable, to the user, from " +
+          "a genuinely truncated index",
+      };
+    }
+    // ⛔⛔ THE VALUE PASSED MUST BE THE VALUE BOUND — the BARE identifier, with
+    // no call, index or slice wrapped round it. Asking only "is the token there,
+    // and is it not literally null/undefined/[]?" was the hole an auditor walked
+    // straight through: `vaultIds: vaultIds.slice(0, 0)` printed `ok` while
+    // sending an EMPTY list, so the library took the blind path and the user got
+    // a refusal BYTE-IDENTICAL to a genuine truncation. Any expression at all is
+    // refused here, because there is no expression this call site needs.
+    if (!passed.shorthand && !BARE_IDENTIFIER.test(passed.text)) {
+      return {
+        ok: false,
+        why:
+          `the call at line ${site.line} passes \`vaultIds: ${passed.text}\` — an EXPRESSION, not ` +
+          "the bound value. Anything that can narrow, empty or invent the list (a slice, an " +
+          "index, a call, a literal) is the same defect wearing the argument's name: the restore " +
+          "silently falls back to the crowdable per-device index and refuses with a message the " +
+          "user cannot tell from a real truncation",
+      };
+    }
+    if (!passed.shorthand && passed.text !== "vaultIds") {
+      return {
+        ok: false,
+        why:
+          `the call at line ${site.line} passes \`vaultIds: ${passed.text}\`, which is not the ` +
+          "`vaultIds` bound from the sheet field. This guard can only follow one name; rename the " +
+          "local back, or move this guard with it",
+      };
+    }
+  }
+  // The value must come FROM THE SHEET. A `vaultIds` computed from anything else
+  // passes the checks above and still cannot survive a flood.
+  const bind = /(?:const|let|var)\s+vaultIds\s*=/.exec(code);
+  if (bind === null) {
+    return {
+      ok: false,
+      why: "`vaultIds` is passed but never bound — this guard cannot see where the ids come from",
+    };
+  }
+  const stmtEnd = code.indexOf(";", bind.index);
+  const rhs = text.slice(bind.index, stmtEnd === -1 ? text.length : stmtEnd);
+  if (!/recovery-restore-vaults/.test(rhs)) {
+    return {
+      ok: false,
+      why:
+        "`vaultIds` is not read from the `recovery-restore-vaults` field. The ids have to be the " +
+        "ones the user copied off the paper; anything else is a value that looks right and " +
+        "cannot survive a flooded index",
+    };
+  }
+  return {
+    ok: true,
+    why: `${sites.length} restore call site(s), each passing ids read from the sheet's covers field`,
+  };
+}
+
+/**
+ * DESKTOP TAURI SHELL — the `recovery_restore` command must ACCEPT the ids and
+ * FORWARD them to the core. Tauri v2 camelCases command arguments, so the JS key
+ * `vaultIds` binds to the Rust parameter `vault_ids`; both spellings are checked
+ * here because that conversion is exactly where a rename goes silent.
+ */
+function desktopRestoreVaultIdsCommand(src) {
+  const sites = hits(src, /#\[tauri::command\]\s*(?:pub\s+)?fn\s+recovery_restore\s*\(/);
+  if (sites.length !== 1) {
+    return {
+      ok: false,
+      why:
+        `expected exactly ONE \`#[tauri::command] fn recovery_restore(\`, found ${sites.length}. ` +
+        "A rename or a second copy makes this guard meaningless",
+    };
+  }
+  const site = sites[0];
+  const parenOpen = src.indexOf("(", site.index + site.text.length - 1);
+  const parenClose = matchParen(src, parenOpen);
+  const bodyOpen = src.indexOf("{", parenClose);
+  const bodyClose = bodyOpen === -1 ? -1 : matchBrace(blank(src, { strings: true }), bodyOpen);
+  if (parenClose === -1 || bodyClose === -1) {
+    return { ok: false, why: "could not brace-match the command's signature and body" };
+  }
+  const sig = src.slice(parenOpen, parenClose + 1);
+  const body = src.slice(bodyOpen, bodyClose + 1);
+  if (!/vault_ids\s*:\s*(?:Option\s*<\s*)?Vec\s*<\s*String\s*>/.test(sig)) {
+    return {
+      ok: false,
+      why:
+        "the command does not accept `vault_ids: Option<Vec<String>>` (the snake_case binding of " +
+        "the UI's `vaultIds`). Without the parameter the ids are dropped at the IPC boundary " +
+        "with no error anywhere",
+    };
+  }
+  // Accepting is not forwarding. Follow whatever local the parameter is bound to
+  // into the core call, so a parameter that is accepted and then ignored fails.
+  //
+  // ⛔ THE BINDING'S RIGHT-HAND SIDE IS CHECKED TOO. `let vaults = vault_ids` —
+  // optionally with the `Option` unwrapped — is the ONLY shape allowed, because
+  // anything else (`…into_iter().take(0).collect()`, `…[..0].to_vec()`) narrows
+  // the list here instead of at the call and reads exactly as innocent.
+  const bound = /let\s+(\w+)\s*(?::[^=;]*)?=\s*([^;]*);/.exec(body);
+  let forwarded = "vault_ids";
+  if (bound && /\bvault_ids\b/.test(bound[2])) {
+    forwarded = bound[1];
+    const rhs = bound[2].replace(/\s+/g, "");
+    const WHOLE_VALUE = /^vault_ids(?:\.unwrap_or_default\(\)|\.unwrap_or\([^;]*\))?$/;
+    if (!WHOLE_VALUE.test(rhs)) {
+      return {
+        ok: false,
+        why:
+          `\`vault_ids\` is bound as \`${bound[2].trim()}\`, which is not the whole value. A ` +
+          "binding that narrows the list makes every later check pass while the sheet's ids are " +
+          "already gone",
+      };
+    }
+  }
+  const callAt = body.search(/\.\s*recovery_restore\s*\(/);
+  if (callAt === -1) {
+    return { ok: false, why: "the command never calls the core's `recovery_restore`" };
+  }
+  const argsOpen = body.indexOf("(", callAt);
+  const argsClose = matchParen(body, argsOpen);
+  const args = argsClose === -1 ? "" : body.slice(argsOpen, argsClose + 1);
+  // ⛔⛔ THE ARGUMENT MUST BE THE BARE BINDING, borrowed and nothing else.
+  // Asking `\bforwarded\b` against the whole argument list accepted
+  // `&vaults[..0]` — an EMPTY slice that `cargo check` is perfectly happy with,
+  // that this guard printed `ok` for, and whose only symptom is a refusal the
+  // user cannot distinguish from a genuinely crowded index.
+  const passes = splitTopLevelArgs(args).some((a) => {
+    const m = /^&?\s*([A-Za-z_]\w*)$/.exec(a);
+    return m !== null && m[1] === forwarded;
+  });
+  if (!passes) {
+    return {
+      ok: false,
+      why:
+        `\`${forwarded}\` does not reach the core call as itself — the argument list is ` +
+        `\`${args.replace(/\s+/g, " ").trim()}\`. An argument that is parsed and then discarded, ` +
+        "narrowed or sliced is the SAME defect as one that was never sent, and it type-checks",
+    };
+  }
+  return { ok: true, why: `\`vault_ids\` accepted and forwarded to the core as \`${forwarded}\`` };
+}
+
+{
+  const RESTORE_GATES = [
+    {
+      rel: "desktop/ui/main.js",
+      gate: desktopRestoreVaultIdsUi,
+      what: "the desktop UI's restore form",
+    },
+    {
+      rel: "desktop/src-tauri/src/main.rs",
+      gate: desktopRestoreVaultIdsCommand,
+      what: "the desktop's `recovery_restore` IPC command",
+    },
+  ];
+  for (const { rel, gate, what } of RESTORE_GATES) {
+    const src = read(rel);
+    if (src === null) continue;
+    checks += 1;
+    const r = gate(src);
+    if (r.ok) {
+      console.log(`  ok  ${rel}: ${what} carries the sheet's vault ids — ${r.why}`);
+    } else {
+      fail(
+        `${rel}: ${what} — ${r.why}. The kit's per-device envelope index is ONE uncursored page ` +
+          `any account can crowd rows off, so the sheet's ids are the ONLY flood-proof route to ` +
+          `a restore (ADR 0042; ADR 0040 limitation 1). This hop has no behavioural coverage — ` +
+          `the browsers' Playwright specs cover theirs, and nothing renders desktop/ui/.`,
+      );
+    }
+  }
+
+  // ⛔ THE SELF-TEST. Same posture as section 3b: the mutations this guard exists
+  // to catch are encoded here, so a "fix" that returns true forever — or one that
+  // returns false forever — is caught. Specimens are MINIMAL on purpose; one that
+  // tracked the real sources would be updated to whatever they happened to say.
+  const UI_OK = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds });
+  `;
+  const UI_DROPPED = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore", { code, deviceId, adopt });
+  `;
+  const UI_NULLED = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds: null });
+  `;
+  const UI_INVENTED = `
+    const vaultIds = [];
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds });
+  `;
+  const UI_RENAMED = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore_v2", { code, deviceId, adopt, vaultIds });
+  `;
+  // ⛔⛔ THE TWO BYPASSES AN AUDITOR ACTUALLY WALKED THROUGH. Both were planted
+  // in the REAL sources; both left this section printing `ok` and exit 0, and
+  // the Rust one compiled. They are the reason the checks above relate the value
+  // PASSED to the value BOUND instead of asking whether a token appears.
+  const UI_EXPLICIT_OK = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds: vaultIds });
+  `;
+  const UI_SLICED = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds: vaultIds.slice(0, 0) });
+  `;
+  const UI_FILTERED = `
+    const vaultIds = $("recovery-restore-vaults").value.split(/[\\s,]+/).filter(Boolean);
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds: vaultIds.filter(() => false) });
+  `;
+  const CMD_OK = `
+#[tauri::command]
+fn recovery_restore(code: String, vault_ids: Option<Vec<String>>) -> CmdResult<RestoreOutcome> {
+    let vaults = vault_ids.unwrap_or_default();
+    let r = sync_config(&state)?.recovery_restore(&code, None, false, &vaults).map_err(ipc)?;
+    Ok(r)
+}`;
+  const CMD_NO_PARAM = `
+#[tauri::command]
+fn recovery_restore(code: String) -> CmdResult<RestoreOutcome> {
+    let vaults = Vec::new();
+    let r = sync_config(&state)?.recovery_restore(&code, None, false, &vaults).map_err(ipc)?;
+    Ok(r)
+}`;
+  const CMD_IGNORED = `
+#[tauri::command]
+fn recovery_restore(code: String, vault_ids: Option<Vec<String>>) -> CmdResult<RestoreOutcome> {
+    let vaults = vault_ids.unwrap_or_default();
+    let r = sync_config(&state)?.recovery_restore(&code, None, false, &[]).map_err(ipc)?;
+    Ok(r)
+}`;
+  const CMD_SLICED = `
+#[tauri::command]
+fn recovery_restore(code: String, vault_ids: Option<Vec<String>>) -> CmdResult<RestoreOutcome> {
+    let vaults = vault_ids.unwrap_or_default();
+    let r = sync_config(&state)?.recovery_restore(&code, None, false, &vaults[..0]).map_err(ipc)?;
+    Ok(r)
+}`;
+  const CMD_TRUNCATING_BINDING = `
+#[tauri::command]
+fn recovery_restore(code: String, vault_ids: Option<Vec<String>>) -> CmdResult<RestoreOutcome> {
+    let vaults: Vec<String> = vault_ids.unwrap_or_default().into_iter().take(0).collect();
+    let r = sync_config(&state)?.recovery_restore(&code, None, false, &vaults).map_err(ipc)?;
+    Ok(r)
+}`;
+
+  const SPECIMENS = [
+    [desktopRestoreVaultIdsUi, UI_OK, true, "ui: ids read from the sheet field and passed"],
+    [desktopRestoreVaultIdsUi, UI_EXPLICIT_OK, true, "ui: the explicit `vaultIds: vaultIds` form is accepted"],
+    [desktopRestoreVaultIdsUi, UI_DROPPED, false, "ui: the argument DROPPED from the call is caught"],
+    [desktopRestoreVaultIdsUi, UI_NULLED, false, "ui: `vaultIds: null` is caught"],
+    [desktopRestoreVaultIdsUi, UI_INVENTED, false, "ui: ids not read from the sheet field are caught"],
+    [desktopRestoreVaultIdsUi, UI_RENAMED, false, "ui: a renamed command leaves ZERO sites, which fails"],
+    [desktopRestoreVaultIdsUi, UI_SLICED, false, "ui: ⛔ a correct binding passed through `.slice(0, 0)` is caught"],
+    [desktopRestoreVaultIdsUi, UI_FILTERED, false, "ui: ⛔ a correct binding passed through a filter is caught"],
+    [desktopRestoreVaultIdsCommand, CMD_OK, true, "cmd: the parameter is accepted and forwarded"],
+    [desktopRestoreVaultIdsCommand, CMD_NO_PARAM, false, "cmd: a command that does not accept it is caught"],
+    [desktopRestoreVaultIdsCommand, CMD_IGNORED, false, "cmd: accepted-then-discarded is caught"],
+    [desktopRestoreVaultIdsCommand, CMD_SLICED, false, "cmd: ⛔ forwarding `&vaults[..0]` is caught"],
+    [
+      desktopRestoreVaultIdsCommand,
+      CMD_TRUNCATING_BINDING,
+      false,
+      "cmd: ⛔ a binding that narrows before the call is caught",
+    ],
+  ];
+  for (const [gate, specimen, want, what] of SPECIMENS) {
+    checks += 1;
+    const got = gate(specimen).ok;
+    if (got === want) {
+      console.log(`  ok  self-test: ${what}`);
+    } else {
+      fail(`self-test: ${what} — expected ok=${want}, got ok=${got}`);
+    }
+  }
+}
+
 // ⭐ It must fail when it finds nothing, or a rename turns it into a no-op.
 if (checks === 0) {
   fail(

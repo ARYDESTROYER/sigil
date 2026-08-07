@@ -63,6 +63,7 @@ import {
   TRUST_DERIVED,
   deleteKeyEnvelope,
   getKeyEnvelope,
+  listKeyEnvelopes,
   hybridPublicIdentity,
   newPinStore,
   publishHybridKey,
@@ -261,6 +262,17 @@ export function deriveRecoveryIdentity(wasm, seed) {
  * would have recovered the first 500 and REPORTED SUCCESS — a partial recovery
  * presented as a complete one, which is the worst possible failure for a
  * mechanism whose entire job is "did I get everything back?".
+ *
+ * ⚠️ **THIS ROUTE IS DENIABLE BY A THIRD PARTY, and that is the other half of
+ * why `truncated` exists.** Any account may deposit an envelope addressed to
+ * this device and grant it `read` on a vault it owns, so a party that knows this
+ * device's id can push genuine rows off the single uncursored page. It cannot
+ * read anything and it cannot forge an envelope — but it can make discovery
+ * return `has_more: true` and hide what matters. Measured against a real sigild:
+ * 520 planted vaults in 0.6 s pushed the one genuine row out. Recovery therefore
+ * must not DEPEND on this route: `restoreFromKit` takes vault ids straight from
+ * the printed sheet, which no later act can touch. Mirrors the Rust twin
+ * `cli/src/lib.rs::list_recoverable_vaults`; ADR 0052.
  */
 export async function listRecoverableVaults(wasm, auth, deviceId = null) {
   const target = checkId("device id", deviceId ?? auth?.deviceId);
@@ -492,15 +504,30 @@ export async function generateRecoveryKit(
       );
     }
     const indexed = await listRecoverableVaults(wasm, rebornAuth, kitId);
+    // ⭐ GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT — re-print, reduce
+    // coverage, copy the `covers` line carefully. By restore time the paper is
+    // fixed. So a kit whose index is ALREADY truncated must say so here, on
+    // every client, not on one of four.
     let verification = {
       accountId: kitAccountId,
       indexedVaults: indexed.length,
+      indexTruncated: indexed.truncated === true,
       unwrappedVault: "",
       fingerprint: "",
     };
     if (vaultKeys.length > 0) {
       const first = vaultKeys[0];
-      if (!indexed.some((v) => v.vaultId === first.vaultId)) {
+      // ⚠️ A TRUNCATED index is NOT grounds to refuse to print. The sheet carries
+      // the covered vault ids, so a restore does not need this route — and
+      // destroying a working kit because a stranger crowded a listing would hand
+      // an availability attack the ability to stop kits being made at all. It is
+      // reported instead, and the envelope is still unwrapped end to end below.
+      // Mirrors `cli/src/lib.rs::recovery_verify_kit`; without this the SAME
+      // flood, performed BEFORE generate, lets any current or former
+      // collaborator stop this client ever printing a kit — a denial of the last
+      // line of defence (ADR 0040 limitation 1), strictly worse than the
+      // truncation it would be reacting to.
+      if (!indexed.truncated && !indexed.some((v) => v.vaultId === first.vaultId)) {
         throw new RecoveryError(
           `the kit's own envelope index does not list ${first.vaultId}; it is being revoked and ` +
             "NOT returned",
@@ -526,6 +553,7 @@ export async function generateRecoveryKit(
       verification = {
         accountId: kitAccountId,
         indexedVaults: indexed.length,
+        indexTruncated: indexed.truncated === true,
         unwrappedVault: first.vaultId,
         fingerprint,
       };
@@ -621,11 +649,46 @@ export async function coverVault(
 }
 
 /**
+ * Work out WHICH DEVICE deposited the envelope addressed to `recipient` for
+ * `vaultId`, WITHOUT going through the per-device index.
+ *
+ * ⭐ The discovery path that cannot be denied: `GET /v1/vaults/{id}/keys` is
+ * addressed BY VAULT ID, so it returns this vault's recipients however many
+ * unrelated vaults exist. Mirrors `envelope_sender_for` in `cli/src/lib.rs`.
+ *
+ * Requires WRITE, which for a kit is satisfied by its ACCOUNT owning the vault
+ * (ADR 0040). A cross-account share is a per-DEVICE read grant, so this
+ * legitimately 403s there and the caller falls back to "unknown sender".
+ */
+async function envelopeSenderFor(wasm, auth, vaultId, recipient) {
+  try {
+    const holders = await listKeyEnvelopes(wasm, auth, vaultId);
+    const row = holders.find((h) => h.deviceId === recipient);
+    return row && row.senderDeviceId ? row.senderDeviceId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * RESTORE from a printed recovery kit, on a client with NO local state.
  *
- *   restoreFromKit(wasm, { baseUrl, code, deviceId }) ->
+ *   restoreFromKit(wasm, { baseUrl, code, deviceId, vaultIds }) ->
  *     { deviceId, accountId, vaults: [{ vaultId, vaultKey, container, fingerprint }],
- *       skipped: [{ vaultId, reason }], identity }
+ *       skipped: [{ vaultId, reason }], identity, indexTruncated, fromSheet }
+ *
+ * ⭐ `vaultIds` COMES OFF THE PRINTED SHEET (its `covers` line), and it is what
+ * makes a flooded index survivable rather than fatal. Supplying them makes this
+ * ask each VAULT which device deposited its envelope instead of asking the
+ * server what is waiting for this kit — and the per-device index is a single
+ * page capped at 500 rows with NO CURSOR that any other account can push rows
+ * onto (deposit an opaque envelope addressed to a device id it knows, then grant
+ * that device read on a vault it claimed itself). With no ids and a truncated
+ * index this REFUSES, because it cannot know what it is missing.
+ *
+ * ⚠️ A vault covered AFTER the sheet was printed is on no sheet, and the index
+ * is the only way to find it. `indexTruncated` says when that gap is live, and a
+ * UI must not round it up to "everything".
  *
  * The code is decoded and checksummed **OFFLINE, before any network I/O**, so a
  * mistyped code never reaches a server.
@@ -640,7 +703,7 @@ export async function coverVault(
  * can deliberately "adopt" the kit — which makes that client a second copy of the
  * paper and must be presented that way.
  */
-export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
+export async function restoreFromKit(wasm, { baseUrl, code, deviceId, vaultIds = [] }) {
   if (!baseUrl) throw new RecoveryError("recovery: baseUrl is required");
   // ⭐ OFFLINE FIRST. Zero network I/O happens before this succeeds.
   const seed = verifyRecoveryKit(wasm, code);
@@ -653,22 +716,114 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
     hybrid: { x25519Secret: identity.hybrid.x25519Secret, mlkemSeed: identity.hybrid.mlkemSeed },
   };
 
+  const sheetVaults = (Array.isArray(vaultIds) ? vaultIds : [])
+    .map((v) => String(v ?? "").trim())
+    .filter(Boolean);
+
   const account = await getAccount(wasm, auth, baseUrl);
-  const indexed = await listRecoverableVaults(wasm, auth, deviceId);
+
+  // ⭐ THE SHEET PATH MUST NOT BE GATED BEHIND THE ROUTE IT EXISTS TO BYPASS.
+  // `vaultIds` exists precisely because the per-device index is deniable, so a
+  // restore that names its vaults has to survive that route being UNAVAILABLE —
+  // not merely crowded. A server that 500s or hangs on this ONE endpoint would
+  // otherwise kill the sheet path too, which touches it for nothing but a sender
+  // hint and the truncation flag. With sheet ids an index failure DEGRADES to
+  // "empty, and completeness unknown"; with none it still throws, because there
+  // is nothing left to fall back to. It degrades LOUDLY: `indexError` is
+  // reported, never swallowed. Mirrors `cli/src/lib.rs::recovery_restore`.
+  let indexError = null;
+  let indexed;
+  try {
+    indexed = await listRecoverableVaults(wasm, auth, deviceId);
+  } catch (err) {
+    if (sheetVaults.length === 0) throw err;
+    indexError = String(err?.message ?? err);
+    indexed = [];
+    // An index that never answered is the strongest possible statement that
+    // this client cannot enumerate its own coverage.
+    Object.defineProperty(indexed, "truncated", { value: true, enumerable: false });
+  }
   // ⛔ REFUSE RATHER THAN UNDER-REPORT. The index route has a hard page cap and no
   // cursor, so a truncated answer means this client CANNOT know what it is
   // missing. Restoring the visible prefix and calling it a recovery would tell a
   // customer their vaults are back while some are silently absent — so this fails
-  // loudly instead, and names the operator action that fixes it.
-  if (indexed.truncated) {
+  // loudly instead, and names the way out: the printed sheet already carries the
+  // covered vault ids, and nothing that happened after it was printed can change
+  // what it says.
+  if (indexed.truncated && sheetVaults.length === 0) {
     throw new RecoveryError(
-      "this kit covers MORE vaults than the server will list in one page, and that route has no " +
-        "cursor — so this client cannot see all of them and refuses to report a partial recovery " +
-        "as a complete one. Nothing was restored. Reduce what this kit covers (or raise the " +
-        "server's per-device index page cap) and try again.",
+      "this server lists MORE vaults for this kit than it will return in one page, and that " +
+        "route has no cursor — so this client cannot see all of them and REFUSES to report a " +
+        "partial recovery as a complete one. Nothing was restored. Restore by naming the vaults " +
+        "printed on the sheet's `covers` line: that path asks each vault directly and cannot be " +
+        "crowded out. A vault covered AFTER the sheet was printed is not on it and stays " +
+        "invisible until the listing clears.",
     );
   }
-  if (indexed.length === 0) {
+
+  // ⭐ WHO IS ALLOWED TO INTRODUCE A VAULT TO THIS RESTORE.
+  //
+  // An authenticated envelope (ADR 0048) proves WHO deposited it. It proves
+  // NOTHING about whether that sender is trusted — and every input to the wrap
+  // is public: any enrolled device on ANY account may fetch this kit's published
+  // hybrid key, and the AAD is (purpose, vault id, recipient id, sender id). So
+  // a stranger can mint a GENUINE, correctly-authenticated envelope addressed to
+  // this kit for a vault they own, grant the kit read, and push a container
+  // sealed under a key of their choosing. This runs on a machine with an EMPTY
+  // pin store, so `verifySenderForUnwrap` returns first-sight TOFU, PINS the
+  // stranger's key, unwraps, and hands their vault back as a RECOVERED one — to
+  // the one person who by definition has nothing left to check it against.
+  //
+  //   * a vault NAMED ON THE SHEET is vouched for BY THE USER and is processed
+  //     whatever the sender says — the sheet is the channel nothing on the
+  //     network can touch, and that is the entire point of it;
+  //   * a vault the INDEX alone introduced is processed only if its sender is a
+  //     device in this kit's OWN ACCOUNT (active or revoked — the covering
+  //     device may since have been revoked, and its envelopes stay valid).
+  //
+  // ⭐ Decided from the index row alone, BEFORE any network call for that row,
+  // so a flood costs nothing: no fetch, no unwrap, and above all no PIN.
+  //
+  // ⚠️ HONEST LIMIT: this defends against a THIRD PARTY, not against the SERVER.
+  // The account device list is served by the same server, so a hostile one could
+  // omit a genuine sender and cause a legitimate index-only row to be ignored.
+  // That is reported, not silent — and a server that wanted to deny recovery can
+  // already withhold the envelope outright.
+  const accountDevices = new Set(
+    (account?.devices ?? []).map((d) => d?.device_id).filter(Boolean),
+  );
+
+  // What to try, in a stable order. Sheet ids first: they are the ones the user
+  // can vouch for. Each carries whatever the index managed to say about it.
+  const targets = [];
+  const fromSheet = [];
+  const seen = new Set();
+  let ignoredUntrusted = 0;
+  for (const vaultId of sheetVaults) {
+    if (seen.has(vaultId)) continue;
+    seen.add(vaultId);
+    const row = indexed.find((v) => v.vaultId === vaultId);
+    const senderDeviceId = row && row.senderDeviceId ? row.senderDeviceId : null;
+    if (!senderDeviceId) fromSheet.push(vaultId);
+    targets.push({ vaultId, senderDeviceId });
+  }
+  for (const entry of indexed) {
+    if (seen.has(entry.vaultId)) continue;
+    seen.add(entry.vaultId);
+    // Index-only: the sender must be one of OUR devices. An unnamed sender names
+    // no device in this account and so fails this test too — there is nothing to
+    // authenticate such an envelope against in any case.
+    if (!accountDevices.has(entry.senderDeviceId)) {
+      ignoredUntrusted += 1;
+      continue;
+    }
+    targets.push({
+      vaultId: entry.vaultId,
+      senderDeviceId: entry.senderDeviceId || null,
+    });
+  }
+
+  if (targets.length === 0) {
     throw new RecoveryError(
       "valid code and device, but there is nothing to recover: this kit holds no vault key on " +
         "this server. It was enrolled but never covered a vault, or a rotation dropped it.",
@@ -684,12 +839,17 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
   const pins = newPinStore();
   const vaults = [];
   const skipped = [];
-  for (const entry of indexed) {
-    if (!entry.senderDeviceId) {
+  for (const entry of targets) {
+    // TWO SOURCES for the sender, and the second is the one that survives a
+    // flood: the per-device index when it listed this vault, otherwise the
+    // VAULT's own recipient list, addressed by an id taken off the sheet.
+    const senderDeviceId =
+      entry.senderDeviceId ?? (await envelopeSenderFor(wasm, auth, entry.vaultId, deviceId));
+    if (!senderDeviceId) {
       skipped.push({
         vaultId: entry.vaultId,
         reason: new UnknownSenderError(
-          `the server's envelope index does not name the device that deposited the key for ` +
+          `the server did not name the device that deposited the key for ` +
             `vault ${JSON.stringify(entry.vaultId)}`,
         ).message,
       });
@@ -698,7 +858,7 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
     let envelope;
     let sender;
     try {
-      sender = await verifySenderForUnwrap(wasm, auth, entry.senderDeviceId, { pins });
+      sender = await verifySenderForUnwrap(wasm, auth, senderDeviceId, { pins });
       envelope = await getKeyEnvelope(wasm, auth, entry.vaultId, deviceId);
     } catch (err) {
       skipped.push({ vaultId: entry.vaultId, reason: String(err?.message ?? err) });
@@ -715,7 +875,7 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
         {
           vaultId: entry.vaultId,
           recipientDeviceId: deviceId,
-          senderDeviceId: entry.senderDeviceId,
+          senderDeviceId,
         },
         envelope,
       );
@@ -726,14 +886,39 @@ export async function restoreFromKit(wasm, { baseUrl, code, deviceId }) {
     vaults.push({
       vaultId: entry.vaultId,
       vaultKey,
-      senderDeviceId: entry.senderDeviceId,
+      senderDeviceId,
       senderTrust: sender.trust,
       senderSafetyNumber: sender.safetyNumber,
       fingerprint: await vaultKeyFingerprint(vaultKey),
     });
   }
 
-  return { deviceId, accountId: account.account_id ?? "", vaults, skipped, identity, pins };
+  return {
+    deviceId,
+    accountId: account.account_id ?? "",
+    vaults,
+    skipped,
+    identity,
+    pins,
+    // ⛔ NEVER PRESENT A TRUNCATED RESTORE AS COMPLETE. Reaching here with this
+    // true means vault ids WERE supplied, so what came back is what the caller
+    // named plus one page — a floor, not a total.
+    indexTruncated: indexed.truncated === true,
+    // Vault ids the caller supplied that the index did not list, recovered by
+    // asking each vault directly.
+    fromSheet,
+    // ⚠️ The index route could not be read AT ALL and this restore carried on
+    // with only the named vaults. Set only when vault ids WERE supplied. A
+    // caller MUST surface it: "listed nothing" and "never answered" are
+    // different facts, and the second is how a vault covered after the sheet was
+    // printed goes missing.
+    indexError,
+    // How many listed rows were deposited by devices OUTSIDE this account and
+    // were ignored without being fetched, unwrapped or pinned. A COUNT, never
+    // one entry per row — a flood is bounded noise, and reporting it row by row
+    // would bury the real result, which is exactly what the flood is for.
+    ignoredUntrusted,
+  };
 }
 
 /**

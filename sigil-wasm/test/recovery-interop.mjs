@@ -54,17 +54,21 @@ import {
 import {
   generateHybridIdentity,
   generateVaultKey,
+  fetchHybridKey,
   listKeyEnvelopes,
   newPinStore,
   publishHybridKey,
   rotateVaultKey,
   shareVault,
   vaultKeyFingerprint,
+  wrapVaultKey,
   PIN_ORIGIN_RECOVERY_KIT,
   RecipientsWouldBeDroppedError,
   UnverifiedRecoveryKitError,
   SafetyNumberMismatchError,
+  putKeyEnvelope,
 } from "../sharing.mjs";
+import { grantVaultAccess } from "../device-auth.mjs";
 import {
   RECOVERY_DEVICE_LABEL,
   RecoveryError,
@@ -208,6 +212,10 @@ const ARGON2 = { m_cost: 8, t_cost: 1, p_cost: 1 };
 
 const TOKEN_JS = "enroll-token-JS-0123456789";
 const TOKEN_CLI = "enroll-token-CLI-0123456789";
+const TOKEN_FLOOD = "enroll-token-FLOOD-012345678";
+/// A SECOND flooding account, for the flood-BEFORE-generate arm. Enrollment
+/// tokens are single-ATTEMPT, so this cannot reuse TOKEN_FLOOD.
+const TOKEN_FLOOD2 = "enroll-token-FLOOD2-01234567";
 
 // The PUBLIC RFC 6238 test seed. NOT a real secret — it is the published vector.
 const RFC_SEED_B32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
@@ -305,7 +313,11 @@ try {
       SIGILD_ADDR: `127.0.0.1:${port}`,
       SIGILD_ENABLE_DEV_OPS: "1",
       SIGILD_DEVICE_AUTH: "1",
-      SIGILD_ENROLL_TOKENS: `${TOKEN_JS},${TOKEN_CLI}`,
+      SIGILD_ENROLL_TOKENS: `${TOKEN_JS},${TOKEN_CLI},${TOKEN_FLOOD},${TOKEN_FLOOD2}`,
+      // This suite enrolls several devices, kits and floods into a handful of
+      // accounts; the seat cap is not what it is testing, so lift it out of the
+      // way rather than have an unrelated 409 masquerade as a recovery failure.
+      SIGILD_ACCOUNT_MAX_DEVICES: "50",
     },
     stdio: ["ignore", logFd, logFd],
   });
@@ -508,6 +520,221 @@ try {
     assert(code === RFC_CODE, `(b) the browser produced ${code}, want ${RFC_CODE}`);
     console.log(
       `  (b) OK: ⭐ the browser recovered the CLI's vault from the CLI's paper -> ${code} at T=${RFC_T}`,
+    );
+  }
+
+  // =====================================================================
+  // ⭐⭐ (b2) A FLOODED ENVELOPE INDEX MUST NOT PRODUCE A SILENT PARTIAL.
+  //
+  //  `GET /v1/devices/{id}/keys` is how a restored kit — a client with NO local
+  //  state — finds out what it can decrypt. It is ONE page, capped at 500 rows,
+  //  with NO CURSOR. Any account can put rows in it: deposit an opaque envelope
+  //  addressed to a device id it knows, then grant that device `read` on a vault
+  //  it claimed itself. Nothing is decrypted and nothing is forged, but genuine
+  //  rows get pushed off the page.
+  //
+  //  ⚠️ The kit's device id is not guessable, but it is not secret either:
+  //  `GET /v1/vaults/{id}/grants` discloses it with read alone, so any current
+  //  OR FORMER collaborator keeps it permanently.
+  //
+  //  THREE PROPERTIES, and the third is the sharpest:
+  //    1. ⛔ blind restore REFUSES — never the visible prefix reported as
+  //       success (that is exactly what the Rust CLI used to do);
+  //    2. ⭐ naming the vaults printed on the SHEET recovers them anyway,
+  //       because that path asks each VAULT directly and cannot be crowded out —
+  //       while still REPORTING `indexTruncated` so nothing calls it complete;
+  //    3. ⛔⛔ and EXACTLY the sheet's vault comes back. Not one of the planted
+  //       ones, and the planter's hybrid key is NOT pinned into the fresh trust
+  //       store the restore just built.
+  //
+  //  ⭐⭐ THE ENVELOPES BELOW ARE GENUINE, AND THAT IS THE WHOLE POINT OF (3).
+  //  This flood used to deposit 64 bytes of 0x5a from a device that had never
+  //  published a hybrid key — junk the AEAD could only ever refuse, addressed by
+  //  a sender that could not even be fetched. It therefore proved the index
+  //  could be CROWDED and nothing whatsoever about what a restore does with a
+  //  row it can actually open, and a verifier confirmed it: with the own-account
+  //  filter disabled, every outcome assertion still passed and only the COUNT
+  //  moved. That is this phase's own lesson turned on its own test — build the
+  //  attacker who is trying to SUCCEED, not the one trying to be refused.
+  //
+  //  Every input to a vault-key wrap is PUBLIC: sigild serves any device's
+  //  published hybrid key to any authenticated device, and the AAD is (purpose,
+  //  vault id, recipient id, sender id). So a stranger mints an envelope that
+  //  authenticates PERFECTLY — ADR 0048's `hybrid_auth_seal` proves WHO
+  //  deposited it and says NOTHING about whether they are trusted. A restore
+  //  runs with an EMPTY pin store, so first-sight TOFU would pin the stranger's
+  //  key, unwrap, open their container and hand it back as a RECOVERED VAULT.
+  // =====================================================================
+  {
+    const flood = {
+      baseUrl: base,
+      seed: generateDeviceSeed(),
+      hybrid: generateHybridIdentity(),
+      pins: newPinStore(),
+    };
+    const floodEnrolled = await enrollDevice(wasm, {
+      baseUrl: base,
+      token: TOKEN_FLOOD,
+      label: "unrelated-account",
+      seed: flood.seed,
+    });
+    flood.deviceId = floodEnrolled.deviceId;
+    assert(
+      floodEnrolled.deviceId !== cliKitId,
+      "the flooding device must not be the kit itself",
+    );
+    // ⭐ The stranger PUBLISHES its hybrid key, because a restore that reaches
+    // the unwrap has to be able to FETCH the depositing device's key and pin it.
+    // Without this the attack cannot even get started, which is exactly why the
+    // old junk-bytes version of this block was vacuous.
+    await publishHybridKey(wasm, flood);
+    // The kit's own PUBLIC hybrid key — served to any authenticated device.
+    const kitHybridPublic = await fetchHybridKey(wasm, flood, cliKitId);
+    // A key of the STRANGER'S choosing, and a container it opens, so that
+    // without the trust rule these come back as fully-formed "recovered" vaults
+    // rather than merely poisoning the keyring and the pin store.
+    const plantedKey = generateVaultKey();
+    const plantedContainer = (() => {
+      const v = newVault();
+      addEntry(v, {
+        label: "PLANTED-BY-A-STRANGER",
+        issuer: "not-yours",
+        secretBytes: base32Decode(RFC_SEED_B32),
+        algorithm: "sha1",
+        digits: 8,
+        period: 30,
+      });
+      const salt = webcrypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+      const nonce = webcrypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+      return sealVault(wasm, plantedKey, v, salt, nonce, ARGON2);
+    })();
+
+    // 520 > sigild's maxRecipientIndexRows (500). Ids sort BEFORE the real vault,
+    // which is how a flood pushes a genuine row off a listing ordered by vault id.
+    const PLANTED_WITH_CONTENT = 5;
+    const spamIds = [];
+    for (let i = 0; i < 520; i += 1) {
+      const spamVault = `aaa-flood-${String(i).padStart(5, "0")}`;
+      spamIds.push(spamVault);
+      const envelope = wrapVaultKey(
+        wasm,
+        { deviceId: flood.deviceId, hybrid: flood.hybrid },
+        kitHybridPublic,
+        { vaultId: spamVault, recipientDeviceId: cliKitId, senderDeviceId: flood.deviceId },
+        plantedKey,
+      );
+      // A non-empty deposit is a WRITE, and a write to an unclaimed vault claims
+      // it for the writer's account (trust-on-first-write).
+      await putKeyEnvelope(wasm, flood, spamVault, cliKitId, envelope);
+      // Read authorization is what makes the row survive the index's own
+      // per-row authorizeVault(needRead) filter.
+      await grantVaultAccess(wasm, flood, base, spamVault, cliKitId, "read");
+      if (i < PLANTED_WITH_CONTENT) {
+        await pushContainerAuthed(wasm, flood, base, spamVault, plantedContainer);
+      }
+    }
+
+    const kitAuth = {
+      baseUrl: base,
+      deviceId: cliKitId,
+      seed: restored.identity.ed25519Seed,
+      hybrid: restored.identity.hybrid,
+      pins: newPinStore(),
+    };
+    const flooded = await listRecoverableVaults(wasm, kitAuth, cliKitId);
+    assert(flooded.truncated === true, `the flood did not truncate the index (${flooded.length} rows)`);
+    assert(
+      !flooded.some((v) => v.vaultId === VAULT_CLI),
+      "the genuine vault is still listed — the flood was too small and this proves nothing",
+    );
+    // The planted rows really are visible to the kit and really do name the
+    // stranger as their sender — otherwise the filter below has nothing to act
+    // on and the outcome assertions would be vacuous a second time.
+    assert(
+      flooded.some((v) => v.senderDeviceId === flood.deviceId),
+      "the flooded rows do not name the stranger as sender, so the own-account rule is untested",
+    );
+
+    // 1. ⛔ THE REFUSAL.
+    let refused = null;
+    try {
+      await restoreFromKit(wasm, { baseUrl: base, code: cliKitCode, deviceId: cliKitId });
+    } catch (e) {
+      refused = e;
+    }
+    assert(
+      refused instanceof RecoveryError,
+      `a truncated index must REFUSE, got ${refused && refused.name}: ${refused && refused.message}`,
+    );
+    assert(
+      /REFUSES/.test(refused.message) && /Nothing was restored/.test(refused.message),
+      `the refusal must say plainly that nothing was restored: ${refused.message}`,
+    );
+    assert(
+      /covers/.test(refused.message),
+      `the refusal must name the way out (the sheet's covered vault ids): ${refused.message}`,
+    );
+
+    // 2. ⭐ THE WAY OUT — and it still tells the truth about what it could not see.
+    const bySheet = await restoreFromKit(wasm, {
+      baseUrl: base,
+      code: cliKitCode,
+      deviceId: cliKitId,
+      vaultIds: [VAULT_CLI],
+    });
+    const recovered = bySheet.vaults.find((v) => v.vaultId === VAULT_CLI);
+    assert(
+      recovered,
+      `restoring by the sheet's ids must recover ${VAULT_CLI}: ${JSON.stringify(bySheet.skipped)}`,
+    );
+    assert(
+      recovered.fingerprint === target.fingerprint,
+      "a DIFFERENT key came back from the sheet-driven restore",
+    );
+    assert(bySheet.indexTruncated === true, "a truncated index must be REPORTED even on success");
+    assert(
+      bySheet.fromSheet.includes(VAULT_CLI),
+      `the report must say the vault came from the SHEET: ${JSON.stringify(bySheet.fromSheet)}`,
+    );
+
+    // 3. ⛔⛔ THE OUTCOME, WHICH IS WHAT THE RULE IS FOR. Each of these fails on
+    //    its own if the own-account filter is removed — the counter is the
+    //    weakest of the four and used to be the ONLY one that moved.
+    const came = bySheet.vaults.map((v) => v.vaultId).sort();
+    assert(
+      came.length === 1 && came[0] === VAULT_CLI,
+      `⛔⛔ a STRANGER'S VAULT WAS HANDED BACK AS THE USER'S OWN. expected exactly ` +
+        `["${VAULT_CLI}"], got ${JSON.stringify(came)}`,
+    );
+    for (const spam of spamIds.slice(0, PLANTED_WITH_CONTENT)) {
+      assert(
+        !came.includes(spam),
+        `the planted vault ${spam} — a genuine, correctly authenticated envelope backed by a real ` +
+          "container — was adopted as a recovered vault",
+      );
+    }
+    assert(
+      bySheet.pins.pins[flood.deviceId] === undefined,
+      "⛔ the STRANGER'S hybrid key was PINNED into the fresh trust store this restore built. " +
+        "A restore runs on a machine with no pins at all, so first-sight TOFU would accept it — " +
+        "and everything that device later deposits then reads as an established peer",
+    );
+    assert(
+      bySheet.ignoredUntrusted >= 500,
+      `the planted rows must be reported as ONE COUNT, got ignoredUntrusted=${bySheet.ignoredUntrusted}`,
+    );
+    // ⚠️ And the report never lists them row by row: a flood is bounded noise,
+    // and rendering it line by line buries the one row the user came to read —
+    // which is exactly what the flood is for.
+    assert(
+      bySheet.skipped.length === 0,
+      `ignored rows must NOT be itemised into skipped: ${JSON.stringify(bySheet.skipped).slice(0, 300)}`,
+    );
+    console.log(
+      "  (b2) OK: ⭐ a 520-vault flood of GENUINE, correctly-authenticated envelopes from an " +
+        "unrelated account truncated the index; the blind restore REFUSED; the sheet-driven one " +
+        `recovered EXACTLY ${VAULT_CLI}, adopted none of the ${bySheet.ignoredUntrusted} planted ` +
+        "rows and pinned none of the stranger's keys",
     );
   }
 
@@ -932,6 +1159,288 @@ try {
         "succeeds once `drop` names it — the call shape both browsers now use — and it does " +
         "NOT weaken the container's Argon2 parameters while re-sealing",
     );
+  }
+
+  // =====================================================================
+  // (h) ⛔⛔ A FLOOD PERFORMED *BEFORE* GENERATE MUST NOT STOP A KIT BEING
+  //     PRINTED AT ALL.
+  //
+  //  The Rust half was relaxed for exactly this reason: a truncated index is
+  //  not grounds to refuse to print, because the SHEET carries the covered
+  //  vault ids and a restore does not need that route. The JS twin was NOT
+  //  relaxed — it threw, and that throw is caught by `abort`, which calls
+  //  `revokeSelf`. So the same flood, timed BEFORE the pre-print check instead
+  //  of after it, let any current or former collaborator stop the webapp and
+  //  the MV3 extension EVER printing a recovery kit: a denial of the LAST LINE
+  //  OF DEFENCE under ADR 0040 limitation 1 — strictly worse than the
+  //  truncation it would be reacting to.
+  //
+  //  ⭐ HOW THE RACE IS MADE DETERMINISTIC, faithfully rather than by stubbing:
+  //  a kit's device id does not exist until `generateRecoveryKit` enrols it, so
+  //  an attacker floods the moment it learns that id — which it can, because
+  //  `GET /v1/vaults/{id}/grants` discloses it to any collaborator the instant
+  //  step 6 grants the kit read. Here the SAME window is closed on purpose: a
+  //  fetch wrapper watches for the enrolment response, learns the new kit id,
+  //  and floods before returning — so every request is still real, against the
+  //  real server, over the real routes.
+  // =====================================================================
+  {
+    const VAULT_H = "vault-flood-before-generate";
+    const vaultKeyH = generateVaultKey();
+    {
+      const v = newVault();
+      addEntry(v, {
+        label: "before-generate",
+        secretBytes: base32Decode(RFC_SEED_B32),
+        algorithm: "sha1",
+        digits: 8,
+        period: 30,
+      });
+      const salt = webcrypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+      const nonce = webcrypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+      await pushContainerAuthed(
+        wasm,
+        authJs,
+        base,
+        VAULT_H,
+        sealVault(wasm, vaultKeyH, v, salt, nonce, ARGON2),
+      );
+    }
+
+    const flood2 = {
+      baseUrl: base,
+      seed: generateDeviceSeed(),
+      hybrid: generateHybridIdentity(),
+      pins: newPinStore(),
+    };
+    const flood2Enrolled = await enrollDevice(wasm, {
+      baseUrl: base,
+      token: TOKEN_FLOOD2,
+      label: "unrelated-account-2",
+      seed: flood2.seed,
+    });
+    flood2.deviceId = flood2Enrolled.deviceId;
+    // ⭐ Published up front so the GENUINE envelopes minted below (after the kit
+    // exists and has published its own key) can be fetched, pinned and unwrapped
+    // by a restore. Without this the stranger cannot even be looked up, and the
+    // outcome assertions at the end of this block are vacuous.
+    await publishHybridKey(wasm, flood2);
+
+    // The interceptor: flood the new kit's index the moment the kit exists, and
+    // before `generateRecoveryKit` reaches its pre-print index read. It flips
+    // `globalThis.fetch` back to the recording wrapper while it floods, so the
+    // flood's own requests do not re-enter this handler.
+    const junk = new Uint8Array(64).fill(0x5a);
+    let floodedKitId = null;
+    const recordingWrapper = globalThis.fetch;
+    globalThis.fetch = async function raceFetch(url, init = {}) {
+      const res = await recordingWrapper(url, init);
+      if (floodedKitId || !String(url).endsWith("/v1/devices/enroll") || res.status !== 201) {
+        return res;
+      }
+      // `.clone()` so `enrollDevice` can still read the body it is waiting for.
+      const body = await res.clone().json();
+      if (!body?.device_id) return res;
+      floodedKitId = body.device_id;
+      const racer = globalThis.fetch;
+      globalThis.fetch = recordingWrapper;
+      try {
+        // 501 rows > sigild's maxRecipientIndexRows (500). Ids sort BEFORE the
+        // real vault, so the genuine row is the one pushed off the page.
+        for (let i = 0; i < 501; i += 1) {
+          const spam = `aaa-pre-${String(i).padStart(5, "0")}`;
+          await putKeyEnvelope(wasm, flood2, spam, floodedKitId, junk);
+          await grantVaultAccess(wasm, flood2, base, spam, floodedKitId, "read");
+        }
+      } finally {
+        globalThis.fetch = racer;
+      }
+      return res;
+    };
+
+    let kitH;
+    try {
+      kitH = await generateRecoveryKit(wasm, authJs, {
+        vaultKeys: [{ vaultId: VAULT_H, vaultKey: vaultKeyH }],
+        pins: authJs.pins,
+      });
+    } finally {
+      globalThis.fetch = recordingWrapper;
+    }
+    secretsSeen.push(kitH.code, kitH.formatted, kitH.formatted.replace(/-/g, ""));
+
+    assert(
+      floodedKitId === kitH.deviceId,
+      `the race did not fire against the kit under test (${floodedKitId} vs ${kitH.deviceId})`,
+    );
+    assert(
+      kitH.verification.indexTruncated === true,
+      "⭐ the pre-print check must REPORT the truncation — generation is the one moment the user " +
+        "can still act on it (re-print, reduce coverage, copy the covers line carefully); by " +
+        "restore time the paper is fixed",
+    );
+    // ⭐ AND THE KIT MUST STILL WORK. A printed-but-dead kit would be the same
+    // denial wearing a different hat.
+    assert(
+      kitH.verification.unwrappedVault === VAULT_H,
+      "the pre-print verification must still unwrap a real envelope end to end",
+    );
+
+    // ⭐⭐ UPGRADE A HANDFUL OF THE PLANTED ROWS TO GENUINE, CORRECTLY
+    // AUTHENTICATED ENVELOPES, BACKED BY REAL CONTAINERS.
+    //
+    // The race above had to deposit opaque bytes, because a kit's hybrid public
+    // key does not exist until `generateRecoveryKit` publishes it — which is
+    // after the enrolment the interceptor fires on. Junk is enough to CROWD the
+    // index, which is all the pre-print arm needs. It is NOT enough for the
+    // restore assertions below: an envelope the AEAD can only refuse proves
+    // nothing about what a restore does with a row it can actually open, and a
+    // verifier showed that with the own-account filter disabled every one of
+    // those assertions still passed. So now that the kit's key IS published,
+    // re-deposit over the first few spam ids with the real thing.
+    const kitHHybridPublic = await fetchHybridKey(wasm, flood2, kitH.deviceId);
+    const plantedKeyH = generateVaultKey();
+    const plantedContainerH = (() => {
+      const v = newVault();
+      addEntry(v, {
+        label: "PLANTED-BY-A-STRANGER",
+        issuer: "not-yours",
+        secretBytes: base32Decode(RFC_SEED_B32),
+        algorithm: "sha1",
+        digits: 8,
+        period: 30,
+      });
+      const salt = webcrypto.getRandomValues(new Uint8Array(wasm.recommended_salt_len()));
+      const nonce = webcrypto.getRandomValues(new Uint8Array(wasm.nonce_len()));
+      return sealVault(wasm, plantedKeyH, v, salt, nonce, ARGON2);
+    })();
+    const plantedIdsH = [];
+    for (let i = 0; i < 5; i += 1) {
+      const spam = `aaa-pre-${String(i).padStart(5, "0")}`;
+      plantedIdsH.push(spam);
+      const envelope = wrapVaultKey(
+        wasm,
+        { deviceId: flood2.deviceId, hybrid: flood2.hybrid },
+        kitHHybridPublic,
+        { vaultId: spam, recipientDeviceId: kitH.deviceId, senderDeviceId: flood2.deviceId },
+        plantedKeyH,
+      );
+      await putKeyEnvelope(wasm, flood2, spam, kitH.deviceId, envelope);
+      await pushContainerAuthed(wasm, flood2, base, spam, plantedContainerH);
+    }
+
+    const restoredH = await restoreFromKit(wasm, {
+      baseUrl: base,
+      code: kitH.code,
+      deviceId: kitH.deviceId,
+      vaultIds: [VAULT_H],
+    });
+    const rowH = restoredH.vaults.find((v) => v.vaultId === VAULT_H);
+    assert(
+      rowH,
+      `the kit printed under a flood must still RESTORE: ${JSON.stringify(restoredH.skipped)}`,
+    );
+    assert(
+      rowH.fingerprint === (await vaultKeyFingerprint(vaultKeyH)),
+      "the kit printed under a flood recovered a DIFFERENT key",
+    );
+    // C2, from the JS side: 501 rows deposited by another account, five of them
+    // GENUINE and backed by content this kit could unwrap and open — none
+    // adopted, and the stranger's key never pinned.
+    const cameH = restoredH.vaults.map((v) => v.vaultId).sort();
+    assert(
+      cameH.length === 1 && cameH[0] === VAULT_H,
+      `⛔⛔ a STRANGER'S VAULT WAS HANDED BACK AS THE USER'S OWN. expected exactly ["${VAULT_H}"], ` +
+        `got ${JSON.stringify(cameH)}`,
+    );
+    for (const spam of plantedIdsH) {
+      assert(
+        !cameH.includes(spam),
+        `the planted vault ${spam} — a genuine authenticated envelope backed by a real container — ` +
+          "was adopted as a recovered vault",
+      );
+    }
+    assert(
+      restoredH.ignoredUntrusted > 100,
+      `the planted rows must be IGNORED as a COUNT, got ignoredUntrusted=${restoredH.ignoredUntrusted}`,
+    );
+    assert(
+      restoredH.pins.pins[flood2.deviceId] === undefined,
+      "⛔ the flooding device's hybrid key was PINNED by the restore — a restore starts with an " +
+        "EMPTY pin store, so first-sight TOFU accepts anything the index introduces",
+    );
+    console.log(
+      "  (h) OK: ⛔ a 501-row flood landed BEFORE the pre-print check and the kit was still " +
+        "PRINTED, still verified end to end, and still restores — while REPORTING the truncation; " +
+        `and the restore recovered EXACTLY ${VAULT_H}, adopted none of the stranger's vaults ` +
+        "(five of which were genuine, openable and backed by content) and pinned none of their keys",
+    );
+
+    // -------------------------------------------------------------------
+    // (i) ⛔ THE SHEET PATH MUST NOT BE GATED BEHIND THE ROUTE IT BYPASSES.
+    //
+    //  `restoreFromKit` called `listRecoverableVaults` unconditionally and let
+    //  its error escape, so a server that merely FAILS that one endpoint killed
+    //  the sheet path too — the path whose entire purpose is not needing it.
+    //  The Rust half is covered by `cli/tests/recovery_index_flood.rs`; this is
+    //  the JS mirror, and a drift between the two is INVISIBLE (both keep
+    //  working, they just disagree about when recovery is possible).
+    //
+    //  Only the index route is broken here — everything else still goes to the
+    //  real sigild, so a fallback that quietly stopped working would show up.
+    // -------------------------------------------------------------------
+    {
+      const healthy = globalThis.fetch;
+      const indexPath = `/v1/devices/${kitH.deviceId}/keys`;
+      let indexCalls = 0;
+      globalThis.fetch = async function indexDown(url, init = {}) {
+        if (String(url).endsWith(indexPath)) {
+          indexCalls += 1;
+          return new Response('{"error":"internal"}', {
+            status: 500,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return healthy(url, init);
+      };
+      let degraded;
+      try {
+        degraded = await restoreFromKit(wasm, {
+          baseUrl: base,
+          code: kitH.code,
+          deviceId: kitH.deviceId,
+          vaultIds: [VAULT_H],
+        });
+      } finally {
+        globalThis.fetch = healthy;
+      }
+      assert(indexCalls > 0, "the index route was never called, so this arm proves nothing");
+      const degradedRow = degraded.vaults.find((v) => v.vaultId === VAULT_H);
+      assert(
+        degradedRow,
+        `naming the sheet's vault MUST still recover it when the index route is DEAD: ${JSON.stringify(
+          degraded.skipped,
+        )}`,
+      );
+      assert(
+        degradedRow.fingerprint === (await vaultKeyFingerprint(vaultKeyH)),
+        "the degraded restore recovered a DIFFERENT key",
+      );
+      assert(
+        typeof degraded.indexError === "string" && degraded.indexError.length > 0,
+        "a degraded index must be REPORTED, never swallowed — 'listed nothing' and 'never " +
+          "answered' are different facts, and the second is how a vault covered after the sheet " +
+          "was printed goes missing",
+      );
+      assert(
+        degraded.indexTruncated === true,
+        "an index that never answered must not read as complete",
+      );
+      console.log(
+        "  (i) OK: ⛔ with the per-device index route returning 500, naming the SHEET's vault " +
+          "still recovers it — and the failure is REPORTED (indexError) rather than swallowed",
+      );
+    }
   }
 
   // A kit that covers nothing reports "nothing to recover", not a fault.

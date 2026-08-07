@@ -2075,13 +2075,40 @@ hold a wrapped key addressed to me?"*
   `has_more` is `true`. ⚠️ There is deliberately **no cursor** — a device with
   more than 500 covered vaults cannot page past the first 500.
 
-  > ⚠️ **AND NO CLIENT IN THIS REPO READS `has_more` ON THIS ROUTE** (found by the
-  > fourth audit). A **recovery kit covering more than 500 vaults would silently
-  > recover the first 500 and report success** — the worst shape a truncation can
-  > take, because the person using it is by definition unable to check against
-  > anything else. The server is honest; the clients ignore the flag. No cursor
-  > exists to fix it with, so closing this properly means adding one. Until then,
-  > treat 500 covered vaults as the kit's real ceiling.
+  > ⚠️ **THIS ROUTE IS DENIABLE BY A THIRD PARTY. Read
+  > [ADR 0052](decisions/0052-recovery-discovery-and-the-printed-sheet.md) before
+  > building anything on it.** Any account may deposit an opaque envelope
+  > addressed to a device id it knows and then grant that device `read` on a vault
+  > it claimed itself — trust-on-first-write caps nothing — so a stranger can push
+  > genuine rows off this single page and set `has_more`. Measured against a real
+  > server: **520 vaults in 0.6 s with junk bytes, ~3 s when every envelope is genuine and authenticated with junk bytes, ~3 s when every envelope is genuine and authenticated**. The kit's device id is 128 bits of CSPRNG and
+  > unguessable, but it is **not secret**: `GET /v1/vaults/{id}/grants` discloses
+  > it with `read` alone, so any current **or former** collaborator keeps it
+  > permanently.
+  >
+  > ⭐ **`has_more` is therefore load-bearing, and every client now honours it.**
+  > A client given no vault ids **REFUSES** on a truncated index rather than
+  > reporting a partial recovery as a complete one, and recovers instead from the
+  > **vault ids printed on the kit's sheet** — which reach the envelopes through
+  > `GET /v1/vaults/{id}/keys` and `GET /v1/vaults/{id}/keys/{deviceID}`, both
+  > addressed **by vault id**, where there is nothing to crowd out.
+  >
+  > ⚠️ **A previous revision of this block said "NO CLIENT IN THIS REPO READS
+  > `has_more` ON THIS ROUTE" and that "closing this properly means adding [a
+  > cursor]". Both were wrong** — the JS half has refused on the flag since
+  > Phase 58, and Phase 64 closed it in Rust **without** a cursor. It is recorded
+  > rather than quietly deleted because a status block that tells a reviewer a
+  > defence does not exist is the failure this repo keeps shipping
+  > ([`engineering-lessons.md`](engineering-lessons.md)).
+  >
+  > ⚠️ **Still open, and not fixed:** an unauthorized row is `continue`d without
+  > consuming the row budget and `ListKeyEnvelopesForRecipient` has **no `LIMIT`**,
+  > so a stranger who deposits envelopes and grants **nothing** makes this handler
+  > scan without bound. That is a **latency** denial — the listing it returns stays
+  > correct — and bounding it means pushing the authorization filter into the
+  > query, not capping the scan (a cap would let that same attacker push genuine
+  > rows past it, which is the [ADR 0041](decisions/0041-abuse-bounds-and-the-removed-webhook-limiter.md)
+  > mistake).
 
 - **Errors:**
 

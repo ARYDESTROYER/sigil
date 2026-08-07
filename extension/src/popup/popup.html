@@ -87,6 +87,15 @@
           <input id="restore-url" spellcheck="false" value="http://127.0.0.1:8080" data-testid="restore-url" />
           <label for="restore-device">Kit device id <span class="dim">(printed on the sheet)</span></label>
           <input id="restore-device" spellcheck="false" placeholder="dev_…" data-testid="restore-device-id" />
+          <label for="restore-vaults">Vaults from the sheet&rsquo;s &ldquo;covers&rdquo; line</label>
+          <input id="restore-vaults" spellcheck="false" placeholder="vault-a, vault-b" data-testid="restore-vaults" />
+          <p class="hint">
+            Copying these off the sheet asks each vault directly instead of relying
+            on the server&rsquo;s list of what is waiting for this kit &mdash; a list
+            anyone else can crowd out. Leave it blank and, if that list is being
+            crowded, this refuses rather than restoring part of your vaults and
+            calling it done.
+          </p>
           <label for="restore-code">Recovery code <span class="dim">(56 characters)</span></label>
           <textarea
             id="restore-code"
@@ -120,6 +129,22 @@
            whichever import caused it. Set by `persist()`, which is the single
            place this popup seals the vault, so every growth path reaches it. -->
       <p id="size-warning" class="warn" role="alert" hidden data-testid="vault-size-warning"></p>
+      <!-- ⛔⛔ WHAT A RESTORE COULD NOT ACCOUNT FOR (Phase 64). A truncated
+           envelope index, an index route that would not answer, or rows
+           deposited from outside the account are all facts about a restore that
+           has ALREADY SUCCEEDED, so they arrive in the unlocked vault. They were
+           previously folded into the one-line `#status` message under the label
+           "Not restored:", which reads as though a named vault failed — and any
+           later action overwrites `#status` entirely. This is persistent for the
+           same reason the size warning above it is: the user cannot act on it
+           from here and it does not stop being true. -->
+      <div id="restore-notes" class="warn" role="alert" hidden data-testid="restore-notes">
+        <p><strong>This restore could not account for everything.</strong></p>
+        <ul id="restore-notes-list"></ul>
+        <button id="restore-notes-dismiss" type="button" data-testid="restore-notes-dismiss">
+          Dismiss
+        </button>
+      </div>
       <ul id="accounts" class="accounts" data-testid="accounts"></ul>
       <p id="empty" class="hint" data-testid="empty">
         No accounts yet. Add one below.
@@ -566,14 +591,40 @@
             Account: <span id="recovery-account"></span><br />
             Server: <span id="recovery-server"></span><br />
             Safety number: <span id="recovery-safety" data-testid="recovery-safety-number"></span><br />
-            Vaults covered as of today:
-            <span id="recovery-covered" data-testid="recovery-covered"></span>
+            <!-- ⭐ THE LITERAL WORD `covers`, and that is not cosmetic. The
+                 restore field and the truncation warning both tell the user to
+                 copy "the sheet's covers line" — and this sheet used to be
+                 headed "Vaults covered as of today", so in a crisis it pointed a
+                 person at a label their own paper did not carry. `sigil recovery
+                 generate` prints `covers <ids> (as of the print date)` and the
+                 desktop prints `covers:`, so a user may also be holding a sheet
+                 from another client. One word across all four. -->
+            covers <span id="recovery-covered" data-testid="recovery-covered"></span>
+            (as of the print date)
           </p>
           <p id="recovery-covers-nothing" class="warn" role="alert" hidden data-testid="recovery-covers-nothing">
             <strong>This kit covers NOTHING, so it would recover nothing.</strong>
             It can authenticate to the account but holds no vault key. Convert a
             vault to a shared vault and then use <em>Cover this vault</em> below,
             or this sheet is worthless.
+          </p>
+          <!-- ⭐ GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT — re-print,
+               reduce coverage, copy the "covers" line carefully. By restore time
+               the paper is fixed, so a kit whose envelope index is ALREADY
+               crowded has to say so HERE. The kit is still PRINTED: refusing
+               would let anyone who can crowd a server listing stop kits being
+               made at all, a denial of the last line of defence (ADR 0040
+               limitation 1) and strictly worse than the truncation. -->
+          <p id="recovery-index-truncated" class="warn" role="alert" hidden data-testid="recovery-index-truncated">
+            <strong>
+              This server already lists more waiting keys for this kit than it
+              will show at once, and there is no way to ask for the rest.
+            </strong>
+            The kit works, and the <em>covers</em> line above is what a restore
+            should be given &mdash; it asks each vault directly, which cannot be
+            crowded out. But do not rely on the server being able to tell this
+            kit what it holds, and <strong>re-print</strong> this sheet after
+            covering anything new.
           </p>
           <ul class="warnlist">
             <li>

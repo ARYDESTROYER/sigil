@@ -1001,6 +1001,20 @@ $("recovery-generate-btn").addEventListener("click", async () => {
     }\n` +
     `verified:      unwrapped ${kit.verified_vault || "(nothing to unwrap)"} as ` +
     `${kit.verified_account_id} before printing\n` +
+    // ⭐ GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT — re-print, reduce
+    // coverage, copy the "covers" line carefully. By restore time the paper is
+    // fixed. The kit is still PRINTED: refusing because a stranger crowded a
+    // server listing would let an availability attack stop kits being made at
+    // all, a denial of the last line of defence (ADR 0040 limitation 1) and
+    // strictly worse than the truncation it would be reacting to. Mirrors the
+    // block in `cli/src/main.rs`.
+    (kit.index_truncated
+      ? "⚠ index:       this server ALREADY lists more waiting keys for this kit than it will\n" +
+        "               show at once, and that route has no cursor. The kit works — the\n" +
+        "               `covers` line above is what a restore should be given, because it asks\n" +
+        "               each vault directly and cannot be crowded out — but do NOT rely on\n" +
+        "               discovery, and re-print this sheet after covering anything new.\n"
+      : "") +
     `seats:         ${kit.seats_used} of ${kit.seat_limit} devices (the kit uses one)`;
   $("recovery-sheet").hidden = false;
   $("recovery-sheet").scrollIntoView({ block: "nearest" });
@@ -1111,9 +1125,16 @@ $("recovery-restore-form").addEventListener("submit", async (e) => {
   )
     return;
 
+  // The sheet's "covers" line, typed in. Commas, spaces or newlines — a person
+  // copying from paper should not have to know which.
+  const vaultIds = $("recovery-restore-vaults")
+    .value.split(/[\s,]+/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+
   let r;
   try {
-    r = await call("recovery_restore", { code, deviceId, adopt });
+    r = await call("recovery_restore", { code, deviceId, adopt, vaultIds });
   } finally {
     // ⚠️ Whatever happened, the credential does not stay in the window.
     field.value = "";
@@ -1127,8 +1148,40 @@ $("recovery-restore-form").addEventListener("submit", async (e) => {
           `${v.vault_id}: ${v.entries} account(s) -> ${v.path}  (key sha256 ${v.key_fingerprint})`
       )
       .join("\n") +
+    (r.from_sheet.length
+      ? `\n\nfound by asking the vault directly (the server's list did not name ${
+          r.from_sheet.length === 1 ? "it" : "them"
+        }): ${r.from_sheet.join(", ")}`
+      : "") +
     (r.skipped.length
       ? `\n\nnot recovered:\n${r.skipped.map(([v, why]) => `${v}: ${why}`).join("\n")}`
+      : "") +
+    // ⭐ ONE SUMMARY, NEVER ONE LINE PER ROW. A flood is bounded noise; listing
+    // it row by row would bury the result the user came to read, which is
+    // precisely what the flood is for.
+    (r.ignored_untrusted > 0
+      ? `\n\n⚠ ${r.ignored_untrusted} vault(s) this server listed for this kit were deposited ` +
+        "by devices OUTSIDE your account and were ignored — not fetched, not unwrapped, and " +
+        "their keys were not pinned. Anyone can address an envelope to a kit; an envelope " +
+        "proves WHO sent it, never that they are trusted. A vault genuinely shared to this " +
+        "kit from another account must be collected from a working device with `vault accept`."
+      : "") +
+    // ⚠️ DEGRADED, NOT SILENT. The sheet path deliberately does not depend on the
+    // index route, so this is survivable — but nothing here could then check for
+    // a vault covered AFTER the sheet was printed, and the user must be told.
+    (r.index_error
+      ? `\n\n⚠ the server's envelope index for this kit could NOT be read (${r.index_error}). ` +
+        "This restore used only the vault ids you named, which is exactly what that line on " +
+        "the sheet is for — but nothing here could check for vaults covered AFTER the sheet " +
+        "was printed. Re-check from a working device once the server answers again."
+      : "") +
+    // ⛔ NEVER PRESENT A TRUNCATED RESTORE AS COMPLETE.
+    (r.index_truncated
+      ? "\n\n⚠️⚠️ THIS IS NOT PROVABLY EVERYTHING. This server holds more envelopes for " +
+        "this kit than it will list at once, and there is no way to ask for the rest. " +
+        "What came back is what you named plus one page — a vault covered AFTER the " +
+        "sheet was printed may exist and be invisible here. Treat the list above as a " +
+        "floor, not a total, and re-check from a working device once you have one."
       : "") +
     (r.adopted
       ? "\n\n⚠️ This machine now holds the kit's own keys — it is a second copy of the paper."
@@ -1137,8 +1190,10 @@ $("recovery-restore-form").addEventListener("submit", async (e) => {
   toast(
     r.vaults.length === 0
       ? "nothing was recovered — the kit holds no vault this server can serve"
-      : `recovered ${r.vaults.length} vault(s). Open one with its vault id above.`,
-    r.vaults.length === 0
+      : r.index_truncated
+        ? `recovered ${r.vaults.length} vault(s) — ⚠️ that may NOT be all of them, see below`
+        : `recovered ${r.vaults.length} vault(s). Open one with its vault id above.`,
+    r.vaults.length === 0 || r.index_truncated
   );
   await refreshSync();
 });

@@ -168,13 +168,18 @@ USAGE:
                                          Cover one more vault. From a device that did NOT generate
                                          the kit, --safety-number is REQUIRED and must match
   sigil recovery restore --device-id <kitID> [--code \"<56 chars>\" | --code-stdin]
-                         [--out-dir <dir>] [--adopt] [--server <url>]
+                         [--vault <id> ...] [--out-dir <dir>] [--adopt] [--server <url>]
                                          Recover every covered vault on a machine with NO local
                                          state. The code is PROMPTED for (echo off) or read from
                                          stdin; --code still works for scripts but exposes the
                                          SECRET in argv and shell history. --adopt ALSO persists
                                          the kit's secrets here, making this machine a second
-                                         copy of the paper
+                                         copy of the paper.
+                                         ⭐ --vault takes the ids off the sheet's `covers` line and
+                                         asks each VAULT directly, so discovery cannot be crowded
+                                         out. Without it, a server that truncates the kit's
+                                         envelope index makes this command REFUSE rather than
+                                         restore a silent partial
   sigil recovery revoke --device-id <kitID> [--vault <id> ...] [--keyring <f>] [--key <f>]
                         [--server <url>]
                                          Revoke the kit and take back its envelopes (then rotate)
@@ -4223,6 +4228,20 @@ fn render_recovery_sheet(kit: &sigil_cli::RecoveryKitOutcome) -> String {
             kit.public.covered.join(", ")
         ));
     }
+    // ⭐ THE SHEET IS THE ONE DISCOVERY CHANNEL NOTHING LATER CAN TOUCH. Naming
+    // the vaults makes `restore` ask each vault directly instead of relying on
+    // the server's per-device envelope index, which is a single uncursored page
+    // any account can crowd rows off. Printing the exact command means the
+    // person holding the paper never has to know that.
+    s.push_str("\nrestore with\n  sigil recovery restore --device-id ");
+    s.push_str(&kit.public.device_id);
+    for vault_id in &kit.public.covered {
+        s.push_str(" \\\n    --vault ");
+        s.push_str(vault_id);
+    }
+    s.push_str("\n  (--server ");
+    s.push_str(&kit.public.server);
+    s.push_str(")\n");
     s.push('\n');
     s.push_str(
         "⚠ Anyone holding the SECRET line has FULL CONTROL of this account: they can\n  \
@@ -4231,6 +4250,9 @@ fn render_recovery_sheet(kit: &sigil_cli::RecoveryKitOutcome) -> String {
          Store it where your devices are not. Never photograph it.\n\
          ⚠ Losing every device AND this sheet is unrecoverable, by you and by us.\n\
          ⚠ This kit recovers KEYS, not DATA: a vault that was never synced is gone.\n\
+         ⚠ The `covers` line is what this kit could open ON THE PRINT DATE. A vault\n  \
+         covered later is not on it — re-run `sigil recovery generate` after covering\n  \
+         new vaults, and keep the newest sheet.\n\
          ⚠ Pre-audit, UNAUDITED, dev-only. Do not store real 2FA secrets.\n",
     );
     s
@@ -4292,6 +4314,14 @@ fn cmd_recovery_generate(f: &RecoveryFlags) -> Result<(), String> {
     );
     for (vault_id, fp) in &kit.covered {
         println!("  covered:     {vault_id}  key_sha256={fp}");
+    }
+    if kit.verification.index_truncated {
+        println!(
+            "  ⚠ index:     this server already TRUNCATES the kit's envelope index (more rows than\n  \
+             \x20            it will list, and no cursor). The kit works — the sheet below names the\n  \
+             \x20            vaults, and `restore --vault <id>` asks each vault directly — but do NOT\n  \
+             \x20            rely on discovery, and re-print after covering anything new."
+        );
     }
     println!(
         "  seats:       {}/{} active devices in this account (the kit consumes one)",
@@ -4481,9 +4511,43 @@ fn cmd_recovery_check(f: &RecoveryFlags) -> Result<(), String> {
              sigil recovery cover --device-id {kit_id} --vault <id>"
         );
     }
+    // ⭐ THE SHEET-INDEPENDENT RECORD. `restore` prefers ids named on the command
+    // line because that path asks each vault directly and cannot be crowded out
+    // by an unrelated party flooding the kit's envelope index. A sheet printed
+    // before these vaults existed does not name them, so print the CURRENT
+    // command here and tell the user to keep it with the paper.
+    let covered: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.covered)
+        .map(|r| r.vault_id.as_str())
+        .collect();
+    if !covered.is_empty() {
+        println!(
+            "\nKeep this beside the sheet — it is how a restore finds these vaults without\n\
+                  depending on the server's per-device index:"
+        );
+        println!(
+            "  sigil recovery restore --device-id {kit_id}{}",
+            covered
+                .iter()
+                .map(|v| format!(" \\\n    --vault {v}"))
+                .collect::<String>()
+        );
+    }
     println!(
         "\n⚠ This is coverage as seen FROM THIS DEVICE, not \"you are covered\". A vault created \
          on another device that never heard of this kit is invisible here."
+    );
+    // ⚠️ WHY THERE IS NO TRUNCATION WARNING HERE, and it is a real limit, not an
+    // omission: the kit's envelope index (`GET /v1/devices/{id}/keys`) is
+    // SELF-ONLY, so a member device cannot read it and cannot observe whether it
+    // is being crowded. That self-only rule is correct and is not being loosened
+    // to buy a warning. The answer is instead structural: `restore` does not
+    // depend on that route when it is given the vault ids above.
+    println!(
+        "⚠ It also cannot see the kit's own envelope index — that route is self-only — so it \
+         cannot tell you whether the kit's DISCOVERY is being crowded out. Restoring with the \
+         --vault ids above does not use that route at all."
     );
     Ok(())
 }
@@ -4550,7 +4614,7 @@ fn cmd_recovery_restore(f: &RecoveryFlags) -> Result<(), String> {
         None => default_state_dir(),
     };
 
-    let report = recovery_restore(&code, &server, &kit_id, &out_dir, f.adopt)
+    let report = recovery_restore(&code, &server, &kit_id, &out_dir, f.adopt, &f.vault)
         .map_err(|e| explain_recovery_error(e, "restoring from the recovery kit"))?;
 
     println!(
@@ -4575,6 +4639,63 @@ fn cmd_recovery_restore(f: &RecoveryFlags) -> Result<(), String> {
     }
     for (vault_id, why) in &report.skipped {
         println!("  ⚠ skipped:   {vault_id}: {why}");
+    }
+    if !report.from_sheet.is_empty() {
+        println!(
+            "  from sheet:  {} — the server's index did not list {these}, so {they} recovered by\n  \
+             \x20            asking the vault directly (the discovery path nothing can crowd out)",
+            report.from_sheet.join(", "),
+            these = if report.from_sheet.len() == 1 {
+                "it"
+            } else {
+                "them"
+            },
+            they = if report.from_sheet.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            },
+        );
+    }
+    // ⭐ ONE SUMMARY, NEVER ONE LINE PER ROW. A flood is bounded noise; printing
+    // it row by row would bury the result the user came to read, which is
+    // precisely what the flood is for.
+    if report.ignored_untrusted > 0 {
+        println!(
+            "  ⚠ ignored:   {n} vault(s) this server listed for this kit were deposited by devices\n  \
+             \x20            OUTSIDE your account and were ignored — not fetched, not unwrapped, and\n  \
+             \x20            their keys were not pinned. Anyone can address an envelope to a kit; an\n  \
+             \x20            envelope proves WHO sent it, never that they are trusted. A vault genuinely\n  \
+             \x20            shared to this kit from another account must be collected from a working\n  \
+             \x20            device with `sigil vault accept`.",
+            n = report.ignored_untrusted
+        );
+    }
+    // ⚠️ DEGRADED, NOT SILENT. The sheet path deliberately does not depend on the
+    // index route — but the user must be told the route was unreachable, because
+    // that is also how a vault covered after printing goes missing.
+    if let Some(err) = &report.index_error {
+        println!(
+            "\n⚠ the server's envelope index for this kit could NOT be read ({err}).\n  \
+             This restore used only the vault ids you named, which is exactly what that list is\n  \
+             for — but nothing here could check for vaults covered AFTER the sheet was printed.\n  \
+             Re-run `sigil recovery check --device-id {kit}` once the server answers again.",
+            kit = report.device_id
+        );
+    }
+    // ⛔ NEVER REPORT A TRUNCATED RESTORE AS COMPLETE. The user named vaults, so
+    // this did not refuse — but what it recovered is what the SHEET said, not
+    // provably everything the kit covers.
+    if report.index_truncated {
+        println!(
+            "\n⚠⚠ THIS IS NOT PROVABLY EVERYTHING. This server holds MORE envelopes for kit {kit}\n   \
+             than it will list in one page, and that route has no cursor. What came back above is\n   \
+             what you NAMED plus whatever the single page happened to show — a vault covered AFTER\n   \
+             the sheet was printed may exist and be invisible here.\n   \
+             Re-check from a working device (`sigil recovery check --device-id {kit}`) once you\n   \
+             have one, and treat the count above as a floor, not a total.",
+            kit = report.device_id
+        );
     }
     if report.adopted {
         println!(

@@ -12,7 +12,7 @@ end are in the repository.
 
 ---
 
-## The one failure mode this project has, in eleven disguises
+## The one failure mode this project has, in thirteen disguises
 
 > **Work that quietly does not run looks exactly like work that passes.**
 
@@ -32,6 +32,8 @@ algorithm — a *green signal that meant nothing*.
 | 9 | No test asserted the "browsers persist only sealed containers" invariant. A planted plaintext write of the device seed, hybrid secret and every vault key passed **19/19 and 12/12**. | The suites checked for one needle, not for the property. |
 | 10 | Two Phase 59 fixes were **guarded in the library and unguarded in the product**. A verifier reverted `cloneVault(vault)` in `authenticator.tsx` to the pre-fix `{ version, entries }` shape, and five of six `sealParams(...)` call sites to the bare constant — **webapp 50/50 and extension 14/14 stayed green** both times. Mutating the *same* logic inside `totp-vault.mjs` / `passkey.mjs` went red every time. | The module was covered, so the coverage *looked* real — while the fix in the shipping app was deletable without a single red light. |
 | 11 | A capability probe for `BarcodeDetector` was run on **`about:blank`** and reported the API absent. `BarcodeDetector` is **secure-context gated**: the *same* browser, in the *same* session, exposes it on `http://localhost` and hides it on `about:blank`. The probe was correct about the page and wrong about the browser. | A negative result from a real measurement, on a real browser, reads as a fact about the browser. |
+| 12 | ⭐ **In `scripts/gate.sh` itself, for the fourth time.** The Rust block was `t=$(cargo test … \| grep -E 'test result:')` followed by `grep -q FAILED && bad \|\| ok`. A crate that does not **compile** emits no `test result:` line at all, so `$t` is empty, `grep -q FAILED` does not match, and the gate printed a **PASS with a blank count**. Reproduced against a nonexistent manifest before the fix and after it (`OK-branch taken` → `✗ … produced NO 'test result:' line`). Adjacent, same commit: the `cargo build --bin sigil` line **discarded its exit code**, so a failed rebuild left the *previous* binary on disk for every node interop suite to test. | An empty result was treated as a count of zero failures rather than as an absence of evidence. |
+| 13 | A **source-structure guard** written in Phase 64 to protect the one product layer with no behavioural coverage checked that the token `vaultIds` *appeared* and was not a literal `[]`. It never related the value **passed** to the value **bound**, so `vaultIds: vaultIds.slice(0, 0)` and `&vaults[..0]` both passed it while sending an **empty list** — the exact invisible failure it was written to catch. ⚠️ `cargo check` was clean on the second, so the type system did not catch it either. **The seventh guard in this repo to fail on its own subject matter.** | The guard ran, named the right file, and printed `ok`. |
 
 The common shape: **the measurement was broken, not the code.** In most of these
 the product was fine; what failed was the thing that was supposed to notice.
@@ -120,6 +122,50 @@ laptop, the obvious way someone would try to scan a code** — silently loses th
 API. That is why `qrSupport()` is a runtime probe rather than a build-time one,
 and why the message the user sees names the page's **origin** as a cause and not
 only the browser brand.
+
+**⭐ An attack test that could only fail one way, and the defect it hid.** Phase 64
+reproduced a flood of a recovery kit's discovery index by depositing **520
+envelopes of junk bytes**. It passed, and it proved the listing could be crowded.
+It could prove nothing else: junk can only ever be refused by the AEAD, so every
+planted row landed in `skipped` no matter what the restore did with a row it
+could actually *open*.
+
+Rewriting the same flood to mint **genuine, correctly authenticated** envelopes —
+which any account can do, because every input to a vault-key wrap is public —
+changed the answer completely. With the new trust rule mutated off, the restore
+returned **six** vaults:
+
+```
+left:  ["zz-real-vault", "aaa-spam-00000", "aaa-spam-00001",
+        "aaa-spam-00002", "aaa-spam-00003", "aaa-spam-00004"]
+right: ["zz-real-vault"]
+```
+
+Five vaults belonging to a stranger, handed to the one person who by construction
+has nothing left to check them against. The original test would have stayed green
+through all of it.
+
+⭐ **The lesson: build the attacker who is trying to SUCCEED, not the one who is
+trying to be refused.** A negative-only adversary measures your error path; it
+says nothing about your success path. Ask of every attack test: *if the control
+were absent, is my attacker strong enough that something bad would actually
+happen?* If the answer is no, the test is a shape, not a proof.
+
+**⭐ An invariant closed for one instance and missed for its twin.** Phase 64
+wrote down, in its own ADR, that a restore must never report a vault as recovered
+when the result cannot be opened — and enforced it for a failed **keyring write**.
+An independent verifier then found the *same* invariant broken by the **file
+name**: `sanitize_file_stem` is not injective, so `team.vault` and `team_vault`
+both became `team_vault.sigil`, the second silently replacing the first while both
+were reported recovered. **Reachable with no attacker at all.**
+
+⭐ The lesson is not "be more careful". It is that **stating an invariant is not
+sweeping for it.** When a defect is characterised precisely enough to write down —
+*"a container on disk that cannot be opened, reported as recovered"* — that
+sentence is a **grep-able specification**, and the next step is to enumerate every
+way it can happen, not to fix the instance in front of you. The same rule already
+appears in this document as *"a false sentence is a class, not an instance"*; this
+is its constructive twin.
 
 **Documentation that was true when written.** Several status blocks told a
 reader that `sigild` "performs no cryptography" and "holds no keys" while there

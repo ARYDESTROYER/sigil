@@ -1446,6 +1446,14 @@ export function generateRecoveryKit(
   verification: {
     accountId: string;
     indexedVaults: number;
+    /**
+     * ⚠️ The kit's envelope index was ALREADY truncated when it was printed, so
+     * this kit must be restored from the sheet's `covers` line rather than from
+     * discovery. ⭐ GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT on that
+     * — re-print, reduce coverage, copy the ids carefully. By restore time the
+     * paper is fixed, so a UI must surface it HERE.
+     */
+    indexTruncated: boolean;
     unwrappedVault: string;
     fingerprint: string;
   };
@@ -1479,10 +1487,16 @@ export function coverVault(
  * Restore from a printed kit on a client with NO local state. `deviceId` is
  * printed on the sheet and is NOT a secret. Nothing is persisted here — the
  * caller decides, and the browser clients keep everything sealed.
+ *
+ * ⭐ `vaultIds` are the ids on the sheet's `covers` line. Supplying them makes
+ * the restore ask each VAULT directly rather than depending on the per-device
+ * envelope index — one uncursored 500-row page that any other account can crowd
+ * rows onto. With none supplied and a truncated index this REFUSES rather than
+ * restoring a silent partial.
  */
 export function restoreFromKit(
   wasm: SigilWasm,
-  args: { baseUrl: string; code: string; deviceId: string },
+  args: { baseUrl: string; code: string; deviceId: string; vaultIds?: string[] },
 ): Promise<{
   deviceId: string;
   accountId: string;
@@ -1503,6 +1517,29 @@ export function restoreFromKit(
   identity: RecoveryIdentity;
   /** The pin store this restore built (every sender pinned on first sight). */
   pins: HybridPinStore;
+  /**
+   * ⚠️ The server's per-device envelope index was TRUNCATED. What came back is
+   * what the caller NAMED plus one page — a UI must NOT call it "everything".
+   */
+  indexTruncated: boolean;
+  /** Vault ids the caller supplied that the index did not list. */
+  fromSheet: string[];
+  /**
+   * ⚠️ The per-device index could not be read AT ALL, and this restore carried
+   * on using only the vault ids the caller named — which is exactly what that
+   * list is for. Non-null only when ids WERE supplied. "Listed nothing" and
+   * "never answered" are DIFFERENT facts and a UI must not merge them: the
+   * second is also how a vault covered after the sheet was printed goes missing.
+   */
+  indexError: string | null;
+  /**
+   * How many listed rows were deposited by devices OUTSIDE this kit's account
+   * and were ignored — not fetched, not unwrapped, and their keys NOT pinned.
+   * An envelope proves WHO sent it, never that they are trusted. Render it as a
+   * COUNT: one line per row would bury the real result, which is exactly what a
+   * flood is for.
+   */
+  ignoredUntrusted: number;
 }>;
 
 /** Revoke a kit and take back its envelopes. Does NOT auto-rotate. */

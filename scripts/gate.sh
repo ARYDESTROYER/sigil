@@ -250,12 +250,26 @@ for m in libsigil cli sigil-wasm desktop; do
   cargo fmt --manifest-path $m/Cargo.toml --all -- --check >/dev/null 2>&1 && ok "$m fmt" || bad "$m fmt"
   cargo clippy --manifest-path $m/Cargo.toml --all-targets -- -D warnings >/dev/null 2>&1 && ok "$m clippy" || bad "$m clippy"
   t=$(cargo test --manifest-path $m/Cargo.toml 2>&1 | grep -E 'test result:' )
-  printf '%s' "$t" | grep -q FAILED && bad "$m tests" || ok "$m tests ($(printf '%s' "$t" | grep -oE '[0-9]+ passed' | awk -F' ' '{s+=$1} END {print s}') passed)"
+  # ⛔ AN EMPTY RESULT IS A FAILURE, NEVER A COUNT. A crate that does not COMPILE
+  # emits no `test result:` line at all, so `$t` is empty, `grep -q FAILED` does
+  # not match, and the old form printed a PASS with a blank count. Reproduced
+  # against a nonexistent manifest: `OK-branch taken`. This is the repo's one
+  # recurring failure mode — work that quietly does not run looks exactly like
+  # work that passes — sitting inside the script written to prevent it, which is
+  # the fourth time (docs/engineering-lessons.md #6). It matters more from
+  # Phase 64 on: `cli/tests/recovery_index_flood.rs` shells out to `go build`,
+  # so it is the single most likely thing here to stop compiling.
+  [ -n "$t" ] || bad "$m tests produced NO 'test result:' line — the crate did not build, or the run was killed"
+  printf '%s' "$t" | grep -q FAILED && bad "$m tests" || { [ -n "$t" ] && ok "$m tests ($(printf '%s' "$t" | grep -oE '[0-9]+ passed' | awk -F' ' '{s+=$1} END {print s}') passed)"; }
 done
 
 note "=== WASM + NODE INTEROP (dynamically enumerated) ==="
 ./sigil-wasm/build-wasm.sh >/dev/null 2>&1 && ok "build-wasm" || bad "build-wasm"
-cargo build --manifest-path cli/Cargo.toml --bin sigil >/dev/null 2>&1
+# ⛔ Its exit code used to be DISCARDED. Every node interop suite shells out to
+# this binary, so a failed rebuild leaves the PREVIOUS run's `sigil` on disk and
+# the suites happily test a stale binary — a false green of exactly the shape
+# this script exists to catch.
+cargo build --manifest-path cli/Cargo.toml --bin sigil >/dev/null 2>&1 && ok "sigil binary" || bad "sigil binary (the node interop suites would have tested a STALE one)"
 # Helpers are NOT tests. fake-sigild.mjs is a server double and would hang here.
 for t in sigil-wasm/test/*.mjs; do
   case "$(basename "$t")" in fake-*|*-helper.mjs) continue;; esac
@@ -406,6 +420,11 @@ printf '  go test pkgs:     %s\n' "$(find sigild -name '*_test.go' | sed 's|/[^/
 # number whose job is to make a MISSING suite visible is itself wrong.
 printf '  node interop:     %s\n' "$(ls sigil-wasm/test/*.mjs | grep -vE '/(fake-|[^/]*-helper\.mjs)' | grep -c .)"
 printf '  shell e2e:        %s\n' "$(ls cli/tests/*.sh | grep -vc '/_')"
+# Rust INTEGRATION test files had no inventory line, so `recovery_index_flood.rs`
+# — which boots a real sigild — was invisible to the one list whose stated job is
+# making a missing suite visible. They run inside `cargo test` above; this counts
+# the FILES so a deleted one shows up as a number that moved.
+printf '  rust integration: %s\n' "$(ls cli/tests/*.rs desktop/core/tests/*.rs 2>/dev/null | grep -c .)"
 printf '  playwright specs: %s\n' "$(find web extension -name '*.spec.ts' -o -name '*.spec.mjs' | grep -vc node_modules)"
 
 [ "$fail" -eq 0 ] && note "

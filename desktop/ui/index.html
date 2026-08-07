@@ -485,6 +485,16 @@
                  placeholder="XXXXXXXX-XXXXXXXX-… (7 groups of 8)" required />
           <label for="recovery-restore-device">Kit device id</label>
           <input id="recovery-restore-device" spellcheck="false" placeholder="dev_…" required />
+          <label for="recovery-restore-vaults">Vaults from the sheet&rsquo;s &ldquo;covers&rdquo; line</label>
+          <input id="recovery-restore-vaults" spellcheck="false"
+                 placeholder="vault-a, vault-b   (optional, but see below)" />
+          <p class="note">
+            Copying the ids off the sheet asks each vault directly instead of
+            relying on the server&rsquo;s list of what is waiting for this kit &mdash;
+            a list any other account can crowd out. Leave it blank and, if that
+            list is being crowded, this refuses rather than restoring part of
+            your vaults and calling it done.
+          </p>
           <label class="checkline">
             <input id="recovery-adopt" type="checkbox" />
             Also keep the kit&rsquo;s identity on this machine

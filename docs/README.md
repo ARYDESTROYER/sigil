@@ -128,7 +128,20 @@ Add one more that is about reach rather than about us: **QR scanning depends on
 **secure-context gated** — so a page served over plain HTTP from a LAN address
 gets no scanner, and **no CI runner exercises the supported branch**. Each
 ADR ends with its own limits, and they are meant to be read as
-findings-in-waiting rather than disclaimers.
+findings-in-waiting rather than disclaimers. Since Phase 64
+([0052](decisions/0052-recovery-discovery-and-the-printed-sheet.md)), add the
+sharpest one in the recovery story: the self-only route a **recovery kit** uses to
+discover what it can decrypt is **one uncursored page a third party can crowd**
+(measured: 520 vaults in 0.6 s with junk bytes, ~3 s when every envelope is genuine and authenticated), and — because every input to a vault-key wrap is
+public — that third party can deposit a **perfectly authenticated** envelope, so a
+restore on a machine with an empty pin store once accepted **a stranger's vault as
+the user's own**. Discovery now runs off the **vault ids printed on the sheet**,
+and the index may only introduce a vault whose sender is a device in the kit's own
+account. ⛔ What is *not* closed: the sheet lists coverage **as of the print
+date**, that trust rule defends against a **third party and not against the
+server**, and a stranger who deposits without granting read still causes an
+**unbounded server-side scan** (a latency denial, pre-existing, recorded rather
+than fixed).
 
 ⚠️ **Two documents in this folder recently asserted a defense that did not
 exist** — `threat-model.md` row V and `crypto-spec.md`'s "cannot mint" paragraph,

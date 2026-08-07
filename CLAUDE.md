@@ -816,6 +816,25 @@ public, make no security claims, until the audit completes and trademark clears.
   `GET /v1/billing/subscription`. The verifier mutation-tested this phase hard: **15
   separate control mutations all went red.** ADR 0043; `docs/deployment.md` §16.
   **⚠️ NO MIGRATION was added by Phases 53–55 — `sigild_schema_version` is still 5.**
+- `sigild/` ⚠️ **PHASE 64 (ADR 0052) MODIFIED `sigild` — say so, do NOT reach for the
+  "sigild gained nothing" line.** It is a **COMMENT ONLY**: the justification block above
+  **`maxRecipientIndexRows`** (`internal/api/sharing.go`). It said having no cursor was fine
+  *"because the realistic count is single digits and a cursor would be dead code"* — and
+  **the count is not the user's, it is an ATTACKER'S** (measured from a second
+  account: 520 vaults in 0.6 s with junk bytes, ~3 s when every envelope is genuine and
+  authenticated). ⛔ **NO behaviour changed**: no route, header, canonical message,
+  migration, table, metric or dependency; `sigild_schema_version` stays **5**; still exactly
+  **ONE** direct Go dependency; the constant is still **500**. The comment now carries the
+  measurement, the rejected options **with their reasons** (a cursor does not help; a **scan
+  cap is an ADR 0041 mistake** because unauthorized rows are `continue`d without consuming
+  the row budget, so a cap would turn a slow-but-CORRECT listing into an EMPTY one;
+  own-account-first ordering only half-closes it), and the residual it does **not** fix (an
+  unauthorized row costs a store round trip and `ListKeyEnvelopesForRecipient` has **no
+  `LIMIT`**, so a stranger who deposits and grants nothing makes the handler **scan without
+  bound** — a **LATENCY** denial that leaves the listing correct, **PRE-EXISTING**, and
+  fixable only by pushing the authorization filter into the query). ⭐ **The duty moved to
+  the CLIENT, because that is where the information to settle it exists** — the printed
+  sheet. ⚠️ **A comment is not a control**, and the ADR says so.
 - `sigild/` **THE RECOVERY-KIT SERVER SIDE (Phase 54, ADR 0042) is ONE ROUTE and NOTHING
   ELSE.** ⭐ **`sigild` gained NO concept of "recovery"**: no table, no migration, no flag,
   no config. A recovery kit is an **ORDINARY MEMBER DEVICE** (label `"recovery-kit"`,
@@ -1200,8 +1219,19 @@ public, make no security claims, until the audit completes and trademark clears.
 - `docs/` — architecture map, threat model, crypto spec, op-log API reference,
   sprint plan, deployment runbook (internal/pre-audit), plus `docs/decisions/` —
   Architecture Decision Records (Nygard-style ADRs for load-bearing choices; latest is
-  **0051**, *"bounds on an untrusted provisioning payload, and the QR door that made
-  them urgent"* — a stranger's `otpauth://` URI could install an entry whose code
+  **0052**, *"recovery discovery, the printed sheet, and the stranger's vault"* — the one
+  flow that exists because everything else is already lost could **silently restore a
+  partial vault set and report success** (the Rust CLI never read `has_more`; JS has
+  refused since Phase 58), and a **third party could deny discovery outright** by crowding
+  the single uncursored 500-row page of `GET /v1/devices/{deviceID}/keys` (**measured:
+  520 vaults in 0.6 s with junk bytes, ~3 s when every envelope is genuine and
+  authenticated**). ⭐ The answer was **already on paper** — the sheet's `covers` line —
+  so the fix is **retroactive to every sheet printed since Phase 54**; ⛔⛔ and attacking
+  our own fix found the sharper defect, that a stranger can mint a **perfectly
+  authenticated** envelope and a restore's **empty pin store** made it first-sight TOFU.
+  ⭐ `sigild`'s BEHAVIOUR is unchanged **and the ADR argues why** rather than asserting it.
+  Before it, **0051**, *"bounds on an untrusted provisioning payload, and the QR door that
+  made them urgent"* — a stranger's `otpauth://` URI could install an entry whose code
   **NEVER CHANGES**, rendered with an ordinary countdown; ⭐ the ceiling is
   **INGEST-ONLY** because *refusing to ADD is a different act from refusing to READ*,
   it has deliberately **NO FLOOR**, and it leaves `--period` and the vault **MERGE**
@@ -1241,6 +1271,22 @@ public, make no security claims, until the audit completes and trademark clears.
   `handle /metrics { respond 404 }` **before** the proxy — **404, not 403, because a
   403 confirms the route exists**. Nothing is deployed, so this is still unproven end
   to end. **Documentation is not a control.**
+- `scripts/` ⚠️ **A FOURTH BLIND SPOT IN `gate.sh` WAS FOUND AND FIXED IN PHASE 64, and it
+  is the repo's signature failure mode inside the script written to prevent it.** The Rust
+  block was `t=$(cargo test … | grep -E 'test result:')` followed by
+  `grep -q FAILED && bad || ok`. **A crate that does not COMPILE emits no `test result:` line
+  at all**, so `$t` was empty, `grep -q FAILED` did not match, and the gate printed a **PASS
+  with a blank count**. ⭐ **Reproduced BOTH directions before and after**: a nonexistent
+  manifest printed `OK-branch taken`, and now prints `✗ … produced NO 'test result:' line`,
+  while `libsigil` still prints `✓ … (165 passed)` — a guard that fails on everything is as
+  useless as one that fails on nothing. It matters more from this phase on, because
+  `cli/tests/recovery_index_flood.rs` shells out to `go build` and is the single most likely
+  thing in the tree to stop compiling. **Adjacent, same commit:** `cargo build --bin sigil`
+  **discarded its exit code**, so a failed rebuild left the **PREVIOUS** binary on disk for
+  every node interop suite to test — also fixed. And the **INVENTORY gained a
+  `rust integration:` line**, because Rust integration-test FILES had no line at all, so the
+  new real-sigild suite was invisible to the one list whose stated job is making a missing
+  suite visible.
 - `scripts/` — **`gate.sh`** (Phase 56), the documented way to run **everything**: it
   enumerates every suite dynamically, counts results instead of trusting exit codes,
   prints an inventory, and runs a **CI-drift check** asserting every node interop suite
@@ -1453,7 +1499,7 @@ public, make no security claims, until the audit completes and trademark clears.
   ENTRIES ARE IMMUTABLE.** If a rename/edit/in-place update is ever added this merge
   **silently keeps whichever copy sorts higher**. **An edit MUST be delete + add with a
   fresh uuid, or the merge needs a revision rule FIRST.** Guarded by
-  **`sigil-wasm/test/merge-guard.mjs` (51 structural checks**, measured): no in-place
+  **`sigil-wasm/test/merge-guard.mjs` (124 structural checks**, measured): no in-place
   write to a content field (**exact per-file counts with written justifications, so a
   MISSING hit also fails**), no edit-shaped declaration, the `sigil totp` subcommand set
   stays `{add,code,export,import,list,remove,sync}`, and the in-code immutability
@@ -1649,6 +1695,90 @@ public, make no security claims, until the audit completes and trademark clears.
   but only if a human actually compares it); a user who blindly re-pins defeats it;
   rotation protects **FUTURE content ONLY** (a device that already unwrapped a key keeps
   what it copied); UNAUDITED.
+  ⭐⭐ **PHASE 64 (ADR 0052) — `sigil recovery restore` GAINED `--vault <id> ...`, AND
+  THE REASON IS THAT THE OLD PATH COULD BE DENIED BY A STRANGER.** ⛔ **TWO defects,
+  both reproduced against a REAL sigild with two real accounts.** (1) `list_recoverable_vaults`'s
+  wire struct had **no `has_more` field at all** and `recovery_restore` never looked, so a
+  truncated index meant restoring the visible prefix and **REPORTING SUCCESS** — silent data
+  loss in the one flow whose entire job is answering *"did I get everything back?"*, landing
+  on the one person who by construction has nothing left to check it against. **The JS half
+  had refused since Phase 58; Rust had not.** (2) `GET /v1/devices/{deviceID}/keys` is **ONE
+  page, 500 rows, NO CURSOR**, and any account may deposit an envelope addressed to a device
+  id it knows and then **grant that device `read`** on a vault it claimed itself — TOFW caps
+  nothing — pushing genuine rows off the page. ⚠️ **The obvious mechanism does NOT work:** a
+  bare deposit is not counted (the handler filters every row through `authorizeVault(needRead)`),
+  measured at `count: 3, truncated: false`; **the grant is required**. ⚠️ **Reachability:** the
+  kit's device id is 128 bits of CSPRNG and unguessable but **NOT secret** —
+  `GET /v1/vaults/{id}/grants` discloses it with **`read` alone**, so any current **or former**
+  collaborator keeps it permanently and revocation cannot un-learn it.
+  ⭐ **THE FIX USES WHAT THE SYSTEM ALREADY HAD:** `render_recovery_sheet` has printed the
+  covered vault ids on its **`covers` line** since Phase 54, so `--vault` makes the restore ask
+  each **VAULT** directly (`GET /v1/vaults/{id}/keys` via the new `envelope_sender_for`, then
+  `GET /v1/vaults/{id}/keys/{deviceID}`) — both addressed **BY VAULT ID**, with nothing for a
+  flood to crowd out — and it is therefore **RETROACTIVE to every sheet already printed**.
+  Given no ids and `has_more: true` it **REFUSES** and writes nothing (`RecoverableIndex
+  { vaults, truncated }`, `RestoreReport { index_truncated, from_sheet, index_error,
+  ignored_untrusted }`). The sheet now also prints the exact restore command, and
+  `recovery check` prints the CURRENT one because coverage drifts.
+  ⛔⛔ **THE SHARPEST DEFECT WAS FOUND BY ATTACKING OUR OWN FIX, and it is the lesson to keep:**
+  the first flood deposited **junk bytes**, which the AEAD could only ever refuse — so it
+  measured the ERROR path and proved nothing about the SUCCESS path. Every input to a
+  vault-key wrap is **PUBLIC** (sigild serves any device's published hybrid key to any
+  authenticated device; the AAD is purpose+vault+recipient+sender), so a stranger can mint a
+  **GENUINELY AUTHENTICATED** envelope — **ADR 0048 proves WHO deposited one and NOTHING about
+  whether they are trusted** — and a restore runs with an **EMPTY PIN STORE**, so first-sight
+  TOFU pinned the stranger's key, unwrapped, opened their container and reported it as a
+  **RECOVERED VAULT**. Mutating the fix off returned **six** vaults:
+  `["zz-real-vault", "aaa-spam-00000", …, "aaa-spam-00004"]`. ⭐ **THE RULE:** a vault **NAMED
+  ON THE SHEET** is vouched for **by the user** and is processed whatever the sender; a vault
+  the **INDEX ALONE** introduced is processed **only if its `sender_device_id` is a device in
+  the kit's OWN ACCOUNT** — read from the `get_account` call the restore **already made**
+  (`AccountInfo.devices` lists **active AND revoked**, load-bearing because the covering device
+  may since have been revoked). The verdict is reached **from the index row alone, BEFORE any
+  network call for that row**, so a flood costs nothing: no fetch, no unwrap, and **no PIN of
+  the stranger's key**. Ignored rows are **ONE SUMMARY COUNT** (`ignored_untrusted`), never one
+  line each — rendering a flood row by row buries the real result, which is what the flood is
+  for. ⚠️ **HONEST LIMIT, in the doc comment in both languages: this defends against a THIRD
+  PARTY, not against the SERVER**, which serves the account device list.
+  ⭐ **THREE MORE FIXES THE SAME PHASE FOUND IN ITS OWN FIRST CUT:** (a) the sheet path was
+  **GATED BEHIND THE VERY ROUTE IT EXISTS TO BYPASS** — `list_recoverable_vaults(…)?` ran
+  unconditionally, so a dead index killed the sheet path too and the phrase *"the discovery
+  path that cannot be denied"*, written three times in the new code, was **FALSIFIABLE AS
+  SHIPPED**; it now **DEGRADES** (recorded in `index_error`) when ids were supplied and still
+  propagates when they were not. (b) `pull_ops_auth(…)?`, the keyring writes and the file
+  writes propagated with `?`, so **ONE hostile row erased the report of every vault already on
+  disk** — sheet vaults are processed FIRST, so the user was told the recovery failed while
+  their vaults sat in `~/.sigil`; they now record into `skipped`. ⚠️ A failed **keyring** write
+  is NOT merely made non-fatal — that would count a vault as recovered whose key was never
+  persisted — so `keep_key` returns whether the key is on disk and the vault is not counted
+  when it is not. (c) ⛔ **THE BROWSERS WERE REVOKING A WORKING KIT:** the Rust pre-print check
+  was relaxed to tolerate a truncated index and **the JS twin was not**, and its throw is
+  caught by a handler that calls `revokeSelf` — so a stranger crowding the listing could stop
+  the webapp and the extension **EVER printing a kit**, a denial of the last line of defence
+  under ADR 0040 limitation 1 and **strictly worse than the truncation being fixed**. ⚠️ It is
+  not "flood before generate" (a kit's device id does not exist until it is enrolled) but a
+  **RACE**, which the regression test wins against a real server.
+  ⭐ **`sigild`'s BEHAVIOUR IS UNCHANGED — but `sigild` WAS modified, by a COMMENT, and this
+  file will not reach for "sigild gained nothing".** `maxRecipientIndexRows` justified having
+  no cursor with *"the realistic count is single digits and a cursor would be dead code"*; **the
+  count is an ATTACKER'S**. ⛔ **Every server option was weighed and rejected on the merits:** a
+  cursor does not help (the flooder bloats what must be paged through, on a client with no
+  local state and no way to know when to stop); **capping the SCAN is worse than the disease**
+  — unauthorized rows are `continue`d **without consuming the row budget**, so a cap would let
+  an attacker who deposits and grants **nothing** push genuine rows past it, turning a
+  slow-but-**CORRECT** listing into an **EMPTY** one, which is **ADR 0041 exactly**; and
+  own-account-first ordering only **half-closes** it (a cross-account-covered vault stays
+  crowdable) with no version marker for any client to rely on. ⚠️ **STILL OPEN AND NOT FIXED:**
+  an unauthorized row costs a store round trip, neither consumes the budget nor ends the loop,
+  and `ListKeyEnvelopesForRecipient` has **no `LIMIT`** — a stranger who deposits and grants
+  nothing makes the handler **scan without bound**. That is a **LATENCY** denial (the listing
+  stays correct), it is **PRE-EXISTING**, and bounding it correctly means pushing the
+  authorization filter **into the query**. Proof: **`cli/tests/recovery_index_flood.rs`** (2
+  tests, real sigild, 520 GENUINE authenticated envelopes, 5 backed by real containers; plus a
+  `FailProxy` that 500s exactly one route). ⚠️ **The generate-time `index_truncated == true` is
+  proven in JS only** — the Rust/desktop side asserts only the FALSE case, because making it
+  true needs winning the enrol→pre-print race and `recovery_generate` offers no interception
+  point in Rust the way `globalThis.fetch` does in JS.
   ⭐ Also **`sigil recovery generate|cover|check|verify|restore|revoke`** — the
   **RECOVERY KIT** (Phase 54, ADR 0042), the answer to ADR 0040's limit 1. ⚠️ **A KIT IS AN
   ORDINARY MEMBER DEVICE** whose Ed25519 + hybrid private keys are HKDF-SHA256 derivations
@@ -2054,6 +2184,30 @@ public, make no security claims, until the audit completes and trademark clears.
   sight. Proven by
   **`sigil-wasm/test/pinning-interop.mjs`** (below). It does **NO crypto itself** (SHA-256
   via `crypto.subtle`, KEM/AEAD in the wasm), so `Cargo.lock`s stay `getrandom`==0.
+  ⭐⭐ **PHASE 64 (ADR 0052) — THE JS HALF OF THE SHEET-DRIVEN RESTORE, PLUS A DEFECT THAT
+  LET A STRANGER STOP THE BROWSERS PRINTING A KIT AT ALL.** `restoreFromKit` gained
+  **`vaultIds`** (the sheet's `covers` line) and returns **`indexTruncated`**, **`fromSheet`**,
+  **`indexError`** and **`ignoredUntrusted`**; a new `envelopeSenderFor` asks the VAULT which
+  device deposited its envelope, mirroring `envelope_sender_for` in `cli/src/lib.rs`. The
+  index call is now inside a **try/catch** that rethrows only when NO ids were supplied — it
+  used to run unconditionally, so the sheet path was **gated behind the very route it exists
+  to bypass**. ⭐ The same **own-account sender rule** as Rust: a sheet-named vault is
+  processed whatever the sender; a vault the index alone introduced needs a sender in the
+  kit's own account, decided from the index row **before any network call**, so a flood costs
+  nothing and the stranger's key is **never pinned**. ⛔⛔ **THE DEFECT THIS FOUND:
+  `generateRecoveryKit`'s pre-print check threw when the index did not list the vault, and
+  that throw is caught by a handler that calls `revokeSelf` — so a stranger crowding the
+  listing could stop the webapp and the MV3 extension EVER PRINTING A RECOVERY KIT**, a
+  denial of the last line of defence under ADR 0040 limitation 1 and **strictly worse than
+  the truncation this phase set out to fix**. The Rust twin had been relaxed in the same
+  phase; the JS one had not. ⚠️ **The reachable attack is a RACE, not "flood before
+  generate"** — a kit's device id does not exist until it is enrolled, and
+  `GET /v1/vaults/{id}/grants` discloses it the instant it is granted read; the new
+  `recovery-interop.mjs` arm **(h)** wins that race against a real server by watching for the
+  enroll 201. Arm **(i)** 500s only the index route and proves the sheet still recovers.
+  `verification` now carries **`indexTruncated`**, and `web/packages/sigil-wasm/index.d.ts`
+  was updated with it (the **two-hole trap** from Phase 56 — no new module export was needed,
+  so `index.mjs` was correctly left alone).
   **Phase 54 added the JS half of the RECOVERY KIT (ADR 0042):** six thin-shell wasm exports
   (`recovery_encode`/`recovery_decode`/`recovery_derive_ed25519_seed`/
   `recovery_derive_x25519_secret`/`recovery_derive_mlkem_seed`/`recovery_format`, adding **no
@@ -2365,6 +2519,37 @@ public, make no security claims, until the audit completes and trademark clears.
   nothing). Pinned by a NEW **`tests/user-safety.spec.mjs`** driving the real popup —
   **9 spec files** at the time (**11** since Phase 63). ⚠️ Against the `fake-sigild.mjs` DOUBLE. ⛔⛔ The clock control
   **reports and never corrects**; offline is **NO READING**, not "fine".
+  ⭐⭐ **Phase 64 (ADR 0052) gave BOTH BROWSERS a "vaults from the sheet" input, a
+  PERSISTENT restore-notes alert, and a generate-time truncation warning.** ⚠️ **The webapp's
+  bug here was that it COMPUTED the warning and THREW IT AWAY on success** — `await
+  onRestore({…})` discarded the return value, and the only consumer was the failure throw, so
+  the exact scenario this phase exists to make honest landed in the unlocked vault saying
+  NOTHING. ⭐ **The notes state could NOT live in `RestorePanel`**, which is mounted only in
+  the `setup`/`locked` branches and is therefore **unmounted by the very success it would be
+  reporting on** — it lives in the parent, beside `notice`/`sizeWarn`, is `role="alert"`,
+  survives the vault render, is dismissible, and is cleared on `forget()` but **deliberately
+  not on `lock()`** ("this may not be everything" does not stop being true). The extension's
+  `#status` is ONE LINE that every later action overwrites, so it got the same shape plus a
+  split of per-vault `notes` from whole-restore `caveats` (the truncation sentence used to
+  render under **"Not restored:"**, reading as though a named vault had failed) and a headline
+  that switches on `indexTruncated`. Both also surface `indexError` and `ignoredUntrusted`,
+  which no browser rendered at all. **All three GUIs still PRINT the kit** under a truncated
+  index — refusing would hand an availability attack the power to stop kits being made.
+  ⇒ extension **11 spec files, 40 tests**; webapp **15 spec files, 78 tests**.
+  ⭐ **`merge-guard.mjs` gained section 8 (⇒ 124 structural checks)** because the DESKTOP's
+  Tauri IPC hop was the one product layer where this fix was revertible with the whole gate
+  green: `vaultIds` → `vault_ids: Option<Vec<String>>` → `unwrap_or_default()` deserializes a
+  dropped or mis-named argument to `None` **silently**, and its only symptom is a refusal
+  byte-identical to a genuine truncation. Two `src -> {ok, why}` predicates check the UI
+  passes it (and reads it from the real field), and that the command **accepts AND forwards**
+  it — **accepted-then-discarded fails**, ZERO call sites fails, and eight self-test
+  specimens encode the mutations. ⚠️ A test comment in `server_interop.rs` claimed to pin
+  "that the DESKTOP threads the ids through" while calling the LIBRARY directly; corrected.
+  ⚠️ **`desktop/ui/` is still rendered by NO test** — the desktop remains the least-verified
+  client. ⚠️ The browser specs shrink `fake-sigild.mjs`'s `indexPageCap` rather than minting
+  500 envelopes, so `fromSheet` is empty there and `envelopeSenderFor` is **not** exercised in
+  the browser — that lives in `recovery-interop.mjs` against a REAL sigild. ⭐ **The double
+  was NOT touched**: every new assertion was reachable through its existing knob.
   ⭐⭐ **Phase 63 (ADR 0051) gave the popup the SAME provisioning gate, QR door and two
   warnings as the webapp**, through the vendored helpers (`build.sh` now vendors **NINE**;
   `qr-scan.mjs` imports nothing). The `add-form` submit handler calls the vendored
@@ -2378,7 +2563,7 @@ public, make no security claims, until the audit completes and trademark clears.
   **both** causes), a **`.frozen` `role="alert"`** read-path warning, and a
   **`#size-warning`** element fed from `persist()` **and** the unlock path. NEW
   **`tests/provisioning.spec.mjs`** (4) and **`tests/qr.spec.mjs`** (5) ⇒ **11 spec files,
-  39 tests**, driving the **real unpacked extension**. ⚠️ **A real UX wrinkle was NOT
+  40 tests**, driving the **real unpacked extension**. ⚠️ **A real UX wrinkle was NOT
   papered over:** the label/secret fields were `required`, so with native validation off an
   empty secret now reports *"base32 secret decoded to zero bytes"* (thrown while evaluating
   the gate's argument) rather than the browser's prompt, and with **both** empty the secret
@@ -2626,8 +2811,8 @@ public, make no security claims, until the audit completes and trademark clears.
   and a finding that names one instance is a finding about the CLASS (the Phase 62 lesson,
   applied prospectively). ⛔ **REPORTS, NEVER CORRECTS:** the entry is still listed, still
   generates and is not altered. Pinned by a new unit test
-  `an_entry_whose_code_never_rotates_is_reported_as_such_and_still_generates` (⇒ **26 unit
-  + 9 integration = 35**), which asserts **BOTH** halves — the warning fires **and** the
+  `an_entry_whose_code_never_rotates_is_reported_as_such_and_still_generates` (⇒ **27 unit
+  + 9 integration = 36**), which asserts **BOTH** halves — the warning fires **and** the
   entry still produces a code — because either alone is the wrong product. ⚠️ **STILL
   BY-EYE:** the `desktop/ui/main.js` *rendering* of it is covered by **no test**, exactly
   like the clock panel and the delete-confirm dialog. ⛔ **The desktop got NO QR scanner**
@@ -2760,7 +2945,16 @@ cargo build --manifest-path $M -p sigil-core --target wasm32-unknown-unknown
 # building it, confirm it did NOT leak into the wasm-pure core:
 cargo fmt   --manifest-path cli/Cargo.toml --all -- --check
 cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path cli/Cargo.toml
+cargo test  --manifest-path cli/Cargo.toml   # 151 (142 lib + 2 cli + 4 + 3 integration)
+# ⚠️ `cli/tests/recovery_index_flood.rs` (Phase 64, ADR 0052) is an INTEGRATION test that
+# BUILDS AND BOOTS A REAL sigild (`go build ./cmd/server`) and floods a recovery kit's
+# per-device envelope index with 520 GENUINE, correctly authenticated envelopes from a
+# second account. It PANICS rather than skipping when Go is absent — a suite that silently
+# skips reads exactly like one that passes. Hence `GO=go` and `actions/setup-go` in
+# `.github/workflows/cli.yml`, and `sigild/**` in that workflow's path filters: a workflow
+# that runs a real-sigild suite but is not triggered by a sigild change runs for neither
+# the change that breaks it nor the one that fixes it.
+GO=go cargo test --manifest-path cli/Cargo.toml --test recovery_index_flood -- --nocapture
 grep -c 'name = "getrandom"' libsigil/Cargo.lock   # must STILL be 0
 
 # Device-to-device vault sharing — the Phase 46 end-to-end proof (ADR 0035). Builds
@@ -2825,7 +3019,7 @@ node sigil-wasm/test/passkey-uv-interop.mjs         # 14/21 (Phase 59) the ONLY 
 node sigil-wasm/test/seal-params-guard.mjs          # 15/21 (Phase 59) a SOURCE-STRUCTURE guard, not a behavioural one: every product re-seal site must ratchet its Argon2 parameters. A verifier proved mutating five of the six sites left webapp 50/50 and extension 14/14 GREEN, so this buys the regression guard for the failure that actually happens — a NEW call site that forgets. Checks 6 sealing sites across 2 product sources and FAILS if it finds ZERO; PASS
 node sigil-wasm/test/portability-guard.mjs          # 16/21 ⚠️ NOT Phase 59 feature work — it belongs to the 2026-07-30 CI-portability repair that shares this working tree. The suites are WRITTEN on macOS and RUN on ubuntu-latest, and nothing checked the two agreed: six suites hardcoded /opt/homebrew/bin/go (ENOENT on every runner) and two shell proofs used `stat -f … || stat -c …`, which GNU stat does NOT fail on — so those jobs were RED for several phases while the macOS gate printed ALL GREEN. A SOURCE check, NOT a Linux run: it guards the two idioms that have actually bitten and CANNOT prove portability. PASS
 node sigil-wasm/test/merge-interop.mjs               # 17/21 (Phase 61) the ONLY cross-language proof that a vault MERGES instead of overwriting. Real sigild + the REAL `sigil` binary + JS clients, 16 blocks: the HEADLINE reproduction (two devices, neither pulls, BOTH accounts survive — this was a reproduced data LOSS), convergence/idempotence/associativity, delete + re-add, the LEGACY derived-id path, import de-dup on CONTENT (`work@github` and `work@gitlab` both live), the entry-id KAT, a PROPERTY block (600 generated vault pairs, order-independence asserted byte-for-byte and FAILING if fewer than 20 rounds hit the interesting same-uuid conflict), TOMB-XTRA (Rust and JS must pick the SAME winner for a conflicting unknown tombstone field), THREE-DEV (a device joining LATE with UNPUSHED local work of its own — the only account in the repo that exists nowhere but one client's memory when a three-branch log is folded) and SIZE (a 750-tombstone vault warns without failing). ⚠️ SLOW (~10-15 min: every sync runs Argon2id at RECOMMENDED); PASS
-node sigil-wasm/test/merge-guard.mjs                 # 18/21 (Phase 61; extended in Phase 62) a SOURCE-STRUCTURE guard on the property the merge RESTS on: entries are IMMUTABLE. 108 checks across the shipping clients — no in-place write to a content field (exact per-file counts with written justifications, so a MISSING hit fails too), no edit-shaped declaration (`rename*`/`edit[Ee]ntry*`/`set(Label|Secret|…)`), the `sigil totp` subcommand set stays {add,code,export,import,list,remove,sync}, the in-code immutability warning cannot be deleted, every adoption path merges, every removal tombstones, every import de-dups by content, the id derivation is NOT reimplemented in JS, and the 64 KiB op cap agrees across Go/Rust/JS. ⭐ **Phase 62 rewrote §3b into three `src -> {ok, why}` predicates** (`desktopDeleteGate`/`extensionDeleteGate`/`webappDeleteGate`) that **LOCATE the destructive call and walk OUT from it** (a length-preserving `blank()` + `matchBrace()` + `enclosingClickListener()`), after TWO planted mutations survived the old "does this pattern appear anywhere in the file?" form — the desktop check required `window.confirm(` anywhere in a file holding **SIX** of them, and the extension check banned exactly ONE spelling of the bypass. The three mutations are now encoded as self-test specimens. ⚠️ It CANNOT catch an edit routed through an unknown helper, it is a hand-rolled scanner and NOT a parser, and a legitimate refactor (hoisting the confirm into a helper) FALSE-ALARMS by design; PASS
+node sigil-wasm/test/merge-guard.mjs                 # 18/21 (Phase 61; extended in Phase 62) a SOURCE-STRUCTURE guard on the property the merge RESTS on: entries are IMMUTABLE. 124 checks across the shipping clients — no in-place write to a content field (exact per-file counts with written justifications, so a MISSING hit fails too), no edit-shaped declaration (`rename*`/`edit[Ee]ntry*`/`set(Label|Secret|…)`), the `sigil totp` subcommand set stays {add,code,export,import,list,remove,sync}, the in-code immutability warning cannot be deleted, every adoption path merges, every removal tombstones, every import de-dups by content, the id derivation is NOT reimplemented in JS, and the 64 KiB op cap agrees across Go/Rust/JS. ⭐ **Phase 62 rewrote §3b into three `src -> {ok, why}` predicates** (`desktopDeleteGate`/`extensionDeleteGate`/`webappDeleteGate`) that **LOCATE the destructive call and walk OUT from it** (a length-preserving `blank()` + `matchBrace()` + `enclosingClickListener()`), after TWO planted mutations survived the old "does this pattern appear anywhere in the file?" form — the desktop check required `window.confirm(` anywhere in a file holding **SIX** of them, and the extension check banned exactly ONE spelling of the bypass. The three mutations are now encoded as self-test specimens. ⚠️ It CANNOT catch an edit routed through an unknown helper, it is a hand-rolled scanner and NOT a parser, and a legitimate refactor (hoisting the confirm into a helper) FALSE-ALARMS by design; PASS
 node sigil-wasm/test/clock-skew-interop.mjs          # 19/21 (Phase 62, ADR 0050) the CLOCK-SKEW DIAGNOSTIC agrees Rust <-> JS, guarded TWO ways because a MIRROR is what it is: (3a) the LITERAL — CLOCK_SKEW_WARN_SECONDS is read out of `cli/src/lib.rs` and compared to the JS export, and BOTH are pinned to the golden 15, because a COORDINATED retune passes a cross-language equality check while changing what every client tells a user (the `"recovery-kit"` lesson); (3b) the BEHAVIOUR — a local `node:http` server serves a `Date` offset by a chosen number of seconds and the REAL `sigil clock` binary is driven against it at 0, ±14, ±15, ±16, ±17, ±60, its printed server/local pair handed to the JS `skewFromDateHeader` so BOTH HALVES JUDGE ONE IDENTICAL READING (zero jitter, no clock race) and verdict + exit status + direction word must all agree. Plus: offline reads as NO READING (never "fine") and `Date` is readable CROSS-ORIGIN off a real sigild. ⚠️ Uses async `spawn` for the CLI, NOT `spawnSync` — `spawnSync` blocks Node's event loop, so the in-process Date server can never answer and the suite HANGS. Mutation-proven on the RUST constant alone (15->45 and 15->16 both RED); PASS
 node sigil-wasm/test/provisioning-interop.mjs        # 20/21 (Phase 63, ADR 0051) the CROSS-LANGUAGE AGREEMENT proof for the UNTRUSTED-TEXT PROVISIONING GATE. The gate is implemented TWICE (`sigil_core::validate_provisioning` reached by the CLI + desktop; `validateProvisioning` in totp-migration.mjs reached by both browsers AND the QR scanner) and ⚠️ **a drift between them does NOT fail loudly** — it produces entries that look completely ORDINARY on every client. So both are driven over ONE shared table of hostile vectors with the REAL `sigil` binary as the Rust half: 13 that must be REFUSED by both (the live `period=4294967295` freeze, one second over, period 0, oversized label, oversized issuer, U+202E, U+2066, an embedded newline, a secret one byte over, digits=11, an hotp:// URI, a non-otpauth URL, a `javascript:` payload) and vectors that must be ACCEPTED by both so the product is not broken to be safe (30s/60s/120s, EXACTLY the ceiling, an ARABIC issuer+label and a HEBREW label — RTL SCRIPT is not an override — and a TWO-CHARACTER secret, because there is deliberately NO FLOOR). ⚠️ The numbers are ALSO pinned against GOLDEN LITERALS (600/1024/256), because a cross-language EQUALITY check passes a coordinated retune (the `"recovery-kit"` lesson). Plus: the bulk-count ceiling inside the decode loop; §7 pins BOTH `frozen_period_warning`/`frozenPeriodWarning` at the SAME boundary (silent at 600, warns at 601) behaviourally through the real binary; §8 pins the MERGE DECISION (the merge must ADOPT a peer's out-of-bounds entry AND the read path must warn); §9 asserts the QR-unsupported message in BOTH its copies names the SECURE-ORIGIN cause and `localhost` (Node has no BarcodeDetector, so it exercises the REAL unsupported branch); §10 does the CLI's import-time size warning. Needs no server; PASS
 node sigil-wasm/test/docs-claims-guard.mjs           # 21/21 the COUNTABLE claims in every .md (except docs/decisions/, whose ADRs are dated records) must match the tree: the desktop Tauri command count (drifted 21 -> 31 -> 40 -> 41 -> 42), sigild's direct dependency count, the node interop + shell e2e suite counts, the Playwright spec-FILE counts, no dangling/gapped ADR reference, and getrandom==0. ⚠️ It checks NUMBERS, not PROSE — the threat-model row that asserted a defence which did not exist is invisible to it. ✅ It IS run by `interop.yml` as of `27f0da6` (the fix that wired it also had to fix the guard itself, which had shipped a hardcoded Homebrew Go path — see the journal); PASS
@@ -2893,7 +3087,7 @@ corepack pnpm --filter webapp exec playwright test   # webapp: 78 tests in 15 sp
 # the extension can be loaded unpacked or tested). NOT wired into CI.
 corepack pnpm -C extension install
 ./extension/build.sh                          # -> extension/vendor/ (gitignored)
-corepack pnpm -C extension test               # extension: 39 tests in 11 spec files, PASS
+corepack pnpm -C extension test               # extension: 40 tests in 11 spec files, PASS
 # ⚠️ Use `pnpm test`, NOT `pnpm -C extension exec playwright test`: only the former
 # runs the `pretest` vendor hook, so the latter can test a STALE extension/vendor/.
 # The suite loads the REAL unpacked extension in a full Chromium (channel:
@@ -2907,7 +3101,7 @@ corepack pnpm -C extension test               # extension: 39 tests in 11 spec f
 # perturb the wasm-pure core lockfile. NO wasm toolchain is involved here.
 cargo fmt   --manifest-path desktop/Cargo.toml --all -- --check
 cargo clippy --manifest-path desktop/Cargo.toml --all-targets -- -D warnings
-cargo test  --manifest-path desktop/Cargo.toml   # 26 unit + 9 integration (2 files) = 35
+cargo test  --manifest-path desktop/Cargo.toml   # 27 unit + 9 integration (2 files) = 36
 grep -c 'name = "getrandom"' libsigil/Cargo.lock # must STILL be 0 after desktop work
 # Integration test 1 is THE VAULT INTEROP PROOF (desktop/core/tests/cli_interop.rs): it
 # builds the real `sigil` binary itself and drives it against ONE shared vault file in

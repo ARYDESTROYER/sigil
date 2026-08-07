@@ -11163,3 +11163,277 @@ provisioning payload* — the widest-reach and cheapest-to-be adversary in that
 document: no account, no device, no key, no server access);
 `docs/README.md` (reviewer entry point + sharp edges); `README.md`; `CLAUDE.md`.
 **`docs/api.md` deliberately unchanged** — nothing on the wire moved.
+
+## 2026-08-07 — Phase 64: recovery discovery, the printed sheet, and the stranger's vault
+
+**Where this started.** Phase 64 arrived as work already on disk: sixteen modified
+files and a new integration test, uncommitted, unverified, its build agent stopped
+mid-run. The brief said to assess it critically before extending it. That turned
+out to be the whole job — the work was articulate and largely right, and it was
+also **falsifiable in its own headline claim**.
+
+### The two defects it set out to fix
+
+⛔ **`sigil recovery restore` silently restored a partial vault set and reported
+success.** `list_recoverable_vaults`'s wire struct had **no `has_more` field at
+all**; `recovery_restore` never looked. So a truncated index meant restoring the
+visible prefix and returning a success-shaped report — in the one flow that exists
+*because everything else is already lost*, landing on the one person who by
+construction has nothing left to check it against. **The JS half has refused since
+Phase 58. Rust had not.**
+
+⛔ **A third party can deny recovery discovery.** `GET /v1/devices/{deviceID}/keys`
+is one page, 500 rows, no cursor. Measured against a real server:
+
+```
+BEFORE:  count=1    truncated=false   real vault visible=true
+flooded 520 vaults from a second account in 0.6s
+AFTER:   count=500  truncated=true    real vault PUSHED OUT
+```
+
+⚠️ The obvious mechanism does **not** work — a bare deposit is not counted, because
+every row is filtered through `authorizeVault(needRead)`. The attacker must also
+**grant read** on vaults they claimed themselves, which trust-on-first-write caps
+at nothing. And the kit's 128-bit device id, while unguessable, is **not secret**:
+`GET /v1/vaults/{id}/grants` discloses it with `read` alone, so any current **or
+former** collaborator keeps it permanently.
+
+### ⭐ The fix was already on paper
+
+`render_recovery_sheet` has printed the covered vault ids on its `covers` line
+since Phase 54. Naming them makes a restore ask **each vault directly** — routes
+addressed **by vault id**, where a flood has nothing to crowd out. So the fix is
+**retroactive to every sheet already printed**, and it needed no cursor, no wire
+change and no server behaviour change.
+
+That is the instinct this project keeps returning to: **use what the system already
+has.** ADR 0048 authenticated with the already-published hybrid key rather than
+adding a signature route; ADR 0049 folded ops the op-log was already storing.
+
+### ⛔⛔ Then attacking our own fix found something much worse
+
+The flood test deposited **junk bytes**. It passed. It could only ever pass: junk
+can be refused only by the AEAD, so every planted row landed in `skipped` no matter
+what the restore did with a row it could actually **open**.
+
+Every input to a vault-key wrap is **public** — `sigild` serves any device's
+published hybrid key to any authenticated device, and the AAD is
+(purpose, vault, recipient, sender). So a stranger can mint an envelope that
+authenticates **perfectly**: ADR 0048 proves *who* deposited one and **nothing**
+about whether they are trusted. A restore runs with an **empty pin store**, so
+first-sight TOFU pinned the stranger's key, unwrapped, opened their container and
+reported it as a **recovered vault**.
+
+I reproduced this myself, mutating the new rule off:
+
+```
+left:  ["zz-real-vault", "aaa-spam-00000", "aaa-spam-00001",
+        "aaa-spam-00002", "aaa-spam-00003", "aaa-spam-00004"]
+right: ["zz-real-vault"]
+```
+
+Five of a stranger's vaults, handed back as the user's own.
+
+⭐ **The rule now:** a vault **named on the sheet** is vouched for **by the user**; a
+vault the **index alone** introduced needs a sender in the kit's **own account** —
+read from the `get_account` call the restore already made, decided from the index
+row **before any network call for that row**, so a flood costs nothing and the
+stranger's key is never pinned. Ignored rows are **one summary count**, never one
+line each: rendering a flood row by row buries the real result, which is what the
+flood is for.
+
+⚠️ Honest limit, written into both languages: this defends against a **third
+party**, not against the **server**, which serves the account device list.
+
+### Three more defects, all in this phase's own first cut
+
+- **The sheet path was gated behind the very route it exists to bypass.**
+  `list_recoverable_vaults(…)?` ran unconditionally, so a dead index killed the
+  sheet path too — making *"the discovery path that cannot be denied"*, written
+  three times in the new code, **falsifiable as shipped**.
+- **One hostile row erased the report of every vault already on disk.** Sheet
+  vaults are processed first, so a later `?` told the user the recovery failed
+  while their vaults sat in `~/.sigil`. ⚠️ A failed *keyring* write was not simply
+  made non-fatal — that would count a vault as recovered whose key was never
+  persisted.
+- ⛔ **The browsers were revoking a working kit.** The Rust pre-print check was
+  relaxed to tolerate a truncated index; **the JS twin was not**, and its throw is
+  caught by a handler that calls `revokeSelf`. A stranger crowding the listing
+  could stop the webapp and the extension **ever printing a kit** — a denial of the
+  last line of defence under ADR 0040 limitation 1, **strictly worse** than the
+  truncation being fixed. ⚠️ It is not "flood before generate" (the kit's id does
+  not exist until it is enrolled) but a **race**, which the new test wins against a
+  real server.
+
+### The server decision — and why I overruled my own panel
+
+`sigild`'s **behaviour** is unchanged. Every option was weighed, and the
+recommendation I was given for a follow-up phase — a scan cap,
+`if i >= 2000 { hasMore = true; break }` — I rejected as **harmful**: unauthorized
+rows are `continue`d **without consuming the row budget**, so a cap lets an attacker
+who deposits and grants *nothing* push genuine rows past it, turning a
+slow-but-**correct** listing into an **empty** one. That is ADR 0041 exactly — a
+protective bound that breaks the legitimate path. A cursor does not help; own-account-first
+ordering only half-closes it and nothing could rely on it without a version marker.
+
+⚠️ **`sigild` was nevertheless modified, and this entry will not reach for "sigild
+gained nothing".** The comment above `maxRecipientIndexRows` justified having no
+cursor with *"the realistic count is single digits and a cursor would be dead
+code"*. **The count is an attacker's.** It is a comment-only change, and **a comment
+is not a control**.
+
+### ⚠️ A fourth blind spot in `scripts/gate.sh` — the signature failure, in the script written to prevent it
+
+`t=$(cargo test … | grep -E 'test result:')` then `grep -q FAILED && bad || ok`. A
+crate that does not **compile** emits no `test result:` line, so `$t` is empty,
+`grep -q FAILED` does not match, and the gate printed a **PASS with a blank count**.
+Reproduced both directions, before and after:
+
+```
+before:  OK-branch taken  <-- gate would print PASS
+after:   ✗ … tests produced NO 'test result:' line
+         ✓ libsigil tests (165 passed)
+```
+
+Adjacent, same commit: `cargo build --bin sigil` **discarded its exit code**, so a
+failed rebuild left the *previous* binary on disk for every node interop suite to
+test. Both fixed; `engineering-lessons.md` gains disguise **#12**.
+
+### What the agents got right that I got wrong
+
+⭐ **The client agent refused a premise in my own brief.** I told it to hoist the
+restore-notes state into `RestorePanel`. It read the render tree first and found
+that `RestorePanel` is mounted only in the `setup`/`locked` branches — it is
+**unmounted by the very success it would be reporting on**. It hoisted to the parent
+and wrote the reason into the code. That is the Phase 63 lesson (an instruction is a
+claim like any other) working in the right direction, and it is the second time an
+agent has been right against my briefing.
+
+### Verification
+
+I re-planted the security-critical mutation **myself** rather than trusting the
+report: the trust rule mutated off returned six vaults; restored from an md5
+baseline (`828fad4d…`), marker grep zero, suite green again.
+
+### ⛔ What independent verification found AFTER all of that
+
+Four adversarial lenses ran against the fixed tree. They found a **real defect
+nobody had looked for**, reachable **with no attacker at all**.
+
+`check_vault` permits every character except `/` and whitespace.
+`sanitize_file_stem` folds everything outside `[A-Za-z0-9_-]` to `_`. So
+`team.vault` and `team_vault` — two perfectly ordinary ids — both resolved to
+`team_vault.sigil`. The second write **silently replaced** the first, **both**
+appeared in `report.vaults`, and because the keyring is keyed by the *exact* vault
+id, the losing vault became a container on disk that **does not open** with the key
+filed beside it.
+
+⭐ **That is the same invariant this phase had already written down and enforced —
+for the other instance.** ADR 0052 §5 says in as many words: *"a container on disk
+that cannot be opened, reported as recovered"*. We closed it for a failed **keyring
+write** and missed it for the **file name**. Writing an invariant down is not the
+same as sweeping for it.
+
+Fixed by tracking which vault id has claimed each output stem and disambiguating
+with the id's own digest — the unambiguous name is untouched, so nothing that
+restores today changes name. I mutation-proved it myself through the **real**
+`recovery_restore` against a **real** `sigild`, not through the naming rule in
+isolation:
+
+```
+⛔ both vaults were reported recovered at ONE path — the second overwrote
+   the first and the report is a lie: …/team_vault.sigil vs …/team_vault.sigil
+```
+
+Restored from an md5 baseline (`c0af3a58…`), markers zero, three tests green.
+
+**Other findings acted on in the same change:** a false absolute in threat-model
+row **AI** (a vault id the user *types* is deliberately exempt from the sender
+check — so the honest claim is *"the index cannot introduce a stranger's vault"*,
+not *"a stranger's vault can never be restored"*, now ADR 0052 limit 7); the
+**"520 vaults in 0.6 s"** figure quoted in seven places while the shipped test
+prints ~3 s, because it now mints genuine envelopes — every site qualified;
+ADR 0052 limit 6 widened after a verifier showed the *rendered* warning is
+asserted by nothing at all on the Rust/desktop side; and a further round covering a
+**bypassable guard**, a **vacuous JS attack proof**, and a **double that cannot
+exercise the rule it is used to test**.
+
+### The second fix round — seven findings, and one honestly left open
+
+- **A guard bypassable by the failure it was written to catch.** `merge-guard.mjs`
+  §8 checked that the *token* `vaultIds` appeared and was not a literal `[]`; it
+  never related the value **passed** to the value **bound**. Both
+  `vaultIds: vaultIds.slice(0, 0)` and `&vaults[..0]` passed it while sending an
+  empty list — and `cargo check` was clean on the second, proving the type system
+  does not catch it either. Now the passed expression must be the bare identifier;
+  five new self-test specimens encode both bypasses. **124 structural checks.**
+  ⚠️ **That is the seventh structural guard in this repo to fail on its own subject
+  matter.**
+- **A control ADR 0052 §5 claims it resolved was pinned by nothing.** Replacing
+  `if !keep_key(…) { continue; }` with `let _ = keep_key(…);` left the whole CLI
+  suite *and* the desktop proof green. Now forced by pre-creating the keyring path
+  as a **directory**, with a positive control on the identical setup.
+- ⭐ **The JS attack proof was vacuous — the phase's own lesson, applied to itself.**
+  Both JS floods deposited junk bytes, and the flooding devices never published a
+  hybrid key, so a pin was impossible *regardless of the filter*. Disabling the
+  rule left both outcome assertions **passing**; only a counter failed. The floods
+  now mint genuine authenticated envelopes with real containers behind them, and
+  the mutation was chosen to isolate the claim — keeping the counter intact so only
+  the outcome could fire:
+
+  ```
+  ⛔⛔ a STRANGER'S VAULT WAS HANDED BACK AS THE USER'S OWN.
+      expected exactly ["clivault"], got ["aaa-flood-00000", … 500 rows …, "clivault"]
+  ```
+
+  The ADR's left/right line, now reproduced in **JavaScript** as well as Rust.
+- **A double that structurally cannot exercise the rule.** `fake-sigild.mjs` mints
+  every device into **one account**, so ADR 0052 §3's filter can never fire in a
+  browser spec. ⭐ Fixed **without making the double laxer**: the specs plant a row
+  whose sender was never enrolled — the exact shape the client rule tests — and the
+  header now names the limitation.
+- **The browsers told users to copy a label their sheet did not have.** Both said
+  *"the sheet's `covers` line"* while rendering *"Vaults covered as of today"*. In a
+  crisis that points someone at a label their own paper does not carry. Both sheets
+  now print the literal `covers` label, matching the CLI and the desktop.
+
+⚠️ **Left open, and said plainly rather than closed badly:** a flaky extension spec
+was **not** root-caused. It could not be reproduced in four full-suite runs under
+15 CPU hogs, 24 loaded repeat-each executions, or isolation. ⭐ **No timeout was
+raised** — this repo has a documented incident where exactly that produced a
+confident wrong conclusion. Instead the evidence was shown to be *ambiguous*: the
+popup writes "Restore failed." on any failed submit and never clears it, and step 1
+is a refusal **by design**, so a step 2 that threw and a step 2 that never ran look
+identical. The spec is now self-diagnosing and will name its own cause next time.
+Also still open: `indexError`'s **rendering** in the two browsers is deletable with
+every browser test green (the library behaviour is pinned against a real server).
+
+### Honest limits, all in ADR 0052
+
+1. Coverage **drifts** — the `covers` line is what the kit could open **on the print
+   date**; a vault covered later is on no sheet and the index remains its only
+   discovery path.
+2. The trust rule defends against a **third party**, not against the **server**.
+3. ⛔ **The unbounded scan is real, pre-existing and NOT fixed** — a stranger who
+   deposits and grants nothing makes the handler scan without bound. A **latency**
+   denial; the listing it returns stays correct.
+4. **Vault-id squatting is the root and is untouched** — there is still no
+   per-account claim budget.
+5. The kit's device id leaks from `GET /v1/vaults/{id}/grants` with `read` alone.
+6. **Generate-time `index_truncated == true` is proven in JS only** — a hardcoded
+   `false` on the Rust/desktop side would survive.
+7. ⚠️ **`desktop/ui/` is rendered by no test.** The new `merge-guard.mjs` section 8
+   proves the vault ids are *passed and forwarded* across the IPC; it proves nothing
+   about what appears in the window. The desktop remains the least-verified client.
+8. Dev-gated, plain HTTP, pre-audit, **UNAUDITED**.
+
+### Docs updated in this same change
+
+**ADR 0052** (new) + index row; a dated **addendum to ADR 0042** retiring its
+"silently recovers the first 500" limitation and recording that *both* of its
+accompanying claims were wrong; `docs/api.md` and `docs/threat-model.md` (the
+correction kept visible **as a correction**, plus new adversary row **AI**);
+`docs/README.md` sharp edges; `docs/engineering-lessons.md` (disguise #12 and a new
+reasoning lesson — ⭐ *build the attacker who is trying to SUCCEED, not the one
+trying to be refused*); `CLAUDE.md`. **`docs/crypto-spec.md` deliberately unchanged
+— no primitive, construction or format moved.**

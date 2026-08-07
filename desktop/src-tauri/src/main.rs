@@ -1149,6 +1149,11 @@ struct RecoveryKitView {
     verified_vault: String,
     verified_fingerprint: String,
     indexed_vaults: usize,
+    /// ⚠️ The kit's envelope index was ALREADY truncated when it was printed, so
+    /// this kit must be restored from the sheet's `covers` line and not from
+    /// discovery. ⭐ Generation is the ONE moment the user can still act on that
+    /// — re-print, reduce coverage, copy the ids carefully.
+    index_truncated: bool,
 }
 
 /// One vault's coverage as seen FROM THIS DEVICE.
@@ -1168,6 +1173,17 @@ struct RestoreOutcome {
     vaults: Vec<RestoredRow>,
     skipped: Vec<(String, String)>,
     adopted: bool,
+    /// ⚠️ The server truncated the kit's envelope index. What came back is what
+    /// was NAMED plus one page — the UI must not call it "everything".
+    index_truncated: bool,
+    /// Vault ids the caller supplied that the index did not list.
+    from_sheet: Vec<String>,
+    /// ⚠️ The index route could not be read AT ALL; only the named vaults were
+    /// tried. "Listed nothing" and "never answered" are different facts.
+    index_error: Option<String>,
+    /// How many listed rows were deposited by devices OUTSIDE this account and
+    /// were ignored — a COUNT, never one row per line.
+    ignored_untrusted: usize,
 }
 
 /// One vault a restore wrote back.
@@ -1239,6 +1255,7 @@ fn recovery_generate(
         verified_vault: kit.proof.unwrapped_vault,
         verified_fingerprint: kit.proof.key_fingerprint,
         indexed_vaults: kit.proof.indexed_vaults,
+        index_truncated: kit.proof.index_truncated,
     })
 }
 
@@ -1293,15 +1310,29 @@ fn recovery_verify(code: String) -> CmdResult<bool> {
 ///
 /// `adopt = true` writes the kit's own secrets onto this machine, making it a
 /// SECOND COPY OF THE PAPER; the UI must say that before offering it.
+///
+/// ⭐ `vault_ids` are the ids printed on the sheet's `covers` line. Supplying
+/// them makes the restore ask each vault directly rather than depending on the
+/// kit's per-device envelope index, which is one uncursored page that any other
+/// account can crowd rows off. With none supplied and a truncated index the
+/// library REFUSES rather than restoring a silent partial.
 #[tauri::command]
 fn recovery_restore(
     code: String,
     device_id: String,
     adopt: Option<bool>,
+    vault_ids: Option<Vec<String>>,
     state: State<'_, AppState>,
 ) -> CmdResult<RestoreOutcome> {
+    let vaults = vault_ids.unwrap_or_default();
     let r = sync_config(&state)?
-        .recovery_restore(&code, device_id.trim(), None, adopt.unwrap_or(false))
+        .recovery_restore(
+            &code,
+            device_id.trim(),
+            None,
+            adopt.unwrap_or(false),
+            &vaults,
+        )
         .map_err(ipc)?;
     Ok(RestoreOutcome {
         device_id: r.device_id,
@@ -1318,6 +1349,10 @@ fn recovery_restore(
             .collect(),
         skipped: r.skipped,
         adopted: r.adopted,
+        index_truncated: r.index_truncated,
+        from_sheet: r.from_sheet,
+        index_error: r.index_error,
+        ignored_untrusted: r.ignored_untrusted,
     })
 }
 

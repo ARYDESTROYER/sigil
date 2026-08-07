@@ -59,6 +59,19 @@
 // on the per-device envelope index. A spec here can therefore prove what the
 // BROWSER does, and NOTHING about what sigild would allow. Every one of those
 // lives in the real-server suites listed above.
+//
+// ⚠️⚠️ AND ONE MORE, BECAUSE IT SILENTLY DISARMS A CONTROL. THERE IS EXACTLY
+// ONE ACCOUNT HERE: `/v1/devices/enroll` mints every device into `state.accountId`
+// and `GET /v1/account` returns all of them. So ADR 0052 §3 — "the per-device
+// envelope index may only INTRODUCE a vault whose `sender_device_id` is a device
+// in the kit's OWN account" — is a rule a browser spec cannot reach through
+// enrolment: every enrolled sender is in the account, so `ignoredUntrusted` is
+// always 0. A spec that wants to exercise the REFUSAL must plant an envelope
+// whose `sender` is a device id that was never enrolled here (see the recovery
+// specs) — which is the same shape the client rule tests, since the rule is
+// `accountDevices.has(sender)` and a foreign account's device is simply absent
+// from `GET /v1/account`. The multi-account form is proven against a REAL sigild
+// in sigil-wasm/test/recovery-interop.mjs and cli/tests/recovery_index_flood.rs.
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";

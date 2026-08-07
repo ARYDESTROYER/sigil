@@ -6376,16 +6376,37 @@ pub fn accept_vault_key(
         None => {
             let index = list_recoverable_vaults(server, self_device_id, auth)?;
             let found = index
+                .vaults
                 .iter()
                 .find(|v| v.vault_id == vault_id)
                 .map(|v| v.sender_device_id.clone())
                 .filter(|s| !s.is_empty());
-            found.ok_or_else(|| {
-                CliError::UnknownSender(format!(
-                    "this device's envelope index does not say which device deposited the key for \
-                     vault {vault_id:?}"
-                ))
-            })?
+            match found {
+                Some(id) => id,
+                None => {
+                    // ⭐ The index is a single uncursored page and a third party
+                    // can push rows off it (see `list_recoverable_vaults`). The
+                    // per-VAULT recipient list is addressed by the id we already
+                    // have, so nothing can crowd it out. It needs WRITE, which a
+                    // read-only grantee does not have — hence a fallback, not a
+                    // replacement, and an error that names the truncation when
+                    // that is what actually happened.
+                    let fallback =
+                        envelope_sender_for(server, vault_id, self_device_id, auth).unwrap_or(None);
+                    fallback.ok_or_else(|| {
+                        CliError::UnknownSender(format!(
+                            "this device's envelope index does not say which device deposited the \
+                             key for vault {vault_id:?}{}. Pass `--from <deviceID>` to name it.",
+                            if index.truncated {
+                                " — and that index was TRUNCATED by the server, so the entry may \
+                                 exist and simply not have been listed"
+                            } else {
+                                ""
+                            }
+                        ))
+                    })?
+                }
+            }
         }
     };
 
@@ -6462,6 +6483,31 @@ pub struct RecoverableVault {
     pub created_at: String,
 }
 
+/// One page of a device's envelope index, WITH the flag that says whether it is
+/// the whole story.
+///
+/// ⚠️ **`truncated` IS LOAD-BEARING AND CALLERS MUST HONOUR IT.** The route caps
+/// one page at 500 rows (`maxRecipientIndexRows` in sigild) and reports the
+/// overflow as `has_more: true`; there is **no cursor**, so the remainder is
+/// unreachable through this route at all. Ignoring the flag means recovering the
+/// visible prefix and calling it a recovery — a partial restore presented as a
+/// complete one, which is the worst possible failure for the one mechanism whose
+/// entire job is answering *"did I get everything back?"*.
+///
+/// The JS half (`sigil-wasm/recovery.mjs`) hangs the same flag off its returned
+/// array under the same name and refuses on it in `restoreFromKit`. This is a
+/// struct rather than an extra field on `Vec` because Rust has no equivalent of
+/// a non-enumerable property — the vocabulary is deliberately identical.
+#[derive(Debug, Clone, Default)]
+pub struct RecoverableIndex {
+    /// The rows the server was willing to list, in its order.
+    pub vaults: Vec<RecoverableVault>,
+    /// The server had MORE rows for this device than it would return, and there
+    /// is no cursor to ask for them. A caller that claims completeness on a
+    /// truncated index is lying to the one person who cannot check.
+    pub truncated: bool,
+}
+
 /// ASK THE SERVER which vaults hold a wrapped key for `device_id`.
 ///
 /// SELF-ONLY server-side: asking for another device's index is a `403`. A
@@ -6469,6 +6515,15 @@ pub struct RecoverableVault {
 /// ids — this is the only way it can find out what it is able to decrypt. It
 /// grants nothing new: the server already holds every one of these ids, and the
 /// caller could already fetch each envelope by naming its vault.
+///
+/// ⚠️ **THIS ROUTE IS DENIABLE BY A THIRD PARTY, and that is why the result
+/// carries [`RecoverableIndex::truncated`].** Any account may deposit an
+/// envelope addressed to this device and grant it `read` on a vault it owns, so
+/// a party that knows this device's id can push genuine rows off the single
+/// uncursored page. It cannot read anything and it cannot forge an envelope —
+/// but it can make discovery return `has_more: true` and hide what matters.
+/// Recovery therefore must not DEPEND on this route: `recovery_restore` takes
+/// vault ids straight from the printed sheet, which no later act can touch.
 ///
 /// # Errors
 /// - [`CliError::Server`] on a non-2xx: `401` (unknown/revoked kit — or the
@@ -6479,12 +6534,18 @@ pub fn list_recoverable_vaults(
     server: &str,
     device_id: &str,
     auth: &RequestAuth<'_>,
-) -> Result<Vec<RecoverableVault>, CliError> {
+) -> Result<RecoverableIndex, CliError> {
     check_device_id(device_id)?;
     #[derive(Deserialize)]
     struct Wire {
         #[serde(default)]
         vaults: Vec<RecoverableVault>,
+        /// ⚠️ ABSENT-MEANS-FALSE is the SAFE default here and only here: an old
+        /// server that never truncates omits it, and a truncating one always
+        /// sends it. A missing field can therefore only under-report a
+        /// truncation that did not happen.
+        #[serde(default)]
+        has_more: bool,
     }
     let path = format!("/v1/devices/{device_id}/keys");
     let req = ureq::get(&join_url(server, &path));
@@ -6492,7 +6553,50 @@ pub fn list_recoverable_vaults(
     let text = finish(req.call())?;
     let wire: Wire =
         serde_json::from_str(&text).map_err(|e| CliError::BadResponse(e.to_string()))?;
-    Ok(wire.vaults)
+    Ok(RecoverableIndex {
+        vaults: wire.vaults,
+        truncated: wire.has_more,
+    })
+}
+
+/// Work out WHICH DEVICE deposited the envelope addressed to `recipient` for
+/// `vault`, WITHOUT going through the per-device index.
+///
+/// ⭐ This is the discovery path that cannot be denied. `GET
+/// /v1/vaults/{id}/keys` is addressed BY VAULT ID, so it returns exactly this
+/// vault's recipients however many unrelated vaults exist; there is nothing for
+/// a flood to push out. The per-device index is a convenience for a client that
+/// does not know its vault ids — a client holding the printed sheet does.
+///
+/// Requires WRITE on the vault, which for a kit is satisfied by its ACCOUNT
+/// owning the vault (ADR 0040) and needs no grant row. A cross-account share is
+/// a per-DEVICE `read` grant, so this legitimately `403`s there.
+///
+/// ⚠️ **WHAT THE CALLER DOES WITH THAT 403 DIFFERS, and this comment used to
+/// claim one answer for both.** [`accept_vault_key`] genuinely falls back — to
+/// the per-device index, and then to an explicitly named sender. [`recovery_restore`]
+/// has NEITHER: a kit restoring on a bare machine knows only what is printed on
+/// the sheet, and `sigil recovery restore` has no flag for naming a sender. So
+/// for a restore a 403 here is the END OF THE ROAD for that vault: it is recorded
+/// in `skipped` with the reason and nothing is unwrapped. That is the correct
+/// outcome — an envelope with no established sender must never be opened from
+/// "whoever" — but it is a refusal, not a fallback, and a cross-account-shared
+/// vault is the case where it bites.
+///
+/// # Errors
+/// - [`CliError::Server`] / [`CliError::Http`] from the transport.
+fn envelope_sender_for(
+    server: &str,
+    vault_id: &str,
+    recipient: &str,
+    auth: &RequestAuth<'_>,
+) -> Result<Option<String>, CliError> {
+    let holders = list_key_envelopes(server, vault_id, auth)?;
+    Ok(holders
+        .into_iter()
+        .find(|h| h.device_id == recipient)
+        .map(|h| h.sender_device_id)
+        .filter(|s| !s.is_empty()))
 }
 
 /// What the mandatory pre-print verification round-trip proved.
@@ -6505,6 +6609,10 @@ pub struct RecoveryVerification {
     pub account_id: String,
     /// How many vaults the kit's own envelope index reported.
     pub indexed_vaults: usize,
+    /// The kit's index was already TRUNCATED at print time — so this kit cannot
+    /// rely on that route to discover its own coverage and must be restored from
+    /// the vault ids printed on the sheet.
+    pub index_truncated: bool,
     /// The vault whose envelope was actually unwrapped end to end.
     pub unwrapped_vault: String,
     /// The 16-hex SHA-256 fingerprint of the unwrapped key — matched against the
@@ -6733,14 +6841,20 @@ fn verify_kit_round_trip(
         // own (empty) index, which is everything there is to prove.
         return Ok(RecoveryVerification {
             account_id: account.account_id,
-            indexed_vaults: indexed.len(),
+            indexed_vaults: indexed.vaults.len(),
+            index_truncated: indexed.truncated,
             unwrapped_vault: String::new(),
             key_fingerprint: String::new(),
         });
     }
 
     let (vault_id, expected_key) = &keys[0];
-    if !indexed.iter().any(|v| &v.vault_id == vault_id) {
+    // ⚠️ A TRUNCATED index is NOT grounds to refuse to print. The sheet carries
+    // the covered vault ids, so a restore does not need this route — and
+    // destroying a working kit because a stranger crowded a listing would hand
+    // an availability attack the ability to stop kits being made at all. It is
+    // reported instead, and the envelope is still unwrapped end to end below.
+    if !indexed.truncated && !indexed.vaults.iter().any(|v| &v.vault_id == vault_id) {
         return Err(CliError::Recovery(format!(
             "the kit's own envelope index does not list vault {vault_id:?}; it is being revoked \
              and NOT printed"
@@ -6762,7 +6876,8 @@ fn verify_kit_round_trip(
     }
     Ok(RecoveryVerification {
         account_id: account.account_id,
-        indexed_vaults: indexed.len(),
+        indexed_vaults: indexed.vaults.len(),
+        index_truncated: indexed.truncated,
         unwrapped_vault: vault_id.clone(),
         key_fingerprint: fingerprint,
     })
@@ -6912,12 +7027,37 @@ pub struct RestoreReport {
     pub account_id: String,
     /// `(vault id, vault file path, key fingerprint, entries recovered)`.
     pub vaults: Vec<(String, std::path::PathBuf, String, usize)>,
-    /// Vaults the index listed but that could not be recovered, with a reason.
-    /// A covered-but-never-synced vault lands here: the KEY was recovered, the
+    /// Vaults that could not be recovered, with a reason. A
+    /// covered-but-never-synced vault lands here: the KEY was recovered, the
     /// DATA was never on the server.
     pub skipped: Vec<(String, String)>,
     /// Whether the kit's own secrets were persisted (`--adopt`).
     pub adopted: bool,
+    /// ⚠️ The server's per-device envelope index was TRUNCATED: it holds more
+    /// rows for this kit than it will list, and there is no cursor. Whatever was
+    /// recovered here is therefore NOT provably everything the kit covers — only
+    /// everything the caller NAMED plus whatever the one page happened to show.
+    /// A caller MUST surface this; a restore that reports success on a truncated
+    /// index is the silent partial this field exists to prevent.
+    pub index_truncated: bool,
+    /// Vault ids the CALLER named (from the printed sheet) that the index did
+    /// NOT list. These were found by asking the vault directly — the discovery
+    /// path nothing can crowd out — and are the reason a truncated index is
+    /// survivable rather than fatal.
+    pub from_sheet: Vec<String>,
+    /// ⚠️ The per-device index could not be read AT ALL, and this restore
+    /// carried on using only the vault ids the caller named. Set only when vault
+    /// ids WERE supplied — with none there is nothing to fall back to and the
+    /// error propagates instead. A caller MUST surface it: it is the difference
+    /// between "the index listed nothing" and "the index never answered", and it
+    /// is also how a vault covered after the sheet was printed goes missing.
+    pub index_error: Option<String>,
+    /// How many rows the index listed that were deposited by devices OUTSIDE
+    /// this kit's account, and were therefore ignored without being fetched,
+    /// unwrapped or pinned. Reported as a COUNT and never as one line per row —
+    /// a flood is bounded noise, and printing it row by row would bury the real
+    /// result, which is exactly what the flood is for.
+    pub ignored_untrusted: usize,
 }
 
 /// RESTORE from a printed recovery kit.
@@ -6936,9 +7076,50 @@ pub struct RestoreReport {
 /// persisted `0600` — and the caller MUST tell the user that this machine is now
 /// a second copy of the paper.
 ///
+/// # `sheet_vaults` — DISCOVERY THAT CANNOT BE DENIED
+///
+/// ⭐ **The printed sheet already carries the covered vault ids** (they are on
+/// the `covers` line). Pass them here and this function does not need the
+/// per-device index for them at all: for each named vault it asks the VAULT
+/// which device deposited the envelope ([`envelope_sender_for`]) and collects
+/// that envelope by name. Both of those are addressed BY VAULT ID, so no amount
+/// of unrelated traffic can crowd them out.
+///
+/// That matters because the index route is a single **uncursored** page that a
+/// third party can flood (see [`list_recoverable_vaults`]). Without the sheet
+/// this function has no choice but to **REFUSE** on a truncated index, because
+/// it cannot know what it is missing. With the sheet it recovers what the sheet
+/// names, and reports the truncation instead of pretending it did not happen.
+///
+/// ⚠️ **THE LIMIT, AND IT IS REAL:** the sheet lists coverage **as of the print
+/// date**. A vault covered *after* printing is on no sheet, and the index is the
+/// only way to discover it — so if the index is truncated, that vault is
+/// invisible here. [`RestoreReport::index_truncated`] says so; the remedy is to
+/// re-print the kit after covering new vaults, and the caller must not imply the
+/// sheet is complete.
+///
+/// ⭐ **THE SHEET PATH IS NOT GATED BEHIND THE INDEX.** When vault ids are
+/// supplied, an index that FAILS outright (500, timeout, a server that simply
+/// refuses that one route) degrades to an empty, truncated index and the restore
+/// carries on with the named vaults; the failure is reported in
+/// [`RestoreReport::index_error`], never swallowed. With no ids it still
+/// propagates — there is nothing left to fall back to.
+///
+/// # WHO MAY INTRODUCE A VAULT
+///
+/// An authenticated envelope proves WHO deposited it and nothing about whether
+/// they are trusted, and every input to the wrap is public — so a stranger can
+/// mint a genuine envelope addressed to this kit for a vault they own. A vault
+/// **named on the sheet** is vouched for by the user and is processed whatever
+/// the sender. A vault the **index alone** introduced is processed only if its
+/// sender is a device in this kit's own account; otherwise it is not fetched,
+/// not unwrapped, and its sender's key is not pinned. The count lands in
+/// [`RestoreReport::ignored_untrusted`] as one summary, never one line per row.
+///
 /// # Errors
-/// - [`CliError::Recovery`] for an undecodable code (offline) or a kit whose
-///   index is empty.
+/// - [`CliError::Recovery`] for an undecodable code (offline), a kit whose index
+///   is empty and which was given no vault ids, or a TRUNCATED index with no
+///   vault ids to fall back on.
 /// - [`CliError::Server`]: `401` = valid code, but this server has no such
 ///   device (wrong server, wrong account, or revoked — the server deliberately
 ///   will not say which).
@@ -6948,10 +7129,14 @@ pub fn recovery_restore(
     device_id: &str,
     out_dir: &std::path::Path,
     adopt: bool,
+    sheet_vaults: &[String],
 ) -> Result<RestoreReport, CliError> {
     // ⭐ OFFLINE FIRST. Zero network I/O happens before this succeeds.
     let seed = recovery_verify(code)?;
     check_device_id(device_id)?;
+    for vault_id in sheet_vaults {
+        check_vault(vault_id)?;
+    }
     let identity = derive_recovery_identity(&seed);
     let auth = RequestAuth::V3 {
         device_id,
@@ -6959,8 +7144,138 @@ pub fn recovery_restore(
     };
 
     let account = get_account(server, &auth)?;
-    let indexed = list_recoverable_vaults(server, device_id, &auth)?;
-    if indexed.is_empty() {
+
+    // ⭐ THE SHEET PATH MUST NOT BE GATED BEHIND THE ROUTE IT EXISTS TO BYPASS.
+    // The whole point of `sheet_vaults` is that the per-device index is deniable
+    // by a third party, so a restore that names its vaults has to survive that
+    // route being unavailable — not merely being crowded. A server (hostile,
+    // broken, or mid-deploy) that 500s or hangs on this ONE endpoint would
+    // otherwise kill the sheet path too, which touches it for nothing but a
+    // sender hint and the truncation flag. So: with sheet ids, an index failure
+    // DEGRADES to "empty, and treat completeness as unknown"; with none, it
+    // still propagates, because there is nothing left to fall back to.
+    //
+    // ⚠️ It degrades LOUDLY. `index_error` is reported, never swallowed: a
+    // caller must be able to tell "the index said nothing" from "the index was
+    // never reachable", and the second is also how a vault covered after the
+    // sheet was printed becomes invisible.
+    let mut index_error: Option<String> = None;
+    let index = match list_recoverable_vaults(server, device_id, &auth) {
+        Ok(index) => index,
+        Err(e) if !sheet_vaults.is_empty() => {
+            index_error = Some(e.to_string());
+            // Truncated, because an index that never answered is the strongest
+            // possible statement that this client cannot enumerate its coverage.
+            RecoverableIndex {
+                vaults: Vec::new(),
+                truncated: true,
+            }
+        }
+        Err(e) => return Err(e),
+    };
+
+    // ⛔ REFUSE RATHER THAN UNDER-REPORT — the JS half's rule, verbatim, and the
+    // reason this function exists in this shape. A truncated index means this
+    // client CANNOT know what it is missing, so restoring the visible prefix and
+    // calling it a recovery would tell a customer their vaults are back while
+    // some are silently absent. The sheet is the way out: it names the vaults,
+    // and nothing that happened after it was printed can change what it says.
+    if index.truncated && sheet_vaults.is_empty() {
+        return Err(CliError::Recovery(format!(
+            "this server lists MORE vaults for kit {device_id} than it will return in one page, \
+             and that route has no cursor — so this client cannot see all of them and REFUSES to \
+             report a partial recovery as a complete one. NOTHING WAS RESTORED.\n  \
+             -> Restore by naming the vaults printed on the sheet's `covers` line:\n     \
+             sigil recovery restore --device-id {device_id} --vault <id> [--vault <id> ...]\n  \
+             -> That path asks each vault directly and cannot be crowded out. A vault covered \
+             AFTER the sheet was printed is not on it and stays invisible until the listing \
+             clears."
+        )));
+    }
+
+    // ⭐ WHO IS ALLOWED TO INTRODUCE A VAULT TO THIS RESTORE.
+    //
+    // An authenticated envelope (ADR 0048) proves WHO deposited it. It proves
+    // NOTHING about whether that sender is trusted — and every input to the
+    // wrap is public: any enrolled device on ANY account may fetch this kit's
+    // published hybrid key, and the AAD is (purpose, vault id, recipient id,
+    // sender id). So a stranger can mint a GENUINE, correctly-authenticated
+    // envelope addressed to this kit for a vault they own, grant the kit read,
+    // and push a container sealed under a key of their choosing. On a fresh
+    // machine the pin store is EMPTY, so `verify_sender_for_unwrap` returns
+    // `UnverifiedFirstSight`, pins the stranger's key, unwraps, opens their
+    // container and hands it back as a RECOVERED VAULT — presented identically
+    // to a real one, to the one person who by definition has nothing left to
+    // check it against.
+    //
+    // The rule, using only what this function already fetched:
+    //
+    //   * a vault NAMED ON THE SHEET is vouched for BY THE USER. It is
+    //     processed whatever the sender says — the sheet is the channel nothing
+    //     on the network can touch, and that is the entire point of it;
+    //   * a vault the INDEX alone introduced is processed only if its sender is
+    //     a device in the kit's OWN ACCOUNT (active or revoked — the covering
+    //     device may since have been revoked, and its envelopes stay valid).
+    //
+    // ⭐ The verdict is reached from the index row alone, BEFORE any network
+    // call for that row, so a flood of stranger rows costs nothing: no fetch, no
+    // unwrap, and above all no PIN of the stranger's key.
+    //
+    // ⚠️ HONEST LIMIT: this defends against a THIRD PARTY, not against the
+    // SERVER. The account device list is served by the same server, so a hostile
+    // one could omit a genuine sender and cause a legitimate index-only row to
+    // be ignored. That is reported, not silent — and a server that wanted to
+    // deny recovery can already withhold the envelope outright, so this hands it
+    // no capability it did not have.
+    let account_devices: std::collections::HashSet<&str> = account
+        .devices
+        .iter()
+        .map(|d| d.device_id.as_str())
+        .collect();
+
+    // What to try, in a stable order, each with however much the index told us
+    // about it. Sheet ids come first: they are the ones the user can vouch for.
+    // Which vault id has claimed each output file stem in THIS restore. Two
+    // distinct vault ids can sanitize to one file name, and without this the
+    // second silently overwrote the first while both were reported recovered.
+    let mut claimed_stems: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut targets: Vec<(String, Option<String>)> = Vec::new();
+    let mut from_sheet: Vec<String> = Vec::new();
+    let mut ignored_untrusted = 0usize;
+    for vault_id in sheet_vaults {
+        if targets.iter().any(|(v, _)| v == vault_id) {
+            continue;
+        }
+        let indexed_sender = index
+            .vaults
+            .iter()
+            .find(|v| &v.vault_id == vault_id)
+            .map(|v| v.sender_device_id.clone())
+            .filter(|s| !s.is_empty());
+        if indexed_sender.is_none() {
+            from_sheet.push(vault_id.clone());
+        }
+        targets.push((vault_id.clone(), indexed_sender));
+    }
+    for entry in &index.vaults {
+        if targets.iter().any(|(v, _)| v == &entry.vault_id) {
+            continue;
+        }
+        // Index-only: the sender must be one of OUR devices. An unnamed sender
+        // names no device in this account and so fails this test too — there is
+        // nothing to authenticate such an envelope against in any case.
+        if !account_devices.contains(entry.sender_device_id.as_str()) {
+            ignored_untrusted += 1;
+            continue;
+        }
+        targets.push((
+            entry.vault_id.clone(),
+            Some(entry.sender_device_id.clone()).filter(|s| !s.is_empty()),
+        ));
+    }
+
+    if targets.is_empty() {
         return Err(CliError::Recovery(
             "valid code and device, but there is nothing to recover: this kit holds no vault key \
              on this server. It was enrolled but never covered a vault (`sigil recovery cover`), \
@@ -6980,52 +7295,69 @@ pub fn recovery_restore(
         vaults: Vec::new(),
         skipped: Vec::new(),
         adopted: adopt,
+        index_truncated: index.truncated,
+        from_sheet,
+        index_error,
+        ignored_untrusted,
     };
 
-    for entry in &indexed {
-        let envelope = match get_key_envelope(server, &entry.vault_id, device_id, &auth) {
+    for (vault_id, indexed_sender) in &targets {
+        let entry_vault_id = vault_id;
+        let envelope = match get_key_envelope(server, entry_vault_id, device_id, &auth) {
             Ok(e) => e,
             Err(e) => {
-                report.skipped.push((entry.vault_id.clone(), e.to_string()));
+                report.skipped.push((entry_vault_id.clone(), e.to_string()));
                 continue;
             }
         };
         // ⭐ WHO DEPOSITED THIS? A vault-key envelope is authenticated to its
         // sender, so a restore must establish one. The kit knows nothing locally
-        // — it is a fresh machine — so the sender id comes from the kit's OWN
-        // envelope index. That id is server-supplied and therefore untrusted:
-        // naming the wrong device simply makes the AEAD refuse, because the
-        // sender's static key is an input to the derivation. A server can
-        // withhold recovery this way; it cannot forge one.
-        if entry.sender_device_id.is_empty() {
-            report.skipped.push((
-                entry.vault_id.clone(),
-                "the server did not say which device deposited this envelope, so there is no \
-                 sender to authenticate it against and it was NOT unwrapped"
-                    .to_string(),
-            ));
-            continue;
-        }
-        let sender = match verify_sender_for_unwrap(
-            server,
-            &entry.sender_device_id,
-            &auth,
-            &pins_path,
-            None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                report.skipped.push((
-                    entry.vault_id.clone(),
-                    format!(
-                        "could not establish the sending device {}: {e}",
-                        entry.sender_device_id
-                    ),
-                ));
-                continue;
-            }
+        // — it is a fresh machine — so the sender id comes from the server. That
+        // id is server-supplied and therefore untrusted: naming the wrong device
+        // simply makes the AEAD refuse, because the sender's static key is an
+        // input to the derivation. A server can withhold recovery this way; it
+        // cannot forge one.
+        //
+        // TWO SOURCES, and the second is the one that survives a flood: the
+        // per-device index when it listed this vault, otherwise the VAULT's own
+        // recipient list, addressed by an id taken off the printed sheet.
+        let sender_device_id = match indexed_sender {
+            Some(id) => id.clone(),
+            None => match envelope_sender_for(server, entry_vault_id, device_id, &auth) {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    report.skipped.push((
+                        entry_vault_id.clone(),
+                        "the server did not say which device deposited this envelope, so there is \
+                         no sender to authenticate it against and it was NOT unwrapped"
+                            .to_string(),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    report.skipped.push((
+                        entry_vault_id.clone(),
+                        format!(
+                            "could not find out which device deposited this envelope ({e}), so \
+                             there is no sender to authenticate it against and it was NOT unwrapped"
+                        ),
+                    ));
+                    continue;
+                }
+            },
         };
-        let ctx = VaultKeyWrapContext::new(&entry.vault_id, device_id, &entry.sender_device_id)?;
+        let sender =
+            match verify_sender_for_unwrap(server, &sender_device_id, &auth, &pins_path, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    report.skipped.push((
+                        entry_vault_id.clone(),
+                        format!("could not establish the sending device {sender_device_id}: {e}"),
+                    ));
+                    continue;
+                }
+            };
+        let ctx = VaultKeyWrapContext::new(entry_vault_id, device_id, &sender_device_id)?;
         // Rejects a legacy/anonymous envelope, a forged one, and any recovered
         // plaintext that is not exactly 32 bytes.
         let key = match unwrap_vault_key(&identity.hybrid_secret, &sender, &ctx, &envelope) {
@@ -7033,21 +7365,44 @@ pub fn recovery_restore(
             Err(e) => {
                 report
                     .skipped
-                    .push((entry.vault_id.clone(), format!("envelope refused: {e}")));
+                    .push((entry_vault_id.clone(), format!("envelope refused: {e}")));
                 continue;
             }
         };
 
-        let ops = pull_ops_auth(server, &entry.vault_id, 0, &auth)?;
+        // ⛔ FROM HERE ON, A PER-VAULT FAILURE IS A PER-VAULT FAILURE.
+        //
+        // These used to propagate with `?`. Sheet vaults are processed FIRST, so
+        // the user's real vaults could already be on disk and in the keyring
+        // when one later row — a 403, a 413, a 500, a full disk — returned
+        // `Err`, and the caller then printed only that error. The customer was
+        // told the recovery FAILED while their vaults sat in the state dir, and
+        // `index_truncated`, `from_sheet` and the recovered list were never
+        // shown at all. A hostile row must not be able to erase the report of
+        // the work already done.
+        let ops = match pull_ops_auth(server, entry_vault_id, 0, &auth) {
+            Ok(ops) => ops,
+            Err(e) => {
+                report.skipped.push((
+                    entry_vault_id.clone(),
+                    format!(
+                        "the key was recovered but this vault's op-log could not be read ({e}), so \
+                         nothing was written for it"
+                    ),
+                ));
+                keep_key(&mut report, &keyring_path, entry_vault_id, &key);
+                continue;
+            }
+        };
         let Some(last) = ops.last() else {
             report.skipped.push((
-                entry.vault_id.clone(),
+                entry_vault_id.clone(),
                 "the key was recovered but this vault has NEVER been pushed to the op-log — a kit \
                  recovers KEYS, not DATA, so there is nothing here to open"
                     .to_string(),
             ));
             // The key is still worth keeping: the data may be pushed later.
-            keyring_put(&keyring_path, &entry.vault_id, &key)?;
+            keep_key(&mut report, &keyring_path, entry_vault_id, &key);
             continue;
         };
 
@@ -7057,30 +7412,76 @@ pub fn recovery_restore(
             Ok(v) => v,
             Err(e) => {
                 report.skipped.push((
-                    entry.vault_id.clone(),
+                    entry_vault_id.clone(),
                     format!(
                         "the newest op for this vault did not open with the recovered key: {e}"
                     ),
                 ));
-                keyring_put(&keyring_path, &entry.vault_id, &key)?;
+                keep_key(&mut report, &keyring_path, entry_vault_id, &key);
                 continue;
             }
         };
 
-        let path = out_dir.join(format!("{}.sigil", sanitize_file_stem(&entry.vault_id)));
+        // ⛔ TWO VAULT IDS CAN SANITIZE TO ONE FILE NAME, AND THE SECOND USED TO
+        // SILENTLY REPLACE THE FIRST. `check_vault` permits everything except
+        // `/` and whitespace, while `sanitize_file_stem` folds every character
+        // outside `[A-Za-z0-9_-]` to `_` — so `my.vault` and `my_vault` (also
+        // `my:vault`, `my@vault`, `my+vault`) all become `my_vault.sigil`. The
+        // loop then reported BOTH as recovered, pointing at ONE path holding ONE
+        // of them, and the keyring was correct for both — so the vault that lost
+        // the race was a container on disk that DOES NOT OPEN with the key filed
+        // beside it. That is the exact invariant this function already enforces
+        // for a failed keyring write (see `keep_key`), missed for the file name.
+        //
+        // ⚠️ Reachable with NO attacker at all — two of a user's own vault ids
+        // are enough. It is also reachable through the path the account-trust
+        // rule deliberately TRUSTS, because index rows are processed after sheet
+        // rows, so an in-account device's colliding row lands second.
+        //
+        // The pretty name is kept whenever it is unambiguous, so nothing that
+        // restores today changes name; a collision is disambiguated by the
+        // vault id's own digest, which is stable across runs.
+        let mut stem = sanitize_file_stem(entry_vault_id);
+        let mut nth: u32 = 0;
+        while claimed_stems
+            .get(&stem)
+            .is_some_and(|owner: &String| owner != entry_vault_id)
+        {
+            nth += 1;
+            let digest = vault_id_digest(entry_vault_id);
+            stem = if nth == 1 {
+                format!("{}-{digest}", sanitize_file_stem(entry_vault_id))
+            } else {
+                format!("{}-{digest}-{nth}", sanitize_file_stem(entry_vault_id))
+            };
+        }
+        claimed_stems.insert(stem.clone(), entry_vault_id.clone());
+        let path = out_dir.join(format!("{stem}.sigil"));
         let tmp = path.with_extension("restore.tmp");
-        write_secret_file(&tmp, &last.blob)
-            .map_err(|e| CliError::Recovery(format!("could not write restored vault: {e}")))?;
-        std::fs::rename(&tmp, &path).map_err(|e| {
+        if let Err(e) = write_secret_file(&tmp, &last.blob) {
+            report.skipped.push((
+                entry_vault_id.clone(),
+                format!("could not write the restored vault: {e}"),
+            ));
+            keep_key(&mut report, &keyring_path, entry_vault_id, &key);
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
             let _ = std::fs::remove_file(&tmp);
-            CliError::Recovery(format!(
-                "could not place restored vault {}: {e}",
-                path.display()
-            ))
-        })?;
-        keyring_put(&keyring_path, &entry.vault_id, &key)?;
+            report.skipped.push((
+                entry_vault_id.clone(),
+                format!("could not place the restored vault {}: {e}", path.display()),
+            ));
+            keep_key(&mut report, &keyring_path, entry_vault_id, &key);
+            continue;
+        }
+        if !keep_key(&mut report, &keyring_path, entry_vault_id, &key) {
+            // The container is on disk but its key is not — so it is NOT
+            // recovered, and saying so is the whole point of this pass.
+            continue;
+        }
         report.vaults.push((
-            entry.vault_id.clone(),
+            entry_vault_id.clone(),
             path,
             vault_key_fingerprint(&key),
             vault.entries.len(),
@@ -7114,6 +7515,36 @@ pub fn recovery_restore(
     Ok(report)
 }
 
+/// Persist one recovered vault key, recording a failure against THAT VAULT
+/// instead of aborting the whole restore.
+///
+/// ⛔ A keyring write used to propagate with `?`. Sheet vaults are processed
+/// first, so a failure on a later row discarded the report of every vault
+/// already written — telling the user the recovery failed while their vaults sat
+/// on disk. Returns whether the key is now on disk; the caller must not count a
+/// vault as recovered when it is not, because a container whose key was never
+/// saved cannot be opened.
+fn keep_key(
+    report: &mut RestoreReport,
+    keyring_path: &std::path::Path,
+    vault_id: &str,
+    key: &[u8; VAULT_KEY_LEN],
+) -> bool {
+    match keyring_put(keyring_path, vault_id, key) {
+        Ok(()) => true,
+        Err(e) => {
+            report.skipped.push((
+                vault_id.to_string(),
+                format!(
+                    "the vault key was recovered but could NOT be saved to the keyring ({e}), so \
+                     this vault cannot be opened on this machine"
+                ),
+            ));
+            false
+        }
+    }
+}
+
 /// Create `dir` mode `0700` if it does not exist, so everything written into it
 /// starts out owner-only.
 fn ensure_state_dir(dir: &std::path::Path) -> Result<(), CliError> {
@@ -7128,9 +7559,34 @@ fn ensure_state_dir(dir: &std::path::Path) -> Result<(), CliError> {
         .map_err(|e| CliError::Recovery(format!("could not create {}: {e}", dir.display())))
 }
 
-/// Make a vault id safe to use as a FILE NAME. Vault ids are already free of
-/// `/` and whitespace ([`check_vault`]), so this only guards the remaining
-/// awkward cases (`.`/`..` and other path-ish characters).
+/// A short, stable, filename-safe digest of a vault id — 8 hex characters of
+/// SHA-256.
+///
+/// It exists ONLY to disambiguate two vault ids whose [`sanitize_file_stem`]
+/// collide. It is **not** a security property and nothing authenticates it: it
+/// is a deterministic tiebreak, chosen over a counter so the same vault lands on
+/// the same file name across runs.
+fn vault_id_digest(vault_id: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(vault_id.as_bytes());
+    let mut out = String::with_capacity(8);
+    for b in digest.iter().take(4) {
+        out.push(char::from_digit((b >> 4) as u32, 16).expect("nibble < 16"));
+        out.push(char::from_digit((b & 0x0f) as u32, 16).expect("nibble < 16"));
+    }
+    out
+}
+
+/// Make a vault id safe to use as a FILE NAME.
+///
+/// ⚠️ **THIS IS NOT INJECTIVE AND MUST NOT BE USED AS A UNIQUE KEY.** Vault ids
+/// are only guaranteed free of `/` and whitespace ([`check_vault`]), and every
+/// other awkward character is folded to `_` — so `my.vault`, `my_vault`,
+/// `my:vault`, `my@vault` and `my+vault` all produce **`my_vault`**. The single
+/// caller ([`recovery_restore`]) therefore tracks which vault id has claimed each
+/// stem and disambiguates with [`vault_id_digest`]; treating the result as unique
+/// meant one restored container silently replacing another while **both** were
+/// reported as recovered.
 fn sanitize_file_stem(vault_id: &str) -> String {
     let cleaned: String = vault_id
         .chars()
@@ -11476,5 +11932,264 @@ mod unwrap_gate_tests {
         assert_eq!(report.key_fingerprint, vault_key_fingerprint(&key));
         assert_eq!(keyring_get(&keyring, VAULT).expect("keyring"), Some(key));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =======================================================================
+    // ⭐⭐ A VAULT WHOSE KEY WAS NOT PERSISTED IS NOT A RECOVERED VAULT
+    //
+    // ADR 0052 §5 records this as deliberately RESOLVED rather than papered
+    // over: a failed keyring write on the success path must not simply be
+    // non-fatal, or the vault lands in `report.vaults` while its key was never
+    // saved — a container on disk that CANNOT BE OPENED, reported as recovered,
+    // to the one person who by construction has nothing left to check it
+    // against. `keep_key` returns whether the key is actually on disk and
+    // `recovery_restore` `continue`s when it is not.
+    //
+    // ⛔ AND THAT DECISION WAS PINNED BY NOTHING. A verifier replaced
+    //
+    //     if !keep_key(&mut report, &keyring_path, entry_vault_id, &key) { continue; }
+    //
+    // with `let _ = keep_key(…);` and the WHOLE CLI suite stayed green, as did
+    // the desktop proof. The two tests below close that: one FORCES the write to
+    // fail (the keyring PATH is pre-created as a DIRECTORY, so no permission
+    // games and no root needed) and the other is its positive control on the
+    // identical setup.
+    // =======================================================================
+
+    /// Every route `recovery_restore` asks for, including the account listing
+    /// `accept_routes` does not need. `kit_id` is the recipient, and the kit's
+    /// own hybrid identity is DERIVED from the printed code, so the envelope
+    /// below is a genuine authenticated wrap addressed to that derivation.
+    fn restore_routes(
+        kit_id: &str,
+        envelope: &[u8],
+        sender_public: &HybridPublicIdentity,
+        tip: &[u8],
+    ) -> Vec<Route> {
+        let account_json = serde_json::to_vec(&serde_json::json!({
+            "account_id": "acct_test",
+            "devices": [
+                { "device_id": SENDER, "label": "laptop", "status": "active" },
+                { "device_id": kit_id, "label": RECOVERY_DEVICE_LABEL, "status": "active" },
+            ],
+        }))
+        .expect("account json");
+        let mut routes = accept_routes(envelope, sender_public, Some(tip));
+        routes.push((
+            "/v1/account".to_string(),
+            200,
+            "application/json",
+            account_json,
+        ));
+        routes
+    }
+
+    /// The fixed 32-byte recovery secret these two tests print. A PUBLIC test
+    /// value, exactly like the RFC seeds elsewhere in this repo.
+    const RESTORE_SEED: [u8; RECOVERY_SEED_LEN] = [0x42; RECOVERY_SEED_LEN];
+
+    /// Build the whole restore scenario: a code, a genuine envelope wrapped to
+    /// the code's derived hybrid identity, a tip the recovered key opens, and a
+    /// server serving all of it. Returns `(code, server, out_dir)`.
+    fn restore_scenario(tag: &str) -> (String, String, PathBuf, [u8; VAULT_KEY_LEN]) {
+        let dir = temp_dir(tag);
+        let code = String::from_utf8(encode_recovery_kit(&RESTORE_SEED).to_vec()).expect("ascii");
+        let identity = derive_recovery_identity(&RESTORE_SEED);
+        let (sender_secret, sender_public) = generate_hybrid_identity().expect("sender");
+        let key = generate_vault_key().expect("vault key");
+        // `wrap_from` addresses `ME`, which is the kit's device id here.
+        let envelope = wrap_from(SENDER, sender_secret, &identity.hybrid_public, &key);
+        let tip = sealed_tip(&key);
+        let server = stub_server(restore_routes(ME, &envelope, &sender_public, &tip));
+        (code, server, dir, key)
+    }
+
+    /// ⛔⛔ THE KEYRING WRITE FAILS, SO THE VAULT IS **NOT** RECOVERED.
+    ///
+    /// The container may well be on disk — that is not the claim. The claim is
+    /// that a vault whose key was never saved must be reported as SKIPPED, with
+    /// the reason, and must never appear in `report.vaults`, because a caller
+    /// (and every UI in this repo) renders that list as "these came back".
+    ///
+    /// ⚠️ MUTATION: change the `if !keep_key(…) { continue; }` in
+    /// `recovery_restore` to `let _ = keep_key(…);` and this test fails.
+    #[test]
+    fn a_vault_whose_key_could_not_be_saved_is_not_reported_as_recovered() {
+        let (code, server, dir, _key) = restore_scenario("keyringfail");
+        let out_dir = dir.join("restore");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        // ⭐ THE FORCED FAILURE, and it needs no privileges: the keyring path is
+        // a DIRECTORY, so both the read and the write inside `keyring_put` fail
+        // on every platform this ships to.
+        let keyring = out_dir.join(VAULT_KEYRING_FILE);
+        std::fs::create_dir_all(&keyring).expect("keyring-as-directory");
+
+        let report = recovery_restore(&code, &server, ME, &out_dir, false, &[VAULT.to_string()])
+            .expect("a failed keyring write must be a PER-VAULT failure, never a fatal one");
+
+        let recovered: Vec<&str> = report
+            .vaults
+            .iter()
+            .map(|(v, _, _, _)| v.as_str())
+            .collect();
+        assert!(
+            !recovered.contains(&VAULT),
+            "⛔ {VAULT} was reported RECOVERED while its key was never written to the keyring — \
+             that is a container on disk which cannot be opened, handed back as a success to the \
+             one person who has nothing left to check it against. recovered={recovered:?}"
+        );
+        assert!(
+            report.vaults.is_empty(),
+            "nothing at all should be reported recovered here: {:?}",
+            report.vaults
+        );
+        let skipped = report
+            .skipped
+            .iter()
+            .find(|(v, _)| v == VAULT)
+            .unwrap_or_else(|| panic!("{VAULT} must be NAMED in `skipped`: {:?}", report.skipped));
+        assert!(
+            skipped.1.contains("keyring") && skipped.1.contains("cannot be opened"),
+            "the reason must say the key was not saved and the vault cannot be opened here: {}",
+            skipped.1
+        );
+        // And the keyring really is unusable, so this is not a test of nothing.
+        assert!(
+            keyring_get(&keyring, VAULT).is_err(),
+            "the forced failure did not take — the keyring is readable, so this proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE POSITIVE CONTROL for the test above, on the IDENTICAL setup with a
+    /// writable keyring. Without it, "the restore never reports anything" would
+    /// look exactly like a pass.
+    #[test]
+    fn the_same_restore_with_a_writable_keyring_does_recover_the_vault() {
+        let (code, server, dir, key) = restore_scenario("keyringok");
+        let out_dir = dir.join("restore");
+
+        let report = recovery_restore(&code, &server, ME, &out_dir, false, &[VAULT.to_string()])
+            .expect("the restore must succeed");
+
+        let row = report
+            .vaults
+            .iter()
+            .find(|(v, _, _, _)| v == VAULT)
+            .unwrap_or_else(|| panic!("{VAULT} must be recovered: {:?}", report.skipped));
+        assert_eq!(
+            row.2,
+            vault_key_fingerprint(&key),
+            "a DIFFERENT key came back"
+        );
+        assert!(row.1.exists(), "the restored container is not on disk");
+        assert_eq!(
+            keyring_get(&out_dir.join(VAULT_KEYRING_FILE), VAULT).expect("keyring"),
+            Some(key),
+            "the vault key must be ON DISK for the vault to count as recovered"
+        );
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⛔ TWO VAULT IDS THAT SANITIZE TO ONE FILE NAME MUST NOT OVERWRITE EACH
+    /// OTHER, because `recovery_restore` reports both as recovered.
+    ///
+    /// Found by an adversarial verifier, reachable with **no attacker at all**:
+    /// `check_vault` permits every character except `/` and whitespace, and
+    /// `sanitize_file_stem` folds everything outside `[A-Za-z0-9_-]` to `_`, so
+    /// `my.vault` and `my_vault` both became `my_vault.sigil`. The second write
+    /// replaced the first, both appeared in `report.vaults`, and — because the
+    /// keyring is keyed by the exact vault id — the losing vault became a
+    /// container on disk that does NOT open with the key filed beside it. That
+    /// is the same invariant `keep_key` already enforces for a failed keyring
+    /// write, missed for the file name.
+    ///
+    /// ⚠️ This pins the NAMING rule directly rather than through a live restore,
+    /// because the collision is a property of the id, not of the server: an
+    /// unambiguous id keeps its pretty name (so nothing that restores today
+    /// changes name), and a colliding one is disambiguated stably.
+    #[test]
+    fn two_vault_ids_that_sanitize_alike_get_distinct_file_names() {
+        // The collision itself — this is what made the overwrite possible.
+        assert_eq!(
+            sanitize_file_stem("my.vault"),
+            sanitize_file_stem("my_vault")
+        );
+        assert_eq!(
+            sanitize_file_stem("my:vault"),
+            sanitize_file_stem("my_vault")
+        );
+
+        // The rule `recovery_restore` applies: first claimant keeps the pretty
+        // name, every later DIFFERENT id is disambiguated.
+        let mut claimed: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut stem_for = |vault_id: &str| -> String {
+            let mut stem = sanitize_file_stem(vault_id);
+            let mut nth: u32 = 0;
+            while claimed
+                .get(&stem)
+                .is_some_and(|owner: &String| owner != vault_id)
+            {
+                nth += 1;
+                let digest = vault_id_digest(vault_id);
+                stem = if nth == 1 {
+                    format!("{}-{digest}", sanitize_file_stem(vault_id))
+                } else {
+                    format!("{}-{digest}-{nth}", sanitize_file_stem(vault_id))
+                };
+            }
+            claimed.insert(stem.clone(), vault_id.to_string());
+            stem
+        };
+
+        let a = stem_for("my.vault");
+        let b = stem_for("my_vault");
+        let c = stem_for("my:vault");
+        assert_eq!(
+            a, "my_vault",
+            "the first claimant keeps the unsurprising name"
+        );
+        assert_ne!(
+            a, b,
+            "a second id must NOT reuse the first id's file: {a} vs {b}"
+        );
+        assert_ne!(a, c);
+        assert_ne!(
+            b, c,
+            "a third colliding id must be distinct too: {b} vs {c}"
+        );
+
+        // Stable across runs: the same id always lands on the same name.
+        let mut claimed2: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        claimed2.insert("my_vault".to_string(), "my.vault".to_string());
+        let mut stem2 = sanitize_file_stem("my_vault");
+        if claimed2
+            .get(&stem2)
+            .is_some_and(|o: &String| o != "my_vault")
+        {
+            stem2 = format!(
+                "{}-{}",
+                sanitize_file_stem("my_vault"),
+                vault_id_digest("my_vault")
+            );
+        }
+        assert_eq!(
+            stem2, b,
+            "disambiguation must be deterministic, not a counter"
+        );
+
+        // An ordinary id is untouched — no existing restore changes name.
+        let mut claimed3: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut plain = |v: &str| {
+            let st = sanitize_file_stem(v);
+            claimed3.insert(st.clone(), v.to_string());
+            st
+        };
+        assert_eq!(plain("zz-real-vault"), "zz-real-vault");
+        assert_eq!(plain("webapp-demo"), "webapp-demo");
     }
 }

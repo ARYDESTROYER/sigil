@@ -72,6 +72,54 @@ async function openPopup(context) {
   return { page, failures };
 }
 
+/** The visible text of `#restore-error`, or "" when it is hidden. */
+async function visibleRestoreError(page) {
+  const box = page.getByTestId("restore-error");
+  if (!(await box.isVisible())) return "";
+  return ((await box.textContent()) ?? "").trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Wait for a restore to land in an UNLOCKED vault, and — if it does not — FAIL
+ * WITH THE REASON THE POPUP GAVE.
+ *
+ * ⛔ THIS EXISTS BECAUSE THE OBVIOUS ASSERTION IS AMBIGUOUS, and that ambiguity
+ * cost a reviewer a whole investigation. A bare
+ * `expect(view-unlocked).toBeVisible({ timeout: 60_000 })` reports only "hidden
+ * after 60 s", so the reviewer reached for `#status` — which said
+ * `"Restore failed."`. That reads like proof that the restore threw. It is not:
+ * the popup writes exactly that line on ANY failed submit and NEVER clears it,
+ * so after profile 3's step 1 (whose refusal is the point of step 1) `#status`
+ * ALREADY says "Restore failed." A step 2 that never ran at all, and a step 2
+ * that ran and threw, look identical through that field.
+ *
+ * `priorError` is the visible `#restore-error` text from BEFORE the submit. The
+ * popup hides that box on entry to the handler, so:
+ *   - a DIFFERENT visible message  => this attempt ran and refused, with reason;
+ *   - the SAME message, unchanged  => the submit very likely never ran.
+ * Both are named. Neither is a timeout to be raised.
+ */
+async function expectRestoreUnlocks(page, { priorError = "", timeout = 60_000 } = {}) {
+  await expect
+    .poll(
+      async () => {
+        if (await page.getByTestId("view-unlocked").isVisible()) return "unlocked";
+        const why = await visibleRestoreError(page);
+        if (why === "") return "pending";
+        const status = ((await page.getByTestId("status").textContent()) ?? "").trim();
+        if (priorError !== "" && why === priorError) {
+          return (
+            "NO NEW ATTEMPT — #restore-error still shows the PREVIOUS refusal verbatim " +
+            `(${why}), so this submit appears never to have run | #status: ${status}`
+          );
+        }
+        return `REFUSED — #restore-error: ${why} | #status: ${status}`;
+      },
+      { timeout, message: "the restore never reached an unlocked vault" },
+    )
+    .toBe("unlocked");
+}
+
 test("profile 1: generate a recovery kit that covers a real vault", async () => {
   const { context, userDataDir } = await launchProfile();
   try {
@@ -132,6 +180,12 @@ test("profile 1: generate a recovery kit that covers a real vault", async () => 
     await expect(page.getByTestId("recovery-sheet")).toContainText("NEVER PHOTOGRAPH IT");
     await expect(page.getByTestId("recovery-sheet")).toContainText("RECOVERS KEYS, NOT DATA");
     await expect(page.getByTestId("recovery-covers-nothing")).toBeHidden();
+    // ⭐ THE INDEX WAS HEALTHY, so the generate-time truncation warning must be
+    // HIDDEN. This direction is what keeps the other one worth reading: a warning
+    // that is always on is one people learn to skip, and it would send a user off
+    // to re-print a sheet that was fine. The VISIBLE direction is pinned in
+    // profile 3, which prints a fresh kit against a crowded index.
+    await expect(page.getByTestId("recovery-index-truncated")).toBeHidden();
 
     // ⭐ THE CODE IS A CREDENTIAL: storage still holds exactly the two sealed
     // containers, and the code is in neither of them.
@@ -207,7 +261,7 @@ test("profile 2: RESTORE on a completely clean profile", async () => {
 
     // ⭐ Landed in an UNLOCKED vault, with the account back and the wasm
     // computing the RFC vector — on a profile that started completely empty.
-    await expect(page.getByTestId("view-unlocked")).toBeVisible({ timeout: 60_000 });
+    await expectRestoreUnlocks(page);
     await expect(page.getByTestId("account")).toHaveCount(1);
     await expect(page.getByTestId("code")).toHaveText(RFC_CODE_6);
     await expect(page.getByTestId("status")).toContainText("SECOND COPY OF THAT PAPER");
@@ -231,3 +285,149 @@ test("profile 2: RESTORE on a completely clean profile", async () => {
     await rm(userDataDir, { recursive: true, force: true });
   }
 });
+
+/**
+ * ⭐ A CROWDED ENVELOPE INDEX MUST REFUSE — AND THE SHEET MUST STILL WORK.
+ *
+ * `GET /v1/devices/{id}/keys` is how a restored kit finds what it can decrypt.
+ * It is ONE page, capped at 500 rows, with NO CURSOR — and any account can put
+ * rows in it (deposit an opaque envelope addressed to a device id it knows, then
+ * grant that device read on a vault it claimed itself). So:
+ *
+ *   1. ⛔ a restore that relies on that listing must REFUSE, never restore the
+ *      visible prefix and report success;
+ *   2. ⭐ naming the vaults printed on the SHEET must recover them anyway,
+ *      because that path asks each VAULT directly and cannot be crowded out.
+ *
+ * The page cap is shrunk rather than minting 500 envelopes; the flag and the
+ * branch are the real ones. ⚠️ Against the DOUBLE — this proves what the POPUP
+ * does, not what sigild would allow.
+ */
+test("profile 3: a CROWDED index refuses, and the sheet's vault ids still recover", async () => {
+  expect(kitCode).not.toBe("");
+  const previousCap = fake.indexPageCap;
+  // ⭐ TWO decoys, and the FIRST is deposited by a device that was never enrolled
+  // here — exactly the shape ADR 0052 §3 refuses, because the client rule is
+  // `accountDevices.has(sender)` and a foreign account's device is simply absent
+  // from `GET /v1/account`. ⚠️ The double mints every enrolled device into ONE
+  // account (its header says so), so a stranger cannot be expressed by enrolling
+  // one; planting the row is the only way to reach that refusal from a browser
+  // spec at all. The multi-account form is proven against a REAL sigild in
+  // sigil-wasm/test/recovery-interop.mjs.
+  const strangerKey = `yy-strangers-vault\u0000${kitDeviceId}`;
+  const decoyKey = `zz-crowding-vault\u0000${kitDeviceId}`;
+  fake.state.envelopes.set(strangerKey, {
+    bytes: Buffer.alloc(1226),
+    sender: "dev_not_in_this_account",
+    createdAt: new Date().toISOString(),
+  });
+  fake.state.envelopes.set(decoyKey, {
+    bytes: Buffer.alloc(1226),
+    sender: "dev_fake_1",
+    createdAt: new Date().toISOString(),
+  });
+  // TWO rows visible (the real vault and the stranger's) and a third beyond the
+  // cap — so the listing is BOTH crowded and carrying an untrusted row.
+  fake.indexPageCap = 2;
+  const { context, userDataDir } = await launchProfile();
+  try {
+    const { page, failures } = await openPopup(context);
+    await expect(page.getByTestId("view-restore")).toBeVisible();
+
+    await page.getByTestId("restore-toggle").click();
+    await page.getByTestId("restore-url").fill(fake.baseUrl);
+    await page.getByTestId("restore-device-id").fill(kitDeviceId);
+    await page.getByTestId("restore-password").fill("profile-three-password");
+    await page.getByTestId("restore-confirm").fill("profile-three-password");
+    await page.getByTestId("restore-code").fill(kitCode.toLowerCase());
+
+    // 1. ⛔ Blind: the listing is crowded, so this cannot know what it is
+    //    missing and must say so rather than restore a prefix.
+    await page.getByTestId("restore-submit").click();
+    await expect(page.getByTestId("restore-error")).toContainText("partial recovery", {
+      timeout: 60_000,
+    });
+    // A half-restored browser is worse than a clean refusal.
+    expect(
+      await page.evaluate(async () => Object.keys(await chrome.storage.local.get(null))),
+    ).toEqual([]);
+
+    // 2. ⭐ The way out: the ids off the sheet's "covers" line.
+    //
+    // ⚠️ The step-1 refusal above is still on screen. Capture it, so that if this
+    // submit fails the report can say WHICH of the two things happened — a real
+    // refusal with its reason, or a submit that never ran — instead of leaving a
+    // reader with `#status: "Restore failed."`, which step 1 wrote and nothing
+    // clears.
+    const priorError = await visibleRestoreError(page);
+    expect(priorError).toContain("partial recovery");
+    await page.getByTestId("restore-vaults").fill(VAULT_ID);
+    await page.getByTestId("restore-submit").click();
+    await expectRestoreUnlocks(page, { priorError });
+    await expect(page.getByTestId("code")).toHaveText(RFC_CODE_6);
+
+    // ⛔⛔ 3. AND IT MUST SAY SO. The restore SUCCEEDED, so there is no error
+    //    screen to carry the qualification — and this popup used to fold the
+    //    warning into the one-line `#status` under the heading "Not restored:",
+    //    which reads as though a NAMED VAULT failed rather than "the result
+    //    itself cannot be proven complete". It now has its own persistent alert.
+    const notes = page.getByTestId("restore-notes");
+    await expect(notes).toBeVisible({ timeout: 60_000 });
+    await expect(notes).toContainText("THIS MAY NOT BE EVERYTHING");
+    await expect(notes).toContainText("no way to ask for the rest");
+    // ⛔⛔ AND THE OTHER CAVEAT, which had NO test at all: a row the INDEX ALONE
+    // introduced, deposited by a device outside this account, is IGNORED — not
+    // fetched, not unwrapped, and above all not PINNED into the fresh trust
+    // store this restore just built. Deleting this whole note block from the
+    // popup used to leave every browser test green.
+    await expect(notes).toContainText("OUTSIDE your account");
+    await expect(notes).toContainText("were ignored");
+    // ⭐ ONE SUMMARY, NEVER ONE LINE PER ROW: the ignored vault must not be
+    // itemised, because a flood rendered row by row buries the real result —
+    // which is exactly what a flood is for.
+    await expect(notes).not.toContainText("yy-strangers-vault");
+    // ⭐ AND THE HEADLINE CHANGES, the way the desktop's does. A truncated
+    // restore that announces a plain "Restored" and buries the qualification in
+    // a trailing clause is the under-report this phase exists to remove.
+    await expect(page.getByTestId("status")).toContainText("MAY NOT BE ALL OF THEM");
+    // ⚠️ It must NOT still be labelled as a per-vault failure.
+    await expect(notes).not.toContainText("Not restored");
+
+    // ⚠️ HONEST SCOPE: the cap is shrunk rather than 500 envelopes minted, and
+    // the real vault is still ON the single visible page — so `fromSheet` is
+    // EMPTY here and the envelope-sender path is NOT exercised in the browser.
+    // That path is proven against a REAL sigild in
+    // `sigil-wasm/test/recovery-interop.mjs`. What this pins is the truncation
+    // flag reaching the user.
+
+    // ── 4. ⭐ AND AT THE MOMENT OF PRINTING, which is the only moment the user
+    //    can still act on it. This restored profile holds the kit's identity and
+    //    the vault key, so it can print a FRESH sheet — the obvious next thing to
+    //    do after a recovery. With the index still crowded, that sheet must carry
+    //    the warning, and must still be PRINTED: refusing would let anyone who
+    //    can crowd a server listing stop kits being made at all, which is a
+    //    denial of the last line of defence (ADR 0040 limitation 1) and strictly
+    //    worse than the truncation. A cap of ZERO overflows on the first row,
+    //    which is the only way to have the index already crowded for a device id
+    //    that does not exist until the enrol inside `generateRecoveryKit`.
+    fake.indexPageCap = 0;
+    await page.getByTestId("recovery-toggle").click();
+    await page.getByTestId("recovery-generate").click();
+    await expect(page.getByTestId("recovery-sheet")).toBeVisible({ timeout: 60_000 });
+    const truncWarn = page.getByTestId("recovery-index-truncated");
+    await expect(truncWarn).toBeVisible();
+    await expect(truncWarn).toContainText("re-print");
+    // The sheet is real: 56 Crockford characters, printed as 7 groups of 8.
+    const reprint = ((await page.getByTestId("recovery-code").textContent()) ?? "").trim();
+    expect(reprint.replace(/-/g, "")).toHaveLength(56);
+
+    expect(failures).toEqual([]);
+  } finally {
+    await context.close();
+    await rm(userDataDir, { recursive: true, force: true });
+    fake.indexPageCap = previousCap;
+    fake.state.envelopes.delete(decoyKey);
+    fake.state.envelopes.delete(strangerKey);
+  }
+});
+

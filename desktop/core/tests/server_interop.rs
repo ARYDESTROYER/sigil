@@ -1041,6 +1041,23 @@ fn a_printed_sheet_recovers_the_vaults_after_every_device_is_gone() {
     assert_eq!(sheet.proof.unwrapped_vault, VAULT_FROM_DESKTOP);
     assert_eq!(sheet.proof.key_fingerprint, fp_one);
     assert_eq!(sheet.proof.account_id, sheet.account_id);
+    // ⭐ GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT on a truncated
+    // index — re-print, reduce coverage, copy the `covers` line carefully. By
+    // restore time the paper is fixed. So the flag has to REACH the desktop and
+    // not stop at the CLI, and it must be FALSE when discovery is healthy: a
+    // warning that is always on is a warning people learn to ignore.
+    //
+    // ⚠️ WHAT THIS DOES NOT PROVE, stated plainly: nothing here truncates the
+    // index at generate time, so a hardcoded `false` would still pass. Making it
+    // TRUE requires flooding a kit's index in the window between enrolment and
+    // the pre-print check, which needs an interception point `recovery_generate`
+    // does not offer in Rust. The TRUE case is proven in
+    // `sigil-wasm/test/recovery-interop.mjs` arm (h), which wins that race
+    // against a real sigild through a fetch wrapper.
+    assert!(
+        !sheet.proof.index_truncated,
+        "an unmolested index must not report itself as truncated: {sheet:?}"
+    );
     assert!(sheet.seats_used >= 2, "a kit consumes a seat");
     // ⚠️ And the credential is NOT in the Debug rendering.
     assert!(!format!("{sheet:?}").contains(&groups[0].to_string()));
@@ -1127,6 +1144,7 @@ fn a_printed_sheet_recovers_the_vaults_after_every_device_is_gone() {
         &doomed.device_id,
         None,
         false,
+        &[],
     ) {
         Err(DesktopError::Unauthenticated(_)) => {}
         other => panic!("a REVOKED kit must recover nothing, got {other:?}"),
@@ -1154,13 +1172,13 @@ fn a_printed_sheet_recovers_the_vaults_after_every_device_is_gone() {
     let stranger = sigil_core::encode_recovery_kit(&[0x11u8; sigil_core::RECOVERY_SEED_LEN]);
     let stranger = std::str::from_utf8(&stranger).expect("ascii");
     sigil_desktop_core::verify_recovery_code(stranger).expect("it IS well-formed");
-    match fresh.recovery_restore(stranger, &kit_id, None, false) {
+    match fresh.recovery_restore(stranger, &kit_id, None, false, &[]) {
         Err(DesktopError::Unauthenticated(_)) => {}
         other => panic!("a valid-but-wrong code must recover nothing, got {other:?}"),
     }
     // ...and a mistyped one never even reaches the network.
     assert!(matches!(
-        fresh.recovery_restore(&typo, &kit_id, None, false),
+        fresh.recovery_restore(&typo, &kit_id, None, false, &[]),
         Err(DesktopError::Recovery(_))
     ));
     assert!(
@@ -1173,13 +1191,82 @@ fn a_printed_sheet_recovers_the_vaults_after_every_device_is_gone() {
     // 5. ⭐ THE RESTORE. The paper alone rebuilds both vaults.
     // -----------------------------------------------------------------
     let restored = fresh
-        .recovery_restore(&sheet.code, &kit_id, None, false)
+        .recovery_restore(&sheet.code, &kit_id, None, false, &[])
         .expect("restore from the printed sheet");
     assert_eq!(restored.device_id, kit_id);
     assert_eq!(restored.account_id, sheet.account_id);
     assert_eq!(restored.vaults.len(), 2, "{restored:?}");
     assert!(restored.skipped.is_empty(), "{restored:?}");
     assert!(!restored.adopted);
+    // Discovery was not being crowded here, so the report must say so plainly.
+    // A UI keys its "this may not be everything" warning off this field, and a
+    // value that is always true would train people to ignore it.
+    assert!(
+        !restored.index_truncated && restored.from_sheet.is_empty(),
+        "an unmolested index must report a COMPLETE restore: {restored:?}"
+    );
+
+    // ⭐ THE SHEET-DRIVEN PATH, which is what survives a flooded index: naming
+    // the vaults printed on the sheet asks each VAULT directly instead of asking
+    // the server what is waiting for this kit. It must recover the same two
+    // vaults with the same keys. (The flood itself is reproduced against a real
+    // sigild in `cli/tests/recovery_index_flood.rs`.)
+    //
+    // ⚠️ WHAT THIS DOES AND DOES NOT PIN — corrected, because the first version of
+    // this comment claimed it pinned "that the DESKTOP threads the ids through",
+    // which it does not. It calls `DeviceConfig::recovery_restore` DIRECTLY, so
+    // it pins the LIBRARY: that a non-empty `vault_ids` reaches the sheet-driven
+    // path and a covered vault comes back without the index. The PRODUCT hop —
+    // `desktop/ui/main.js` sending `vaultIds` over the IPC and
+    // `desktop/src-tauri/src/main.rs` accepting it as `vault_ids` — is NOT
+    // exercised here and cannot be: this is a headless core test and there is no
+    // test that renders `desktop/ui/`. That hop is the one place this fix is
+    // revertible with the whole gate green (a dropped or mis-named IPC argument
+    // deserializes to `None` SILENTLY, and its only observable consequence is a
+    // refusal byte-identical to a genuinely truncated index), so it is covered
+    // instead by the SOURCE-STRUCTURE guard `desktopRestoreVaultIds` in
+    // `sigil-wasm/test/merge-guard.mjs`. Both browsers do have genuine
+    // end-to-end product coverage of the same hop in their Playwright specs.
+    //
+    // The "kit-does-not-cover-this" discriminator below still earns its place:
+    // without it a library that silently dropped the ids would look identical
+    // here, because the (unflooded) index lists the other two anyway.
+    let by_sheet_dir = h.tmp.join("restore-by-sheet/.sigil");
+    let by_sheet = DeviceConfig::new(&h.server, &by_sheet_dir)
+        .recovery_restore(
+            &sheet.code,
+            &kit_id,
+            None,
+            false,
+            &[
+                VAULT_FROM_DESKTOP.to_string(),
+                VAULT_TWO.to_string(),
+                // ⭐ A vault this kit does NOT cover, included deliberately. It
+                // is the discriminator: it appears in `skipped` ONLY if the ids
+                // actually reached the library. Without it, a desktop that
+                // silently DROPPED the ids would look identical here, because
+                // the (unflooded) index lists the other two anyway.
+                "kit-does-not-cover-this".to_string(),
+            ],
+        )
+        .expect("restore by the vault ids printed on the sheet");
+    assert_eq!(by_sheet.vaults.len(), 2, "{by_sheet:?}");
+    assert!(by_sheet
+        .vaults
+        .iter()
+        .any(|v| v.vault_id == VAULT_FROM_DESKTOP && v.key_fingerprint == fp_one));
+    assert!(by_sheet
+        .vaults
+        .iter()
+        .any(|v| v.vault_id == VAULT_TWO && v.key_fingerprint == fp_two));
+    assert!(
+        by_sheet
+            .skipped
+            .iter()
+            .any(|(v, _)| v == "kit-does-not-cover-this"),
+        "the vault ids must reach the library — a dropped list is invisible otherwise: {by_sheet:?}"
+    );
+    say("naming the sheet's vault ids recovers the same two vaults without the index");
 
     let one = restored
         .vaults
@@ -1224,7 +1311,7 @@ fn a_printed_sheet_recovers_the_vaults_after_every_device_is_gone() {
     let adopt_dir = h.tmp.join("adopted/.sigil");
     let adopted = DeviceConfig::new(&h.server, &adopt_dir);
     let report = adopted
-        .recovery_restore(&sheet.code, &kit_id, None, true)
+        .recovery_restore(&sheet.code, &kit_id, None, true, &[])
         .expect("restore with adopt");
     assert!(report.adopted);
     assert_0600(&adopted.identity_path());

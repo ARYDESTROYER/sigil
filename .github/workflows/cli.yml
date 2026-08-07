@@ -1,16 +1,26 @@
 name: cli
 
+# ⚠️ `sigild/**` IS IN THE PATH FILTERS ON PURPOSE. `cargo test` here now runs
+# `cli/tests/recovery_index_flood.rs`, which BUILDS AND BOOTS A REAL sigild and
+# asserts a client contract against it (a flooded per-device envelope index must
+# never yield a silent partial recovery). A workflow that names a real-sigild
+# suite but is not triggered by a sigild change runs neither for the change that
+# breaks it — the exact gap `scripts/gate.sh`'s drift check found in
+# `desktop.yml` and `web.yml` on 2026-07-30, and the check that flagged this file
+# the moment the test was added.
 on:
   push:
     paths:
       - "cli/**"
       - "libsigil/**"
+      - "sigild/**"
       - "rust-toolchain.toml"
       - ".github/workflows/cli.yml"
   pull_request:
     paths:
       - "cli/**"
       - "libsigil/**"
+      - "sigild/**"
       - "rust-toolchain.toml"
       - ".github/workflows/cli.yml"
 
@@ -29,6 +39,15 @@ jobs:
         run: |
           rustup show
           rustup component add rustfmt clippy
+      # `recovery_index_flood.rs` builds sigild with `go build ./cmd/server`. It
+      # PANICS rather than skipping when Go is absent, deliberately — a suite
+      # that silently skips reads exactly like one that passes. `GO: go` is set
+      # on the test step because `setup-go` puts go on PATH and NEVER sets $GO
+      # (the mistake that left `cors.spec.ts` skipping itself in CI).
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cli
@@ -38,6 +57,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+        env:
+          GO: go
       - name: build
         run: cargo build
 

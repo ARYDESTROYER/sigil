@@ -79,6 +79,14 @@ pub struct RecoveryProof {
     pub account_id: String,
     /// How many vaults the kit's own envelope index reported.
     pub indexed_vaults: usize,
+    /// ⚠️ The kit's envelope index was ALREADY truncated at print time, so this
+    /// kit cannot rely on that route to discover its own coverage and must be
+    /// restored from the vault ids printed on the sheet.
+    ///
+    /// ⭐ **GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT** — re-print,
+    /// reduce coverage, copy the `covers` line carefully. By restore time the
+    /// paper is fixed, so this must reach every client rather than one of four.
+    pub index_truncated: bool,
     /// The vault whose envelope was unwrapped end to end (`""` if none).
     pub unwrapped_vault: String,
     /// Fingerprint of the key that came back out. Never the key.
@@ -153,13 +161,35 @@ pub struct RestoreView {
     pub account_id: String,
     /// The vaults written out.
     pub vaults: Vec<RestoredVault>,
-    /// Vaults the index listed but that could not be recovered, with a reason —
-    /// most importantly a covered-but-never-synced vault, where the KEY came
-    /// back and the DATA was never on the server.
+    /// Vaults that could not be recovered, with a reason — most importantly a
+    /// covered-but-never-synced vault, where the KEY came back and the DATA was
+    /// never on the server.
     pub skipped: Vec<(String, String)>,
     /// Whether the kit's own secrets were persisted on this machine.
     /// ⚠️ `true` means this machine is now a second copy of the paper.
     pub adopted: bool,
+    /// ⚠️ The server's per-device envelope index was TRUNCATED, and that route
+    /// has no cursor. What came back is what the caller NAMED plus whatever one
+    /// page showed — **a UI must not present it as "everything"**. Reaching this
+    /// state at all requires vault ids to have been supplied; with none, the
+    /// library refuses outright rather than restoring a silent partial.
+    pub index_truncated: bool,
+    /// Vault ids the caller supplied (from the printed sheet) that the index did
+    /// not list. Recovered by asking each vault directly.
+    pub from_sheet: Vec<String>,
+    /// ⚠️ The per-device envelope index could not be read AT ALL, and this
+    /// restore carried on using only the vault ids the caller named — which is
+    /// exactly what that list is for. Set only when ids WERE supplied. "Listed
+    /// nothing" and "never answered" are different facts and a UI must not merge
+    /// them: the second is also how a vault covered AFTER the sheet was printed
+    /// goes missing.
+    pub index_error: Option<String>,
+    /// How many rows the index listed that were deposited by devices OUTSIDE
+    /// this kit's account, and were ignored without being fetched, unwrapped or
+    /// pinned. A COUNT, never one row per line: an envelope proves WHO sent it,
+    /// never that they are trusted, and rendering a flood row by row would bury
+    /// the real result — which is what the flood is for.
+    pub ignored_untrusted: usize,
 }
 
 /// One vault a restore rebuilt.
@@ -329,6 +359,7 @@ impl DeviceConfig {
             proof: RecoveryProof {
                 account_id: kit.verification.account_id,
                 indexed_vaults: kit.verification.indexed_vaults,
+                index_truncated: kit.verification.index_truncated,
                 unwrapped_vault: kit.verification.unwrapped_vault,
                 key_fingerprint: kit.verification.key_fingerprint,
             },
@@ -429,9 +460,24 @@ impl DeviceConfig {
     ///
     /// Vaults land in `out_dir` (default: this config's state directory).
     ///
+    /// ⭐ **`vault_ids` COMES OFF THE PRINTED SHEET, and it is what makes this
+    /// survivable.** The sheet's `covers` line names the vaults; passing them
+    /// here makes the library ask each VAULT which device deposited its
+    /// envelope, instead of relying on the kit's per-device index — a single
+    /// **uncursored** page that any other account can push rows off by
+    /// depositing envelopes and granting this kit read on vaults it owns. With
+    /// no ids and a truncated index the library **REFUSES**, because it cannot
+    /// know what it is missing; a silent partial is the one outcome recovery
+    /// must never produce.
+    ///
+    /// ⚠️ A vault covered **after** the sheet was printed is on no sheet, and the
+    /// index is the only way to find it. [`RestoreView::index_truncated`] says
+    /// when that gap is live, and a UI must not round it up to "everything".
+    ///
     /// # Errors
     /// - [`DesktopError::Recovery`] for an undecodable code (offline, nothing
-    ///   sent) or a kit whose index is empty.
+    ///   sent), a kit whose index is empty, or a TRUNCATED index with no vault
+    ///   ids to fall back on.
     /// - [`DesktopError::Unauthenticated`] (`401`) — a well-formed code that
     ///   this server has no device for: wrong server, wrong kit id, or revoked.
     ///   The server deliberately will not say which.
@@ -441,16 +487,23 @@ impl DeviceConfig {
         kit_device_id: &str,
         out_dir: Option<&Path>,
         adopt: bool,
+        vault_ids: &[String],
     ) -> Result<RestoreView> {
         // OFFLINE FIRST, with the actionable message, before any network I/O.
         verify_recovery_code(code)?;
         let dir = out_dir.map_or_else(|| self.state_dir().to_path_buf(), Path::to_path_buf);
+        let sheet_vaults: Vec<String> = vault_ids
+            .iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
         let report = recovery_restore(
             code.trim(),
             self.server(),
             kit_device_id.trim(),
             &dir,
             adopt,
+            &sheet_vaults,
         )
         .map_err(|e| net_error(e, self.server(), "restoring from the recovery kit"))?;
         Ok(RestoreView {
@@ -468,6 +521,10 @@ impl DeviceConfig {
                 .collect(),
             skipped: report.skipped,
             adopted: report.adopted,
+            index_truncated: report.index_truncated,
+            from_sheet: report.from_sheet,
+            index_error: report.index_error,
+            ignored_untrusted: report.ignored_untrusted,
         })
     }
 
@@ -596,7 +653,7 @@ mod tests {
         // ...and a restore with a bad code fails OFFLINE, before the identity is
         // even consulted — there is no identity here and no server listening.
         assert!(matches!(
-            c.recovery_restore("nonsense", "dev_kit", None, false),
+            c.recovery_restore("nonsense", "dev_kit", None, false, &[]),
             Err(DesktopError::Recovery(_))
         ));
         assert!(
@@ -624,6 +681,7 @@ mod tests {
             proof: RecoveryProof {
                 account_id: "acct_1".to_string(),
                 indexed_vaults: 1,
+                index_truncated: false,
                 unwrapped_vault: "v".to_string(),
                 key_fingerprint: "00000000deadbeef".to_string(),
             },

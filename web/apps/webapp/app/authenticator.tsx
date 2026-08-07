@@ -194,6 +194,18 @@ export default function Authenticator() {
   // form add, otpauth paste, migration import, QR scan, merge adoption — reaches
   // it without any of them having to remember to.
   const [sizeWarn, setSizeWarn] = useState<string>("");
+  // ⛔⛔ WHAT A RESTORE COULD NOT ACCOUNT FOR — and the reason it is HERE and not
+  // inside `RestorePanel`. A successful restore calls `setPhase("unlocked")`,
+  // which swaps the whole screen for `VaultView` and UNMOUNTS the panel, so a
+  // message rendered there would be destroyed at the exact instant it became
+  // true. `restoreFromKit` builds these notes — a truncated index, an index
+  // route that would not answer, rows deposited from outside the account, vaults
+  // whose keys came back but whose content did not — and until now the ONLY
+  // consumer was the failure throw. So the one scenario this all exists to make
+  // honest, a sheet-driven restore of a crowded index, landed in an unlocked
+  // vault telling the user NOTHING. Persistent and dismissible, never a toast:
+  // "this may not be everything" is not a transient fact.
+  const [restoreNotes, setRestoreNotes] = useState<string[]>([]);
 
   const now = useUnixClock();
 
@@ -547,6 +559,10 @@ export default function Authenticator() {
 
   function forget(): void {
     setNotice("");
+    // The profile these notes were about is being destroyed; keeping them would
+    // describe a restore that no longer exists. (`lock()` deliberately does NOT
+    // clear them — "this may not be everything" stays true across a lock.)
+    setRestoreNotes([]);
     window.localStorage.removeItem(STORAGE_KEY);
     window.localStorage.removeItem(DEVICE_KEY);
     window.localStorage.removeItem(HWSLOT_KEY);
@@ -896,15 +912,23 @@ export default function Authenticator() {
     code: string;
     deviceId: string;
     password: string;
+    vaultIds?: string[];
   }): Promise<{ vaultId: string; accounts: number; accountId: string; notes: string[] }> {
     if (!wasm) throw new Error("wasm not ready");
     const baseUrl = args.baseUrl.trim();
 
     // Offline decode + checksum happens inside restoreFromKit, before any I/O.
+    // ⭐ `vaultIds` are the ids printed on the sheet's "covers" line. Supplying
+    // them makes the restore ask each VAULT directly instead of asking the
+    // server what is waiting for this kit — that listing is ONE uncursored page
+    // any other account can crowd rows off. With none supplied and a crowded
+    // listing, `restoreFromKit` REFUSES rather than restoring part of the vaults
+    // and calling it done.
     const res = await wasm.restoreFromKit(wasm, {
       baseUrl,
       code: args.code,
       deviceId: args.deviceId.trim(),
+      vaultIds: args.vaultIds ?? [],
     });
 
     const kitAuth = {
@@ -917,6 +941,45 @@ export default function Authenticator() {
     // The kit recovers KEYS. Ciphertext still has to exist on the server, so try
     // each recovered vault until one has content this key opens.
     const notes: string[] = res.skipped.map((s) => `${s.vaultId}: ${s.reason}`);
+    // ⛔ NEVER PRESENT A TRUNCATED RESTORE AS COMPLETE.
+    if (res.indexTruncated) {
+      notes.push(
+        "⚠️ THIS MAY NOT BE EVERYTHING: this server holds more waiting keys for this kit " +
+          "than it will list at once, and there is no way to ask for the rest. What came " +
+          "back is what you named plus one page — a vault covered AFTER the sheet was " +
+          "printed may exist and be invisible here.",
+      );
+    }
+    // ⚠️ DEGRADED, NOT SILENT. The sheet path deliberately does not depend on the
+    // index route, so a dead route is survivable — but nothing here could check
+    // for a vault covered AFTER the sheet was printed, and the user has to be
+    // told that rather than shown a clean success.
+    if (res.indexError) {
+      notes.push(
+        `the server's list of what is waiting for this kit could not be read (${res.indexError}). ` +
+          "Only the vault ids you typed were used, which is what that line on the sheet is for — " +
+          "but a vault covered AFTER the sheet was printed could not be looked for.",
+      );
+    }
+    // ⭐ ONE SUMMARY, NEVER ONE LINE PER ROW: a flood is bounded noise, and
+    // printing it row by row would bury the result the user came to read — which
+    // is exactly what the flood is for.
+    if (res.ignoredUntrusted > 0) {
+      notes.push(
+        `${res.ignoredUntrusted} vault(s) this server listed for this kit were deposited by ` +
+          "devices OUTSIDE your account and were ignored — not fetched, not unwrapped, and their " +
+          "keys were not pinned. Anyone can address an envelope to a kit; an envelope proves WHO " +
+          "sent it, never that they are trusted. A vault genuinely shared to this kit from " +
+          "another account has to be collected from a working device.",
+      );
+    }
+    if (res.fromSheet.length > 0) {
+      notes.push(
+        `found by asking the vault directly (the server's list did not name ${
+          res.fromSheet.length === 1 ? "it" : "them"
+        }): ${res.fromSheet.join(", ")}`,
+      );
+    }
     let opened: TotpVault | null = null;
     let openedId = "";
     let openedKey: Uint8Array | null = null;
@@ -1014,6 +1077,11 @@ export default function Authenticator() {
     vaultKeyRef.current = openedKey;
     setActiveVaultId(openedId);
     setVault(opened);
+    // ⛔ RAISED BEFORE the phase flip that unmounts the panel, and held at the top
+    // level so it survives it. A restore that could not account for everything
+    // must say so in the vault it just opened, not in a screen that is about to
+    // disappear.
+    setRestoreNotes(notes);
     setPhase("unlocked");
     return {
       vaultId: openedId,
@@ -1215,6 +1283,35 @@ export default function Authenticator() {
           className="mb-4 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
         >
           {sizeWarn}
+        </div>
+      )}
+      {restoreNotes.length > 0 && (
+        // ⛔⛔ WHAT THE RESTORE COULD NOT ACCOUNT FOR. Persistent and top-level
+        // for the same reason the vault-size warning is: the user cannot act on
+        // it from here and it does not stop being true when a toast times out.
+        // It deliberately OUTLIVES the panel that produced it — that panel is
+        // unmounted by the success it is reporting on.
+        <div
+          data-testid="restore-notes"
+          role="alert"
+          className="mb-4 rounded border border-amber-500 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+        >
+          <p className="mb-1 font-semibold">
+            This restore could not account for everything.
+          </p>
+          <ul className="list-disc space-y-1 pl-5">
+            {restoreNotes.map((n, i) => (
+              <li key={i}>{n}</li>
+            ))}
+          </ul>
+          <button
+            data-testid="restore-notes-dismiss"
+            className={`${btnGhost} mt-2`}
+            type="button"
+            onClick={() => setRestoreNotes([])}
+          >
+            Dismiss
+          </button>
         </div>
       )}
       {notice && (
@@ -1727,11 +1824,13 @@ function RestorePanel({
     code: string;
     deviceId: string;
     password: string;
+    vaultIds?: string[];
   }) => Promise<{ vaultId: string; accounts: number; accountId: string; notes: string[] }>;
 }) {
   const [open, setOpen] = useState(false);
   const [url, setUrl] = useState("http://127.0.0.1:8080");
   const [deviceId, setDeviceId] = useState("");
+  const [vaults, setVaults] = useState("");
   const [code, setCode] = useState("");
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
@@ -1753,7 +1852,15 @@ function RestorePanel({
     setTimeout(() => {
       void (async () => {
         try {
-          await onRestore({ baseUrl: url, code, deviceId, password: pw });
+          await onRestore({
+            baseUrl: url,
+            code,
+            deviceId,
+            password: pw,
+            // Commas, spaces or newlines — someone copying from paper should
+            // not have to know which.
+            vaultIds: vaults.split(/[\s,]+/).map((v) => v.trim()).filter(Boolean),
+          });
           // ⭐ USED — so it leaves the DOM immediately. (This component also
           // unmounts on success, but clearing does not depend on that.)
           setCode("");
@@ -1827,6 +1934,26 @@ function RestorePanel({
           />
         </label>
         <label className="block text-sm">
+          <span className="mb-1 block font-medium">
+            Vaults from the sheet&rsquo;s &ldquo;covers&rdquo; line
+          </span>
+          <input
+            data-testid="restore-vaults"
+            className={`${inputCls} font-mono`}
+            value={vaults}
+            onChange={(e) => setVaults(e.target.value)}
+            placeholder="vault-a, vault-b"
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <span className="mt-1 block text-xs text-neutral-600 dark:text-neutral-400">
+            Copying these off the sheet asks each vault directly instead of relying on
+            the server&rsquo;s list of what is waiting for this kit &mdash; a list anyone
+            else can crowd out. Leave it blank and, if that list is being crowded, this
+            refuses rather than restoring part of your vaults and calling it done.
+          </span>
+        </label>
+        <label className="block text-sm">
           <span className="mb-1 block font-medium">Recovery code (56 characters)</span>
           <textarea
             data-testid="restore-code"
@@ -1888,6 +2015,7 @@ function RestorePanel({
               setCode("");
               setPw("");
               setPw2("");
+              setVaults("");
               setFailure(null);
               setOpen(false);
             }}
@@ -4659,7 +4787,16 @@ interface GeneratedKit {
   baseUrl: string;
   safetyNumber: string;
   covered: { vaultId: string; fingerprint: string }[];
-  verification: { accountId: string; indexedVaults: number; unwrappedVault: string; fingerprint: string };
+  verification: {
+    accountId: string;
+    indexedVaults: number;
+    // ⭐ GENERATION IS THE ONE MOMENT THE USER CAN STILL ACT — re-print, reduce
+    // coverage, copy the "covers" line carefully. By restore time the paper is
+    // fixed, so a kit whose index is ALREADY crowded has to say so HERE.
+    indexTruncated: boolean;
+    unwrappedVault: string;
+    fingerprint: string;
+  };
 }
 
 function RecoveryPanel({
@@ -4956,11 +5093,20 @@ function RecoveryPanel({
               </dd>
             </div>
           </dl>
+          {/* ⭐ THE LABEL IS THE LITERAL WORD `covers`, and that is not
+              cosmetic. The restore field above and the truncation warning below
+              both tell the user to copy "the sheet's `covers` line" — and this
+              sheet used to be headed "Vaults covered as of today", so in a
+              crisis it pointed a person at a label their own paper did not
+              carry. `sigil recovery generate` prints `covers <ids> (as of the
+              print date)` and the desktop prints `covers:`, so a user may also
+              be holding a sheet from another client; one word across all four. */}
           <p className="mt-2 text-xs">
-            <span className="font-medium">Vaults covered as of today: </span>
+            <span className="font-medium">covers </span>
             <span data-testid="recovery-covered" className="font-mono">
               {kit.covered.length ? kit.covered.map((c) => c.vaultId).join(", ") : "NONE"}
             </span>
+            <span className="opacity-70"> (as of the print date)</span>
           </p>
           {kit.covered.length === 0 && (
             <p
@@ -4972,6 +5118,30 @@ function RecoveryPanel({
               authenticate to the account, but it holds no vault key. Convert a vault to a shared
               vault (Sharing → Convert) and then use <em>Cover this vault</em> below, or this sheet
               is worthless.
+            </p>
+          )}
+          {kit.verification.indexTruncated && (
+            // ⭐ RENDERED AT THE MOMENT OF PRINTING, deliberately — this is the
+            // last point at which the user can do anything about it. The kit
+            // still works and is still printed: refusing to print because a
+            // stranger crowded a server listing would hand an availability
+            // attack the power to stop kits being made at all, which is a denial
+            // of the last line of defence (ADR 0040 limitation 1) and strictly
+            // worse than the truncation it would be reacting to. Mirrors the
+            // block in `cli/src/main.rs`.
+            <p
+              data-testid="recovery-index-truncated"
+              role="alert"
+              className="mt-2 rounded border border-amber-500 bg-amber-50 p-2 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+            >
+              <strong>
+                This server already lists more waiting keys for this kit than it will show at once,
+                and there is no way to ask for the rest.
+              </strong>{" "}
+              The kit works, and the <em>covers</em> line above is what a restore should be given —
+              it asks each vault directly, which cannot be crowded out. But do not rely on the
+              server being able to tell this kit what it holds, and <strong>re-print</strong> this
+              sheet after covering anything new.
             </p>
           )}
           <ul className="mt-3 space-y-2 text-xs">

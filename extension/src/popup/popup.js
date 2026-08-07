@@ -262,6 +262,29 @@ function showSizeWarning(text) {
 }
 
 /**
+ * Render (or clear) the persistent "what this restore could not account for"
+ * alert in the unlocked vault.
+ *
+ * ⛔ These are facts about a restore that ALREADY SUCCEEDED, which is exactly why
+ * they need somewhere to live that is not the one-line `#status`: that line is
+ * overwritten by the next action the user takes, and it labelled every note
+ * "Not restored:", which reads as though a named vault failed when the real
+ * message is "the server would not tell this kit everything it holds".
+ */
+function showRestoreNotes(notes) {
+  const el = $("restore-notes");
+  const list = $("restore-notes-list");
+  if (!el || !list) return;
+  list.textContent = "";
+  for (const note of notes ?? []) {
+    const li = document.createElement("li");
+    li.textContent = note;
+    list.appendChild(li);
+  }
+  el.hidden = !(notes && notes.length);
+}
+
+/**
  * ⭐⭐ THE NO-DOWNGRADE RATCHET, applied at every re-seal this popup performs.
  *
  * ⛔ A `SIGILcli` container carries the Argon2id work factors it was sealed with,
@@ -811,6 +834,9 @@ function lock() {
   $("accounts").dataset.labels = "";
   $("export-out").hidden = true;
   $("export-out").value = "";
+  // The restore that produced these is over; a later unlock is a different
+  // session and must not inherit its caveats.
+  showRestoreNotes([]);
   // A recovery code on screen is a credential on screen: locking removes it.
   $("recovery-code").textContent = "";
   $("recovery-sheet").hidden = true;
@@ -1930,6 +1956,9 @@ $("recovery-generate").addEventListener("click", async () => {
       ? res.covered.map((c) => c.vaultId).join(", ")
       : "NONE";
     $("recovery-covers-nothing").hidden = res.covered.length > 0;
+    // ⭐ AT THE MOMENT OF PRINTING — the last point at which the user can do
+    // anything about it. By restore time the paper is fixed.
+    $("recovery-index-truncated").hidden = res.verification.indexTruncated !== true;
     $("recovery-written").checked = false;
     $("recovery-hide").disabled = true;
     $("recovery-sheet").hidden = false;
@@ -1942,6 +1971,10 @@ $("recovery-generate").addEventListener("click", async () => {
   } catch (e) {
     say(`Generating a recovery kit failed: ${recoveryErr(e)}`, "error");
   }
+});
+
+$("restore-notes-dismiss").addEventListener("click", () => {
+  showRestoreNotes([]);
 });
 
 $("recovery-written").addEventListener("change", () => {
@@ -2105,10 +2138,20 @@ $("restore-form").addEventListener("submit", async (ev) => {
   try {
     const baseUrl = $("restore-url").value.trim();
     say("Checking the code on this device, then asking the server…");
+    // ⭐ The sheet's "covers" line. Supplying the ids makes the restore ask each
+    // VAULT directly instead of asking the server what is waiting for this kit —
+    // ONE uncursored page any other account can crowd rows off. With none
+    // supplied and a crowded listing, restoreFromKit REFUSES rather than
+    // restoring part of the vaults and reporting success.
+    const vaultIds = $("restore-vaults")
+      .value.split(/[\s,]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
     const res = await restoreFromKit(wasm, {
       baseUrl,
       code: $("restore-code").value,
       deviceId: $("restore-device").value.trim(),
+      vaultIds,
     });
 
     const kitAuth = {
@@ -2120,7 +2163,56 @@ $("restore-form").addEventListener("submit", async (ev) => {
 
     // A kit recovers KEYS. The ciphertext still has to exist, so try each
     // recovered vault until one has content this key opens.
+    // ⚠️ TWO DIFFERENT KINDS OF FACT, kept apart on purpose. `notes` is
+    // per-vault: a named vault whose key or content did not come back. `caveats`
+    // are about the RESTORE AS A WHOLE — the server would not list everything,
+    // or would not answer at all, or listed rows from strangers. Folding the
+    // second kind into the first (which is what shipped) rendered
+    // "⚠️ THIS MAY NOT BE EVERYTHING" under the heading "Not restored:", so the
+    // one message that says the RESULT ITSELF is unprovable read as though some
+    // individual vault had failed.
     const notes = res.skipped.map((s) => `${s.vaultId}: ${s.reason}`);
+    const caveats = [];
+    // ⛔ NEVER PRESENT A TRUNCATED RESTORE AS COMPLETE.
+    if (res.indexTruncated) {
+      caveats.push(
+        "⚠️ THIS MAY NOT BE EVERYTHING: this server holds more waiting keys for this kit " +
+          "than it will list at once, and there is no way to ask for the rest. What came back " +
+          "is what you named plus one page — a vault covered AFTER the sheet was printed may " +
+          "exist and be invisible here. Treat the vault above as a floor, not a total, and " +
+          "re-check from a working device once you have one.",
+      );
+    }
+    // ⚠️ DEGRADED, NOT SILENT. The sheet path deliberately does not need the
+    // index route — but nothing here could then look for a vault covered AFTER
+    // the sheet was printed, and that has to be said rather than shown as a
+    // clean success.
+    if (res.indexError) {
+      caveats.push(
+        `the server's list of what is waiting for this kit could not be read (${res.indexError}). ` +
+          "Only the vault ids you typed were used, which is what that line on the sheet is for — " +
+          "but a vault covered AFTER the sheet was printed could not be looked for.",
+      );
+    }
+    // ⭐ ONE SUMMARY, NEVER ONE LINE PER ROW: a flood is bounded noise, and
+    // listing it row by row would bury the result the user came to read, which
+    // is exactly what the flood is for.
+    if (res.ignoredUntrusted > 0) {
+      caveats.push(
+        `${res.ignoredUntrusted} vault(s) this server listed for this kit were deposited by ` +
+          "devices OUTSIDE your account and were ignored — not fetched, not unwrapped, and their " +
+          "keys were not pinned. Anyone can address an envelope to a kit; an envelope proves WHO " +
+          "sent it, never that they are trusted. A vault genuinely shared to this kit from " +
+          "another account has to be collected from a working device.",
+      );
+    }
+    if (res.fromSheet.length > 0) {
+      caveats.push(
+        `found by asking the vault directly (the server's list did not name ${
+          res.fromSheet.length === 1 ? "it" : "them"
+        }): ${res.fromSheet.join(", ")}`,
+      );
+    }
     let opened = null;
     let openedId = "";
     let openedKey = null;
@@ -2171,7 +2263,9 @@ $("restore-form").addEventListener("submit", async (ev) => {
         `the code and device id are valid and ${res.vaults.length} vault key(s) were recovered, ` +
           "but no vault content could be opened. A recovery kit recovers KEYS, not DATA: a vault " +
           "whose sealed container was never pushed to this server cannot come back." +
-          (notes.length ? ` Details: ${notes.join("; ")}.` : ""),
+          (notes.length || caveats.length
+            ? ` Details: ${[...notes, ...caveats].join("; ")}.`
+            : ""),
       );
     }
 
@@ -2209,8 +2303,18 @@ $("restore-form").addEventListener("submit", async (ev) => {
     $("sync-vault").value = openedId;
     renderSharing();
     unlocked();
+    // ⛔ The caveats OUTLIVE this line. `#status` is one line and the next action
+    // the user takes overwrites it, so anything that is still true afterwards
+    // goes in the persistent alert at the top of the vault instead.
+    showRestoreNotes([...notes, ...caveats]);
     say(
-      `Restored vault "${openedId}" — ${opened.entries.length} account(s) — from the printed kit. ` +
+      // ⛔ THE HEADLINE ITSELF CHANGES, the way the desktop's does. A truncated
+      // restore that announces a plain "Restored" and hides the qualification in
+      // a trailing clause is the under-report this phase exists to remove.
+      (res.indexTruncated
+        ? `Restored vault "${openedId}" — ${opened.entries.length} account(s) — but ⚠️ THAT MAY ` +
+          "NOT BE ALL OF THEM, see the warning above. "
+        : `Restored vault "${openedId}" — ${opened.entries.length} account(s) — from the printed kit. `) +
         "⚠️ THIS BROWSER IS NOW A SECOND COPY OF THAT PAPER: it holds the kit's keys. Keep the " +
         "sheet itself somewhere else." +
         (notes.length ? ` Not restored: ${notes.join("; ")}.` : ""),

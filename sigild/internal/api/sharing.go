@@ -494,8 +494,45 @@ func (h *handlers) keyEnvelopeList(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // maxRecipientIndexRows caps one page of the per-device envelope index. A device
-// with more covered vaults than this gets has_more=true; there is no cursor,
-// because the realistic count is single digits and a cursor would be dead code.
+// with more covered vaults than this gets has_more=true; there is still no
+// cursor.
+//
+// ⚠️ THE ORIGINAL JUSTIFICATION FOR HAVING NO CURSOR WAS "the realistic count is
+// single digits and a cursor would be dead code". THAT PREMISE IS FALSE, and it
+// was disproved by measurement in Phase 64 (ADR 0052): the count is not the
+// user's, it is an ATTACKER'S. Any account may deposit an opaque envelope
+// addressed to a device id it knows and then grant that device `read` on a vault
+// it claimed itself — trust-on-first-write places no cap on how many vaults one
+// account may own — so a third party fills this page at will. Reproduced against
+// a real server: 520 vaults in 0.6 s with junk bytes, ~3 s when every envelope is genuine and authenticated pushed a genuine row off the listing.
+//
+// ⭐ THE FIX IS DELIBERATELY NOT HERE, and that is a decision rather than an
+// omission. A cursor does not help: the flooder simply bloats what must be paged
+// through, on a client that by construction has no local state and no way to
+// know when to stop. Capping the SCAN is worse than the disease — an
+// unauthorized row is `continue`d WITHOUT consuming the row budget, so a scan cap
+// would let an attacker who deposits and grants NOTHING push genuine rows past
+// the cap, turning a slow-but-CORRECT listing into an empty one: an ADR 0041
+// mistake exactly, a protective bound that breaks the legitimate path. Ordering
+// the caller's own account first only half-closes it (a cross-account-covered
+// vault stays crowdable) and no client could rely on it without a version marker.
+//
+// So the duty moved to the CLIENT, where the information to settle it already
+// exists: the PRINTED RECOVERY SHEET carries the covered vault ids, and a restore
+// given those ids asks each VAULT directly — `GET /v1/vaults/{id}/keys` and
+// `GET /v1/vaults/{id}/keys/{deviceID}`, both addressed BY VAULT ID, with nothing
+// for a flood to crowd out. Given no ids and has_more=true a client REFUSES,
+// rather than reporting a partial recovery as a complete one.
+//
+// ⚠️ WHAT REMAINS OPEN, so none of the above reads as a clean bill of health: an
+// unauthorized row still costs a store round trip and neither consumes the row
+// budget nor ends the loop, and ListKeyEnvelopesForRecipient has no LIMIT — so a
+// stranger who deposits envelopes and grants NOTHING makes this handler scan
+// without bound. That is a LATENCY denial on one route, not a crowd-out (the
+// listing it returns stays correct and complete), it is PRE-EXISTING, and
+// bounding it correctly means pushing the authorization filter into the query
+// rather than bolting a cap on top. Recorded in ADR 0052 and the threat model;
+// not fixed here.
 const maxRecipientIndexRows = 500
 
 // recipientVaultJSON is one row of the per-device envelope index. Metadata only.

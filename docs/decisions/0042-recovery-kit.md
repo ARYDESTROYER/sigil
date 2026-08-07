@@ -635,3 +635,39 @@ pinned by `web/apps/webapp/tests/user-safety.spec.ts` and
 ⚠️ The finding that prompted this named only the extension. The webapp carried the
 identical sentence and was found by grepping for the claim. *A false sentence is a
 class, not an instance — sweep for it.*
+
+## Addendum (2026-08-07, Phase 64) — the discovery route was deniable, and a stranger's vault could be handed back as yours
+
+Superseded nothing; **revises two limitations** and records a defect this ADR's
+own design made reachable. The decision is
+[0052](0052-recovery-discovery-and-the-printed-sheet.md).
+
+**Retired.** The limitation *"a kit covering more than 500 vaults SILENTLY
+RECOVERS THE FIRST 500 AND REPORTS SUCCESS"* is gone. Every client now **refuses**
+a blind restore on `has_more: true` rather than reporting a partial as complete.
+⚠️ The accompanying claims that *"no client in this repo reads it"* and that
+closing it needed **a cursor** were **both wrong** — the JS half had refused since
+Phase 58, and Phase 64 closed it with **no cursor and no server behaviour change**.
+
+**⭐ What closed it was already in this ADR.** `render_recovery_sheet` has printed
+the covered vault ids on its `covers` line since Phase 54. Passing them to a
+restore makes it ask **each vault directly**, on routes addressed **by vault id**,
+where a flood has nothing to crowd out. The fix is therefore **retroactive to
+every sheet already printed**.
+
+**⚠️ New, and it is the sharper half.** The self-only index this ADR introduced is
+**deniable by a third party**: any account may deposit an envelope addressed to a
+kit and grant it `read` on a vault it claimed itself, pushing genuine rows off the
+single uncursored page (**measured: 520 vaults in 0.6 s with junk bytes, ~3 s when every envelope is genuine and authenticated**). Worse, because every
+input to a vault-key wrap is public, that stranger can mint a **perfectly
+authenticated** envelope — [0048](0048-authenticated-vault-key-envelopes.md)
+proves *who* deposited one and **nothing** about whether they are trusted — and a
+restore runs with an **empty pin store**, so first-sight TOFU accepted it. The
+new rule: a vault **named on the sheet** is vouched for by the user; a vault the
+**index alone** introduced needs a sender in the kit's **own account**.
+
+**⚠️ Two limitations of this ADR are narrowed, not retired.** Coverage still
+drifts after the print date — a vault covered later is on no sheet, and under a
+live flood the index remains its only discovery path. And the new trust rule
+defends against a **third party**, never against the **server**, which serves the
+account device list.
